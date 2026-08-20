@@ -1,9 +1,13 @@
 import {
   canonicalDatabaseName,
+  type ActivatedDatabaseGeneration,
   type BatchResult,
+  type CurrentDatabaseGeneration,
   type DatabaseExportResult,
   type DatabaseImportResult,
   type DatabaseInitResult,
+  type DatabaseSchemaRequirements,
+  type DiscardedDatabaseGeneration,
   type InitAllResult,
   type LocalDatabaseId,
   type LocalDatabaseSelector,
@@ -15,6 +19,7 @@ import {
   type SqlParams,
   type SqlRow,
   type SqlStatement,
+  type StagedDatabaseImportResult,
 } from "./types";
 
 type PendingRequest = {
@@ -176,6 +181,58 @@ export class LocalDatabaseClient {
     );
   }
 
+  stageImport(
+    data: Uint8Array | ArrayBuffer,
+    statements: readonly SqlStatement[],
+    requirements: DatabaseSchemaRequirements,
+  ): Promise<StagedDatabaseImportResult> {
+    const transferable =
+      data instanceof Uint8Array
+        ? data.slice().buffer
+        : data.slice(0);
+    return rpc.request(
+      {
+        operation: "stageImport",
+        database: this.database,
+        data: transferable,
+        statements,
+        requirements,
+      },
+      [transferable],
+    );
+  }
+
+  activateStaged(
+    generationId: string,
+    activationToken: string,
+  ): Promise<ActivatedDatabaseGeneration> {
+    return rpc.request({
+      operation: "activateStaged",
+      database: this.database,
+      generationId,
+      activationToken,
+    });
+  }
+
+  currentGeneration(): Promise<CurrentDatabaseGeneration> {
+    return rpc.request({
+      operation: "currentGeneration",
+      database: this.database,
+    });
+  }
+
+  discardStaged(
+    generationId: string,
+    activationToken: string,
+  ): Promise<DiscardedDatabaseGeneration> {
+    return rpc.request({
+      operation: "discardStaged",
+      database: this.database,
+      generationId,
+      activationToken,
+    });
+  }
+
   reset(): Promise<DatabaseInitResult> {
     return rpc.request({ operation: "reset", database: this.database });
   }
@@ -235,6 +292,37 @@ export const localDb = {
     data: Uint8Array | ArrayBuffer,
   ): Promise<DatabaseImportResult> {
     return getLocalDatabase(database).import(data);
+  },
+
+  stageImport(
+    database: "career",
+    data: Uint8Array | ArrayBuffer,
+    statements: readonly SqlStatement[],
+    requirements: DatabaseSchemaRequirements,
+  ): Promise<StagedDatabaseImportResult> {
+    return getLocalDatabase(database).stageImport(data, statements, requirements);
+  },
+
+  activateStaged(
+    database: "career",
+    generationId: string,
+    activationToken: string,
+  ): Promise<ActivatedDatabaseGeneration> {
+    return getLocalDatabase(database).activateStaged(generationId, activationToken);
+  },
+
+  currentGeneration(
+    database: "career",
+  ): Promise<CurrentDatabaseGeneration> {
+    return getLocalDatabase(database).currentGeneration();
+  },
+
+  discardStaged(
+    database: "career",
+    generationId: string,
+    activationToken: string,
+  ): Promise<DiscardedDatabaseGeneration> {
+    return getLocalDatabase(database).discardStaged(generationId, activationToken);
   },
 
   reset(database: LocalDatabaseId): Promise<DatabaseInitResult> {
