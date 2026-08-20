@@ -58,6 +58,10 @@
 .career-row-open:hover { background: #eef2ef; }
 .career-material-card header em.attached { color: #436b59; background: #e4f0e9; }
 .career-material-card footer { flex-wrap: wrap; gap: 5px 10px; }
+.career-goal-card.calm { background: linear-gradient(145deg, #fff, #f7faf8); }
+.career-no-score { margin-top: 11px; padding: 8px 9px; display: flex; align-items: center; gap: 6px; color: #547264; border-radius: 8px; background: #edf4f0; }
+.career-no-score span { color: inherit; font-size: 9px; font-weight: 600; }
+.career-no-score-note { min-height: 34px; padding: 0 11px; display: inline-flex; align-items: center; justify-content: center; gap: 6px; color: #547264; border: 1px solid #d9e5de; border-radius: 10px; background: #f3f7f5; font-size: 10px; white-space: nowrap; }
 @keyframes career-in { from { opacity: 0; transform: translateY(4px); } }
 @keyframes career-slide { from { transform: translateX(30px); opacity: .7; } }
 @keyframes career-modal-in { from { transform: translateY(8px) scale(.99); opacity: .6; } }
