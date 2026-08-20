@@ -3,6 +3,8 @@ const VERSION = 1 as const;
 const PRODUCT = "zhiji" as const;
 const MAGIC = "CAREER-BACKUP\r\n\u001a";
 const SQLITE_HEADER = "SQLite format 3\u0000";
+const SQLITE_IDENTITY_BYTE_SIZE = 72;
+const UINT32_MAX = 0xffff_ffff;
 
 const textEncoder = new TextEncoder();
 const magicBytes = textEncoder.encode(MAGIC);
@@ -50,8 +52,21 @@ export type CareerBackupManifest = Readonly<{
   database: Readonly<{
     byteSize: number;
     sha256: string;
+    applicationId: number;
+    userVersion: number;
   }>;
   attachments: readonly CareerBackupAttachmentMetadata[];
+  manifestSha256: string;
+}>;
+
+type UnsignedCareerBackupManifest = Omit<
+  CareerBackupManifest,
+  "manifestSha256"
+>;
+
+type SqliteIdentity = Readonly<{
+  applicationId: number;
+  userVersion: number;
 }>;
 
 export type CareerBackupAttachmentInput = Readonly<{
@@ -175,15 +190,23 @@ function assertMimeType(value: unknown, label: string): asserts value is string 
   }
 }
 
-function assertSqliteHeader(bytes: Uint8Array): void {
-  if (bytes.byteLength < sqliteHeaderBytes.byteLength) {
-    fail("The database payload is too short to be SQLite.", "INVALID_SQLITE");
+function readSqliteIdentity(bytes: Uint8Array): SqliteIdentity {
+  if (bytes.byteLength < SQLITE_IDENTITY_BYTE_SIZE) {
+    fail(
+      "The database payload is too short to contain a SQLite identity.",
+      "INVALID_SQLITE",
+    );
   }
   for (let index = 0; index < sqliteHeaderBytes.byteLength; index += 1) {
     if (bytes[index] !== sqliteHeaderBytes[index]) {
       fail("The database payload does not have a SQLite 3 header.", "INVALID_SQLITE");
     }
   }
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  return {
+    applicationId: view.getUint32(68, false),
+    userVersion: view.getUint32(60, false),
+  };
 }
 
 function checkedAdd(left: number, right: number): number {
@@ -234,12 +257,16 @@ function validateAttachmentMetadata(
     fail(`${label}.originalName is not a safe file name.`, "INVALID_MANIFEST");
   }
   assertMimeType(value.mimeType, `${label}.mimeType`);
-  if (value.category !== null) {
+  let category: string | null;
+  if (value.category === null) {
+    category = null;
+  } else {
     assertDisplayString(
       value.category,
       `${label}.category`,
       CAREER_BACKUP_LIMITS.categoryCharacters,
     );
+    category = value.category;
   }
   assertSafeInteger(
     value.byteSize,
@@ -256,7 +283,7 @@ function validateAttachmentMetadata(
     key: value.key,
     originalName: value.originalName,
     mimeType: value.mimeType,
-    category: value.category,
+    category,
     byteSize: value.byteSize,
     sha256: value.sha256,
     createdAt: value.createdAt,
@@ -270,7 +297,15 @@ function validateManifest(value: unknown): CareerBackupManifest {
   }
   assertExactKeys(
     value,
-    ["format", "version", "product", "exportedAt", "database", "attachments"],
+    [
+      "format",
+      "version",
+      "product",
+      "exportedAt",
+      "database",
+      "attachments",
+      "manifestSha256",
+    ],
     "The backup manifest",
   );
   if (value.format !== FORMAT || value.version !== VERSION || value.product !== PRODUCT) {
@@ -281,15 +316,33 @@ function validateManifest(value: unknown): CareerBackupManifest {
   if (!isRecord(value.database)) {
     fail("manifest.database must be an object.", "INVALID_MANIFEST");
   }
-  assertExactKeys(value.database, ["byteSize", "sha256"], "manifest.database");
+  assertExactKeys(
+    value.database,
+    ["byteSize", "sha256", "applicationId", "userVersion"],
+    "manifest.database",
+  );
   assertSafeInteger(
     value.database.byteSize,
     "manifest.database.byteSize",
-    sqliteHeaderBytes.byteLength,
+    SQLITE_IDENTITY_BYTE_SIZE,
     CAREER_BACKUP_LIMITS.databaseBytes,
     "DATABASE_TOO_LARGE",
   );
   assertSha256(value.database.sha256, "manifest.database.sha256");
+  assertSafeInteger(
+    value.database.applicationId,
+    "manifest.database.applicationId",
+    0,
+    UINT32_MAX,
+    "INVALID_MANIFEST",
+  );
+  assertSafeInteger(
+    value.database.userVersion,
+    "manifest.database.userVersion",
+    0,
+    UINT32_MAX,
+    "INVALID_MANIFEST",
+  );
 
   if (!Array.isArray(value.attachments)) {
     fail("manifest.attachments must be an array.", "INVALID_MANIFEST");
@@ -311,6 +364,7 @@ function validateManifest(value: unknown): CareerBackupManifest {
     seenKeys.add(metadata.key);
     return metadata;
   });
+  assertSha256(value.manifestSha256, "manifest.manifestSha256");
 
   return {
     format: FORMAT,
@@ -320,8 +374,48 @@ function validateManifest(value: unknown): CareerBackupManifest {
     database: {
       byteSize: value.database.byteSize,
       sha256: value.database.sha256,
+      applicationId: value.database.applicationId,
+      userVersion: value.database.userVersion,
     },
     attachments,
+    manifestSha256: value.manifestSha256,
+  };
+}
+
+function unsignedManifestProjection(
+  manifest: UnsignedCareerBackupManifest | CareerBackupManifest,
+): UnsignedCareerBackupManifest {
+  return {
+    format: FORMAT,
+    version: VERSION,
+    product: PRODUCT,
+    exportedAt: manifest.exportedAt,
+    database: {
+      byteSize: manifest.database.byteSize,
+      sha256: manifest.database.sha256,
+      applicationId: manifest.database.applicationId,
+      userVersion: manifest.database.userVersion,
+    },
+    attachments: manifest.attachments.map((metadata) => ({
+      key: metadata.key,
+      originalName: metadata.originalName,
+      mimeType: metadata.mimeType,
+      category: metadata.category,
+      byteSize: metadata.byteSize,
+      sha256: metadata.sha256,
+      createdAt: metadata.createdAt,
+      updatedAt: metadata.updatedAt,
+    })),
+  };
+}
+
+function manifestWithDigest(
+  manifest: UnsignedCareerBackupManifest,
+  manifestSha256: string,
+): CareerBackupManifest {
+  return {
+    ...unsignedManifestProjection(manifest),
+    manifestSha256,
   };
 }
 
@@ -382,7 +476,7 @@ export async function createCareerBackupBlob(
   if (input.database.byteLength > CAREER_BACKUP_LIMITS.databaseBytes) {
     fail("The database exceeds the backup safety limit.", "DATABASE_TOO_LARGE");
   }
-  assertSqliteHeader(input.database);
+  const databaseIdentity = readSqliteIdentity(input.database);
   if (input.attachments.length > CAREER_BACKUP_LIMITS.attachmentCount) {
     fail("The backup contains too many attachments.", "TOO_MANY_ATTACHMENTS");
   }
@@ -425,7 +519,7 @@ export async function createCareerBackupBlob(
   // Every digest has a fixed 64-character representation, so this placeholder
   // manifest has the exact final byte length. Reject oversized exports before
   // spending time hashing any potentially large payload.
-  const preflightManifest: CareerBackupManifest = {
+  const preflightUnsignedManifest: UnsignedCareerBackupManifest = {
     format: FORMAT,
     version: VERSION,
     product: PRODUCT,
@@ -433,9 +527,15 @@ export async function createCareerBackupBlob(
     database: {
       byteSize: databaseBlob.size,
       sha256: "0".repeat(64),
+      applicationId: databaseIdentity.applicationId,
+      userVersion: databaseIdentity.userVersion,
     },
     attachments: preparedAttachments.map((attachment) => attachment.metadata),
   };
+  const preflightManifest = manifestWithDigest(
+    preflightUnsignedManifest,
+    "0".repeat(64),
+  );
   const preflightManifestByteSize = textEncoder.encode(
     JSON.stringify(preflightManifest),
   ).byteLength;
@@ -463,7 +563,7 @@ export async function createCareerBackupBlob(
     manifestAttachments.push({ ...attachment.metadata, sha256 });
   }
 
-  const manifest: CareerBackupManifest = {
+  const unsignedManifest: UnsignedCareerBackupManifest = {
     format: FORMAT,
     version: VERSION,
     product: PRODUCT,
@@ -471,9 +571,19 @@ export async function createCareerBackupBlob(
     database: {
       byteSize: databaseBlob.size,
       sha256: databaseSha256,
+      applicationId: databaseIdentity.applicationId,
+      userVersion: databaseIdentity.userVersion,
     },
     attachments: manifestAttachments,
   };
+  const unsignedManifestBytes = textEncoder.encode(
+    JSON.stringify(unsignedManifestProjection(unsignedManifest)),
+  );
+  const manifestSha256 = await trustedHash(
+    new Blob([copyArrayBuffer(unsignedManifestBytes)]),
+    hashBlob,
+  );
+  const manifest = manifestWithDigest(unsignedManifest, manifestSha256);
   const manifestBytes = textEncoder.encode(JSON.stringify(manifest));
   if (manifestBytes.byteLength > CAREER_BACKUP_LIMITS.manifestBytes) {
     fail("The backup manifest exceeds the safety limit.", "MANIFEST_TOO_LARGE");
@@ -579,13 +689,33 @@ export async function parseCareerBackupBlob(
     fail("The backup size does not match its manifest.", "SIZE_MISMATCH");
   }
 
+  const unsignedManifestBytes = textEncoder.encode(
+    JSON.stringify(unsignedManifestProjection(manifest)),
+  );
+  const manifestDigest = await trustedHash(
+    new Blob([copyArrayBuffer(unsignedManifestBytes)]),
+    hashBlob,
+  );
+  if (manifestDigest !== manifest.manifestSha256) {
+    fail("The manifest SHA-256 digest does not match.", "MANIFEST_HASH_MISMATCH");
+  }
+
   const databaseStart = manifestEnd;
   const databaseEnd = databaseStart + manifest.database.byteSize;
   const databaseBlob = blob.slice(databaseStart, databaseEnd);
-  const sqliteHeader = new Uint8Array(
-    await databaseBlob.slice(0, sqliteHeaderBytes.byteLength).arrayBuffer(),
+  const sqliteIdentityBytes = new Uint8Array(
+    await databaseBlob.slice(0, SQLITE_IDENTITY_BYTE_SIZE).arrayBuffer(),
   );
-  assertSqliteHeader(sqliteHeader);
+  const databaseIdentity = readSqliteIdentity(sqliteIdentityBytes);
+  if (
+    databaseIdentity.applicationId !== manifest.database.applicationId ||
+    databaseIdentity.userVersion !== manifest.database.userVersion
+  ) {
+    fail(
+      "The SQLite application ID or user version does not match the manifest.",
+      "DATABASE_IDENTITY_MISMATCH",
+    );
+  }
 
   const attachmentSegments: Array<{
     metadata: CareerBackupAttachmentMetadata;

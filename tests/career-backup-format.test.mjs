@@ -46,6 +46,8 @@ const magicBytes = encoder.encode(CAREER_BACKUP_MAGIC);
 const EMPTY_SHA256 =
   "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 const EXPORTED_AT = "2026-08-21T02:03:04.000Z";
+const APPLICATION_ID = 0x5a48_4a49;
+const USER_VERSION = 1;
 
 async function hashBlob(blob) {
   return createHash("sha256")
@@ -57,11 +59,17 @@ function uuid(index) {
   return `00000000-0000-4000-8000-${String(index).padStart(12, "0")}`;
 }
 
-function sqliteBytes(label = "career-db") {
+function sqliteBytes(
+  label = "career-db",
+  { applicationId = APPLICATION_ID, userVersion = USER_VERSION } = {},
+) {
   const suffix = encoder.encode(label);
-  const bytes = new Uint8Array(64 + suffix.byteLength);
+  const bytes = new Uint8Array(100 + suffix.byteLength);
   bytes.set(encoder.encode("SQLite format 3\u0000"));
-  bytes.set(suffix, 64);
+  const view = new DataView(bytes.buffer);
+  view.setUint32(60, userVersion, false);
+  view.setUint32(68, applicationId, false);
+  bytes.set(suffix, 100);
   return bytes;
 }
 
@@ -143,6 +151,38 @@ function assembleContainer(manifest, databaseBytes, attachmentBytes = []) {
   ]);
 }
 
+function unsignedManifestProjection(manifest) {
+  return {
+    format: manifest.format,
+    version: manifest.version,
+    product: manifest.product,
+    exportedAt: manifest.exportedAt,
+    database: {
+      byteSize: manifest.database.byteSize,
+      sha256: manifest.database.sha256,
+      applicationId: manifest.database.applicationId,
+      userVersion: manifest.database.userVersion,
+    },
+    attachments: manifest.attachments.map((metadata) => ({
+      key: metadata.key,
+      originalName: metadata.originalName,
+      mimeType: metadata.mimeType,
+      category: metadata.category,
+      byteSize: metadata.byteSize,
+      sha256: metadata.sha256,
+      createdAt: metadata.createdAt,
+      updatedAt: metadata.updatedAt,
+    })),
+  };
+}
+
+async function resignManifest(manifest) {
+  manifest.manifestSha256 = await hashBlob(
+    new Blob([JSON.stringify(unsignedManifestProjection(manifest))]),
+  );
+  return manifest;
+}
+
 async function baseBackup(attachments = []) {
   return createCareerBackupBlob(
     { database: sqliteBytes(), attachments, exportedAt: EXPORTED_AT },
@@ -163,10 +203,10 @@ test("zero-attachment backups round-trip with a versioned manifest", async () =>
   );
 
   assert.equal(backup.type, CAREER_BACKUP_MIME_TYPE);
-  assert.equal(hashCalls, 1);
+  assert.equal(hashCalls, 2, "database and unsigned manifest were hashed");
 
   const parsed = await parseCareerBackupBlob(backup, countingHash);
-  assert.equal(hashCalls, 2);
+  assert.equal(hashCalls, 4, "manifest integrity was checked before database bytes");
   assert.deepEqual(parsed.database, database);
   assert.deepEqual(parsed.attachments, []);
   assert.equal(parsed.manifest.format, "career-backup");
@@ -175,6 +215,9 @@ test("zero-attachment backups round-trip with a versioned manifest", async () =>
   assert.equal(parsed.manifest.exportedAt, EXPORTED_AT);
   assert.equal(parsed.manifest.database.byteSize, database.byteLength);
   assert.equal(parsed.manifest.database.sha256, await hashBlob(new Blob([database])));
+  assert.equal(parsed.manifest.database.applicationId, APPLICATION_ID);
+  assert.equal(parsed.manifest.database.userVersion, USER_VERSION);
+  assert.match(parsed.manifest.manifestSha256, /^[0-9a-f]{64}$/);
 });
 
 test("Unicode metadata and multiple ordered attachments round-trip exactly", async () => {
@@ -287,6 +330,95 @@ test("magic and manifest framing corruption are rejected", async (t) => {
   });
 });
 
+test("manifest SHA-256 catches a same-length valid-JSON metadata bit flip before payload hashing", async () => {
+  const source = await attachment({
+    index: 40,
+    name: "portfolio.pdf",
+    type: "application/pdf",
+    content: "portfolio bytes",
+  });
+  const backup = await baseBackup([source]);
+  const parts = await inspectContainer(backup);
+  const bytes = parts.bytes.slice();
+  const manifestText = new TextDecoder().decode(
+    bytes.subarray(parts.manifestStart, parts.manifestEnd),
+  );
+  const nameOffset = manifestText.indexOf("portfolio.pdf");
+  assert.ok(nameOffset >= 0);
+  bytes[parts.manifestStart + nameOffset] = "q".charCodeAt(0);
+
+  const mutatedManifest = JSON.parse(
+    new TextDecoder().decode(bytes.subarray(parts.manifestStart, parts.manifestEnd)),
+  );
+  assert.equal(mutatedManifest.attachments[0].originalName, "qortfolio.pdf");
+
+  let hashCalls = 0;
+  await expectCode(
+    () =>
+      parseCareerBackupBlob(new Blob([bytes]), async (blob) => {
+        hashCalls += 1;
+        return hashBlob(blob);
+      }),
+    "MANIFEST_HASH_MISMATCH",
+  );
+  assert.equal(hashCalls, 1, "no database or attachment payload was hashed");
+});
+
+test("SQLite application ID and user version are derived and matched exactly", async (t) => {
+  const applicationId = 0x1234_abcd;
+  const userVersion = 37;
+  const database = sqliteBytes("identity", { applicationId, userVersion });
+  const backup = await createCareerBackupBlob(
+    { database, attachments: [], exportedAt: EXPORTED_AT },
+    hashBlob,
+  );
+  const parts = await inspectContainer(backup);
+
+  assert.equal(parts.manifest.database.applicationId, applicationId);
+  assert.equal(parts.manifest.database.userVersion, userVersion);
+  const parsed = await parseCareerBackupBlob(backup, hashBlob);
+  assert.equal(parsed.manifest.database.applicationId, applicationId);
+  assert.equal(parsed.manifest.database.userVersion, userVersion);
+
+  async function rejectDatabaseIdentityMutation(offset, replacement) {
+    const bytes = parts.bytes.slice();
+    new DataView(bytes.buffer).setUint32(
+      parts.databaseStart + offset,
+      replacement,
+      false,
+    );
+    let hashCalls = 0;
+    await expectCode(
+      () =>
+        parseCareerBackupBlob(new Blob([bytes]), async (blob) => {
+          hashCalls += 1;
+          return hashBlob(blob);
+        }),
+      "DATABASE_IDENTITY_MISMATCH",
+    );
+    assert.equal(hashCalls, 1, "only the unsigned manifest was hashed");
+  }
+
+  await t.test("application ID bytes", () =>
+    rejectDatabaseIdentityMutation(68, applicationId ^ 1));
+  await t.test("user version bytes", () =>
+    rejectDatabaseIdentityMutation(60, userVersion + 1));
+
+  await t.test("a correctly re-signed manifest cannot lie about the header", async () => {
+    const manifest = structuredClone(parts.manifest);
+    manifest.database.applicationId = applicationId ^ 1;
+    await resignManifest(manifest);
+    await expectCode(
+      () =>
+        parseCareerBackupBlob(
+          assembleContainer(manifest, parts.databaseBytes),
+          hashBlob,
+        ),
+      "DATABASE_IDENTITY_MISMATCH",
+    );
+  });
+});
+
 test("container length must exactly match the manifest", async () => {
   const backup = await baseBackup([
     await attachment({ index: 4, name: "resume.pdf", content: "resume" }),
@@ -336,7 +468,11 @@ test("SQLite header, database hash, and attachment hashes are all enforced", asy
       () => parseCareerBackupBlob(new Blob([bytes]), trackingHash),
       "ATTACHMENT_HASH_MISMATCH",
     );
-    assert.equal(calls, 3, "database and both ordered attachments were hashed");
+    assert.equal(
+      calls,
+      4,
+      "manifest, database, and both ordered attachments were hashed",
+    );
   });
 });
 
@@ -406,6 +542,30 @@ test("duplicate UUIDs and malformed attachment fields are rejected", async (t) =
   await t.test("extra field", () =>
     rejectMutation((manifest) => {
       manifest.attachments[0].path = "/tmp/secret";
+    }));
+  await t.test("missing manifest digest", () =>
+    rejectMutation((manifest) => {
+      delete manifest.manifestSha256;
+    }));
+  await t.test("invalid manifest digest", () =>
+    rejectMutation((manifest) => {
+      manifest.manifestSha256 = "ABC";
+    }));
+  await t.test("top-level extra field", () =>
+    rejectMutation((manifest) => {
+      manifest.comment = "not part of v1";
+    }));
+  await t.test("database extra field", () =>
+    rejectMutation((manifest) => {
+      manifest.database.pageSize = 4_096;
+    }));
+  await t.test("invalid application ID type", () =>
+    rejectMutation((manifest) => {
+      manifest.database.applicationId = "zhiji";
+    }));
+  await t.test("invalid user version range", () =>
+    rejectMutation((manifest) => {
+      manifest.database.userVersion = -1;
     }));
 });
 
