@@ -22,7 +22,7 @@ import {
   WandSparkles, X, Zap,
 } from "lucide-react";
 import {
-  FormEvent, ReactNode, useCallback, useEffect, useMemo, useRef, useState,
+  FormEvent, ReactNode, useCallback, useEffect, useId, useMemo, useRef, useState,
 } from "react";
 import {
   addActivity, exportCareerDb, importCareerDb, initializeCareerDb,
@@ -112,6 +112,73 @@ function readCaptureParams() {
   if (typeof window === "undefined") return "";
   const params = new URL(window.location.href).searchParams;
   return [params.get("capture")?.trim(), params.get("text")?.trim()].filter(Boolean).join("\n\n");
+}
+
+const dialogFocusable = [
+  "a[href]", "button:not([disabled])", "input:not([disabled]):not([type='hidden'])",
+  "select:not([disabled])", "textarea:not([disabled])", "[tabindex]:not([tabindex='-1'])",
+].join(",");
+
+function useDialogA11y(onClose: () => void) {
+  const dialogRef = useRef<HTMLElement | null>(null);
+  const onCloseRef = useRef(onClose);
+  useEffect(() => { onCloseRef.current = onClose; }, [onClose]);
+
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    const trigger = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const layer = dialog.closest<HTMLElement>(".career-layer, .career-command-layer");
+    const root = dialog.closest<HTMLElement>(".career-app");
+    const inertState = new Map<HTMLElement, boolean>();
+    if (root && layer) {
+      Array.from(root.children).forEach((child) => {
+        if (!(child instanceof HTMLElement) || child === layer || child.classList.contains("career-toast-stack")) return;
+        inertState.set(child, child.inert);
+        child.inert = true;
+      });
+    }
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    const focusFrame = window.requestAnimationFrame(() => {
+      const initial = dialog.querySelector<HTMLElement>("[data-dialog-initial]")
+        ?? dialog.querySelector<HTMLElement>("input:not([disabled]):not([type='hidden']), textarea:not([disabled]), select:not([disabled])")
+        ?? dialog.querySelector<HTMLElement>("button:not([disabled]), a[href]");
+      (initial ?? dialog).focus();
+    });
+
+    function focusableItems() {
+      return Array.from(dialog!.querySelectorAll<HTMLElement>(dialogFocusable)).filter((element) =>
+        !element.hidden && element.getAttribute("aria-hidden") !== "true" && element.getClientRects().length > 0);
+    }
+
+    function handleKeydown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        onCloseRef.current();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const items = focusableItems();
+      if (items.length === 0) { event.preventDefault(); dialog?.focus(); return; }
+      const first = items[0];
+      const last = items[items.length - 1];
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+    }
+
+    dialog.addEventListener("keydown", handleKeydown);
+    return () => {
+      window.cancelAnimationFrame(focusFrame);
+      dialog.removeEventListener("keydown", handleKeydown);
+      inertState.forEach((wasInert, element) => { element.inert = wasInert; });
+      document.body.style.overflow = previousOverflow;
+      window.requestAnimationFrame(() => { if (trigger?.isConnected) trigger.focus(); });
+    };
+  }, []);
+
+  return dialogRef;
 }
 
 export default function CareerApp() {
@@ -455,8 +522,16 @@ function SettingsView({ data, onRefresh, onExport, onImport, notify }: { data: C
   </div></div></div>;
 }
 
-function Drawer({ children, onClose, wide = false }: { children: ReactNode; onClose: () => void; wide?: boolean }) { return <div className="career-layer"><button className="career-modal-scrim" onClick={onClose} aria-label="关闭" /><aside className={`career-drawer ${wide ? "wide" : ""}`} role="dialog" aria-modal="true">{children}</aside></div>; }
-function Modal({ title, description, children, onClose, wide = false }: { title: string; description?: string; children: ReactNode; onClose: () => void; wide?: boolean }) { return <div className="career-layer"><button className="career-modal-scrim" onClick={onClose} aria-label="关闭" /><section className={`career-modal ${wide ? "wide" : ""}`} role="dialog" aria-modal="true"><header><div><h2>{title}</h2>{description && <p>{description}</p>}</div><button className="career-icon-button" onClick={onClose}><X size={19} /></button></header>{children}</section></div>; }
+function Drawer({ label, children, onClose, wide = false }: { label: string; children: ReactNode; onClose: () => void; wide?: boolean }) {
+  const dialogRef = useDialogA11y(onClose);
+  return <div className="career-layer"><button className="career-modal-scrim" onClick={onClose} aria-label={`关闭${label}`} /><aside ref={dialogRef} tabIndex={-1} className={`career-drawer ${wide ? "wide" : ""}`} role="dialog" aria-modal="true" aria-label={label}>{children}</aside></div>;
+}
+function Modal({ title, description, children, onClose, wide = false }: { title: string; description?: string; children: ReactNode; onClose: () => void; wide?: boolean }) {
+  const dialogRef = useDialogA11y(onClose);
+  const titleId = useId();
+  const descriptionId = useId();
+  return <div className="career-layer"><button className="career-modal-scrim" onClick={onClose} aria-label={`关闭${title}`} /><section ref={dialogRef} tabIndex={-1} className={`career-modal ${wide ? "wide" : ""}`} role="dialog" aria-modal="true" aria-labelledby={titleId} aria-describedby={description ? descriptionId : undefined}><header><div><h2 id={titleId}>{title}</h2>{description && <p id={descriptionId}>{description}</p>}</div><button className="career-icon-button" onClick={onClose} aria-label={`关闭${title}`}><X size={19} /></button></header>{children}</section></div>;
+}
 function Field({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) { return <label className="career-field"><span>{label}{hint && <small>{hint}</small>}</span>{children}</label>; }
 function EmptyState({ icon, title, text, action }: { icon: ReactNode; title: string; text: string; action?: ReactNode }) { return <div className="career-empty"><span>{icon}</span><h3>{title}</h3><p>{text}</p>{action}</div>; }
 
@@ -467,7 +542,7 @@ function JobDrawer({ job, data, onClose, onMove, onArchive, onRefresh, onAi, not
   const interviews = data.interviews.filter((item) => item.job_id === job.id);
   const materials = data.materials.filter((item) => item.linked_job_id === job.id);
   async function save(event: FormEvent<HTMLFormElement>) { event.preventDefault(); const form = new FormData(event.currentTarget); await runCareerSql("UPDATE career_jobs SET company=?,role=?,location=?,salary=?,work_mode=?,description=?,note=?,tags=?,deadline=?,updated_at=? WHERE id=?", [form.get("company"), form.get("role"), form.get("location"), form.get("salary"), form.get("work_mode"), form.get("description"), form.get("note"), form.get("tags"), fromDateInput(String(form.get("deadline") || "")), new Date().toISOString(), job.id]); await onRefresh(); setEditing(false); notify("职位信息已保存"); }
-  return <Drawer onClose={onClose} wide><div className="career-job-drawer-head"><CompanyMark company={job.company} /><div><SourceBadge source={job.source} /><h2>{job.role}</h2><p>{job.company} · {job.location || "地点待确认"}</p></div><button className="career-icon-button" onClick={onClose} aria-label="关闭"><X size={19} /></button></div><div className="career-job-status-row"><select value={job.stage_id} onChange={(event) => void onMove(job.id, event.target.value)}>{data.stages.map((stage) => <option key={stage.id} value={stage.id}>{stage.name}</option>)}</select><span><Target size={14} />优先级 {job.priority}</span>{safeLink(job.source_url) && <a href={job.source_url} target="_blank" rel="noreferrer">查看原职位 <ExternalLink size={14} /></a>}</div><div className="career-drawer-tabs">{[["overview", "职位概览"], ["tasks", `待办 ${tasks.length}`], ["interviews", `面试 ${interviews.length}`], ["materials", `材料 ${materials.length}`]].map(([id, label]) => <button className={tab === id ? "active" : ""} key={id} onClick={() => setTab(id as typeof tab)}>{label}</button>)}</div><div className="career-drawer-body">{tab === "overview" && (editing ? <form className="career-form" onSubmit={save}><Field label="公司"><input name="company" defaultValue={job.company} required /></Field><Field label="职位"><input name="role" defaultValue={job.role} required /></Field><div className="career-form-row"><Field label="地点"><input name="location" defaultValue={job.location} /></Field><Field label="工作方式"><input name="work_mode" defaultValue={job.work_mode} /></Field></div><div className="career-form-row"><Field label="薪资"><input name="salary" defaultValue={job.salary} /></Field><Field label="截止时间"><input name="deadline" type="datetime-local" defaultValue={dateInputValue(job.deadline)} /></Field></div><Field label="标签"><input name="tags" defaultValue={job.tags} /></Field><Field label="职位描述"><textarea name="description" rows={7} defaultValue={job.description} /></Field><Field label="个人备注"><textarea name="note" rows={4} defaultValue={job.note} /></Field><div className="career-form-actions"><button type="button" className="career-button ghost" onClick={() => setEditing(false)}>取消</button><button className="career-button primary">保存修改</button></div></form> : <><div className="career-detail-actions"><button className="career-button secondary" onClick={() => onAi("fit_analysis", "AI 匹配度分析", { job })}><Sparkles size={15} />匹配度分析</button><button className="career-button ghost" onClick={() => setEditing(true)}><Pencil size={15} />编辑</button></div><dl className="career-detail-grid"><div><dt>薪资范围</dt><dd>{job.salary || "未记录"}</dd></div><div><dt>工作方式</dt><dd>{job.work_mode || "未记录"}</dd></div><div><dt>申请来源</dt><dd>{job.source}</dd></div><div><dt>投递时间</dt><dd>{job.applied_at ? formatDate(job.applied_at) : "尚未投递"}</dd></div><div><dt>联系人</dt><dd>{job.contact_name || "未关联"}</dd></div><div><dt>截止时间</dt><dd>{job.deadline ? formatDate(job.deadline, true) : "未记录"}</dd></div></dl><section className="career-detail-section"><h3>职位描述</h3><p className="career-long-copy">{job.description || "还没有保存职位描述。"}</p></section><section className="career-detail-section"><h3>我的备注</h3><p className="career-long-copy">{job.note || "还没有添加备注。"}</p></section><div className="career-card-tags">{job.tags.split(",").filter(Boolean).map((tag) => <i key={tag}>{tag}</i>)}</div></>)}
+  return <Drawer label={`${job.company} · ${job.role}`} onClose={onClose} wide><div className="career-job-drawer-head"><CompanyMark company={job.company} /><div><SourceBadge source={job.source} /><h2>{job.role}</h2><p>{job.company} · {job.location || "地点待确认"}</p></div><button className="career-icon-button" onClick={onClose} aria-label="关闭职位详情"><X size={19} /></button></div><div className="career-job-status-row"><select value={job.stage_id} onChange={(event) => void onMove(job.id, event.target.value)} aria-label="职位阶段">{data.stages.map((stage) => <option key={stage.id} value={stage.id}>{stage.name}</option>)}</select><span><Target size={14} />优先级 {job.priority}</span>{safeLink(job.source_url) && <a href={job.source_url} target="_blank" rel="noreferrer">查看原职位 <ExternalLink size={14} /></a>}</div><div className="career-drawer-tabs">{[["overview", "职位概览"], ["tasks", `待办 ${tasks.length}`], ["interviews", `面试 ${interviews.length}`], ["materials", `材料 ${materials.length}`]].map(([id, label]) => <button className={tab === id ? "active" : ""} key={id} onClick={() => setTab(id as typeof tab)}>{label}</button>)}</div><div className="career-drawer-body">{tab === "overview" && (editing ? <form className="career-form" onSubmit={save}><Field label="公司"><input name="company" defaultValue={job.company} required /></Field><Field label="职位"><input name="role" defaultValue={job.role} required /></Field><div className="career-form-row"><Field label="地点"><input name="location" defaultValue={job.location} /></Field><Field label="工作方式"><input name="work_mode" defaultValue={job.work_mode} /></Field></div><div className="career-form-row"><Field label="薪资"><input name="salary" defaultValue={job.salary} /></Field><Field label="截止时间"><input name="deadline" type="datetime-local" defaultValue={dateInputValue(job.deadline)} /></Field></div><Field label="标签"><input name="tags" defaultValue={job.tags} /></Field><Field label="职位描述"><textarea name="description" rows={7} defaultValue={job.description} /></Field><Field label="个人备注"><textarea name="note" rows={4} defaultValue={job.note} /></Field><div className="career-form-actions"><button type="button" className="career-button ghost" onClick={() => setEditing(false)}>取消</button><button className="career-button primary">保存修改</button></div></form> : <><div className="career-detail-actions"><button className="career-button secondary" onClick={() => onAi("fit_analysis", "AI 匹配度分析", { job })}><Sparkles size={15} />匹配度分析</button><button className="career-button ghost" onClick={() => setEditing(true)}><Pencil size={15} />编辑</button></div><dl className="career-detail-grid"><div><dt>薪资范围</dt><dd>{job.salary || "未记录"}</dd></div><div><dt>工作方式</dt><dd>{job.work_mode || "未记录"}</dd></div><div><dt>申请来源</dt><dd>{job.source}</dd></div><div><dt>投递时间</dt><dd>{job.applied_at ? formatDate(job.applied_at) : "尚未投递"}</dd></div><div><dt>联系人</dt><dd>{job.contact_name || "未关联"}</dd></div><div><dt>截止时间</dt><dd>{job.deadline ? formatDate(job.deadline, true) : "未记录"}</dd></div></dl><section className="career-detail-section"><h3>职位描述</h3><p className="career-long-copy">{job.description || "还没有保存职位描述。"}</p></section><section className="career-detail-section"><h3>我的备注</h3><p className="career-long-copy">{job.note || "还没有添加备注。"}</p></section><div className="career-card-tags">{job.tags.split(",").filter(Boolean).map((tag) => <i key={tag}>{tag}</i>)}</div></>)}
     {tab === "tasks" && <div className="career-drawer-list">{tasks.map((task) => <article key={task.id}><span className={`career-check ${task.status}`}><Check size={13} /></span><div><b>{task.title}</b><small>{relativeDate(task.due_at)} · {task.kind}</small></div></article>)}{tasks.length === 0 && <EmptyState icon={<ListTodo />} title="还没有待办" text="为这个职位安排一个具体的下一步。" />}</div>}{tab === "interviews" && <div className="career-drawer-list">{interviews.map((item) => <article key={item.id}><span className="career-list-icon"><MessageSquareText size={16} /></span><div><b>{item.round_name}</b><small>{formatDate(item.scheduled_at, true)} · {item.interviewer || "面试官待确认"}</small><p>{item.summary}</p></div></article>)}{interviews.length === 0 && <EmptyState icon={<MessageSquareText />} title="还没有面试轮次" text="推进到面试后，在这里完整记录每一轮。" />}</div>}{tab === "materials" && <div className="career-drawer-list">{materials.map((item) => <article key={item.id}><span className="career-list-icon"><FileText size={16} /></span><div><b>{item.name}</b><small>{item.kind} · {item.version}</small><p>{item.notes}</p></div></article>)}{materials.length === 0 && <EmptyState icon={<FileText />} title="还没有关联材料" text="关联确切版本，之后随时知道发出的是哪一份。" />}</div>}</div><footer className="career-drawer-footer"><button className="career-button danger" onClick={() => void onArchive(job)}><Archive size={15} />归档职位</button><span /><button className="career-button primary" onClick={() => onAi("interview_prep", "生成下一步建议", { job, tasks, interviews })}><Sparkles size={15} />AI 下一步</button></footer></Drawer>;
 }
 
@@ -475,7 +550,7 @@ function InterviewDrawer({ interview, data, onClose, onRefresh, onAi, notify }: 
   const job = data.jobs.find((item) => item.id === interview.job_id);
   const [questions, setQuestions] = useState<InterviewQuestion[]>(parseQuestions(interview.questions_json));
   async function save(event: FormEvent<HTMLFormElement>) { event.preventDefault(); const form = new FormData(event.currentTarget); await runCareerSql("UPDATE career_interviews SET status=?,summary=?,raw_notes=?,questions_json=?,reflection=?,updated_at=? WHERE id=?", [form.get("status"), form.get("summary"), form.get("raw_notes"), JSON.stringify(questions), form.get("reflection"), new Date().toISOString(), interview.id]); await onRefresh(); notify("面经已保存"); }
-  return <Drawer onClose={onClose} wide><div className="career-job-drawer-head"><CompanyMark company={job?.company ?? "职"} /><div><span className="career-eyebrow">INTERVIEW EXPERIENCE</span><h2>{job?.company} · {interview.round_name}</h2><p>{formatDate(interview.scheduled_at, true)} · {interview.interviewer || "面试官待确认"}</p></div><button className="career-icon-button" onClick={onClose}><X size={19} /></button></div><form className="career-experience-form" onSubmit={save}><div className="career-experience-toolbar"><select name="status" defaultValue={interview.status}><option value="scheduled">待进行</option><option value="completed">已完成</option><option value="canceled">已取消</option></select><button type="button" className="career-button secondary" onClick={() => onAi("structure_interview", "AI 整理面经", { job, interview: { ...interview, questions } })}><Sparkles size={15} />AI 整理速记</button></div><Field label="一句话总结"><input name="summary" defaultValue={interview.summary} placeholder="这轮主要考察了什么，整体感受如何？" /></Field><Field label="原始速记"><textarea name="raw_notes" rows={6} defaultValue={interview.raw_notes} placeholder="先把记得的内容都写下来，不必整理…" /></Field><div className="career-question-section"><header><div><h3>面试问题与回答</h3><p>按实际顺序记录，方便之后复盘。</p></div><button type="button" className="career-button ghost" onClick={() => setQuestions((current) => [...current, { question: "", answer: "", note: "" }])}><Plus size={15} />添加问题</button></header>{questions.map((question, index) => <article key={index}><span>{String(index + 1).padStart(2, "0")}</span><div><input value={question.question} onChange={(event) => setQuestions((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, question: event.target.value } : item))} placeholder="面试官问了什么？" /><textarea rows={3} value={question.answer} onChange={(event) => setQuestions((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, answer: event.target.value } : item))} placeholder="我是怎么回答的？" /><input value={question.note} onChange={(event) => setQuestions((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, note: event.target.value } : item))} placeholder="追问、反馈或可以改进的地方" /></div><button type="button" onClick={() => setQuestions((current) => current.filter((_, itemIndex) => itemIndex !== index))}><Trash2 size={15} /></button></article>)}</div><Field label="复盘与下一步"><textarea name="reflection" rows={5} defaultValue={interview.reflection} placeholder="哪些地方做得好？下一次会怎么回答？" /></Field><div className="career-form-actions sticky"><button type="button" className="career-button ghost" onClick={onClose}>取消</button><button className="career-button primary"><Check size={16} />保存面经</button></div></form></Drawer>;
+  return <Drawer label={`${job?.company ?? "职迹"} · ${interview.round_name}面经`} onClose={onClose} wide><div className="career-job-drawer-head"><CompanyMark company={job?.company ?? "职"} /><div><span className="career-eyebrow">INTERVIEW EXPERIENCE</span><h2>{job?.company} · {interview.round_name}</h2><p>{formatDate(interview.scheduled_at, true)} · {interview.interviewer || "面试官待确认"}</p></div><button className="career-icon-button" onClick={onClose} aria-label="关闭面经"><X size={19} /></button></div><form className="career-experience-form" onSubmit={save}><div className="career-experience-toolbar"><select name="status" defaultValue={interview.status} aria-label="面试状态"><option value="scheduled">待进行</option><option value="completed">已完成</option><option value="canceled">已取消</option></select><button type="button" className="career-button secondary" onClick={() => onAi("structure_interview", "AI 整理面经", { job, interview: { ...interview, questions } })}><Sparkles size={15} />AI 整理速记</button></div><Field label="一句话总结"><input name="summary" defaultValue={interview.summary} placeholder="这轮主要考察了什么，整体感受如何？" /></Field><Field label="原始速记"><textarea name="raw_notes" rows={6} defaultValue={interview.raw_notes} placeholder="先把记得的内容都写下来，不必整理…" /></Field><div className="career-question-section"><header><div><h3>面试问题与回答</h3><p>按实际顺序记录，方便之后复盘。</p></div><button type="button" className="career-button ghost" onClick={() => setQuestions((current) => [...current, { question: "", answer: "", note: "" }])}><Plus size={15} />添加问题</button></header>{questions.map((question, index) => <article key={index}><span>{String(index + 1).padStart(2, "0")}</span><div><input value={question.question} onChange={(event) => setQuestions((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, question: event.target.value } : item))} placeholder="面试官问了什么？" aria-label={`第 ${index + 1} 个面试问题`} /><textarea rows={3} value={question.answer} onChange={(event) => setQuestions((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, answer: event.target.value } : item))} placeholder="我是怎么回答的？" aria-label={`第 ${index + 1} 个问题的回答`} /><input value={question.note} onChange={(event) => setQuestions((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, note: event.target.value } : item))} placeholder="追问、反馈或可以改进的地方" aria-label={`第 ${index + 1} 个问题的备注`} /></div><button type="button" onClick={() => setQuestions((current) => current.filter((_, itemIndex) => itemIndex !== index))} aria-label={`删除第 ${index + 1} 个问题`}><Trash2 size={15} /></button></article>)}</div><Field label="复盘与下一步"><textarea name="reflection" rows={5} defaultValue={interview.reflection} placeholder="哪些地方做得好？下一次会怎么回答？" /></Field><div className="career-form-actions sticky"><button type="button" className="career-button ghost" onClick={onClose}>取消</button><button className="career-button primary"><Check size={16} />保存面经</button></div></form></Drawer>;
 }
 
 function JobModal({ data, onClose, onSaved }: { data: CareerData; onClose: () => void; onSaved: (id: string) => Promise<void> }) {
@@ -534,9 +609,10 @@ function SmartImportModal({ data, initialInput, onClose, onSaved, notify }: { da
 }
 
 function CommandPalette({ data, onClose, onNavigate, onSelectJob, onAdd }: { data: CareerData; onClose: () => void; onNavigate: (view: CareerView) => void; onSelectJob: (id: string) => void; onAdd: () => void }) {
-  const [value, setValue] = useState(""); const inputRef = useRef<HTMLInputElement>(null); useEffect(() => inputRef.current?.focus(), []);
+  const [value, setValue] = useState("");
+  const dialogRef = useDialogA11y(onClose);
   const needle = value.toLowerCase(); const jobs = data.jobs.filter((job) => [job.company, job.role, job.tags].join(" ").toLowerCase().includes(needle)).slice(0, 6); const views = navItems.filter((item) => item.label.includes(value));
-  return <div className="career-command-layer"><button className="career-modal-scrim" onClick={onClose} /><section className="career-command" role="dialog" aria-modal="true"><label><Search size={19} /><input ref={inputRef} value={value} onChange={(event) => setValue(event.target.value)} placeholder="搜索职位，或跳转到任意页面…" /><kbd>ESC</kbd></label><div><span className="career-command-label">快捷动作</span><button onClick={onAdd}><span><Plus size={17} /></span><b>记录新职位</b><small>新建一条求职机会</small></button>{views.map((item) => <button key={item.id} onClick={() => { onClose(); onNavigate(item.id); }}><span><item.icon size={17} /></span><b>前往{item.label}</b><small>打开{item.label}</small></button>)}{jobs.length > 0 && <span className="career-command-label">职位</span>}{jobs.map((job) => <button key={job.id} onClick={() => onSelectJob(job.id)}><CompanyMark company={job.company} small /><b>{job.role}</b><small>{job.company} · {data.stages.find((stage) => stage.id === job.stage_id)?.name}</small></button>)}</div><footer><span><kbd>↑</kbd><kbd>↓</kbd> 移动</span><span><kbd>↵</kbd> 打开</span><span>资料来自本地 SQLite</span></footer></section></div>;
+  return <div className="career-command-layer"><button className="career-modal-scrim" onClick={onClose} aria-label="关闭全局搜索" /><section ref={dialogRef} tabIndex={-1} className="career-command" role="dialog" aria-modal="true" aria-label="全局搜索"><label><Search size={19} /><input data-dialog-initial value={value} onChange={(event) => setValue(event.target.value)} placeholder="搜索职位，或跳转到任意页面…" aria-label="搜索职位或页面" /><kbd>ESC</kbd></label><div><span className="career-command-label">快捷动作</span><button onClick={onAdd}><span><Plus size={17} /></span><b>记录新职位</b><small>新建一条求职机会</small></button>{views.map((item) => <button key={item.id} onClick={() => { onClose(); onNavigate(item.id); }}><span><item.icon size={17} /></span><b>前往{item.label}</b><small>打开{item.label}</small></button>)}{jobs.length > 0 && <span className="career-command-label">职位</span>}{jobs.map((job) => <button key={job.id} onClick={() => onSelectJob(job.id)}><CompanyMark company={job.company} small /><b>{job.role}</b><small>{job.company} · {data.stages.find((stage) => stage.id === job.stage_id)?.name}</small></button>)}</div><footer><span>输入关键词即时筛选</span><span><kbd>ESC</kbd> 关闭</span><span>资料来自本地 SQLite</span></footer></section></div>;
 }
 
 function AiPreview({ state, onClose, onAccept }: { state: { action: AiAction; title: string; loading: boolean; result?: unknown; error?: string }; onClose: () => void; onAccept: () => Promise<void> }) {
