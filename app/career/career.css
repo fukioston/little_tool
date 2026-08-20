@@ -316,3 +316,5 @@
   .career-error * { scroll-behavior: auto !important; animation: none !important; transition: none !important; }
   .spin { animation: none !important; }
 }
+
+.career-interview-card { cursor: default; }
