@@ -120,7 +120,10 @@ async function initDatabase(name: LocalDatabaseName): Promise<DatabaseInitResult
 }
 
 function bindStatement(statement: ReturnType<Database["prepare"]>, params?: SqlParams): void {
-  if (params !== undefined) statement.bind(params as BindingSpec);
+  const hasValues = Array.isArray(params)
+    ? params.length > 0
+    : params !== undefined && Object.keys(params).length > 0;
+  if (hasValues) statement.bind(params as BindingSpec);
 }
 
 function executeQuery<Row extends object = SqlRow>(

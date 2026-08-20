@@ -72,7 +72,11 @@ class LocalDbRpcClient {
       );
     }
 
-    const worker = new Worker(new URL("./sqlite.worker.ts", import.meta.url), {
+    const bundledWorkerUrl = new URL("./sqlite.worker.ts", import.meta.url);
+    const workerUrl = bundledWorkerUrl.protocol === "file:" && typeof window !== "undefined"
+      ? new URL(`${bundledWorkerUrl.pathname}${bundledWorkerUrl.search}`, window.location.origin)
+      : bundledWorkerUrl;
+    const worker = new Worker(workerUrl, {
       type: "module",
       name: "private-ai-suite-sqlite",
     });
