@@ -318,3 +318,7 @@
 }
 
 .career-interview-card { cursor: default; }
+.career-stage-settings label { grid-template-columns: auto 1fr auto; }
+.career-status-neutral { display: flex; align-items: center; gap: 5px; color: var(--career-faint); font-size: 12px; }
+.career-status-neutral i { width: 6px; height: 6px; border-radius: 50%; background: #9aa29e; }
+.career-form-actions.sticky { bottom: 0; z-index: 2; margin: 0 -24px -40px; padding: 12px 24px calc(12px + env(safe-area-inset-bottom)); border-top: 1px solid var(--career-line); }
