@@ -94,6 +94,77 @@ function initials(value: string) {
 
 function safeLink(url: string) { return /^https?:\/\//i.test(url) ? url : undefined; }
 
+type JobImportDraft = {
+  company: string;
+  role: string;
+  location: string;
+  source: string;
+  sourceUrl: string;
+  salary: string;
+  workMode: string;
+  description: string;
+  keywords: string;
+  warnings: string[];
+};
+
+function stringList(value: unknown) {
+  return Array.isArray(value) ? value.map((item) => String(item).trim()).filter(Boolean) : [];
+}
+
+function normalizeWorkMode(value: unknown) {
+  const normalized = String(value ?? "").trim().toLowerCase();
+  if (["remote", "远程"].includes(normalized)) return "远程";
+  if (["hybrid", "混合", "混合办公"].includes(normalized)) return "混合办公";
+  if (["onsite", "on-site", "现场", "现场办公"].includes(normalized)) return "现场办公";
+  return String(value ?? "").trim();
+}
+
+function normalizeSalary(value: unknown) {
+  if (typeof value === "string") return value.trim();
+  if (!value || typeof value !== "object") return "";
+  const salary = value as Record<string, unknown>;
+  if (typeof salary.raw === "string" && salary.raw.trim()) return salary.raw.trim();
+  const min = typeof salary.min === "number" ? salary.min : null;
+  const max = typeof salary.max === "number" ? salary.max : null;
+  if (min === null && max === null) return "";
+  const currency = String(salary.currency ?? "").toUpperCase();
+  const currencyLabel = currency === "CNY" ? "¥" : currency === "USD" ? "$" : currency === "SGD" ? "S$" : currency ? `${currency} ` : "";
+  const compact = (amount: number) => amount >= 1_000 && amount % 1_000 === 0 ? `${amount / 1_000}K` : String(amount);
+  const range = min !== null && max !== null ? `${compact(min)}–${compact(max)}` : min !== null ? `${compact(min)} 起` : `最高 ${compact(max!)}`;
+  const period = salary.period === "month" ? " / 月" : salary.period === "year" ? " / 年" : salary.period === "day" ? " / 天" : salary.period === "hour" ? " / 小时" : "";
+  const months = typeof salary.months === "number" && salary.months !== 12 ? ` · ${salary.months} 薪` : "";
+  return `${currencyLabel}${range}${period}${months}`;
+}
+
+function createJobImportDraft(parsed: Record<string, unknown>, input: string, detectedSource: string): JobImportDraft {
+  const responsibilities = stringList(parsed.responsibilities);
+  const mustHave = stringList(parsed.must_have);
+  const niceToHave = stringList(parsed.nice_to_have);
+  const summary = String(parsed.summary ?? "").trim();
+  const sections = [
+    summary,
+    responsibilities.length ? `职位职责\n${responsibilities.map((item) => `• ${item}`).join("\n")}` : "",
+    mustHave.length ? `必需条件\n${mustHave.map((item) => `• ${item}`).join("\n")}` : "",
+    niceToHave.length ? `加分项\n${niceToHave.map((item) => `• ${item}`).join("\n")}` : "",
+    input.trim() ? `原始分享文本\n${input.trim()}` : "",
+  ].filter(Boolean);
+  const embeddedUrl = input.match(/https?:\/\/[^\s<>"']+/i)?.[0]?.replace(/[),，。]+$/, "") ?? "";
+  const parsedSource = String(parsed.source ?? "").toLowerCase();
+  const source = detectedSource !== "智能识别" ? detectedSource : parsedSource === "linkedin" ? "LinkedIn" : parsedSource === "boss" ? "BOSS直聘" : "智能导入";
+  return {
+    company: String(parsed.company ?? parsed.company_name ?? "").trim(),
+    role: String(parsed.role ?? parsed.title ?? "").trim(),
+    location: String(parsed.location ?? "").trim(),
+    source,
+    sourceUrl: String(parsed.url ?? parsed.original_url ?? embeddedUrl).trim(),
+    salary: normalizeSalary(parsed.salary),
+    workMode: normalizeWorkMode(parsed.work_mode),
+    description: sections.join("\n\n") || input.trim(),
+    keywords: stringList(parsed.keywords).join(", "),
+    warnings: stringList(parsed.warnings),
+  };
+}
+
 function parseAiContent(value: unknown): unknown {
   if (!value || typeof value !== "object") return value;
   const record = value as Record<string, unknown>;
@@ -638,13 +709,35 @@ function MaterialModal({ data, onClose, onSaved }: { data: CareerData; onClose: 
 function SmartImportModal({ data, initialInput, onClose, onSaved, notify }: { data: CareerData; initialInput: string; onClose: () => void; onSaved: () => Promise<void>; notify: (text: string, tone?: Notice["tone"]) => void }) {
   const [mode, setMode] = useState<"smart" | "csv">("smart");
   const [input, setInput] = useState(initialInput); const [loading, setLoading] = useState(false);
-  const [parsed, setParsed] = useState<Record<string, unknown> | null>(null); const [error, setError] = useState("");
+  const [draft, setDraft] = useState<JobImportDraft | null>(null); const [error, setError] = useState("");
   const source = /zhipin\.com|BOSS直聘/i.test(input) ? "BOSS直聘" : /linkedin\.com|LinkedIn/i.test(input) ? "LinkedIn" : "智能识别";
-  const duplicate = parsed && data.jobs.find((job) => { const company = String(parsed.company ?? parsed.company_name ?? "").toLowerCase(); const role = String(parsed.role ?? parsed.title ?? "").toLowerCase(); return job.company.toLowerCase() === company && job.role.toLowerCase() === role; });
-  async function parse() { if (!input.trim()) return; setLoading(true); setError(""); setParsed(null); try { const isUrl = /^https?:\/\//i.test(input.trim()); const response = await fetch("/api/import/job", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ url: isUrl ? input.trim() : "", text: isUrl ? "" : input.trim() }) }); const body = await response.json().catch(() => null); if (!response.ok) throw new Error((body as { error?: string } | null)?.error || "职位解析失败"); const content = parseAiContent(body); if (!content || typeof content !== "object") throw new Error("服务没有返回可用的职位字段"); setParsed(content as Record<string, unknown>); } catch (requestError) { setError(requestError instanceof Error ? requestError.message : "解析失败"); } finally { setLoading(false); } }
-  async function saveParsed() { if (!parsed) return; const id = newId("job"); const now = new Date().toISOString(); const company = String(parsed.company ?? parsed.company_name ?? "待确认公司"); const role = String(parsed.role ?? parsed.title ?? "待确认职位"); await runCareerSql(`INSERT INTO career_jobs (id,company,role,location,source,source_url,stage_id,priority,salary,work_mode,description,applied_at,deadline,contact_name,note,tags,created_at,updated_at,archived,position) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,0)`, [id, company, role, String(parsed.location ?? ""), source === "智能识别" ? String(parsed.source ?? "智能导入") : source, String(parsed.url ?? (/^https?:\/\//i.test(input) ? input : "")), "stage_saved", 2, typeof parsed.salary === "string" ? parsed.salary : "", String(parsed.work_mode ?? ""), String(parsed.description ?? parsed.description_raw ?? input), null, null, "", "通过智能导入创建，请核对原始信息。", Array.isArray(parsed.keywords) ? parsed.keywords.join(",") : "", now, now]); await addActivity(id, "import", `从 ${source} 导入 ${company} · ${role}`); await onSaved(); }
+  const duplicate = draft && data.jobs.find((job) => job.company.trim().toLowerCase() === draft.company.trim().toLowerCase() && job.role.trim().toLowerCase() === draft.role.trim().toLowerCase());
+  function updateDraft<K extends keyof JobImportDraft>(key: K, value: JobImportDraft[K]) { setDraft((current) => current ? { ...current, [key]: value } : current); }
+  async function parse() { if (!input.trim()) return; setLoading(true); setError(""); setDraft(null); try { const isUrl = /^https?:\/\/\S+$/i.test(input.trim()); const response = await fetch("/api/import/job", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ url: isUrl ? input.trim() : "", text: isUrl ? "" : input.trim() }) }); const body = await response.json().catch(() => null); if (!response.ok) throw new Error((body as { error?: string } | null)?.error || "职位解析失败"); const content = parseAiContent(body); if (!content || typeof content !== "object") throw new Error("服务没有返回可用的职位字段"); setDraft(createJobImportDraft(content as Record<string, unknown>, input, source)); } catch (requestError) { setError(requestError instanceof Error ? requestError.message : "解析失败"); } finally { setLoading(false); } }
+  async function saveDraft() { if (!draft) return; if (!draft.company.trim() || !draft.role.trim()) { notify("请先补全公司与职位", "error"); return; } const id = newId("job"); const now = new Date().toISOString(); await runCareerSql(`INSERT INTO career_jobs (id,company,role,location,source,source_url,stage_id,priority,salary,work_mode,description,applied_at,deadline,contact_name,note,tags,created_at,updated_at,archived,position) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,0)`, [id, draft.company.trim(), draft.role.trim(), draft.location.trim(), draft.source, safeLink(draft.sourceUrl.trim()) ?? "", "stage_saved", 2, draft.salary.trim(), draft.workMode, draft.description.trim(), null, null, "", "通过分享文本或链接导入，已由用户核对后保存。", draft.keywords, now, now]); await addActivity(id, "import", `从 ${draft.source} 导入 ${draft.company.trim()} · ${draft.role.trim()}`); await onSaved(); }
   function csvImport(file: File) { const reader = new FileReader(); reader.onload = async () => { const text = String(reader.result ?? ""); const lines = text.split(/\r?\n/).filter(Boolean); if (lines.length < 2) { notify("CSV 没有可导入的数据", "error"); return; } const headers = lines[0].split(",").map((item) => item.replace(/^"|"$/g, "").trim().toLowerCase()); const companyIndex = headers.findIndex((item) => /company|公司/.test(item)); const roleIndex = headers.findIndex((item) => /title|position|职位/.test(item)); const urlIndex = headers.findIndex((item) => /url|link|链接/.test(item)); if (companyIndex < 0 || roleIndex < 0) { notify("CSV 需要包含公司和职位列", "error"); return; } const now = new Date().toISOString(); const statements = lines.slice(1).map((line) => { const cells = line.match(/("[^"]*(?:""[^"]*)*"|[^,]*)(?:,|$)/g)?.map((cell) => cell.replace(/,$/, "").replace(/^"|"$/g, "").replace(/""/g, '"')) ?? []; return { sql: `INSERT INTO career_jobs (id,company,role,location,source,source_url,stage_id,priority,salary,work_mode,description,applied_at,deadline,contact_name,note,tags,created_at,updated_at,archived,position) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,0)`, params: [newId("job"), cells[companyIndex] || "待确认公司", cells[roleIndex] || "待确认职位", "", "LinkedIn", urlIndex >= 0 ? cells[urlIndex] || "" : "", "stage_saved", 1, "", "", "", null, null, "", "从 Saved Jobs CSV 导入", "", now, now] }; }); await runCareerBatch(statements); notify(`已导入 ${statements.length} 个职位`); await onSaved(); }; reader.readAsText(file); }
-  return <Modal title="智能导入职位" description="适配 LinkedIn 与 BOSS直聘，也支持 Saved Jobs CSV。" onClose={onClose} wide><div className="career-import-tabs"><button className={mode === "smart" ? "active" : ""} onClick={() => setMode("smart")}><Link2 size={16} />链接 / 分享文本</button><button className={mode === "csv" ? "active" : ""} onClick={() => setMode("csv")}><FileArchive size={16} />Saved Jobs CSV</button></div>{mode === "smart" ? <div className="career-smart-import"><div className="career-platform-strip"><span className="linkedin"><b>in</b>LinkedIn</span><span className="boss"><b>BOSS</b>直聘</span><small>复制职位链接或完整分享文本</small></div><label className="career-import-box"><textarea value={input} onChange={(event) => { setInput(event.target.value); setParsed(null); }} rows={7} placeholder={"粘贴 LinkedIn / BOSS直聘职位链接\n或粘贴“分享职位”得到的完整文本…"} /><footer><span><ShieldCheck size={14} />只在你点击解析后发送</span><SourceBadge source={source} /></footer></label><button className="career-button primary import-button" onClick={() => void parse()} disabled={loading || !input.trim()}>{loading ? <LoaderCircle className="spin" size={16} /> : <WandSparkles size={16} />}{loading ? "正在读取职位…" : "解析职位信息"}</button>{error && <div className="career-inline-error"><X size={15} />{error}<button onClick={() => void parse()}>重试</button></div>}{parsed && <div className="career-import-preview"><header><div><span>解析预览</span><h3>{String(parsed.role ?? parsed.title ?? "职位待确认")}</h3><p>{String(parsed.company ?? parsed.company_name ?? "公司待确认")} · {String(parsed.location ?? "地点待确认")}</p></div><CheckCircle2 size={21} /></header>{duplicate && <div className="career-duplicate-warning"><Bell size={16} /><span><b>可能已经收藏过</b><small>{duplicate.company} · {duplicate.role}</small></span></div>}<dl><div><dt>来源</dt><dd><SourceBadge source={source} /></dd></div><div><dt>工作方式</dt><dd>{String(parsed.work_mode ?? "待确认")}</dd></div><div><dt>薪资</dt><dd>{typeof parsed.salary === "string" ? parsed.salary : "待确认"}</dd></div><div><dt>关键词</dt><dd>{Array.isArray(parsed.keywords) ? parsed.keywords.join(" · ") : "待确认"}</dd></div></dl><footer>{/^https?:\/\//i.test(input) && <a href={input.trim()} target="_blank" rel="noreferrer">打开原职位 <ExternalLink size={14} /></a>}<span /><button className="career-button primary" onClick={() => void saveParsed()}>{duplicate ? "仍然保存副本" : "核对后保存"}</button></footer></div>}<div className="career-capture-helper"><span><Command size={17} /></span><div><b>更快的收集方式</b><p>在招聘平台点“分享”或复制链接，再回到这里粘贴。职迹不会安装后台脚本、读取登录态或自动替你投递。</p></div></div></div> : <div className="career-csv-import"><span><FileArchive size={32} /></span><h3>导入 Saved Jobs CSV</h3><p>支持包含 Company / Title / URL 的 LinkedIn 导出，也识别“公司 / 职位 / 链接”中文列。</p><label className="career-button primary"><Upload size={16} />选择 CSV<input hidden type="file" accept=".csv,text/csv" onChange={(event) => { const file = event.target.files?.[0]; if (file) csvImport(file); }} /></label><small>导入前建议保留原始导出文件。重复职位会在“全部职位”中便于检查。</small></div>}</Modal>;
+  return <Modal title="智能导入职位" description="把 LinkedIn 或 BOSS直聘的链接/分享文本整理为可核对的本地草稿。" onClose={onClose} wide>
+    <div className="career-import-tabs" role="group" aria-label="导入方式">
+      <button type="button" className={mode === "smart" ? "active" : ""} aria-pressed={mode === "smart"} onClick={() => setMode("smart")}><Link2 size={16} />链接 / 分享文本</button>
+      <button type="button" className={mode === "csv" ? "active" : ""} aria-pressed={mode === "csv"} onClick={() => setMode("csv")}><FileArchive size={16} />Saved Jobs CSV</button>
+    </div>
+    {mode === "smart" ? <div className="career-smart-import">
+      <div className="career-platform-strip"><span className="linkedin"><b>in</b>LinkedIn</span><span className="boss"><b>BOSS</b>直聘</span><small>优先使用平台的“分享职位”文本</small></div>
+      <label className="career-import-box"><textarea aria-label="职位链接或分享文本" value={input} onChange={(event) => { setInput(event.target.value); setDraft(null); }} rows={7} placeholder={"粘贴 LinkedIn / BOSS直聘职位链接\n或粘贴“分享职位”得到的完整文本…"} /><footer><span><ShieldCheck size={14} />只在你点击解析后发送</span><SourceBadge source={source} /></footer></label>
+      <button type="button" className="career-button primary import-button" onClick={() => void parse()} disabled={loading || !input.trim()}>{loading ? <LoaderCircle className="spin" size={16} /> : <WandSparkles size={16} />}{loading ? "正在整理职位…" : "解析为本地草稿"}</button>
+      {error && <div className="career-inline-error"><X size={15} />{error}<button type="button" onClick={() => void parse()}>重试</button></div>}
+      {draft && <div className="career-import-preview"><header><div><span>保存前核对</span><h3>{draft.role || "职位待确认"}</h3><p>{draft.company || "公司待确认"} · {draft.location || "地点待确认"}</p></div><CheckCircle2 size={21} /></header>
+        {duplicate && <div className="career-duplicate-warning"><Bell size={16} /><span><b>已有同名职位</b><small>{duplicate.company} · {duplicate.role}</small></span></div>}
+        <div className="career-import-edit-grid"><Field label="公司"><input value={draft.company} onChange={(event) => updateDraft("company", event.target.value)} required /></Field><Field label="职位"><input value={draft.role} onChange={(event) => updateDraft("role", event.target.value)} required /></Field><Field label="地点"><input value={draft.location} onChange={(event) => updateDraft("location", event.target.value)} /></Field><Field label="工作方式"><select value={draft.workMode} onChange={(event) => updateDraft("workMode", event.target.value)}><option value="">待确认</option><option>现场办公</option><option>混合办公</option><option>远程</option></select></Field><Field label="薪资"><input value={draft.salary} onChange={(event) => updateDraft("salary", event.target.value)} placeholder="待确认" /></Field><Field label="来源"><input value={draft.source} readOnly /></Field></div>
+        <Field label="关键词" hint="用逗号分隔"><input value={draft.keywords} onChange={(event) => updateDraft("keywords", event.target.value)} /></Field>
+        <Field label="原职位链接"><input type="url" value={draft.sourceUrl} onChange={(event) => updateDraft("sourceUrl", event.target.value)} placeholder="https://" /></Field>
+        <Field label="职位描述" hint="已保留原始分享文本"><textarea rows={9} value={draft.description} onChange={(event) => updateDraft("description", event.target.value)} /></Field>
+        {draft.warnings.length > 0 && <div className="career-import-warnings"><b>保存前留意</b><ul>{draft.warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul></div>}
+        <footer>{safeLink(draft.sourceUrl) && <a href={draft.sourceUrl} target="_blank" rel="noreferrer">打开原职位 <ExternalLink size={14} /></a>}<span /><button type="button" className="career-button primary" disabled={!draft.company.trim() || !draft.role.trim()} onClick={() => void saveDraft()}>{duplicate ? "保存一份副本" : "保存到收藏"}</button></footer>
+      </div>}
+      <div className="career-capture-helper"><span><Command size={17} /></span><div><b>安全的联动方式</b><p>在招聘平台点“分享”或复制链接，再回到这里粘贴。职迹不会读取登录态、站内消息或自动替你投递。</p></div></div>
+    </div> : <div className="career-csv-import"><span><FileArchive size={32} /></span><h3>导入 Saved Jobs CSV</h3><p>支持包含 Company / Title / URL 的 LinkedIn 导出，也识别“公司 / 职位 / 链接”中文列。</p><label className="career-button primary"><Upload size={16} />选择 CSV<input hidden type="file" accept=".csv,text/csv" onChange={(event) => { const file = event.target.files?.[0]; if (file) csvImport(file); }} /></label><small>导入前建议保留原始导出文件。重复职位会在“全部职位”中便于检查。</small></div>}
+  </Modal>;
 }
 
 function CommandPalette({ data, onClose, onNavigate, onSelectJob, onAdd }: { data: CareerData; onClose: () => void; onNavigate: (view: CareerView) => void; onSelectJob: (id: string) => void; onAdd: () => void }) {

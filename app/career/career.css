@@ -322,3 +322,14 @@
 .career-status-neutral { display: flex; align-items: center; gap: 5px; color: var(--career-faint); font-size: 12px; }
 .career-status-neutral i { width: 6px; height: 6px; border-radius: 50%; background: #9aa29e; }
 .career-form-actions.sticky { bottom: 0; z-index: 2; margin: 0 -24px -40px; padding: 12px 24px calc(12px + env(safe-area-inset-bottom)); border-top: 1px solid var(--career-line); }
+.career-import-edit-grid { margin: 15px 0 13px; display: grid; grid-template-columns: 1fr 1fr; gap: 11px; }
+.career-import-preview > .career-field { margin-top: 12px; }
+.career-import-preview input[readonly] { color: var(--career-muted); background: #f3f5f3; }
+.career-import-warnings { margin-top: 12px; padding: 11px 13px; color: #6f604f; background: #f6f1e9; border-radius: 11px; }
+.career-import-warnings b { font-size: 12px; }
+.career-import-warnings ul { margin: 7px 0 0; padding-left: 18px; }
+.career-import-warnings li { margin-top: 4px; font-size: 12px; line-height: 1.55; }
+
+@media (max-width: 760px) {
+  .career-import-edit-grid { grid-template-columns: 1fr; }
+}
