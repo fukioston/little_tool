@@ -62,6 +62,21 @@
 .career-no-score { margin-top: 11px; padding: 8px 9px; display: flex; align-items: center; gap: 6px; color: #547264; border-radius: 8px; background: #edf4f0; }
 .career-no-score span { color: inherit; font-size: 9px; font-weight: 600; }
 .career-no-score-note { min-height: 34px; padding: 0 11px; display: inline-flex; align-items: center; justify-content: center; gap: 6px; color: #547264; border: 1px solid #d9e5de; border-radius: 10px; background: #f3f7f5; font-size: 10px; white-space: nowrap; }
+.career-task-calm-empty { margin: 8px 0 0; padding: 18px 10px; color: var(--career-muted); border-top: 1px solid #edf0ed; font-size: 10px; line-height: 1.6; text-align: center; }
+.career-completed-block { margin-top: 10px; padding-top: 10px; border-top: 1px solid #e8ece9; }
+.career-completed-toggle { width: 100%; min-height: 40px; padding: 0 4px; display: grid; grid-template-columns: 1fr auto auto auto; align-items: center; gap: 9px; color: var(--career-muted); border: 0; background: transparent; text-align: left; }
+.career-completed-toggle > span { display: flex; align-items: center; gap: 7px; font-size: 10px; font-weight: 650; }
+.career-completed-toggle em { min-width: 20px; height: 20px; display: grid; place-items: center; color: #587066; border-radius: 10px; background: #eaf1ed; font-size: 9px; font-style: normal; }
+.career-completed-toggle small { color: var(--career-faint); font-size: 9px; }
+.career-completed-toggle svg:last-child { transition: transform .18s ease; }
+.career-completed-toggle[aria-expanded="true"] svg:last-child { transform: rotate(90deg); }
+.career-completed-list { display: grid; }
+.career-completed-list article { min-height: 55px; padding: 8px 4px; display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 10px; border-top: 1px solid #edf0ed; }
+.career-completed-list article > span { width: 22px; height: 22px; display: grid; place-items: center; color: #5f7d6f; border-radius: 50%; background: #e8f1ec; }
+.career-completed-list article > div { min-width: 0; display: grid; gap: 4px; }
+.career-completed-list article b { overflow: hidden; color: #69736e; font-size: 10px; font-weight: 550; text-decoration: line-through; text-overflow: ellipsis; white-space: nowrap; }
+.career-completed-list article small { color: var(--career-faint); font-size: 9px; }
+.career-completed-list article > button { min-height: 32px; padding: 0 10px; color: #4f7162; border: 1px solid #d8e3dd; border-radius: 8px; background: #f8faf9; font-size: 9px; }
 @keyframes career-in { from { opacity: 0; transform: translateY(4px); } }
 @keyframes career-slide { from { transform: translateX(30px); opacity: .7; } }
 @keyframes career-modal-in { from { transform: translateY(8px) scale(.99); opacity: .6; } }

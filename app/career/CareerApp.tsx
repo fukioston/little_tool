@@ -133,6 +133,7 @@ export default function CareerApp() {
   const [activeDragId, setActiveDragId] = useState<string | null>(null);
   const [notices, setNotices] = useState<Notice[]>([]);
   const [undo, setUndo] = useState<{ jobId: string; from: string; to: string } | null>(null);
+  const [taskUndo, setTaskUndo] = useState<{ taskId: string; from: Task["status"]; title: string; token: string } | null>(null);
   const [aiState, setAiState] = useState<{ action: AiAction; title: string; loading: boolean; result?: unknown; error?: string } | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
 
@@ -222,8 +223,28 @@ export default function CareerApp() {
   async function toggleTask(task: Task) {
     const status = task.status === "done" ? "todo" : "done";
     setData((current) => ({ ...current, tasks: current.tasks.map((item) => item.id === task.id ? { ...item, status } : item) }));
-    try { await runCareerSql("UPDATE career_tasks SET status = ? WHERE id = ?", [status, task.id]); }
+    try {
+      await runCareerSql("UPDATE career_tasks SET status = ? WHERE id = ?", [status, task.id]);
+      const change = { taskId: task.id, from: task.status, title: task.title, token: crypto.randomUUID() };
+      setTaskUndo(change);
+      window.setTimeout(() => setTaskUndo((current) => current?.token === change.token ? null : current), 6500);
+    }
     catch { setData((current) => ({ ...current, tasks: current.tasks.map((item) => item.id === task.id ? task : item) })); notify("待办更新失败", "error"); }
+  }
+
+  async function handleTaskUndo() {
+    if (!taskUndo) return;
+    const change = taskUndo;
+    setTaskUndo(null);
+    setData((current) => ({ ...current, tasks: current.tasks.map((item) => item.id === change.taskId ? { ...item, status: change.from } : item) }));
+    try {
+      await runCareerSql("UPDATE career_tasks SET status = ? WHERE id = ?", [change.from, change.taskId]);
+      notify("已撤销待办状态", "info");
+    } catch {
+      const changedStatus = change.from === "todo" ? "done" : "todo";
+      setData((current) => ({ ...current, tasks: current.tasks.map((item) => item.id === change.taskId ? { ...item, status: changedStatus } : item) }));
+      notify("撤销失败，原状态已保留", "error");
+    }
   }
 
   async function removeJob(job: Job) {
@@ -285,7 +306,7 @@ export default function CareerApp() {
     {modal === "import" && <SmartImportModal data={data} initialInput={importInitial} onClose={() => { setModal(null); setImportInitial(""); }} onSaved={async () => { setModal(null); setImportInitial(""); await refresh(); notify("职位已导入"); }} notify={notify} />}
     {searchOpen && <CommandPalette data={data} onClose={() => setSearchOpen(false)} onNavigate={navigate} onSelectJob={(id) => { setSearchOpen(false); setSelectedJobId(id); }} onAdd={() => { setSearchOpen(false); setModal("job"); }} />}
     {aiState && <AiPreview state={aiState} onClose={() => setAiState(null)} onAccept={async () => { setAiState(null); notify("AI 建议已保留为草稿，请在对应记录中核对", "info"); }} />}
-    <div className="career-toast-stack" aria-live="polite">{undo && <button className="career-toast undo" onClick={handleUndo}><RotateCcw size={16} />阶段已更新 <b>撤销</b></button>}{notices.map((notice) => <div className={`career-toast ${notice.tone}`} key={notice.id}>{notice.tone === "success" ? <Check size={16} /> : notice.tone === "error" ? <X size={16} /> : <Bell size={16} />}{notice.text}</div>)}</div>
+    <div className="career-toast-stack" aria-live="polite">{taskUndo && <button className="career-toast undo" onClick={() => void handleTaskUndo()} aria-label={`撤销「${taskUndo.title}」的状态变化`}><RotateCcw size={16} />{taskUndo.from === "todo" ? "待办已完成" : "待办已恢复"} <b>撤销</b></button>}{undo && <button className="career-toast undo" onClick={handleUndo}><RotateCcw size={16} />阶段已更新 <b>撤销</b></button>}{notices.map((notice) => <div className={`career-toast ${notice.tone}`} key={notice.id}>{notice.tone === "success" ? <Check size={16} /> : notice.tone === "error" ? <X size={16} /> : <Bell size={16} />}{notice.text}</div>)}</div>
   </main>;
 }
 
@@ -371,10 +392,12 @@ function JobsView({ data, jobs, stageFilter, sourceFilter, priorityOnly, onStage
 
 function CalendarView({ data, onToggleTask, onAddTask, onAddInterview, onSelectJob }: { data: CareerData; onToggleTask: (task: Task) => void; onAddTask: () => void; onAddInterview: () => void; onSelectJob: (id: string) => void }) {
   const [mode, setMode] = useState<"agenda" | "week">("agenda");
+  const [showCompleted, setShowCompleted] = useState(false);
   const open = data.tasks.filter((task) => task.status === "todo").sort((a, b) => (a.due_at ?? "9999").localeCompare(b.due_at ?? "9999"));
+  const completed = data.tasks.filter((task) => task.status === "done").sort((a, b) => (b.due_at ?? b.created_at).localeCompare(a.due_at ?? a.created_at));
   const days = Array.from({ length: 7 }, (_, index) => { const date = new Date(CAREER_CLOCK); date.setDate(date.getDate() + index); date.setHours(0, 0, 0, 0); return date; });
   return <div className="career-view"><SectionHeading eyebrow="PLAN" title="待办与日历" description="把投递、面试和跟进放在同一条时间线上" action={<div className="career-view-actions"><button className="career-button secondary" onClick={onAddInterview}><CalendarDays size={16} />安排面试</button><button className="career-button primary" onClick={onAddTask}><Plus size={16} />新建待办</button></div>} /><div className="career-segmented"><button className={mode === "agenda" ? "active" : ""} onClick={() => setMode("agenda")}>议程</button><button className={mode === "week" ? "active" : ""} onClick={() => setMode("week")}>未来 7 天</button></div>
-    {mode === "agenda" ? <div className="career-plan-grid"><section className="career-panel career-task-list"><header><h3>待办清单</h3><span>{open.length} 项未完成</span></header>{open.map((task) => { const job = data.jobs.find((item) => item.id === task.job_id); return <article key={task.id}><button className="career-check" onClick={() => onToggleTask(task)} aria-label="完成待办"><Check size={13} /></button><div><b>{task.title}</b><button onClick={() => job && onSelectJob(job.id)}>{job ? `${job.company} · ${job.role}` : "通用任务"}</button></div><span className={task.due_at && new Date(task.due_at).getTime() < CAREER_CLOCK ? "late" : ""}><Clock3 size={13} />{relativeDate(task.due_at)}</span><em>{task.kind}</em></article>; })}</section><section className="career-panel career-upcoming"><header><h3>面试日程</h3><span>按时间排序</span></header>{data.interviews.filter((item) => item.status !== "completed").map((item) => { const job = data.jobs.find((entry) => entry.id === item.job_id); return <button key={item.id} onClick={() => job && onSelectJob(job.id)}><time><b>{new Date(item.scheduled_at ?? "").getDate() || "—"}</b><small>{formatDate(item.scheduled_at)}</small></time><span><b>{job?.company} · {item.round_name}</b><small>{formatDate(item.scheduled_at, true)} · {item.duration} 分钟</small></span><ChevronRight size={16} /></button>; })}</section></div> : <div className="career-week-grid">{days.map((day) => { const key = day.toDateString(); const tasks = open.filter((task) => task.due_at && new Date(task.due_at).toDateString() === key); const interviews = data.interviews.filter((item) => item.scheduled_at && new Date(item.scheduled_at).toDateString() === key); return <section key={key} className={key === CAREER_TODAY.toDateString() ? "today" : ""}><header><span>{new Intl.DateTimeFormat("zh-CN", { weekday: "short" }).format(day)}</span><b>{day.getDate()}</b></header><div>{interviews.map((item) => <article className="event" key={item.id}><CalendarDays size={13} /><b>{data.jobs.find((job) => job.id === item.job_id)?.company}</b><small>{item.round_name}</small></article>)}{tasks.map((task) => <article key={task.id}><Circle size={12} /><b>{task.title}</b><small>{dateInputValue(task.due_at).slice(11)}</small></article>)}</div></section>; })}</div>}
+    {mode === "agenda" ? <div className="career-plan-grid"><section className="career-panel career-task-list"><header><h3>待办清单</h3><span>{open.length} 项未完成</span></header>{open.map((task) => { const job = data.jobs.find((item) => item.id === task.job_id); return <article key={task.id}><button className="career-check" onClick={() => onToggleTask(task)} aria-label={`完成「${task.title}」`}><Check size={13} /></button><div><b>{task.title}</b><button onClick={() => job && onSelectJob(job.id)}>{job ? `${job.company} · ${job.role}` : "通用任务"}</button></div><span className={task.due_at && new Date(task.due_at).getTime() < CAREER_CLOCK ? "late" : ""}><Clock3 size={13} />{relativeDate(task.due_at)}</span><em>{task.kind}</em></article>; })}{open.length === 0 && <p className="career-task-calm-empty">目前没有待办。需要时再记录下一步就好。</p>}{completed.length > 0 && <div className="career-completed-block"><button className="career-completed-toggle" onClick={() => setShowCompleted((current) => !current)} aria-expanded={showCompleted}><span><CheckCircle2 size={15} />已完成</span><em>{completed.length}</em><small>{showCompleted ? "收起" : "查看与恢复"}</small><ChevronRight size={15} /></button>{showCompleted && <div className="career-completed-list">{completed.map((task) => { const job = data.jobs.find((item) => item.id === task.job_id); return <article key={task.id}><span><Check size={13} /></span><div><b>{task.title}</b><small>{job ? `${job.company} · ${job.role}` : "通用任务"}</small></div><button onClick={() => onToggleTask(task)} aria-label={`恢复「${task.title}」`}>恢复</button></article>; })}</div>}</div>}</section><section className="career-panel career-upcoming"><header><h3>面试日程</h3><span>按时间排序</span></header>{data.interviews.filter((item) => item.status !== "completed").map((item) => { const job = data.jobs.find((entry) => entry.id === item.job_id); return <button key={item.id} onClick={() => job && onSelectJob(job.id)}><time><b>{new Date(item.scheduled_at ?? "").getDate() || "—"}</b><small>{formatDate(item.scheduled_at)}</small></time><span><b>{job?.company} · {item.round_name}</b><small>{formatDate(item.scheduled_at, true)} · {item.duration} 分钟</small></span><ChevronRight size={16} /></button>; })}</section></div> : <div className="career-week-grid">{days.map((day) => { const key = day.toDateString(); const tasks = open.filter((task) => task.due_at && new Date(task.due_at).toDateString() === key); const interviews = data.interviews.filter((item) => item.scheduled_at && new Date(item.scheduled_at).toDateString() === key); return <section key={key} className={key === CAREER_TODAY.toDateString() ? "today" : ""}><header><span>{new Intl.DateTimeFormat("zh-CN", { weekday: "short" }).format(day)}</span><b>{day.getDate()}</b></header><div>{interviews.map((item) => <article className="event" key={item.id}><CalendarDays size={13} /><b>{data.jobs.find((job) => job.id === item.job_id)?.company}</b><small>{item.round_name}</small></article>)}{tasks.map((task) => <article key={task.id}><Circle size={12} /><b>{task.title}</b><small>{dateInputValue(task.due_at).slice(11)}</small></article>)}</div></section>; })}</div>}
   </div>;
 }
 
