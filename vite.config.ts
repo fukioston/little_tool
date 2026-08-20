@@ -48,9 +48,17 @@ export default defineConfig(async () => {
       host: "localhost",
       port: 3000,
       strictPort: true,
+      headers: {
+        "Cross-Origin-Opener-Policy": "same-origin",
+        "Cross-Origin-Embedder-Policy": "require-corp",
+        "Cross-Origin-Resource-Policy": "same-origin",
+      },
       ...(isCodexSeatbeltSandbox
         ? { watch: { useFsEvents: false, usePolling: true } }
         : {}),
+    },
+    optimizeDeps: {
+      exclude: ["@sqlite.org/sqlite-wasm"],
     },
     plugins: [
       vinext(),
