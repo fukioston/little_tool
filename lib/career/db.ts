@@ -1,4 +1,9 @@
 import { localDb } from "@/lib/local-db/client";
+import {
+  withCareerReadLock,
+  withCareerWriteLock,
+  type CareerLockContext,
+} from "./lock";
 import type {
   Activity,
   CareerData,
@@ -11,6 +16,8 @@ import type {
 } from "./types";
 
 const DB = "career";
+const CAREER_APPLICATION_ID = 0x5a484a49;
+const CAREER_USER_VERSION = 1;
 
 type SqlStatement = { sql: string; params?: unknown[] };
 
@@ -34,16 +41,36 @@ function unwrapRows<T>(result: unknown): T[] {
   return [];
 }
 
-async function query<T>(sql: string, params: unknown[] = []) {
-  return unwrapRows<T>(await localDb.query(DB, sql, params));
+function assertExclusiveContext(context: CareerLockContext | undefined) {
+  if (context && context.mode !== "exclusive") {
+    throw new Error("Career database mutations require an exclusive storage lock.");
+  }
 }
 
-export async function runCareerSql(sql: string, params: unknown[] = []) {
-  return localDb.run(DB, sql, params);
+async function query<T>(
+  sql: string,
+  params: unknown[] = [],
+  context?: CareerLockContext,
+) {
+  return withCareerReadLock(async () =>
+    unwrapRows<T>(await localDb.query(DB, sql, params)), context);
 }
 
-export async function runCareerBatch(statements: SqlStatement[]) {
-  return localDb.batch(DB, statements);
+export async function runCareerSql(
+  sql: string,
+  params: unknown[] = [],
+  context?: CareerLockContext,
+) {
+  assertExclusiveContext(context);
+  return withCareerWriteLock(() => localDb.run(DB, sql, params), context);
+}
+
+export async function runCareerBatch(
+  statements: SqlStatement[],
+  context?: CareerLockContext,
+) {
+  assertExclusiveContext(context);
+  return withCareerWriteLock(() => localDb.batch(DB, statements), context);
 }
 
 const schemaStatements: SqlStatement[] = [
@@ -295,45 +322,94 @@ function seedStatements(): SqlStatement[] {
   return statements;
 }
 
-export async function initializeCareerDb() {
-  await localDb.init();
-  await runCareerBatch(schemaStatements);
-  const materialColumns = await query<{ name: string }>("PRAGMA table_info(career_materials)");
-  const existingMaterialColumns = new Set(materialColumns.map((column) => column.name));
-  const materialMigrations = [
-    ["file_key", "TEXT"],
-    ["file_name", "TEXT"],
-    ["mime_type", "TEXT"],
-    ["byte_size", "INTEGER"],
-  ] as const;
-  for (const [column, type] of materialMigrations) {
-    if (!existingMaterialColumns.has(column)) {
-      await runCareerSql(`ALTER TABLE career_materials ADD COLUMN ${column} ${type}`);
+export async function initializeCareerDb(context?: CareerLockContext) {
+  assertExclusiveContext(context);
+  return withCareerWriteLock(async (lockContext) => {
+    await localDb.init(DB);
+
+    const [applicationId] = await query<{ application_id: number }>(
+      "PRAGMA application_id",
+      [],
+      lockContext,
+    );
+    const currentApplicationId = Number(applicationId?.application_id ?? 0);
+    if (currentApplicationId !== 0 && currentApplicationId !== CAREER_APPLICATION_ID) {
+      throw new Error("当前 SQLite 文件不是职迹数据库，已停止初始化以保护原数据。");
     }
-  }
-  const count = await query<{ count: number }>("SELECT COUNT(*) AS count FROM career_stages");
-  if (Number(count[0]?.count ?? 0) === 0) {
-    await runCareerBatch(seedStatements());
-  }
+
+    const [userVersion] = await query<{ user_version: number }>(
+      "PRAGMA user_version",
+      [],
+      lockContext,
+    );
+    const currentUserVersion = Number(userVersion?.user_version ?? 0);
+    if (currentUserVersion > CAREER_USER_VERSION) {
+      throw new Error("这份职迹数据库来自更新版本，请升级应用后再打开。");
+    }
+
+    await runCareerBatch(schemaStatements, lockContext);
+    const materialColumns = await query<{ name: string }>(
+      "PRAGMA table_info(career_materials)",
+      [],
+      lockContext,
+    );
+    const existingMaterialColumns = new Set(materialColumns.map((column) => column.name));
+    const materialMigrations = [
+      ["file_key", "TEXT"],
+      ["file_name", "TEXT"],
+      ["mime_type", "TEXT"],
+      ["byte_size", "INTEGER"],
+    ] as const;
+    const missingMaterialColumns = materialMigrations
+      .filter(([column]) => !existingMaterialColumns.has(column))
+      .map(([column, type]) => ({
+        sql: `ALTER TABLE career_materials ADD COLUMN ${column} ${type}`,
+      }));
+    if (missingMaterialColumns.length > 0) {
+      await runCareerBatch(missingMaterialColumns, lockContext);
+    }
+
+    const count = await query<{ count: number }>(
+      "SELECT COUNT(*) AS count FROM career_stages",
+      [],
+      lockContext,
+    );
+    if (Number(count[0]?.count ?? 0) === 0) {
+      await runCareerBatch(seedStatements(), lockContext);
+    }
+
+    await runCareerBatch([
+      { sql: `PRAGMA application_id = ${CAREER_APPLICATION_ID}` },
+      { sql: `PRAGMA user_version = ${CAREER_USER_VERSION}` },
+    ], lockContext);
+  }, context);
 }
 
-export async function loadCareerData(): Promise<CareerData> {
-  const [stages, jobs, tasks, interviews, contacts, materials, activities] = await Promise.all([
-    query<Stage>("SELECT * FROM career_stages ORDER BY position"),
-    query<Job>("SELECT * FROM career_jobs WHERE archived = 0 ORDER BY position, updated_at DESC"),
-    query<Task>("SELECT * FROM career_tasks ORDER BY status, due_at"),
-    query<Interview>("SELECT * FROM career_interviews ORDER BY scheduled_at"),
-    query<Contact>("SELECT * FROM career_contacts ORDER BY next_follow_up, name"),
-    query<Material>("SELECT * FROM career_materials ORDER BY updated_at DESC"),
-    query<Activity>("SELECT * FROM career_activity ORDER BY created_at DESC LIMIT 40"),
-  ]);
-  return { stages, jobs, tasks, interviews, contacts, materials, activities };
+export async function loadCareerData(context?: CareerLockContext): Promise<CareerData> {
+  return withCareerReadLock(async (lockContext) => {
+    const [stages, jobs, tasks, interviews, contacts, materials, activities] = await Promise.all([
+      query<Stage>("SELECT * FROM career_stages ORDER BY position", [], lockContext),
+      query<Job>("SELECT * FROM career_jobs WHERE archived = 0 ORDER BY position, updated_at DESC", [], lockContext),
+      query<Task>("SELECT * FROM career_tasks ORDER BY status, due_at", [], lockContext),
+      query<Interview>("SELECT * FROM career_interviews ORDER BY scheduled_at", [], lockContext),
+      query<Contact>("SELECT * FROM career_contacts ORDER BY next_follow_up, name", [], lockContext),
+      query<Material>("SELECT * FROM career_materials ORDER BY updated_at DESC", [], lockContext),
+      query<Activity>("SELECT * FROM career_activity ORDER BY created_at DESC LIMIT 40", [], lockContext),
+    ]);
+    return { stages, jobs, tasks, interviews, contacts, materials, activities };
+  }, context);
 }
 
-export async function addActivity(jobId: string | null, type: string, detail: string) {
+export async function addActivity(
+  jobId: string | null,
+  type: string,
+  detail: string,
+  context?: CareerLockContext,
+) {
   return runCareerSql(
     "INSERT INTO career_activity (id,job_id,type,detail,created_at) VALUES (?,?,?,?,?)",
     [id("activity"), jobId, type, detail, new Date().toISOString()],
+    context,
   );
 }
 
@@ -341,10 +417,11 @@ export function newId(prefix: string) {
   return id(prefix);
 }
 
-export async function exportCareerDb() {
-  return localDb.export(DB);
+export async function exportCareerDb(context?: CareerLockContext) {
+  return withCareerReadLock(() => localDb.export(DB), context);
 }
 
-export async function importCareerDb(bytes: Uint8Array) {
-  return localDb.import(DB, bytes);
+export async function importCareerDb(bytes: Uint8Array, context?: CareerLockContext) {
+  assertExclusiveContext(context);
+  return withCareerWriteLock(() => localDb.import(DB, bytes), context);
 }
