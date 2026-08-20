@@ -28,6 +28,7 @@ import {
   addActivity, exportCareerDb, importCareerDb, initializeCareerDb,
   loadCareerData, newId, runCareerBatch, runCareerSql,
 } from "@/lib/career/db";
+import { createStructuredInterviewDraft } from "@/lib/career/interview-ai";
 import { createLocalFileObjectUrl, deleteLocalFile, saveLocalFile } from "@/lib/local-db/files";
 import type {
   AiAction, CareerData, CareerView, Contact, Interview, InterviewQuestion,
@@ -294,7 +295,8 @@ export default function CareerApp() {
   const [notices, setNotices] = useState<Notice[]>([]);
   const [undo, setUndo] = useState<{ jobId: string; from: string; to: string } | null>(null);
   const [taskUndo, setTaskUndo] = useState<{ taskId: string; from: Task["status"]; title: string; token: string } | null>(null);
-  const [aiState, setAiState] = useState<{ action: AiAction; title: string; loading: boolean; result?: unknown; error?: string } | null>(null);
+  const [aiState, setAiState] = useState<{ action: AiAction; title: string; loading: boolean; result?: unknown; error?: string; applyLabel?: string; onApply?: (result: unknown) => void | Promise<void> } | null>(null);
+  const aiRequestRef = useRef<{ id: string; controller: AbortController } | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
 
   const refresh = useCallback(async () => setData(await loadCareerData()), []);
@@ -320,7 +322,7 @@ export default function CareerApp() {
       const typing = target?.tagName === "INPUT" || target?.tagName === "TEXTAREA" || target?.isContentEditable;
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") { event.preventDefault(); setSearchOpen(true); }
       if (!typing && event.key === "/") { event.preventDefault(); setSearchOpen(true); }
-      if (event.key === "Escape") { setSearchOpen(false); setModal(null); setAiState(null); }
+      if (event.key === "Escape") { setSearchOpen(false); setModal(null); aiRequestRef.current?.controller.abort(); aiRequestRef.current = null; setAiState(null); }
     }
     window.addEventListener("keydown", onKeydown);
     return () => window.removeEventListener("keydown", onKeydown);
@@ -413,14 +415,21 @@ export default function CareerApp() {
     setSelectedJobId(null); await refresh(); notify("职位已归档");
   }
 
-  async function runAi(action: AiAction, title: string, payload: unknown) {
-    setAiState({ action, title, loading: true });
+  async function runAi(action: AiAction, title: string, payload: unknown, apply?: { label: string; onApply: (result: unknown) => void | Promise<void> }) {
+    aiRequestRef.current?.controller.abort();
+    const request = { id: crypto.randomUUID(), controller: new AbortController() };
+    aiRequestRef.current = request;
+    setAiState({ action, title, loading: true, applyLabel: apply?.label, onApply: apply?.onApply });
     try {
-      const response = await fetch("/api/ai/career", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ action, payload }) });
+      const response = await fetch("/api/ai/career", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ action, payload }), signal: request.controller.signal });
       const body = await response.json().catch(() => null);
+      if (aiRequestRef.current?.id !== request.id) return;
       if (!response.ok) throw new Error((body as { error?: string } | null)?.error || "AI 服务暂时不可用");
-      setAiState({ action, title, loading: false, result: parseAiContent(body) });
-    } catch (error) { setAiState({ action, title, loading: false, error: error instanceof Error ? error.message : "请求失败" }); }
+      setAiState((current) => current ? { ...current, loading: false, result: parseAiContent(body), error: undefined } : current);
+    } catch (error) {
+      if (request.controller.signal.aborted || aiRequestRef.current?.id !== request.id) return;
+      setAiState((current) => current ? { ...current, loading: false, error: error instanceof Error ? error.message : "请求失败" } : current);
+    }
   }
 
   function navigate(next: CareerView) {
@@ -470,7 +479,22 @@ export default function CareerApp() {
     {modal === "material" && <MaterialModal data={data} onClose={() => setModal(null)} onSaved={async () => { setModal(null); await refresh(); notify("材料已保存"); }} />}
     {modal === "import" && <SmartImportModal data={data} initialInput={importInitial} onClose={() => { setModal(null); setImportInitial(""); }} onSaved={async () => { setModal(null); setImportInitial(""); await refresh(); notify("职位已导入"); }} notify={notify} />}
     {searchOpen && <CommandPalette data={data} onClose={() => setSearchOpen(false)} onNavigate={navigate} onSelectJob={(id) => { setSearchOpen(false); setSelectedJobId(id); }} onAdd={() => { setSearchOpen(false); setModal("job"); }} />}
-    {aiState && <AiPreview state={aiState} onClose={() => setAiState(null)} onCopy={async (result) => { const copied = await copyText(aiText(result)); notify(copied ? "AI 结果已复制，可粘贴到需要保留的位置" : "复制失败，请手动选择结果", copied ? "info" : "error"); return copied; }} />}
+    {aiState && <AiPreview
+      state={aiState}
+      onClose={() => { aiRequestRef.current?.controller.abort(); aiRequestRef.current = null; setAiState(null); }}
+      onCopy={async (result) => {
+        const copied = await copyText(aiText(result));
+        notify(copied ? "AI 结果已复制，可粘贴到需要保留的位置" : "复制失败，请手动选择结果", copied ? "info" : "error");
+        return copied;
+      }}
+      onApply={aiState.onApply ? async (result) => {
+        await aiState.onApply?.(result);
+        aiRequestRef.current = null;
+        setAiState(null);
+        notify("已填入面经草稿；只有点击保存面经后才会写入本地数据库", "info");
+      } : undefined}
+      applyLabel={aiState.applyLabel}
+    />}
     <div className="career-toast-stack" aria-live="polite">{taskUndo && <button className="career-toast undo" onClick={() => void handleTaskUndo()} aria-label={`撤销「${taskUndo.title}」的状态变化`}><RotateCcw size={16} />{taskUndo.from === "todo" ? "待办已完成" : "待办已恢复"} <b>撤销</b></button>}{undo && <button className="career-toast undo" onClick={handleUndo}><RotateCcw size={16} />阶段已更新 <b>撤销</b></button>}{notices.map((notice) => <div className={`career-toast ${notice.tone}`} key={notice.id}>{notice.tone === "success" ? <Check size={16} /> : notice.tone === "error" ? <X size={16} /> : <Bell size={16} />}{notice.text}</div>)}</div>
   </main>;
 }
@@ -656,11 +680,107 @@ function JobDrawer({ job, data, onClose, onMove, onArchive, onRefresh, onAi, not
     {tab === "tasks" && <div className="career-drawer-list">{tasks.map((task) => <article key={task.id}><span className={`career-check ${task.status}`}><Check size={13} /></span><div><b>{task.title}</b><small>{relativeDate(task.due_at)} · {task.kind}</small></div></article>)}{tasks.length === 0 && <EmptyState icon={<ListTodo />} title="还没有待办" text="为这个职位安排一个具体的下一步。" />}</div>}{tab === "interviews" && <div className="career-drawer-list">{interviews.map((item) => <article key={item.id}><span className="career-list-icon"><MessageSquareText size={16} /></span><div><b>{item.round_name}</b><small>{formatDate(item.scheduled_at, true)} · {item.interviewer || "面试官待确认"}</small><p>{item.summary}</p></div></article>)}{interviews.length === 0 && <EmptyState icon={<MessageSquareText />} title="还没有面试轮次" text="推进到面试后，在这里完整记录每一轮。" />}</div>}{tab === "materials" && <div className="career-drawer-list">{materials.map((item) => <article key={item.id}><span className="career-list-icon"><FileText size={16} /></span><div><b>{item.name}</b><small>{item.kind} · {item.version}</small><p>{item.notes}</p></div></article>)}{materials.length === 0 && <EmptyState icon={<FileText />} title="还没有关联材料" text="关联确切版本，之后随时知道发出的是哪一份。" />}</div>}</div><footer className="career-drawer-footer"><button className="career-button danger" onClick={() => void onArchive(job)}><Archive size={15} />归档职位</button></footer></Drawer>;
 }
 
-function InterviewDrawer({ interview, data, onClose, onRefresh, onAi, notify }: { interview: Interview; data: CareerData; onClose: () => void; onRefresh: () => Promise<void>; onAi: (action: AiAction, title: string, payload: unknown) => void; notify: (text: string, tone?: Notice["tone"]) => void }) {
+function InterviewDrawer({ interview, data, onClose, onRefresh, onAi, notify }: {
+  interview: Interview;
+  data: CareerData;
+  onClose: () => void;
+  onRefresh: () => Promise<void>;
+  onAi: (
+    action: AiAction,
+    title: string,
+    payload: unknown,
+    apply?: { label: string; onApply: (result: unknown) => void | Promise<void> },
+  ) => void;
+  notify: (text: string, tone?: Notice["tone"]) => void;
+}) {
   const job = data.jobs.find((item) => item.id === interview.job_id);
+  const [status, setStatus] = useState(interview.status);
+  const [summary, setSummary] = useState(interview.summary);
+  const [rawNotes, setRawNotes] = useState(interview.raw_notes);
   const [questions, setQuestions] = useState<InterviewQuestion[]>(parseQuestions(interview.questions_json));
-  async function save(event: FormEvent<HTMLFormElement>) { event.preventDefault(); const form = new FormData(event.currentTarget); await runCareerSql("UPDATE career_interviews SET status=?,summary=?,raw_notes=?,questions_json=?,reflection=?,updated_at=? WHERE id=?", [form.get("status"), form.get("summary"), form.get("raw_notes"), JSON.stringify(questions), form.get("reflection"), new Date().toISOString(), interview.id]); await onRefresh(); notify("面经已保存"); }
-  return <Drawer label={`${job?.company ?? "职迹"} · ${interview.round_name}面经`} onClose={onClose} wide><div className="career-job-drawer-head"><CompanyMark company={job?.company ?? "职"} /><div><span className="career-eyebrow">INTERVIEW EXPERIENCE</span><h2>{job?.company} · {interview.round_name}</h2><p>{formatDate(interview.scheduled_at, true)} · {interview.interviewer || "面试官待确认"}</p></div><button className="career-icon-button" onClick={onClose} aria-label="关闭面经"><X size={19} /></button></div><form className="career-experience-form" onSubmit={save}><div className="career-experience-toolbar"><select name="status" defaultValue={interview.status} aria-label="面试状态"><option value="scheduled">待进行</option><option value="completed">已完成</option><option value="canceled">已取消</option></select><button type="button" className="career-button secondary" onClick={() => onAi("structure_interview", "AI 整理面经", { job, interview: { ...interview, questions } })}><Sparkles size={15} />AI 整理速记</button></div><Field label="一句话总结"><input name="summary" defaultValue={interview.summary} placeholder="这轮主要考察了什么，整体感受如何？" /></Field><Field label="原始速记"><textarea name="raw_notes" rows={6} defaultValue={interview.raw_notes} placeholder="先把记得的内容都写下来，不必整理…" /></Field><div className="career-question-section"><header><div><h3>面试问题与回答</h3><p>按实际顺序记录，方便之后复盘。</p></div><button type="button" className="career-button ghost" onClick={() => setQuestions((current) => [...current, { question: "", answer: "", note: "" }])}><Plus size={15} />添加问题</button></header>{questions.map((question, index) => <article key={index}><span>{String(index + 1).padStart(2, "0")}</span><div><input value={question.question} onChange={(event) => setQuestions((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, question: event.target.value } : item))} placeholder="面试官问了什么？" aria-label={`第 ${index + 1} 个面试问题`} /><textarea rows={3} value={question.answer} onChange={(event) => setQuestions((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, answer: event.target.value } : item))} placeholder="我是怎么回答的？" aria-label={`第 ${index + 1} 个问题的回答`} /><input value={question.note} onChange={(event) => setQuestions((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, note: event.target.value } : item))} placeholder="追问、反馈或可以改进的地方" aria-label={`第 ${index + 1} 个问题的备注`} /></div><button type="button" onClick={() => setQuestions((current) => current.filter((_, itemIndex) => itemIndex !== index))} aria-label={`删除第 ${index + 1} 个问题`}><Trash2 size={15} /></button></article>)}</div><Field label="复盘与下一步"><textarea name="reflection" rows={5} defaultValue={interview.reflection} placeholder="哪些地方做得好？下一次会怎么回答？" /></Field><div className="career-form-actions sticky"><button type="button" className="career-button ghost" onClick={onClose}>取消</button><button className="career-button primary"><Check size={16} />保存面经</button></div></form></Drawer>;
+  const [reflection, setReflection] = useState(interview.reflection);
+  const [saving, setSaving] = useState(false);
+  const [structureUndo, setStructureUndo] = useState<{
+    summary: string;
+    questions: InterviewQuestion[];
+    reflection: string;
+  } | null>(null);
+
+  async function save(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setSaving(true);
+    try {
+      await runCareerSql(
+        "UPDATE career_interviews SET status=?,summary=?,raw_notes=?,questions_json=?,reflection=?,updated_at=? WHERE id=?",
+        [status, summary, rawNotes, JSON.stringify(questions), reflection, new Date().toISOString(), interview.id],
+      );
+      await onRefresh();
+      setStructureUndo(null);
+      notify("面经已保存");
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "面经保存失败", "error");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  function applyStructuredInterview(result: unknown) {
+    const draft = createStructuredInterviewDraft(result, { rawNotes, questions });
+    setStructureUndo({
+      summary,
+      questions: questions.map((question) => ({ ...question })),
+      reflection,
+    });
+    if (draft.summary !== null) setSummary(draft.summary);
+    if (draft.questions !== null) setQuestions(draft.questions);
+    if (draft.reflection !== null) setReflection(draft.reflection);
+  }
+
+  function undoStructure() {
+    if (!structureUndo) return;
+    setSummary(structureUndo.summary);
+    setQuestions(structureUndo.questions.map((question) => ({ ...question })));
+    setReflection(structureUndo.reflection);
+    setStructureUndo(null);
+    notify("已撤销 AI 整理，原始速记始终未被改动", "info");
+  }
+
+  function markStructuredFieldEdited() {
+    if (structureUndo) setStructureUndo(null);
+  }
+
+  return <Drawer label={`${job?.company ?? "职迹"} · ${interview.round_name}面经`} onClose={onClose} wide>
+    <div className="career-job-drawer-head">
+      <CompanyMark company={job?.company ?? "职"} />
+      <div><span className="career-eyebrow">INTERVIEW EXPERIENCE</span><h2>{job?.company} · {interview.round_name}</h2><p>{formatDate(interview.scheduled_at, true)} · {interview.interviewer || "面试官待确认"}</p></div>
+      <button className="career-icon-button" onClick={onClose} aria-label="关闭面经"><X size={19} /></button>
+    </div>
+    <form className="career-experience-form" onSubmit={save}>
+      <div className="career-experience-toolbar">
+        <select value={status} onChange={(event) => setStatus(event.target.value as Interview["status"])} aria-label="面试状态"><option value="scheduled">待进行</option><option value="completed">已完成</option><option value="canceled">已取消</option></select>
+        <button type="button" className="career-button secondary" onClick={() => onAi(
+          "structure_interview",
+          "AI 整理面经",
+          { job, interview: { ...interview, status, summary, raw_notes: rawNotes, questions, reflection } },
+          { label: "填入面经草稿", onApply: applyStructuredInterview },
+        )}><Sparkles size={15} />AI 整理速记</button>
+      </div>
+      <p className="career-ai-context-note"><ShieldCheck size={15} />AI 会读取当前表单里的总结、原始速记、问题和复盘；预览或填入都不会自动保存。</p>
+      <Field label="一句话总结"><input value={summary} onChange={(event) => { markStructuredFieldEdited(); setSummary(event.target.value); }} placeholder="这轮主要考察了什么，整体感受如何？" /></Field>
+      <Field label="原始速记"><textarea rows={6} value={rawNotes} onChange={(event) => setRawNotes(event.target.value)} placeholder="先把记得的内容都写下来，不必整理…" /></Field>
+      {structureUndo && <div className="career-ai-applied-note" role="status"><span><CheckCircle2 size={16} /><span><b>AI 已填入当前表单</b><small>仍可逐项修改，点击“保存面经”前不会写入数据库。</small></span></span><button type="button" onClick={undoStructure}><RotateCcw size={14} />撤销整理</button></div>}
+      <div className="career-question-section">
+        <header><div><h3>面试问题与回答</h3><p>按实际顺序记录，方便之后复盘。</p></div><button type="button" className="career-button ghost" onClick={() => { markStructuredFieldEdited(); setQuestions((current) => [...current, { question: "", answer: "", note: "" }]); }}><Plus size={15} />添加问题</button></header>
+        {questions.map((question, index) => <article key={index}>
+          <span>{String(index + 1).padStart(2, "0")}</span>
+          <div><input value={question.question} onChange={(event) => { markStructuredFieldEdited(); setQuestions((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, question: event.target.value } : item)); }} placeholder="面试官问了什么？" aria-label={`第 ${index + 1} 个面试问题`} /><textarea rows={3} value={question.answer} onChange={(event) => { markStructuredFieldEdited(); setQuestions((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, answer: event.target.value } : item)); }} placeholder="我是怎么回答的？" aria-label={`第 ${index + 1} 个问题的回答`} /><input value={question.note} onChange={(event) => { markStructuredFieldEdited(); setQuestions((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, note: event.target.value } : item)); }} placeholder="追问、反馈或可以改进的地方" aria-label={`第 ${index + 1} 个问题的备注`} /></div>
+          <button type="button" onClick={() => { markStructuredFieldEdited(); setQuestions((current) => current.filter((_, itemIndex) => itemIndex !== index)); }} aria-label={`删除第 ${index + 1} 个问题`}><Trash2 size={15} /></button>
+        </article>)}
+      </div>
+      <Field label="复盘与下一步"><textarea rows={5} value={reflection} onChange={(event) => { markStructuredFieldEdited(); setReflection(event.target.value); }} placeholder="哪些地方做得好？下一次会怎么回答？" /></Field>
+      <div className="career-form-actions sticky"><button type="button" className="career-button ghost" onClick={onClose}>取消</button><button className="career-button primary" disabled={saving}>{saving ? <LoaderCircle className="spin" size={16} /> : <Check size={16} />}{saving ? "正在保存…" : "保存面经"}</button></div>
+    </form>
+  </Drawer>;
 }
 
 function JobModal({ data, onClose, onSaved }: { data: CareerData; onClose: () => void; onSaved: (id: string) => Promise<void> }) {
@@ -747,8 +867,26 @@ function CommandPalette({ data, onClose, onNavigate, onSelectJob, onAdd }: { dat
   return <div className="career-command-layer"><button className="career-modal-scrim" onClick={onClose} aria-label="关闭全局搜索" /><section ref={dialogRef} tabIndex={-1} className="career-command" role="dialog" aria-modal="true" aria-label="全局搜索"><label><Search size={19} /><input data-dialog-initial value={value} onChange={(event) => setValue(event.target.value)} placeholder="搜索职位，或跳转到任意页面…" aria-label="搜索职位或页面" /><kbd>ESC</kbd></label><div><span className="career-command-label">快捷动作</span><button onClick={onAdd}><span><Plus size={17} /></span><b>记录新职位</b><small>新建一条求职机会</small></button>{views.map((item) => <button key={item.id} onClick={() => { onClose(); onNavigate(item.id); }}><span><item.icon size={17} /></span><b>前往{item.label}</b><small>打开{item.label}</small></button>)}{jobs.length > 0 && <span className="career-command-label">职位</span>}{jobs.map((job) => <button key={job.id} onClick={() => onSelectJob(job.id)}><CompanyMark company={job.company} small /><b>{job.role}</b><small>{job.company} · {data.stages.find((stage) => stage.id === job.stage_id)?.name}</small></button>)}</div><footer><span>输入关键词即时筛选</span><span><kbd>ESC</kbd> 关闭</span><span>资料来自本地 SQLite</span></footer></section></div>;
 }
 
-function AiPreview({ state, onClose, onCopy }: { state: { action: AiAction; title: string; loading: boolean; result?: unknown; error?: string }; onClose: () => void; onCopy: (result: unknown) => Promise<boolean> }) {
+function AiPreview({ state, onClose, onCopy, onApply, applyLabel }: {
+  state: { action: AiAction; title: string; loading: boolean; result?: unknown; error?: string };
+  onClose: () => void;
+  onCopy: (result: unknown) => Promise<boolean>;
+  onApply?: (result: unknown) => Promise<void>;
+  applyLabel?: string;
+}) {
   const [copyState, setCopyState] = useState<"idle" | "copying" | "copied" | "failed">("idle");
+  const [applyState, setApplyState] = useState<"idle" | "applying" | "failed">("idle");
+  const [applyError, setApplyError] = useState("");
   async function handleCopy() { setCopyState("copying"); setCopyState(await onCopy(state.result) ? "copied" : "failed"); }
-  return <Modal title={state.title} description="AI 结果不会自动保存；核对后可以复制到你想保留的位置。" onClose={onClose} wide><div className="career-ai-preview">{state.loading ? <div className="career-ai-loading"><span><Sparkles size={22} /></span><LoaderCircle className="spin" size={19} /><h3>正在阅读你选择的内容</h3><p>不会自动改动任何职位、材料或面经。</p></div> : state.error ? <div className="career-ai-error"><X size={24} /><h3>这次没有生成成功</h3><p>{state.error}</p><button className="career-button secondary" onClick={onClose}>返回手动编辑</button></div> : <><div className="career-ai-banner"><ShieldCheck size={17} /><span>建议来自配置的 DeepSeek 服务；个人经历仍需由你确认。</span></div><pre>{aiText(state.result)}</pre><div className="career-form-actions"><button className="career-button ghost" onClick={onClose}>关闭预览</button><button className="career-button primary" disabled={copyState === "copying"} onClick={() => void handleCopy()}><Check size={16} />{copyState === "copying" ? "正在复制…" : copyState === "copied" ? "已复制" : copyState === "failed" ? "请手动选择" : "复制结果"}</button></div></>}</div></Modal>;
+  async function handleApply() {
+    if (!onApply) return;
+    setApplyState("applying");
+    setApplyError("");
+    try { await onApply(state.result); }
+    catch (error) {
+      setApplyState("failed");
+      setApplyError(error instanceof Error ? error.message : "AI 结果无法填入，当前草稿没有被改动");
+    }
+  }
+  return <Modal title={state.title} description={onApply ? "先核对结果，再决定是否填入当前表单；填入后仍需手动保存。" : "AI 结果不会自动保存；核对后可以复制到你想保留的位置。"} onClose={onClose} wide><div className="career-ai-preview">{state.loading ? <div className="career-ai-loading"><span><Sparkles size={22} /></span><LoaderCircle className="spin" size={19} /><h3>正在阅读你选择的内容</h3><p>不会自动改动任何职位、材料或面经。</p></div> : state.error ? <div className="career-ai-error"><X size={24} /><h3>这次没有生成成功</h3><p>{state.error}</p><button className="career-button secondary" onClick={onClose}>返回手动编辑</button></div> : <><div className="career-ai-banner"><ShieldCheck size={17} /><span>{onApply ? "填入只会更新总结、问题和复盘草稿；原始速记与面试状态保持不变，生成内容仍需确认。" : "建议来自配置的 DeepSeek 服务；个人经历仍需由你确认。"}</span></div><pre>{aiText(state.result)}</pre>{applyError && <div className="career-inline-error" role="alert"><X size={15} />{applyError}</div>}<div className="career-form-actions"><button type="button" className="career-button ghost" onClick={onClose}>关闭预览</button><button type="button" className={`career-button ${onApply ? "secondary" : "primary"}`} disabled={copyState === "copying" || applyState === "applying"} onClick={() => void handleCopy()}><Check size={16} />{copyState === "copying" ? "正在复制…" : copyState === "copied" ? "已复制" : copyState === "failed" ? "请手动选择" : "复制结果"}</button>{onApply && <button type="button" className="career-button primary" disabled={applyState === "applying"} onClick={() => void handleApply()}>{applyState === "applying" ? <LoaderCircle className="spin" size={16} /> : <WandSparkles size={16} />}{applyState === "applying" ? "正在填入…" : applyLabel || "填入草稿"}</button>}</div></>}</div></Modal>;
 }
