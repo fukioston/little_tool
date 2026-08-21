@@ -19,25 +19,27 @@ test("storage card shows the exact current origin without probing or navigating 
   );
 });
 
-test("storage card explains address isolation, shared risk, and three-backup migration", async () => {
+test("storage card explains address isolation, shared risk, and registry-sized migration", async () => {
   const source = await readProjectFile("app/StorageTrustCard.tsx");
 
   assert.match(source, /完整地址，加上你现在使用的浏览器资料/);
   assert.match(source, /换主机名、端口或浏览器资料/);
-  assert.match(source, /容量不足，或清除这个地址的资料，都可能同时影响三处/);
+  assert.match(source, /容量不足，或清除这个地址的资料，都可能同时影响它们/);
   assert.match(source, /数据库、附件归处与完整备份各自独立/);
   assert.match(source, /不能彼此替代/);
-  assert.match(source, /分别从三个空间准备完整备份，一共 3 份/);
+  assert.match(source, /现在一共需要 \{spaceCount\} 份/);
+  assert.doesNotMatch(source, /三个空间|一共 3 份/);
 });
 
 test("landing renders the storage truth after the space choices", async () => {
   const source = await readProjectFile("app/page.tsx");
   const choices = source.indexOf('<section className="suite-choices"');
-  const storage = source.indexOf("<StorageTrustCard />");
+  const storage = source.indexOf("<StorageTrustCard spaceCount={suiteSpaces.length} />");
 
   assert.match(source, /import \{ StorageTrustCard \} from "\.\/StorageTrustCard"/);
   assert.ok(choices >= 0 && storage > choices);
-  assert.equal((source.match(/<StorageTrustCard \/>/g) ?? []).length, 1);
+  assert.equal((source.match(/<StorageTrustCard spaceCount=\{suiteSpaces\.length\} \/>/g) ?? []).length, 1);
+  assert.match(source, /\{suiteSpaces\.length\} 个私人空间/);
 });
 
 test("storage truth remains calm, touchable, and bounded at 319px", async () => {

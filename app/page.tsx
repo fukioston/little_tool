@@ -36,8 +36,8 @@ export default function Home() {
           </Link>
         ))}
       </section>
-      <StorageTrustCard />
-      <footer className="suite-trust"><span><i>LOCAL</i><b>三个空间各有自己的资料边界</b></span><p>资料默认保存在当前浏览器；只有你主动使用 AI 功能时，才会发送完成该次请求所需的最少上下文。清除站点数据仍会影响资料。</p></footer>
+      <StorageTrustCard spaceCount={suiteSpaces.length} />
+      <footer className="suite-trust"><span><i>LOCAL</i><b>{suiteSpaces.length} 个私人空间，各有自己的资料边界</b></span><p>资料默认保存在当前浏览器；只有你主动使用 AI 功能时，才会发送完成该次请求所需的最少上下文。清除站点数据仍会影响资料。</p></footer>
     </main>
   );
 }
