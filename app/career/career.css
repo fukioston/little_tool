@@ -1875,16 +1875,34 @@
 }
 .career-activity-row > .career-calm-empty { grid-column: 1 / -1; }
 .career-reflection-view { min-width: 0; }
+.career-reflection-care-note {
+  min-width: 0;
+  margin: -8px 0 16px;
+  padding: 13px 15px;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  color: #53675e;
+  border: 1px solid #dce6e0;
+  border-radius: 13px;
+  background: #f4f7f5;
+  font-size: 13px;
+  line-height: 1.55;
+}
+.career-reflection-care-note svg { flex: 0 0 auto; color: #527563; }
+.career-reflection-places { min-width: 0; margin-bottom: 16px; }
 .career-reflection-grid {
   min-width: 0;
   display: grid;
   grid-template-columns: minmax(0, 1.15fr) minmax(300px, .85fr);
   gap: 16px;
 }
+.career-reflection-places,
 .career-reflection-facts,
 .career-reflection-next,
 .career-reflection-notes { min-width: 0; padding: 24px; }
 .career-reflection-notes { margin-top: 16px; }
+.career-reflection-places > header,
 .career-reflection-facts > header,
 .career-reflection-next > header,
 .career-reflection-notes > header {
@@ -1893,6 +1911,7 @@
   align-items: flex-start;
   gap: 11px;
 }
+.career-reflection-places > header > span,
 .career-reflection-facts > header > span,
 .career-reflection-next > header > span,
 .career-reflection-notes > header > span {
@@ -1905,12 +1924,15 @@
   border-radius: 12px;
   background: #edf3ef;
 }
+.career-reflection-places > header > div,
 .career-reflection-facts > header > div,
 .career-reflection-next > header > div,
 .career-reflection-notes > header > div { min-width: 0; }
+.career-reflection-places h3,
 .career-reflection-facts h3,
 .career-reflection-next h3,
 .career-reflection-notes h3 { margin: 1px 0 0; font-size: 16px; letter-spacing: -.015em; }
+.career-reflection-places header p,
 .career-reflection-facts header p,
 .career-reflection-next header p,
 .career-reflection-notes header p {
@@ -1919,6 +1941,52 @@
   font-size: 13px;
   line-height: 1.5;
 }
+.career-reflection-place-list { min-width: 0; display: grid; }
+.career-reflection-place-list article {
+  min-width: 0;
+  min-height: 68px;
+  padding: 11px 2px;
+  display: grid;
+  grid-template-columns: auto minmax(180px, 1fr) minmax(130px, .55fr) minmax(130px, .55fr);
+  align-items: center;
+  gap: 12px;
+  border-top: 1px solid #e9edea;
+}
+.career-reflection-place-list article > div { min-width: 0; display: grid; gap: 4px; }
+.career-reflection-place-list article b { overflow-wrap: anywhere; font-size: 13px; }
+.career-reflection-place-list article small { color: #6a7670; font-size: 12px; line-height: 1.45; }
+.career-reflection-place-list article > span {
+  min-width: 0;
+  color: #5d6d65;
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.career-reflection-place-list article > span { display: inline-flex; align-items: center; gap: 6px; }
+.career-reflection-place-list article > span i { width: 7px; height: 7px; flex: 0 0 auto; border-radius: 50%; background: #9aa49f; }
+.career-reflection-more-note { margin: 8px 0 0; color: #6a7670; font-size: 12px; line-height: 1.5; }
+.career-reflection-settled { margin-top: 8px; border-top: 1px solid #e3e9e5; }
+.career-reflection-settled > summary {
+  min-height: 48px;
+  padding: 5px 2px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: #53645c;
+  border-radius: 9px;
+  cursor: pointer;
+  list-style: none;
+}
+.career-reflection-settled > summary::-webkit-details-marker { display: none; }
+.career-reflection-settled > summary > span { min-width: 0; display: flex; align-items: center; gap: 10px; }
+.career-reflection-settled > summary > span > svg { flex: 0 0 auto; }
+.career-reflection-settled > summary > span > span { min-width: 0; display: grid; gap: 3px; }
+.career-reflection-settled > summary b { font-size: 13px; }
+.career-reflection-settled > summary small { color: #748079; font-size: 12px; font-weight: 400; }
+.career-reflection-settled > summary > svg { flex: 0 0 auto; transition: transform .16s ease; }
+.career-reflection-settled[open] > summary > svg { transform: rotate(90deg); }
+.career-reflection-settled > summary:focus-visible { outline: 3px solid #8db09f35; outline-offset: 2px; }
 .career-reflection-facts > div,
 .career-reflection-next > div { display: grid; }
 .career-reflection-facts article,
@@ -1992,9 +2060,15 @@
 
 @media (max-width: 760px) {
   .career-sidebar.open .career-sidebar-calm { display: flex; }
+  .career-reflection-care-note { align-items: flex-start; margin-top: -4px; }
+  .career-reflection-places,
   .career-reflection-facts,
   .career-reflection-next,
   .career-reflection-notes { padding: 18px; }
+  .career-reflection-place-list article { grid-template-columns: auto minmax(0, 1fr); gap: 5px 10px; }
+  .career-reflection-place-list article > .career-company-mark { grid-column: 1; grid-row: 1 / 4; align-self: start; margin-top: 2px; }
+  .career-reflection-place-list article > div { grid-column: 2; }
+  .career-reflection-place-list article > span { grid-column: 2; }
   .career-reflection-facts article,
   .career-reflection-next article { grid-template-columns: auto minmax(0, 1fr); }
   .career-reflection-facts article time,

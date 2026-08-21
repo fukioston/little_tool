@@ -1737,7 +1737,7 @@ export default function CareerApp() {
           onRemove={(material, opener) => { materialRemovalOpenerRef.current = opener; materialRemovalFocusPendingRef.current = false; setMaterialRemoval({ id: material.id, name: material.name, file_key: material.file_key }); }}
           notify={notify}
         />}
-        {view === "analytics" && <AnalyticsView data={data} now={careerClock} />}
+        {view === "analytics" && <AnalyticsView data={allData} now={careerClock} />}
         {view === "settings" && <SettingsView data={data} onRefresh={requireRefresh} onExport={async () => {
           try {
             const exported = await exportCompleteCareerBackup();
@@ -1899,10 +1899,10 @@ function MobileNav({ view, onNavigate, onMore }: { view: CareerView; onNavigate:
 }
 
 function SectionHeading({ eyebrow, title, description, action }: { eyebrow?: string; title: string; description?: string; action?: ReactNode }) { return <div className="career-section-heading"><div>{eyebrow && <span>{eyebrow}</span>}<h2>{title}</h2>{description && <p>{description}</p>}</div>{action}</div>; }
-function CompanyMark({ company, small = false }: { company: string; small?: boolean }) {
+function CompanyMark({ company, small = false, decorative = false }: { company: string; small?: boolean; decorative?: boolean }) {
   const colors = ["mint", "lavender", "peach", "blue", "sand", "rose"];
   const index = Array.from(company).reduce((sum, char) => sum + char.charCodeAt(0), 0) % colors.length;
-  return <span className={`career-company-mark ${colors[index]} ${small ? "small" : ""}`}>{initials(company)}</span>;
+  return <span className={`career-company-mark ${colors[index]} ${small ? "small" : ""}`} aria-hidden={decorative || undefined}>{initials(company)}</span>;
 }
 
 function SourceBadge({ source }: { source: string }) { return <span className={`career-source ${sourceClass[source] ?? "other"}`}>{source === "LinkedIn" ? "in" : source === "BOSS直聘" ? "BOSS" : source}</span>; }
@@ -2184,6 +2184,14 @@ function MaterialsView({ data, stale, refreshBusy, recoveryLoaded, recoveryCount
 
 function AnalyticsView({ data, now }: { data: CareerData; now: number }) {
   const jobsById = new Map(data.jobs.map((job) => [job.id, job]));
+  const stagesById = new Map(data.stages.map((stage) => [stage.id, stage]));
+  const terminalStageIds = new Set(data.stages.filter((stage) => stage.is_terminal === 1).map((stage) => stage.id));
+  const activeJobs = data.jobs
+    .filter((job) => job.archived !== 1 && !terminalStageIds.has(job.stage_id))
+    .sort((left, right) => right.updated_at.localeCompare(left.updated_at));
+  const settledJobs = data.jobs
+    .filter((job) => job.archived === 1 || terminalStageIds.has(job.stage_id))
+    .sort((left, right) => right.updated_at.localeCompare(left.updated_at));
   const scheduled = [
     ...data.tasks.flatMap((task) => {
       const timestamp = task.due_at ? new Date(task.due_at).getTime() : Number.NaN;
@@ -2203,9 +2211,16 @@ function AnalyticsView({ data, now }: { data: CareerData; now: number }) {
     .sort((left, right) => (right.scheduled_at ?? "").localeCompare(left.scheduled_at ?? ""));
   return <div className="career-view career-reflection-view">
     <SectionHeading eyebrow="REFLECTION" title="过程回顾" description="回看已经发生的事实，不统计你做得够不够多" action={<span className="career-no-score-note"><ShieldCheck size={15} />没有结果评分</span>} />
+    <p className="career-reflection-care-note"><ShieldCheck size={17} /><span>等待有时会很长。这里不把 Offer 或阶段当成你的分数，也不会因为一段时间没有变化就催你推进。</span></p>
+    <section className="career-panel career-reflection-places">
+      <header><span><BriefcaseBusiness size={17} /></span><div><h3>职位现在放在哪里</h3><p>阶段和来源只帮你找回上下文，不代表做得好或不好。</p></div></header>
+      <div className="career-reflection-place-list" role="list" aria-label="进行中的职位位置">{activeJobs.slice(0, 6).map((job) => { const stage = stagesById.get(job.stage_id); return <article role="listitem" key={job.id}><CompanyMark company={job.company} small decorative /><div><b>{job.company} · {job.role}</b><small>进行中的记录</small></div><span><i style={{ background: stage?.color }} />阶段 · {stage?.name || "待确认"}</span><span className="career-reflection-source">来源 · {job.source.trim() || "未记录"}</span></article>; })}{activeJobs.length === 0 && <p className="career-calm-empty">{settledJobs.length > 0 ? "现在没有进行中的职位。结束或收起只是记录状态，不是对你的结论。" : "还没有职位记录。遇到想记住的机会时再添加，不需要先填满这里。"}</p>}</div>
+      {activeJobs.length > 6 && <p className="career-reflection-more-note">这里只先展示最近有变化的记录；其余仍完整保留在“职位”里。</p>}
+      {settledJobs.length > 0 && <details className="career-reflection-settled"><summary><span><Archive size={16} /><span><b>已结束与已归档</b><small>按需展开；记录仍完整保留</small></span></span><ChevronRight size={17} /></summary><div className="career-reflection-place-list" role="list" aria-label="已结束与已归档的职位位置">{settledJobs.slice(0, 6).map((job) => { const stage = stagesById.get(job.stage_id); return <article role="listitem" key={job.id}><CompanyMark company={job.company} small decorative /><div><b>{job.company} · {job.role}</b><small>{job.archived === 1 ? "已归档 · 只是收好记录" : "已结束 · 只记录结果"}</small></div><span><i style={{ background: stage?.color }} />阶段 · {stage?.name || "待确认"}</span><span className="career-reflection-source">来源 · {job.source.trim() || "未记录"}</span></article>; })}</div>{settledJobs.length > 6 && <p className="career-reflection-more-note">这里只先展示最近有变化的记录；其余仍完整保留在“职位”里。</p>}</details>}
+    </section>
     <div className="career-reflection-grid">
+      <section className="career-panel career-reflection-next"><header><span><CalendarDays size={17} /></span><div><h3>接下来已明确安排</h3><p>只显示你自己定过时间的待办和面试。</p></div></header><div>{scheduled.slice(0, 5).map((item) => { const job = item.jobId ? jobsById.get(item.jobId) : null; const stage = job ? stagesById.get(job.stage_id) : null; const context = job?.archived === 1 ? "职位已归档" : stage?.is_terminal === 1 ? "职位已结束" : stage?.name || "阶段待确认"; return <article key={`${item.kind}:${item.id}`}><span>{item.kind === "interview" ? <MessageSquareText size={15} /> : <ListTodo size={15} />}</span><div><b>{item.title}</b><small>{job ? `${job.company} · ${context}` : "个人待办"}</small></div><time>{formatDate(item.at, true)}</time></article>; })}{scheduled.length === 0 && <p className="career-calm-empty">没有已经定下时间的安排。这里不会替你补一个“应该做”的下一步。</p>}</div></section>
       <section className="career-panel career-reflection-facts"><header><span><Zap size={17} /></span><div><h3>最近发生的事</h3><p>这里只按时间保留变化，不排名，也不计算转化。</p></div></header><div>{data.activities.slice(0, 6).map((item) => { const job = item.job_id ? jobsById.get(item.job_id) : null; return <article key={item.id}><span className={`career-activity-icon ${item.type}`}><Zap size={14} /></span><div><b>{neutralActivityDetail(item.detail)}</b><small>{job ? `${job.company} · ${job.role}` : "职迹"}</small></div><time>{formatDate(item.created_at)}</time></article>; })}{data.activities.length === 0 && <p className="career-calm-empty">还没有变化需要回看。页面安静并不代表你落后。</p>}</div></section>
-      <section className="career-panel career-reflection-next"><header><span><CalendarDays size={17} /></span><div><h3>接下来已明确安排</h3><p>只显示你自己定过时间的待办和面试。</p></div></header><div>{scheduled.slice(0, 5).map((item) => { const job = item.jobId ? jobsById.get(item.jobId) : null; return <article key={`${item.kind}:${item.id}`}><span>{item.kind === "interview" ? <MessageSquareText size={15} /> : <ListTodo size={15} />}</span><div><b>{item.title}</b><small>{job ? `${job.company} · ${job.role}` : "个人待办"}</small></div><time>{formatDate(item.at, true)}</time></article>; })}{scheduled.length === 0 && <p className="career-calm-empty">没有已经定下时间的安排。这里不会替你补一个“应该做”的下一步。</p>}</div></section>
     </div>
     <section className="career-panel career-reflection-notes"><header><span><MessageSquareText size={17} /></span><div><h3>最近想保留的面经</h3><p>只摘录你亲自写下的内容，不用数量衡量是否复盘充分。</p></div></header><div>{reflections.slice(0, 3).map((interview) => { const job = jobsById.get(interview.job_id); const note = interview.summary.trim() || interview.reflection.trim() || "已保留问题与回答。"; return <article key={interview.id}><div><b>{job ? `${job.company} · ${interview.round_name}` : interview.round_name}</b><small>{job?.role || "职位待确认"} · {formatDate(interview.scheduled_at)}</small></div><p>{note}</p></article>; })}{reflections.length === 0 && <p className="career-calm-empty">还没有想留在这里的面经。什么时候愿意写，再写也来得及。</p>}</div></section>
   </div>;
