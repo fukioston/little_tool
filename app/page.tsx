@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { StorageTrustCard } from "./StorageTrustCard";
 import { suiteSpaces } from "./suite-spaces";
 
 export default function Home() {
@@ -35,7 +36,8 @@ export default function Home() {
           </Link>
         ))}
       </section>
-      <footer className="suite-trust"><span><i>SQLite</i><b>每个空间一份独立本地数据库</b></span><p>资料默认保存在当前浏览器；只有你主动使用 AI 功能时，才会发送完成该次请求所需的最少上下文。清除站点数据仍会影响资料，请定期完整备份。</p></footer>
+      <StorageTrustCard />
+      <footer className="suite-trust"><span><i>LOCAL</i><b>三个空间各有自己的资料边界</b></span><p>资料默认保存在当前浏览器；只有你主动使用 AI 功能时，才会发送完成该次请求所需的最少上下文。清除站点数据仍会影响资料。</p></footer>
     </main>
   );
 }
