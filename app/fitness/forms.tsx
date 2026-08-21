@@ -31,6 +31,7 @@ export function FitnessDialog({
   onClose,
   children,
   wide = false,
+  busy = false,
 }: {
   open: boolean;
   title: string;
@@ -38,16 +39,24 @@ export function FitnessDialog({
   onClose: () => void;
   children: ReactNode;
   wide?: boolean;
+  busy?: boolean;
 }) {
-  const dialog = useFitnessDialog<HTMLElement>(open, onClose, "[data-dialog-close]");
+  const requestClose = useCallback(() => {
+    if (!busy) onClose();
+  }, [busy, onClose]);
+  const dialog = useFitnessDialog<HTMLElement>(open, requestClose, "[data-dialog-close]");
   if (!open) return null;
   return <>
-    <button className="sl-scrim" onClick={onClose} aria-label={`关闭${title}`} />
-    <section ref={dialog} className={`sl-dialog ${wide ? "wide" : ""}`} role="dialog" aria-modal="true" aria-labelledby="sl-dialog-title" tabIndex={-1}>
-      <header><div><span>{eyebrow}</span><h2 id="sl-dialog-title">{title}</h2></div><button data-dialog-close onClick={onClose} aria-label={`关闭${title}`}>×</button></header>
+    <button type="button" className="sl-scrim" tabIndex={-1} aria-hidden="true" disabled={busy} onClick={requestClose} />
+    <section ref={dialog} className={`sl-dialog ${wide ? "wide" : ""}`} role="dialog" aria-modal="true" aria-busy={busy} aria-labelledby="sl-dialog-title" tabIndex={-1}>
+      <header><div><span>{eyebrow}</span><h2 id="sl-dialog-title">{title}</h2></div><button type="button" data-dialog-close disabled={busy} onClick={requestClose} aria-label={`关闭${title}`}>×</button></header>
       {children}
     </section>
   </>;
+}
+
+function FormBusyStatus({ busy }: { busy: boolean }) {
+  return busy ? <p className="sl-visually-hidden" role="status">正在保存，请稍候。</p> : null;
 }
 
 function submitValues(event: FormEvent<HTMLFormElement>) {
@@ -121,6 +130,18 @@ export function runReportedFormPersistence(
   return Promise.resolve(result)
     .catch((reason) => onError(reason instanceof Error ? reason.message : fallbackError))
     .finally(settle);
+}
+
+export function clearOwnedFormError(currentError: string, ownedError: string): string {
+  return ownedError && currentError === ownedError ? "" : currentError;
+}
+
+export function isActiveConstraintScopeMissing(
+  active: boolean,
+  movementPatternCount: number,
+  exerciseCount: number,
+): boolean {
+  return active && movementPatternCount === 0 && exerciseCount === 0;
 }
 
 function useReportedFormBusy(onBusyChange?: (busy: boolean) => void) {
@@ -198,7 +219,8 @@ export function VenueForm({
     <label className="sl-inline-check"><input name="verifiedNow" type="checkbox" /><span>本次已在现场核对器材清单</span></label>
     <p className="sl-form-hint">只有勾选时才会更新“上次核对”；普通编辑不会把旧清单伪装成刚刚确认。</p>
     {error && <p className="sl-form-error" role="alert">{error}</p>}
-    <footer><button type="button" onClick={onClose}>取消</button><button className="sl-primary" disabled={busy}>{busy ? "正在保存…" : "保存场地"}</button></footer>
+    <FormBusyStatus busy={busy} />
+    <footer><button type="button" disabled={busy} onClick={onClose}>取消</button><button className="sl-primary" disabled={busy}>{busy ? "正在保存…" : "保存场地"}</button></footer>
   </form>;
 }
 
@@ -273,8 +295,15 @@ export function EquipmentForm({
   const [templateKind, setTemplateKind] = useState<EquipmentKind>(initialTemplate.kind);
   const { busy, beginBusy } = useReportedFormBusy(onBusyChange);
   const [error, setError] = useState("");
+  const [loadError, setLoadError] = useState("");
+  const loadInput = useRef<HTMLTextAreaElement>(null);
   const template = EQUIPMENT_TEMPLATES.find((entry) => entry.kind === templateKind)!;
   const loadNeedsLiteralUnit = templateKind === "bands" || templateKind === "cable" || templateKind === "fixed_machine";
+  const clearLoadError = () => {
+    if (!loadError) return;
+    setError((current) => clearOwnedFormError(current, loadError));
+    setLoadError("");
+  };
   const loadText = loads.map((load) => {
     const value = unit === "kg" ? load.load_grams / 1_000 : load.load_grams / 453.59237;
     return `${Number(value.toFixed(2))}×${load.quantity}`;
@@ -290,7 +319,10 @@ export function EquipmentForm({
         templateKind === "dumbbell" || templateKind === "plates" ? 2 : quantity,
       );
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "器材档位无法识别");
+      const message = reason instanceof Error ? reason.message : "器材档位无法识别";
+      setLoadError(message);
+      setError(message);
+      loadInput.current?.focus();
       return;
     }
     const input: SaveEquipmentInput = {
@@ -316,10 +348,11 @@ export function EquipmentForm({
       notes: String(data.get("notes") ?? "").trim(),
       loads: parsedLoads,
     };
+    setLoadError("");
     setError("");
     void runReportedFormPersistence(beginBusy, () => onSave(input), setError, "器材没有保存");
   }}>
-    <fieldset className="sl-template-picker"><legend>器材类型</legend>{EQUIPMENT_TEMPLATES.map((entry) => <button type="button" aria-pressed={templateKind === entry.kind} className={templateKind === entry.kind ? "active" : ""} key={entry.kind} onClick={() => setTemplateKind(entry.kind)}><i>{entry.label.slice(0, 1)}</i><span>{entry.label}</span></button>)}</fieldset>
+    <fieldset className="sl-template-picker"><legend>器材类型</legend>{EQUIPMENT_TEMPLATES.map((entry) => <button type="button" aria-pressed={templateKind === entry.kind} className={templateKind === entry.kind ? "active" : ""} key={entry.kind} onClick={() => { clearLoadError(); setTemplateKind(entry.kind); }}><i>{entry.label.slice(0, 1)}</i><span>{entry.label}</span></button>)}</fieldset>
     <p className="sl-form-hint">{templateKind === "bands"
       ? "轻 / 中 / 重和阻力范围都是相对信息，适练不会把它们伪装成公斤；请写进下方备注。只有包装明确标注单一阻力值时才录入数字档位。"
       : templateKind === "cable" || templateKind === "fixed_machine"
@@ -327,13 +360,14 @@ export function EquipmentForm({
         : template.hint}</p>
     <div className="sl-field-grid"><label><span>器材名称</span><input required name="name" defaultValue={equipment?.name ?? template.suggestedName} /></label><label><span>数量</span><input required name="quantity" type="number" min="1" max="1000" defaultValue={equipment?.quantity ?? 1} /></label></div>
     <div className="sl-field-grid"><label><span>所在区域</span><input name="area" defaultValue={equipment?.area} placeholder="自由重量区" /></label><label><span>现在的状态</span><select name="status" defaultValue={equipment?.status ?? "available"}><option value="available">可用</option><option value="limited">部分可用</option><option value="maintenance">临时停用</option><option value="removed">这里已没有</option></select></label></div>
-    {template.asksForDiscreteLoads && <label><span>{loadNeedsLiteralUnit ? `明确标有 ${unit} 的档位与数量` : `实际档位与数量（${unit}）`}</span><textarea name="loads" defaultValue={loadText} placeholder={templateKind === "plates" ? "1.25×4, 2.5×4, 5×4, 10×2" : templateKind === "bands" ? `包装明确标有单一 ${unit} 值时，例如：5×1, 10×1` : "5×2, 7.5×2, 10×2"}/><small>{loadNeedsLiteralUnit ? `只填写器材明确标成 ${unit} 的数字；“轻 / 中 / 重”、阻力范围或无单位面板数字请留空，并写进备注。` : "写成“重量×实际数量”。不在这里的重量不会进入确定计划。"}</small></label>}
+    {template.asksForDiscreteLoads && <label><span>{loadNeedsLiteralUnit ? `明确标有 ${unit} 的档位与数量` : `实际档位与数量（${unit}）`}</span><textarea ref={loadInput} name="loads" defaultValue={loadText} aria-invalid={loadError ? true : undefined} aria-describedby={loadError ? "sl-equipment-load-help sl-equipment-load-error" : "sl-equipment-load-help"} onChange={clearLoadError} placeholder={templateKind === "plates" ? "1.25×4, 2.5×4, 5×4, 10×2" : templateKind === "bands" ? `包装明确标有单一 ${unit} 值时，例如：5×1, 10×1` : "5×2, 7.5×2, 10×2"}/><small id="sl-equipment-load-help">{loadNeedsLiteralUnit ? `只填写器材明确标成 ${unit} 的数字；“轻 / 中 / 重”、阻力范围或无单位面板数字请留空，并写进备注。` : "写成“重量×实际数量”。不在这里的重量不会进入确定计划。"}</small></label>}
     {(templateKind === "barbell" || templateKind === "smith_machine") && <label><span>空杆 / 机器杆重（{unit}，未知可留空）</span><input name="barWeight" type="number" min="0" step="0.01" defaultValue={equipment?.bar_weight_grams ? Number((equipment.bar_weight_grams / (unit === "kg" ? 1_000 : 453.59237)).toFixed(2)) : ""} /></label>}
     <div className="sl-field-grid"><label><span>常见占用情况</span><select name="busyLevel" defaultValue={equipment?.busy_level ?? "unknown"}><option value="unknown">还不知道</option><option value="low">通常容易用到</option><option value="medium">有时需要等</option><option value="high">经常需要替代</option></select></label><label><span>附件（逗号分隔）</span><input name="attachments" defaultValue={equipment?.attachments.join(", ")} placeholder="绳索, V把" /></label></div>
     <label className="sl-inline-check"><input name="unilateral" type="checkbox" defaultChecked={equipment?.unilateral} /><span>左右侧可独立训练</span></label>
     <label><span>个人设置与现场备注</span><textarea name="notes" defaultValue={equipment?.notes} placeholder="座椅 4 档；把手在肩下；面板数字不等于真实公斤" /></label>
-    {error && <p className="sl-form-error" role="alert">{error}</p>}
-    <footer><button type="button" onClick={onClose}>取消</button><button className="sl-primary" disabled={busy}>{busy ? "正在保存…" : "保存器材"}</button></footer>
+    {error && <p id={loadError ? "sl-equipment-load-error" : undefined} className="sl-form-error" role="alert">{error}</p>}
+    <FormBusyStatus busy={busy} />
+    <footer><button type="button" disabled={busy} onClick={onClose}>取消</button><button className="sl-primary" disabled={busy}>{busy ? "正在保存…" : "保存器材"}</button></footer>
   </form>;
 }
 
@@ -384,7 +418,8 @@ export function ProfileForm({
     <label><span>动作偏好或其他边界（可选）</span><textarea name="notes" defaultValue={profile?.notes} placeholder="例如：不喜欢跳跃；热身希望保留 8 分钟。这里不会自动发给 AI。" /></label>
     <p className="sl-safety-copy">身体不适、伤病和专业建议请在“身体边界”单独记录。适练不会诊断，也不会把空值当作没有限制。</p>
     {error && <p className="sl-form-error" role="alert">{error}</p>}
-    <footer><button type="button" onClick={onClose}>取消</button><button className="sl-primary" disabled={busy}>{busy ? "正在保存…" : "保存偏好"}</button></footer>
+    <FormBusyStatus busy={busy} />
+    <footer><button type="button" disabled={busy} onClick={onClose}>取消</button><button className="sl-primary" disabled={busy}>{busy ? "正在保存…" : "保存偏好"}</button></footer>
   </form>;
 }
 
@@ -402,11 +437,25 @@ export function ConstraintForm({
   const [patterns, setPatterns] = useState<MovementPattern[]>(constraint ? [...constraint.movement_patterns] : []);
   const { busy, beginBusy } = useReportedFormBusy(onBusyChange);
   const [error, setError] = useState("");
+  const [scopeError, setScopeError] = useState("");
+  const firstPattern = useRef<HTMLButtonElement>(null);
   const patternOptions = useMemo(() => Object.entries(MOVEMENT_PATTERN_LABELS) as Array<[MovementPattern, string]>, []);
+  const clearScopeError = () => {
+    if (!scopeError) return;
+    setError((current) => clearOwnedFormError(current, scopeError));
+    setScopeError("");
+  };
   return <form className="sl-form" onSubmit={(event) => {
     const data = submitValues(event);
-    if (patterns.length === 0 && (constraint?.exercise_ids.length ?? 0) === 0) {
-      setError("请至少选择一个受影响的动作模式；未知范围不会被保存成“全部训练”。");
+    if (isActiveConstraintScopeMissing(
+      constraint?.active ?? true,
+      patterns.length,
+      constraint?.exercise_ids.length ?? 0,
+    )) {
+      const message = "请至少选择一个受影响的动作模式；未知范围不会被保存成“全部训练”。";
+      setScopeError(message);
+      setError(message);
+      firstPattern.current?.focus();
       return;
     }
     const input: SaveConstraintInput = {
@@ -419,16 +468,18 @@ export function ConstraintForm({
       note: String(data.get("note") ?? "").trim(),
       active: constraint?.active ?? true,
     };
+    setScopeError("");
     setError("");
     void runReportedFormPersistence(beginBusy, () => onSave(input), setError, "身体边界没有保存");
   }}>
     <p className="sl-safety-copy strong">这里记录的是你的描述与专业人员建议，不是系统诊断。出现疼痛或异常不适时，先停止相关动作并寻求合格专业人士意见。</p>
     <div className="sl-field-grid"><label><span>怎样称呼这条边界</span><input required name="label" defaultValue={constraint?.label} placeholder="例如：右膝深屈时不舒服" /></label><label><span>身体部位（可选）</span><input name="bodyArea" defaultValue={constraint?.body_area} placeholder="右膝" /></label></div>
     <label><span>规划时如何处理</span><select name="severity" defaultValue={constraint?.severity ?? "monitor"}><option value="monitor">只提醒我留意</option><option value="modify">需要调整动作或幅度</option><option value="avoid">不要安排这些模式</option></select></label>
-    <fieldset className="sl-chip-picker compact"><legend>影响哪些动作模式？（至少一项）</legend>{patternOptions.map(([id, label]) => <button type="button" aria-pressed={patterns.includes(id)} className={patterns.includes(id) ? "active" : ""} key={id} onClick={() => setPatterns((current) => current.includes(id) ? current.filter((entry) => entry !== id) : [...current, id])}>{label}</button>)}</fieldset>
+    <fieldset className="sl-chip-picker compact" aria-invalid={scopeError ? true : undefined} aria-describedby={scopeError ? "sl-constraint-scope-error" : undefined}><legend>影响哪些动作模式？（生效中至少一项）</legend>{patternOptions.map(([id, label], index) => <button ref={index === 0 ? firstPattern : undefined} type="button" aria-pressed={patterns.includes(id)} className={patterns.includes(id) ? "active" : ""} key={id} onClick={() => { clearScopeError(); setPatterns((current) => current.includes(id) ? current.filter((entry) => entry !== id) : [...current, id]); }}>{label}</button>)}</fieldset>
     <label><span>具体说明或专业建议（可选）</span><textarea name="note" defaultValue={constraint?.note} placeholder="例如：康复师建议暂时避免负重深屈；复查日期由我自己决定" /></label>
-    {error && <p className="sl-form-error" role="alert">{error}</p>}
-    <footer><button type="button" onClick={onClose}>取消</button><button className="sl-primary" disabled={busy}>{busy ? "正在保存…" : "保存身体边界"}</button></footer>
+    {error && <p id={scopeError ? "sl-constraint-scope-error" : undefined} className="sl-form-error" role="alert">{error}</p>}
+    <FormBusyStatus busy={busy} />
+    <footer><button type="button" disabled={busy} onClick={onClose}>取消</button><button className="sl-primary" disabled={busy}>{busy ? "正在保存…" : "保存身体边界"}</button></footer>
   </form>;
 }
 

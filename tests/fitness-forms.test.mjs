@@ -6,6 +6,8 @@ import ts from "typescript";
 
 const sourceUrl = new URL("../app/fitness/forms.tsx", import.meta.url);
 const source = await readFile(sourceUrl, "utf8");
+const dialogHookSourceUrl = new URL("../app/fitness/useFitnessDialog.ts", import.meta.url);
+const dialogHookSource = await readFile(dialogHookSourceUrl, "utf8");
 
 async function loadPureFormHelpers() {
   const sourceFile = ts.createSourceFile(
@@ -16,7 +18,9 @@ async function loadPureFormHelpers() {
     ts.ScriptKind.TSX,
   );
   const wanted = new Set([
+    "clearOwnedFormError",
     "createFormBusyController",
+    "isActiveConstraintScopeMissing",
     "parseEquipmentLoadText",
     "resolveVenueVerificationTimestamp",
     "runReportedFormPersistence",
@@ -47,12 +51,81 @@ async function loadPureFormHelpers() {
   return import(`data:text/javascript;base64,${Buffer.from(outputText).toString("base64")}`);
 }
 
+async function loadPureDialogHelpers() {
+  const sourceFile = ts.createSourceFile(
+    dialogHookSourceUrl.pathname,
+    dialogHookSource,
+    ts.ScriptTarget.ES2022,
+    true,
+    ts.ScriptKind.TS,
+  );
+  const helper = sourceFile.statements.find(
+    (statement) => ts.isFunctionDeclaration(statement) &&
+      statement.name?.text === "resolveFitnessDialogTabDestination",
+  );
+  assert.ok(helper);
+  const { outputText, diagnostics = [] } = ts.transpileModule(helper.getText(sourceFile), {
+    fileName: "fitness-dialog-helper.ts",
+    reportDiagnostics: true,
+    compilerOptions: {
+      module: ts.ModuleKind.ESNext,
+      target: ts.ScriptTarget.ES2022,
+    },
+  });
+  assert.deepEqual(
+    diagnostics.filter(
+      (diagnostic) => diagnostic.category === ts.DiagnosticCategory.Error,
+    ),
+    [],
+  );
+  return import(`data:text/javascript;base64,${Buffer.from(outputText).toString("base64")}`);
+}
+
 const {
+  clearOwnedFormError,
   createFormBusyController,
+  isActiveConstraintScopeMissing,
   parseEquipmentLoadText,
   resolveVenueVerificationTimestamp,
   runReportedFormPersistence,
 } = await loadPureFormHelpers();
+const { resolveFitnessDialogTabDestination } = await loadPureDialogHelpers();
+
+test("dialog Tab routing contains focus even after the active control becomes disabled", () => {
+  assert.equal(resolveFitnessDialogTabDestination(0, -1, false), "dialog");
+  assert.equal(resolveFitnessDialogTabDestination(3, -1, false), "first");
+  assert.equal(resolveFitnessDialogTabDestination(3, -1, true), "last");
+  assert.equal(resolveFitnessDialogTabDestination(3, 0, true), "last");
+  assert.equal(resolveFitnessDialogTabDestination(3, 2, false), "first");
+  assert.equal(resolveFitnessDialogTabDestination(3, 0, false), null);
+  assert.equal(resolveFitnessDialogTabDestination(3, 1, false), null);
+  assert.equal(resolveFitnessDialogTabDestination(3, 2, true), null);
+});
+
+test("Fitness dialog and persistent forms expose a complete busy accessibility contract", () => {
+  assert.match(source, /busy = false,/);
+  assert.match(source, /busy\?: boolean;/);
+  assert.match(source, /className="sl-scrim" tabIndex=\{-1\} aria-hidden="true" disabled=\{busy\}/);
+  assert.match(source, /role="dialog" aria-modal="true" aria-busy=\{busy\}/);
+  assert.match(source, /data-dialog-close disabled=\{busy\}/);
+  assert.equal(
+    (source.match(/<button type="button" disabled=\{busy\} onClick=\{onClose\}>取消<\/button>/g) ?? []).length,
+    4,
+  );
+  assert.equal((source.match(/<FormBusyStatus busy=\{busy\} \/>/g) ?? []).length, 4);
+  assert.match(source, /className="sl-visually-hidden" role="status">正在保存，请稍候。/);
+
+  assert.match(dialogHookSource, /resolveFitnessDialogTabDestination\(candidates\.length, activeIndex, event\.shiftKey\)/);
+  assert.match(dialogHookSource, /document\.addEventListener\("focusin", focusin, true\)/);
+  assert.match(dialogHookSource, /document\.removeEventListener\("focusin", focusin, true\)/);
+  const focusinStart = dialogHookSource.indexOf("const focusin =");
+  const listenerStart = dialogHookSource.indexOf('document.addEventListener("keydown"', focusinStart);
+  assert.doesNotMatch(
+    dialogHookSource.slice(focusinStart, listenerStart),
+    /preventDefault/,
+    "focus containment must not swallow the pointer click that opened or closed a surface",
+  );
+});
 
 test("form busy lifecycle is synchronous, deduplicated, and ignores stale settles", () => {
   const reports = [];
@@ -198,6 +271,19 @@ test("equipment load parser rejects duplicate and impossible weights", () => {
   );
 });
 
+test("field-owned validation clears only its own stale error", () => {
+  assert.equal(clearOwnedFormError("档位错误", "档位错误"), "");
+  assert.equal(clearOwnedFormError("保存服务失败", "档位错误"), "保存服务失败");
+  assert.equal(clearOwnedFormError("保存服务失败", ""), "保存服务失败");
+});
+
+test("only an active body boundary requires a known movement or exercise scope", () => {
+  assert.equal(isActiveConstraintScopeMissing(true, 0, 0), true);
+  assert.equal(isActiveConstraintScopeMissing(true, 1, 0), false);
+  assert.equal(isActiveConstraintScopeMissing(true, 0, 1), false);
+  assert.equal(isActiveConstraintScopeMissing(false, 0, 0), false);
+});
+
 test("venue verification timestamp changes only after explicit on-site confirmation", () => {
   const previous = 1_700_000_000_000;
   const now = 1_800_000_000_000;
@@ -249,8 +335,39 @@ test("all persistent Fitness forms expose one shared modal-busy contract", () =>
     "equipment parsing must finish before busy is reported",
   );
   assert.ok(
-    constraintSource.indexOf("patterns.length === 0") <
+    constraintSource.indexOf("isActiveConstraintScopeMissing(") <
       constraintSource.indexOf("runReportedFormPersistence(beginBusy,"),
     "invalid constraint scope must return before busy is reported",
   );
+});
+
+test("custom validation identifies, describes, focuses, and clears the owning control", () => {
+  const equipmentStart = source.indexOf("export function EquipmentForm");
+  const profileStart = source.indexOf("export function ProfileForm");
+  const constraintStart = source.indexOf("export function ConstraintForm");
+  const equipmentSource = source.slice(equipmentStart, profileStart);
+  const constraintSource = source.slice(constraintStart);
+
+  assert.match(equipmentSource, /const loadInput = useRef<HTMLTextAreaElement>\(null\)/);
+  assert.match(equipmentSource, /ref=\{loadInput\} name="loads"/);
+  assert.match(equipmentSource, /aria-invalid=\{loadError \? true : undefined\}/);
+  assert.match(equipmentSource, /aria-describedby=\{loadError \? "sl-equipment-load-help sl-equipment-load-error" : "sl-equipment-load-help"\}/);
+  assert.match(equipmentSource, /id="sl-equipment-load-help"/);
+  assert.match(equipmentSource, /id=\{loadError \? "sl-equipment-load-error" : undefined\}/);
+  assert.match(equipmentSource, /setLoadError\(message\);[\s\S]*setError\(message\);[\s\S]*loadInput\.current\?\.focus\(\);[\s\S]*return;/);
+  assert.match(equipmentSource, /onChange=\{clearLoadError\}/);
+  assert.ok(
+    equipmentSource.indexOf("loadInput.current?.focus();") <
+      equipmentSource.indexOf("runReportedFormPersistence(beginBusy,"),
+    "client load errors must focus without reporting persistence busy",
+  );
+
+  assert.match(constraintSource, /const firstPattern = useRef<HTMLButtonElement>\(null\)/);
+  assert.match(constraintSource, /aria-invalid=\{scopeError \? true : undefined\}/);
+  assert.match(constraintSource, /aria-describedby=\{scopeError \? "sl-constraint-scope-error" : undefined\}/);
+  assert.match(constraintSource, /ref=\{index === 0 \? firstPattern : undefined\}/);
+  assert.match(constraintSource, /id=\{scopeError \? "sl-constraint-scope-error" : undefined\}/);
+  assert.match(constraintSource, /setScopeError\(message\);[\s\S]*setError\(message\);[\s\S]*firstPattern\.current\?\.focus\(\);[\s\S]*return;/);
+  assert.match(constraintSource, /onClick=\{\(\) => \{ clearScopeError\(\); setPatterns/);
+  assert.doesNotMatch(source, /<form[^>]*noValidate/);
 });

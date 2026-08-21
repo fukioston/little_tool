@@ -1,7 +1,7 @@
 .shilian {
   --sl-ink: #1d1d1f;
   --sl-muted: #5d6470;
-  --sl-faint: #747b86;
+  --sl-faint: #626a76;
   --sl-line: #d9dee7;
   --sl-line-strong: #c7cfdd;
   --sl-bg: #f5f5f7;
@@ -72,7 +72,7 @@
 }
 
 .shilian :is(button, a, input, select, textarea):focus-visible {
-  outline: 3px solid color-mix(in srgb, var(--sl-focus) 42%, transparent);
+  outline: 3px solid var(--sl-focus);
   outline-offset: 2px;
 }
 
@@ -163,7 +163,7 @@
 }
 
 .sl-topbar > nav button {
-  min-height: 38px;
+  min-height: 44px;
   padding: 0 16px;
   border-radius: 11px;
   color: var(--sl-muted);
@@ -203,7 +203,7 @@
 
 .sl-top-actions select {
   max-width: 154px;
-  min-height: 34px;
+  min-height: 44px;
   border: 0;
   background: transparent;
   color: var(--sl-ink);
@@ -510,7 +510,7 @@
 }
 
 .sl-today-grid > article > header button {
-  min-height: 36px;
+  min-height: 44px;
   color: var(--sl-blue);
   font-size: 12px;
   font-weight: 630;
@@ -895,7 +895,7 @@
 }
 
 .sl-equipment-grid article > footer button {
-  min-height: 36px;
+  min-height: 44px;
   padding: 0 10px;
   color: var(--sl-blue);
   font-size: 12px;
@@ -1201,7 +1201,7 @@
 }
 
 .sl-segmented button {
-  min-height: 38px;
+  min-height: 44px;
   padding: 0 16px;
   color: var(--sl-muted);
   font-size: 13px;
@@ -1291,7 +1291,7 @@
 }
 
 .sl-agenda article footer button:not(.sl-primary) {
-  min-height: 38px;
+  min-height: 44px;
   padding: 0 10px;
   color: var(--sl-muted);
   font-size: 12px;
@@ -1443,25 +1443,31 @@
 }
 
 .sl-history-list time span,
-.sl-history-card > div > span,
-.sl-history-card p {
+.sl-history-card-copy > span:first-child,
+.sl-history-card-summary {
   color: var(--sl-muted);
   font-size: 12px;
 }
 
-.sl-history-card h2 {
-  margin: 2px 0;
-  font-size: 19px;
+.sl-history-card-copy {
+  display: grid;
+  min-width: 0;
 }
 
-.sl-history-card footer {
+.sl-history-card-title {
+  margin: 2px 0;
+  font-size: 19px;
+  font-weight: 700;
+}
+
+.sl-history-card-facts {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
   margin-top: 10px;
 }
 
-.sl-history-card footer b {
+.sl-history-card-facts b {
   padding: 4px 8px;
   border-radius: 999px;
   background: #f0f2f6;
@@ -1549,7 +1555,11 @@
   gap: 8px;
   margin: 14px 0 0;
   padding: 0;
-  list-style: none;
+  list-style: decimal;
+}
+
+.sl-history-actions li::marker {
+  font-size: 0;
 }
 
 .sl-history-actions li {
@@ -1711,6 +1721,7 @@
 .sl-picker > label input {
   width: 100%;
   min-width: 0;
+  min-height: 44px;
   border: 0;
   outline: 0;
   background: transparent;
@@ -1897,14 +1908,22 @@
   position: relative;
   flex: 0 0 auto;
   width: 52px;
-  min-height: 32px;
+  min-height: 44px;
+  border-radius: 999px;
+  background: transparent;
+}
+
+.sl-setting-row > button::before {
+  position: absolute;
+  inset: 6px 0;
   border-radius: 999px;
   background: #c9ced7;
+  content: "";
 }
 
 .sl-setting-row > button i {
   position: absolute;
-  top: 4px;
+  top: 10px;
   left: 4px;
   width: 24px;
   height: 24px;
@@ -1914,7 +1933,7 @@
   transition: transform 180ms ease;
 }
 
-.sl-setting-row > button.on {
+.sl-setting-row > button.on::before {
   background: var(--sl-blue);
 }
 
@@ -2362,7 +2381,7 @@
 }
 
 .sl-chip-picker button {
-  min-height: 42px;
+  min-height: 44px;
   padding: 0 13px;
   border: 1px solid var(--sl-line);
   border-radius: 999px;
@@ -2373,7 +2392,7 @@
 }
 
 .sl-chip-picker.compact button {
-  min-height: 40px;
+  min-height: 44px;
 }
 
 .sl-form-hint,
@@ -3067,7 +3086,7 @@
 }
 
 .sl-set-form input::placeholder {
-  color: rgba(255, 255, 255, 0.32);
+  color: rgba(255, 255, 255, 0.68);
   font-size: 13px;
 }
 
@@ -3885,7 +3904,8 @@
   }
 
   .sl-more {
-    width: 40px;
+    width: 44px;
+    min-width: 44px;
   }
 
   .sl-title-actions,
@@ -3925,7 +3945,7 @@
   }
 
   .sl-mobile-tabs span {
-    font-size: 9px;
+    font-size: 11px;
   }
 }
 

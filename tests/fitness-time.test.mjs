@@ -44,3 +44,34 @@ test("local day bounds follow 23-hour and 25-hour DST days", () => {
     else process.env.TZ = previous;
   }
 });
+
+test("datetime-local resolution rejects DST gaps and new ambiguous wall-clock times", () => {
+  const previous = process.env.TZ;
+  process.env.TZ = "America/New_York";
+  try {
+    assert.deepEqual(time.resolveLocalDateTimeInput("2026-03-08T02:30"), { status: "nonexistent" });
+    assert.deepEqual(time.resolveLocalDateTimeInput("2026-11-01T01:30"), { status: "ambiguous" });
+    assert.deepEqual(time.resolveLocalDateTimeInput("not-a-date"), { status: "invalid" });
+    assert.deepEqual(time.resolveLocalDateTimeInput("2026-08-21T18:30"), {
+      status: "valid",
+      timestamp: new Date("2026-08-21T18:30:00-04:00").getTime(),
+    });
+  } finally {
+    if (previous === undefined) delete process.env.TZ;
+    else process.env.TZ = previous;
+  }
+});
+
+test("an unchanged repeated time preserves the original DST offset", () => {
+  const previous = process.env.TZ;
+  process.env.TZ = "America/New_York";
+  try {
+    const first = new Date("2026-11-01T01:30:00-04:00").getTime();
+    const second = new Date("2026-11-01T01:30:00-05:00").getTime();
+    assert.deepEqual(time.resolveLocalDateTimeInput("2026-11-01T01:30", first), { status: "valid", timestamp: first });
+    assert.deepEqual(time.resolveLocalDateTimeInput("2026-11-01T01:30", second), { status: "valid", timestamp: second });
+  } finally {
+    if (previous === undefined) delete process.env.TZ;
+    else process.env.TZ = previous;
+  }
+});
