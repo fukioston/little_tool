@@ -915,13 +915,21 @@ export async function saveProgramDraft(
     const constraints = (await rawQuery<Row>("SELECT * FROM fitness_constraints WHERE active=1")).map(mapConstraint);
     const equipmentSnapshots = assertDraftReferences(draft, venue, equipment, loads, constraints);
 
+    const name = requireNonEmpty(draft.name, "计划名称", 160);
+    const previousVersion = (await rawQuery<{ version: number }>(
+      `SELECT COALESCE(MAX(version),0) version
+        FROM fitness_programs
+        WHERE venue_id=? AND name=? AND goal=? AND split=?`,
+      [draft.venue_id, name, draft.goal, draft.split],
+    ))[0]?.version ?? 0;
+    const version = requireInteger(Number(previousVersion) + 1, "计划版本", 1, Number.MAX_SAFE_INTEGER);
     const now = Date.now();
     const programId = uid("program");
     const statements: SqlStatement[] = [];
     if (activate) statements.push({ sql: "UPDATE fitness_programs SET status='archived',updated_at=? WHERE status='active'", params: [now] });
     statements.push({
       sql: "INSERT INTO fitness_programs(id,name,venue_id,goal,split,status,version,source,assumptions_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-      params: [programId, draft.name.trim(), draft.venue_id, draft.goal, draft.split, activate ? "active" : "draft", 1, source, JSON.stringify(draft.assumptions), now, now],
+      params: [programId, name, draft.venue_id, draft.goal, draft.split, activate ? "active" : "draft", version, source, JSON.stringify(draft.assumptions), now, now],
     });
     draft.days.forEach((day, dayIndex) => {
       const dayId = uid("program-day");
@@ -970,7 +978,16 @@ export async function scheduleProgramWeek(programId: string, from = new Date()):
     for (const day of days) {
       if (day.weekday === null || day.kind === "rest") continue;
       const startsAt = nextDateForWeekday(from, day.weekday);
-      const duplicate = (await rawQuery<{ id: string }>("SELECT id FROM fitness_calendar_events WHERE program_day_id=? AND starts_at=? AND status NOT IN ('cancelled','not_performed')", [day.id, startsAt]))[0];
+      const duplicate = (await rawQuery<{ id: string }>(
+        `SELECT e.id
+          FROM fitness_calendar_events e
+          JOIN fitness_program_days d ON d.id=e.program_day_id
+          WHERE d.program_id=? AND e.program_day_id=?
+            AND e.status IN ('planned','in_progress')
+          ORDER BY CASE e.status WHEN 'in_progress' THEN 0 ELSE 1 END,e.updated_at DESC
+          LIMIT 1`,
+        [programId, day.id],
+      ))[0];
       if (duplicate) {
         ids.push(duplicate.id);
         continue;

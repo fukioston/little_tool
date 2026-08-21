@@ -55,6 +55,14 @@ function submitValues(event: FormEvent<HTMLFormElement>) {
   return new FormData(event.currentTarget);
 }
 
+export function resolveVenueVerificationTimestamp(
+  verifiedNow: boolean,
+  previous: number | null | undefined,
+  now = Date.now(),
+): number | null {
+  return verifiedNow ? now : previous ?? null;
+}
+
 export function VenueForm({
   venue,
   onClose,
@@ -80,7 +88,10 @@ export function VenueForm({
       supersets_allowed: data.get("supersets") === "on",
       is_default: data.get("isDefault") === "on",
       status: venue?.status ?? "active",
-      last_verified_at: Date.now(),
+      last_verified_at: resolveVenueVerificationTimestamp(
+        data.get("verifiedNow") === "on",
+        venue?.last_verified_at,
+      ),
     }).catch((reason) => setError(reason instanceof Error ? reason.message : "场地没有保存")).finally(() => setBusy(false));
   }}>
     <div className="sl-field-grid"><label><span>场地名称</span><input required name="name" defaultValue={venue?.name} placeholder="例如：公司楼下健身房" /></label><label><span>场地类型</span><select name="venueType" defaultValue={venue?.venue_type ?? "commercial"}><option value="commercial">商业健身房</option><option value="home">家中</option><option value="office">公司</option><option value="hotel">酒店</option><option value="outdoor">户外</option><option value="other">其他</option></select></label></div>
@@ -89,6 +100,8 @@ export function VenueForm({
     <label><span>常去时段与拥挤规律（可选）</span><textarea name="busyNotes" defaultValue={venue?.busy_notes} placeholder="例如：周二晚 7 点深蹲架常要等；这不是实时空闲状态" /></label>
     <label><span>区域与场地规则（可选）</span><textarea name="areaNotes" defaultValue={venue?.area_notes} placeholder="例如：自由重量区在二层；不适合同时占用多台器材" /></label>
     <div className="sl-check-row"><label><input name="supersets" type="checkbox" defaultChecked={venue?.supersets_allowed} /><span>这里适合跨器材超级组</span></label><label><input name="isDefault" type="checkbox" defaultChecked={venue?.is_default ?? true} /><span>设为常用场地</span></label></div>
+    <label className="sl-inline-check"><input name="verifiedNow" type="checkbox" /><span>本次已在现场核对器材清单</span></label>
+    <p className="sl-form-hint">只有勾选时才会更新“上次核对”；普通编辑不会把旧清单伪装成刚刚确认。</p>
     {error && <p className="sl-form-error" role="alert">{error}</p>}
     <footer><button type="button" onClick={onClose}>取消</button><button className="sl-primary" disabled={busy}>{busy ? "正在保存…" : "保存场地"}</button></footer>
   </form>;
@@ -99,21 +112,49 @@ export function parseEquipmentLoadText(
   unit: "kg" | "lb",
   defaultQuantity: number,
 ): Array<Omit<FitnessEquipmentLoad, "id" | "equipment_id" | "created_at">> {
+  if (!text.trim()) return [];
+
   const factor = unit === "kg" ? 1_000 : 453.59237;
-  const seen = new Set<number>();
-  return text.split(/[,，;；\n]+/).flatMap((token) => {
-    const match = token.trim().match(/^(\d+(?:\.\d+)?)\s*(?:[x×*]\s*(\d+))?$/i);
-    if (!match) return [];
+  const seen = new Map<number, number>();
+  const tokens = text.split(/[,，;；\n]/);
+  const parsed = tokens.map((rawToken, index) => {
+    const token = rawToken.trim();
+    const position = index + 1;
+    if (!token) {
+      throw new TypeError(`第 ${position} 项是空的；请删除多余的分隔符。`);
+    }
+    const match = token.match(/^(\d+(?:\.\d+)?)\s*(?:[x×*]\s*(\d+))?$/i);
+    if (!match) {
+      throw new TypeError(`第 ${position} 项“${token}”无法识别；请写成“重量×数量”，例如 7.5×2。`);
+    }
+
+    const weight = Number(match[1]);
     const grams = Math.round(Number(match[1]) * factor);
-    if (!Number.isSafeInteger(grams) || grams < 0 || seen.has(grams)) return [];
-    seen.add(grams);
-    return [{
+    if (!Number.isFinite(weight) || weight <= 0) {
+      throw new TypeError(`第 ${position} 项的重量必须大于 0 ${unit}。`);
+    }
+    if (!Number.isSafeInteger(grams) || grams > 10_000_000) {
+      throw new TypeError(`第 ${position} 项的重量超出可记录范围（最多 10,000 kg）。`);
+    }
+
+    const quantity = match[2] === undefined ? defaultQuantity : Number(match[2]);
+    if (!Number.isSafeInteger(quantity) || quantity < 1 || quantity > 1_000) {
+      throw new TypeError(`第 ${position} 项的数量必须是 1 到 1000 的整数；不会把 0 自动改成 1。`);
+    }
+
+    const duplicatePosition = seen.get(grams);
+    if (duplicatePosition !== undefined) {
+      throw new TypeError(`第 ${position} 项与第 ${duplicatePosition} 项是同一重量；请只写一次，并填写这个重量的实际总数量。`);
+    }
+    seen.set(grams, position);
+    return {
       load_grams: grams,
-      quantity: match[2] ? Math.max(1, Number(match[2])) : defaultQuantity,
+      quantity,
       label: `${match[1]} ${unit}`,
       available: true,
-    }];
-  }).sort((left, right) => left.load_grams - right.load_grams);
+    };
+  });
+  return parsed.sort((left, right) => left.load_grams - right.load_grams);
 }
 
 export function EquipmentForm({
@@ -136,6 +177,7 @@ export function EquipmentForm({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const template = EQUIPMENT_TEMPLATES.find((entry) => entry.kind === templateKind)!;
+  const loadNeedsLiteralUnit = templateKind === "bands" || templateKind === "cable" || templateKind === "fixed_machine";
   const loadText = loads.map((load) => {
     const value = unit === "kg" ? load.load_grams / 1_000 : load.load_grams / 453.59237;
     return `${Number(value.toFixed(2))}×${load.quantity}`;
@@ -143,11 +185,17 @@ export function EquipmentForm({
   return <form className="sl-form" onSubmit={(event) => {
     const data = submitValues(event);
     const quantity = Number(data.get("quantity") ?? 1);
-    const parsedLoads = parseEquipmentLoadText(
-      String(data.get("loads") ?? ""),
-      unit,
-      templateKind === "dumbbell" || templateKind === "plates" ? 2 : quantity,
-    );
+    let parsedLoads: ReturnType<typeof parseEquipmentLoadText>;
+    try {
+      parsedLoads = parseEquipmentLoadText(
+        String(data.get("loads") ?? ""),
+        unit,
+        templateKind === "dumbbell" || templateKind === "plates" ? 2 : quantity,
+      );
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "器材档位无法识别");
+      return;
+    }
     setBusy(true); setError("");
     void onSave({
       id: equipment?.id,
@@ -174,10 +222,14 @@ export function EquipmentForm({
     }).catch((reason) => setError(reason instanceof Error ? reason.message : "器材没有保存")).finally(() => setBusy(false));
   }}>
     <fieldset className="sl-template-picker"><legend>器材类型</legend>{EQUIPMENT_TEMPLATES.map((entry) => <button type="button" aria-pressed={templateKind === entry.kind} className={templateKind === entry.kind ? "active" : ""} key={entry.kind} onClick={() => setTemplateKind(entry.kind)}><i>{entry.label.slice(0, 1)}</i><span>{entry.label}</span></button>)}</fieldset>
-    <p className="sl-form-hint">{template.hint}</p>
+    <p className="sl-form-hint">{templateKind === "bands"
+      ? "轻 / 中 / 重和阻力范围都是相对信息，适练不会把它们伪装成公斤；请写进下方备注。只有包装明确标注单一阻力值时才录入数字档位。"
+      : templateKind === "cable" || templateKind === "fixed_machine"
+        ? "面板若只写 1 / 2 / 3 等无单位数字，它们不是公斤；请写进下方备注。只有面板明确标注重量单位时才录入数字档位。"
+        : template.hint}</p>
     <div className="sl-field-grid"><label><span>器材名称</span><input required name="name" defaultValue={equipment?.name ?? template.suggestedName} /></label><label><span>数量</span><input required name="quantity" type="number" min="1" max="1000" defaultValue={equipment?.quantity ?? 1} /></label></div>
     <div className="sl-field-grid"><label><span>所在区域</span><input name="area" defaultValue={equipment?.area} placeholder="自由重量区" /></label><label><span>现在的状态</span><select name="status" defaultValue={equipment?.status ?? "available"}><option value="available">可用</option><option value="limited">部分可用</option><option value="maintenance">临时停用</option><option value="removed">这里已没有</option></select></label></div>
-    {template.asksForDiscreteLoads && <label><span>实际档位与数量（{unit}）</span><textarea name="loads" defaultValue={loadText} placeholder={templateKind === "plates" ? "1.25×4, 2.5×4, 5×4, 10×2" : "5×2, 7.5×2, 10×2"}/><small>写成“重量×实际数量”。不在这里的重量不会进入确定计划。</small></label>}
+    {template.asksForDiscreteLoads && <label><span>{loadNeedsLiteralUnit ? `明确标有 ${unit} 的档位与数量` : `实际档位与数量（${unit}）`}</span><textarea name="loads" defaultValue={loadText} placeholder={templateKind === "plates" ? "1.25×4, 2.5×4, 5×4, 10×2" : templateKind === "bands" ? `包装明确标有单一 ${unit} 值时，例如：5×1, 10×1` : "5×2, 7.5×2, 10×2"}/><small>{loadNeedsLiteralUnit ? `只填写器材明确标成 ${unit} 的数字；“轻 / 中 / 重”、阻力范围或无单位面板数字请留空，并写进备注。` : "写成“重量×实际数量”。不在这里的重量不会进入确定计划。"}</small></label>}
     {(templateKind === "barbell" || templateKind === "smith_machine") && <label><span>空杆 / 机器杆重（{unit}，未知可留空）</span><input name="barWeight" type="number" min="0" step="0.01" defaultValue={equipment?.bar_weight_grams ? Number((equipment.bar_weight_grams / (unit === "kg" ? 1_000 : 453.59237)).toFixed(2)) : ""} /></label>}
     <div className="sl-field-grid"><label><span>常见占用情况</span><select name="busyLevel" defaultValue={equipment?.busy_level ?? "unknown"}><option value="unknown">还不知道</option><option value="low">通常容易用到</option><option value="medium">有时需要等</option><option value="high">经常需要替代</option></select></label><label><span>附件（逗号分隔）</span><input name="attachments" defaultValue={equipment?.attachments.join(", ")} placeholder="绳索, V把" /></label></div>
     <label className="sl-inline-check"><input name="unilateral" type="checkbox" defaultChecked={equipment?.unilateral} /><span>左右侧可独立训练</span></label>

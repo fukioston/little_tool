@@ -570,6 +570,111 @@ test("constraint-aware program persistence uses canonical equipment snapshots an
   }
 });
 
+test("program versions advance within one logical venue plan and retain prior versions", async () => {
+  const { database } = await databaseFixture();
+  try {
+    await store.initializeFitnessDatabase();
+    const venueId = await store.saveVenue(venueInput);
+    const equipmentId = await store.saveEquipmentWithLoads(
+      dumbbellInput(venueId, [load(10000), load(12500)]),
+    );
+    const firstId = await store.saveProgramDraft(draftFor(venueId, equipmentId));
+    const secondId = await store.saveProgramDraft({
+      ...draftFor(venueId, equipmentId),
+      name: "  真实器材全身计划  ",
+      assumptions: ["器材复核后的新版本"],
+    });
+    const draftId = await store.saveProgramDraft(
+      draftFor(venueId, equipmentId),
+      "manual",
+      false,
+    );
+    const separateId = await store.saveProgramDraft({
+      ...draftFor(venueId, equipmentId),
+      name: "旅行前保守计划",
+    });
+
+    const programs = database.selectObjects(
+      "SELECT id,name,status,version,source FROM fitness_programs ORDER BY rowid",
+    ).map((row) => ({ ...row }));
+    assert.deepEqual(programs, [
+      { id: firstId, name: "真实器材全身计划", status: "archived", version: 1, source: "local" },
+      { id: secondId, name: "真实器材全身计划", status: "archived", version: 2, source: "local" },
+      { id: draftId, name: "真实器材全身计划", status: "draft", version: 3, source: "manual" },
+      { id: separateId, name: "旅行前保守计划", status: "active", version: 1, source: "local" },
+    ]);
+    assert.equal(Number(database.selectValue("SELECT COUNT(*) FROM fitness_programs")), 4);
+  } finally {
+    database.close();
+  }
+});
+
+test("week scheduling follows program-day state after rescheduling and preserves event truth", async () => {
+  const { database } = await databaseFixture();
+  try {
+    await store.initializeFitnessDatabase();
+    const venueId = await store.saveVenue(venueInput);
+    const equipmentId = await store.saveEquipmentWithLoads(
+      dumbbellInput(venueId, [load(10000), load(12500)]),
+    );
+    const programId = await store.saveProgramDraft(draftFor(venueId, equipmentId));
+    const from = new Date(2026, 7, 24, 9, 0, 0, 0);
+    const [originalId] = await store.scheduleProgramWeek(programId, from);
+    const movedAt = from.getTime() + 3 * 86_400_000;
+    await store.rescheduleCalendarEvent(originalId, movedAt);
+
+    assert.deepEqual(await store.scheduleProgramWeek(programId, from), [originalId]);
+    assert.equal(Number(database.selectValue("SELECT COUNT(*) FROM fitness_calendar_events")), 1);
+    assert.equal(
+      Number(database.selectValue("SELECT starts_at FROM fitness_calendar_events WHERE id=?", [originalId])),
+      movedAt,
+      "scheduling again must not undo a user's reschedule",
+    );
+
+    const sessionId = await store.startFitnessSession({ eventId: originalId, venueId });
+    assert.deepEqual(await store.scheduleProgramWeek(programId, from), [originalId]);
+    assert.equal(
+      database.selectValue("SELECT status FROM fitness_calendar_events WHERE id=?", [originalId]),
+      "in_progress",
+      "an in-progress fact must not be rewritten as planned",
+    );
+    assert.equal(
+      (await store.loadFitnessSnapshot()).events.find(({ id }) => id === originalId)?.status,
+      "in_progress",
+      "agenda data must expose an in-progress event as in-progress",
+    );
+    await store.finishFitnessSession(sessionId, { endedEarly: true });
+
+    const followingWeek = new Date(from.getTime() + 7 * 86_400_000);
+    const [afterCompletedId] = await store.scheduleProgramWeek(programId, followingWeek);
+    assert.notEqual(afterCompletedId, originalId);
+    await store.markCalendarEventNotPerformed(afterCompletedId, "当天休息");
+    const [afterNotPerformedId] = await store.scheduleProgramWeek(programId, followingWeek);
+    assert.notEqual(afterNotPerformedId, afterCompletedId);
+    executeRun(
+      database,
+      "UPDATE fitness_calendar_events SET status='cancelled',updated_at=updated_at+1 WHERE id=?",
+      [afterNotPerformedId],
+    );
+    const [afterCancelledId] = await store.scheduleProgramWeek(programId, followingWeek);
+    assert.notEqual(afterCancelledId, afterNotPerformedId);
+
+    const snapshot = await store.loadFitnessSnapshot();
+    assert.deepEqual(
+      Object.fromEntries(snapshot.events.map(({ id, status }) => [id, status])),
+      {
+        [originalId]: "completed",
+        [afterCompletedId]: "not_performed",
+        [afterNotPerformedId]: "cancelled",
+        [afterCancelledId]: "planned",
+      },
+      "agenda data must preserve historical and current statuses exactly",
+    );
+  } finally {
+    database.close();
+  }
+});
+
 test("manual sessions support added exercises, idempotent sets, undo, and truthful early finish", async () => {
   const { database } = await databaseFixture();
   try {
