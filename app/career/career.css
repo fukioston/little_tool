@@ -10,6 +10,7 @@
   --career-green-2: #287356;
   --career-green-soft: #e8f0eb;
   --career-danger: #a04d45;
+  --career-focus: #087a55;
   min-height: 100dvh;
   background: var(--career-bg);
   color: var(--career-ink);
@@ -370,3 +371,26 @@
 .career-data-actions > label > div { display: grid; gap: 4px; }
 .career-data-actions > label > input { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; cursor: pointer; }
 .career-data-actions > label:has(input:focus-visible) { outline: 3px solid var(--career-focus); outline-offset: 2px; }
+.career-data-actions > label > input:disabled { cursor: default; }
+
+/* Final Apple-style accessibility pass: quiet surfaces still need legible controls. */
+.career-privacy,
+.career-search kbd,
+.career-command kbd,
+.career-table th,
+.career-board-empty,
+.career-add-inline { color: #5f6964; }
+.career-search kbd,
+.career-command kbd { border-color: #c9cfcb; }
+.career-board-empty,
+.career-add-inline { border-color: #aeb7b1; }
+.career-settings-layout > nav a:first-child { color: var(--career-muted); background: transparent; font-weight: inherit; }
+.career-settings-layout > nav a:hover { color: var(--career-green); background: var(--career-green-soft); }
+.career-board-column > header button,
+.career-grip { min-width: 44px; height: 44px; }
+.career-add-inline,
+.career-completed-list article > button { min-height: 44px; }
+
+@media (max-width: 760px) {
+  .career-mobile-nav button { color: #5f6964; }
+}

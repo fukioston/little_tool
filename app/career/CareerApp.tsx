@@ -304,6 +304,7 @@ export default function CareerApp() {
   const [taskUndo, setTaskUndo] = useState<{ taskId: string; from: Task["status"]; title: string; token: string } | null>(null);
   const [aiState, setAiState] = useState<{ action: AiAction; title: string; loading: boolean; result?: unknown; error?: string; applyLabel?: string; onApply?: (result: unknown) => void | Promise<void> } | null>(null);
   const aiRequestRef = useRef<{ id: string; controller: AbortController } | null>(null);
+  const sidebarRef = useRef<HTMLElement | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
 
   const refresh = useCallback(async () => setData(await loadCareerData()), []);
@@ -326,6 +327,61 @@ export default function CareerApp() {
   useEffect(() => () => aiRequestRef.current?.controller.abort(), []);
 
   useEffect(() => subscribeToCareerGenerationChanges(() => window.location.reload()), []);
+
+  useEffect(() => {
+    if (!sidebarOpen || !window.matchMedia("(max-width: 760px)").matches) return;
+    const sidebar = sidebarRef.current;
+    if (!sidebar) return;
+    const sidebarElement: HTMLElement = sidebar;
+    const root = sidebarElement.closest<HTMLElement>(".career-app");
+    if (!root) return;
+    const trigger = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const inertState = new Map<HTMLElement, boolean>();
+    Array.from(root.children).forEach((child) => {
+      if (
+        !(child instanceof HTMLElement) ||
+        child === sidebarElement ||
+        child.classList.contains("career-scrim") ||
+        child.classList.contains("career-toast-stack")
+      ) return;
+      inertState.set(child, child.inert);
+      child.inert = true;
+    });
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    const focusFrame = window.requestAnimationFrame(() => {
+      sidebarElement.querySelector<HTMLElement>("[data-sidebar-close]")?.focus();
+    });
+
+    function focusableItems() {
+      return Array.from(sidebarElement.querySelectorAll<HTMLElement>(dialogFocusable)).filter((element) =>
+        !element.hidden && element.getAttribute("aria-hidden") !== "true" && element.getClientRects().length > 0);
+    }
+    function handleKeydown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        setSidebarOpen(false);
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const items = focusableItems();
+      if (items.length === 0) { event.preventDefault(); sidebarElement.focus(); return; }
+      const first = items[0];
+      const last = items[items.length - 1];
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+    }
+
+    document.addEventListener("keydown", handleKeydown, true);
+    return () => {
+      window.cancelAnimationFrame(focusFrame);
+      document.removeEventListener("keydown", handleKeydown, true);
+      inertState.forEach((wasInert, element) => { element.inert = wasInert; });
+      document.body.style.overflow = previousOverflow;
+      window.requestAnimationFrame(() => { if (trigger?.isConnected) trigger.focus(); });
+    };
+  }, [sidebarOpen]);
 
   useEffect(() => {
     function onKeydown(event: KeyboardEvent) {
@@ -453,7 +509,7 @@ export default function CareerApp() {
   if (loadError) return <CareerError message={loadError} onRetry={() => { setLoading(true); setLoadError(""); setRefreshKey((key) => key + 1); }} />;
 
   return <main className="career-app">
-    <Sidebar view={view} open={sidebarOpen} data={data} onNavigate={navigate} onClose={() => setSidebarOpen(false)} />
+    <Sidebar sidebarRef={sidebarRef} view={view} open={sidebarOpen} data={data} onNavigate={navigate} onClose={() => setSidebarOpen(false)} />
     <section className="career-main">
       <Topbar title={navItems.find((item) => item.id === view)?.label ?? "职迹"} query={query} menuOpen={sidebarOpen} onQuery={setQuery} onSearch={() => setSearchOpen(true)} onMenu={() => setSidebarOpen(true)} onAdd={() => setModal("job")} onSettings={() => navigate("settings")} />
       <div className="career-content">
@@ -513,7 +569,7 @@ export default function CareerApp() {
         }} notify={notify} />}
       </div>
     </section>
-    <MobileNav view={view} onNavigate={navigate} />
+    <MobileNav view={view} onNavigate={navigate} onMore={() => setSidebarOpen(true)} />
     {selectedJob && <JobDrawer job={selectedJob} data={data} onClose={() => setSelectedJobId(null)} onMove={moveJob} onArchive={removeJob} onRefresh={refresh} onAi={runAi} notify={notify} />}
     {selectedInterview && <InterviewDrawer interview={selectedInterview} data={data} onClose={() => setSelectedInterviewId(null)} onRefresh={refresh} onAi={runAi} notify={notify} />}
     {modal === "job" && <JobModal data={data} onClose={() => setModal(null)} onSaved={async (id) => { setModal(null); await refresh(); setSelectedJobId(id); notify("职位已加入职迹"); }} />}
@@ -546,11 +602,11 @@ export default function CareerApp() {
 function CareerLoading() { return <main className="career-loading" role="status"><div className="career-loading-mark">职</div><LoaderCircle className="spin" size={20} /><p>正在打开你的求职工作台…</p></main>; }
 function CareerError({ message, onRetry }: { message: string; onRetry: () => void }) { return <main className="career-error"><ShieldCheck size={30} /><h1>本地资料暂时没有打开</h1><p>{message}</p><button className="career-button primary" onClick={onRetry}><RotateCcw size={16} />重新尝试</button></main>; }
 
-function Sidebar({ view, open, data, onNavigate, onClose }: { view: CareerView; open: boolean; data: CareerData; onNavigate: (view: CareerView) => void; onClose: () => void }) {
+function Sidebar({ sidebarRef, view, open, data, onNavigate, onClose }: { sidebarRef: { current: HTMLElement | null }; view: CareerView; open: boolean; data: CareerData; onNavigate: (view: CareerView) => void; onClose: () => void }) {
   const active = data.jobs.filter((job) => !["stage_accepted", "stage_rejected", "stage_withdrawn"].includes(job.stage_id)).length;
   const recentNotes = data.activities.filter((item) => CAREER_CLOCK - new Date(item.created_at).getTime() < 7 * 86_400_000).length;
-  return <><button className={`career-scrim ${open ? "show" : ""}`} aria-label="关闭导航" onClick={onClose} /><aside id="career-sidebar" className={`career-sidebar ${open ? "open" : ""}`}>
-    <div className="career-brand"><span>职</span><div><b>职迹</b><small>每一步，都算数</small></div><button className="career-icon-button mobile-only" onClick={onClose} aria-label="关闭"><X size={18} /></button></div>
+  return <><button className={`career-scrim ${open ? "show" : ""}`} tabIndex={-1} aria-label="关闭导航" onClick={onClose} /><aside ref={sidebarRef} id="career-sidebar" className={`career-sidebar ${open ? "open" : ""}`} role={open ? "dialog" : undefined} aria-modal={open ? "true" : undefined} aria-label={open ? "职迹导航" : undefined} tabIndex={open ? -1 : undefined}>
+    <div className="career-brand"><span>职</span><div><b>职迹</b><small>每一步，都算数</small></div><button data-sidebar-close className="career-icon-button mobile-only" onClick={onClose} aria-label="关闭导航"><X size={18} /></button></div>
     <nav className="career-nav" aria-label="职迹主导航">{navItems.map((item) => <button key={item.id} aria-label={item.label} className={view === item.id ? "active" : ""} onClick={() => onNavigate(item.id)}><item.icon size={18} strokeWidth={1.8} /><span>{item.label}</span>{item.id === "calendar" && data.tasks.filter((task) => task.status === "todo").length > 0 && <em>{data.tasks.filter((task) => task.status === "todo").length}</em>}</button>)}</nav>
     <div className="career-sidebar-spacer" /><div className="career-goal-card calm"><div><span>近 7 天记录</span><b>{recentNotes}<small> 次变化</small></b></div><div className="career-no-score"><ShieldCheck size={14} /><span>不设目标，也不给你打分</span></div><p>{active} 个机会在工作台里，按自己的节奏来。</p></div><div className="career-privacy"><ShieldCheck size={15} /><span>资料保存在本地 SQLite</span><i /></div>
   </aside></>;
@@ -560,9 +616,10 @@ function Topbar({ title, query, menuOpen, onQuery, onSearch, onMenu, onAdd, onSe
   return <header className="career-topbar"><div className="career-topbar-title"><button className="career-icon-button mobile-only" onClick={onMenu} aria-label="打开导航" aria-expanded={menuOpen} aria-controls="career-sidebar"><Menu size={20} /></button><h1>{title}</h1></div><div className="career-topbar-actions"><label className="career-search"><Search size={16} /><input value={query} onChange={(event) => onQuery(event.target.value)} placeholder="搜索职位、公司、标签" aria-label="搜索" /><kbd>⌘ K</kbd></label><button className="career-icon-button command-compact" onClick={onSearch} aria-label="打开搜索"><Search size={18} /></button><button className="career-button primary" onClick={onAdd}><Plus size={17} />记录职位</button><button className="career-avatar" aria-label="个人设置" onClick={onSettings}>FK<span /></button></div></header>;
 }
 
-function MobileNav({ view, onNavigate }: { view: CareerView; onNavigate: (view: CareerView) => void }) {
+function MobileNav({ view, onNavigate, onMore }: { view: CareerView; onNavigate: (view: CareerView) => void; onMore: () => void }) {
   const visible = navItems.filter((item) => ["today", "board", "calendar", "interviews"].includes(item.id));
-  return <nav className="career-mobile-nav" aria-label="移动端主导航">{visible.map((item) => <button key={item.id} className={view === item.id ? "active" : ""} onClick={() => onNavigate(item.id)}><item.icon size={20} /><span>{item.compact}</span></button>)}<button onClick={() => onNavigate("settings")} className={view === "settings" ? "active" : ""}><Menu size={20} /><span>更多</span></button></nav>;
+  const overflowActive = !visible.some((item) => item.id === view);
+  return <nav className="career-mobile-nav" aria-label="移动端主导航">{visible.map((item) => <button key={item.id} className={view === item.id ? "active" : ""} onClick={() => onNavigate(item.id)}><item.icon size={20} /><span>{item.compact}</span></button>)}<button onClick={onMore} className={overflowActive ? "active" : ""} aria-haspopup="dialog"><Menu size={20} /><span>更多</span></button></nav>;
 }
 
 function SectionHeading({ eyebrow, title, description, action }: { eyebrow?: string; title: string; description?: string; action?: ReactNode }) { return <div className="career-section-heading"><div>{eyebrow && <span>{eyebrow}</span>}<h2>{title}</h2>{description && <p>{description}</p>}</div>{action}</div>; }
@@ -584,9 +641,9 @@ function TodayView({ data, onNavigate, onSelectJob, onToggleTask, onAddJob, onAi
   const waiting = data.jobs.filter((job) => job.stage_id === "stage_applied");
   const heroJob = upcoming[0] ? data.jobs.find((job) => job.id === upcoming[0].job_id) : data.jobs.find((job) => job.stage_id === "stage_offer") ?? activeJobs[0];
   return <div className="career-view career-today"><section className="career-welcome"><div><span>{date}</span><h2>下午好，今天把最重要的一步走好。</h2><p>你的资料已在本地准备好。这里是下一步最值得关注的事项。</p></div><div className="career-welcome-actions"><button className="career-button secondary" onClick={() => onNavigate("calendar")}><CalendarDays size={16} />查看日程</button><button className="career-button primary" onClick={onAddJob}><Plus size={16} />记录职位</button></div></section>
-    <section className="career-today-grid"><div className="career-panel career-focus-panel"><SectionHeading eyebrow="NEXT MOVE" title="最重要的一步" action={heroJob && <button className="career-text-button" onClick={() => onSelectJob(heroJob.id)}>打开职位 <ArrowRight size={14} /></button>} />{heroJob ? <div className="career-focus-card"><CompanyMark company={heroJob.company} /><div className="career-focus-copy"><span>{heroJob.company}</span><h3>{openTasks.find((task) => task.job_id === heroJob.id)?.title ?? `${heroJob.role} · 推进下一步`}</h3><p>{upcoming[0]?.job_id === heroJob.id ? `${formatDate(upcoming[0].scheduled_at, true)} · ${upcoming[0].interviewer || "面试官待确认"}` : heroJob.note}</p></div><div className="career-focus-actions"><button className="career-button primary" onClick={() => onAi("interview_prep", "AI 面试准备", { job: heroJob, interview: upcoming[0] ?? null })}><WandSparkles size={16} />AI 准备</button><button className="career-icon-button" onClick={() => onSelectJob(heroJob.id)} aria-label="打开职位"><ArrowUpRight size={18} /></button></div></div> : <EmptyState icon={<Target />} title="从一个职位开始" text="记录感兴趣的机会，职迹会帮你保持清晰节奏。" action={<button className="career-button primary" onClick={onAddJob}>记录职位</button>} />}<div className="career-focus-tips"><span><i />用 3 分钟写下这次面试最想让对方记住的观点</span><button onClick={() => onAi("interview_prep", "生成 30 分钟准备清单", { job: heroJob, duration: 30 })}>生成 30 分钟清单</button></div></div>
+    <section className="career-today-grid"><div className="career-panel career-focus-panel"><SectionHeading eyebrow="NEXT MOVE" title="最重要的一步" action={heroJob && <button className="career-text-button" onClick={() => onSelectJob(heroJob.id)}>打开职位 <ArrowRight size={14} /></button>} />{heroJob ? <div className="career-focus-card"><CompanyMark company={heroJob.company} /><div className="career-focus-copy"><span>{heroJob.company}</span><h3>{openTasks.find((task) => task.job_id === heroJob.id)?.title ?? `${heroJob.role} · 推进下一步`}</h3><p>{upcoming[0]?.job_id === heroJob.id ? `${formatDate(upcoming[0].scheduled_at, true)} · ${upcoming[0].interviewer || "面试官待确认"}` : heroJob.note}</p></div><div className="career-focus-actions"><button className="career-button primary" onClick={() => onAi("interview_prep", "AI 面试准备", { job: heroJob, interview: upcoming[0] ?? null })}><WandSparkles size={16} />AI 准备</button><button className="career-icon-button" onClick={() => onSelectJob(heroJob.id)} aria-label="打开职位"><ArrowUpRight size={18} /></button></div></div> : <EmptyState icon={<Target />} title="从一个职位开始" text="记录感兴趣的机会，职迹会帮你保持清晰节奏。" action={<button className="career-button primary" onClick={onAddJob}>记录职位</button>} />}{heroJob && <div className="career-focus-tips"><span><i />用 3 分钟写下这次面试最想让对方记住的观点</span><button onClick={() => onAi("interview_prep", "生成 30 分钟准备清单", { job: heroJob, duration: 30 })}>生成 30 分钟清单</button></div>}</div>
       <div className="career-panel career-agenda-panel"><SectionHeading title="今天与接下来" action={<button className="career-text-button" onClick={() => onNavigate("calendar")}>全部日程 <ChevronRight size={14} /></button>} /><div className="career-agenda-list">{openTasks.slice(0, 5).map((task) => { const job = data.jobs.find((item) => item.id === task.job_id); return <button className="career-agenda-item" key={task.id} onClick={() => onToggleTask(task)}><span className={`career-check ${task.status}`}><Check size={13} /></span><span><b>{task.title}</b><small>{job ? `${job.company} · ` : ""}{relativeDate(task.due_at)}</small></span><em className={task.priority >= 3 ? "urgent" : ""}>{task.kind}</em></button>; })}</div></div>
-    </section><section className="career-metric-grid career-today-metrics"><Metric label="活跃机会" value={String(activeJobs.length)} note={`${data.jobs.filter((job) => job.stage_id === "stage_interview").length} 个正在面试`} icon={<BriefcaseBusiness size={18} />} /><Metric label="待办事项" value={String(openTasks.length)} note={`${openTasks.filter((task) => task.due_at && new Date(task.due_at).getTime() < CAREER_CLOCK).length} 项已逾期`} icon={<ListTodo size={18} />} tone="amber" /><Metric label="近期待面" value={String(upcoming.length)} note={upcoming[0] ? `${formatDate(upcoming[0].scheduled_at, true)} · ${upcoming[0].round_name}` : "暂未安排"} icon={<CalendarDays size={18} />} tone="plum" /><Metric label="等待回应" value={String(waiting.length)} note="等待也是流程的一部分" icon={<Clock3 size={18} />} tone="green" /></section><section className="career-panel career-recent"><SectionHeading title="最近动态" description="所有推进都自动留在时间线里" action={<button className="career-text-button" onClick={() => onNavigate("jobs")}>查看全部</button>} /><div className="career-activity-row">{data.activities.slice(0, 4).map((item) => { const job = data.jobs.find((entry) => entry.id === item.job_id); return <button key={item.id} onClick={() => job && onSelectJob(job.id)}><span className={`career-activity-icon ${item.type}`}><Zap size={15} /></span><span><b>{item.detail}</b><small>{job ? `${job.company} · ${job.role}` : "职迹"}</small></span><time>{formatDate(item.created_at)}</time></button>; })}</div></section>
+    </section><section className="career-metric-grid career-today-metrics"><Metric label="活跃机会" value={String(activeJobs.length)} note={`${data.jobs.filter((job) => job.stage_id === "stage_interview").length} 个正在面试`} icon={<BriefcaseBusiness size={18} />} /><Metric label="待办事项" value={String(openTasks.length)} note={`${openTasks.filter((task) => task.due_at && new Date(task.due_at).getTime() < CAREER_CLOCK).length} 项可以重新安排`} icon={<ListTodo size={18} />} tone="amber" /><Metric label="近期待面" value={String(upcoming.length)} note={upcoming[0] ? `${formatDate(upcoming[0].scheduled_at, true)} · ${upcoming[0].round_name}` : "暂未安排"} icon={<CalendarDays size={18} />} tone="plum" /><Metric label="等待回应" value={String(waiting.length)} note="等待也是流程的一部分" icon={<Clock3 size={18} />} tone="green" /></section><section className="career-panel career-recent"><SectionHeading title="最近动态" description="所有推进都自动留在时间线里" action={<button className="career-text-button" onClick={() => onNavigate("jobs")}>查看全部</button>} /><div className="career-activity-row">{data.activities.slice(0, 4).map((item) => { const job = data.jobs.find((entry) => entry.id === item.job_id); return <button key={item.id} onClick={() => job && onSelectJob(job.id)}><span className={`career-activity-icon ${item.type}`}><Zap size={15} /></span><span><b>{item.detail}</b><small>{job ? `${job.company} · ${job.role}` : "职迹"}</small></span><time>{formatDate(item.created_at)}</time></button>; })}</div></section>
   </div>;
 }
 
