@@ -334,6 +334,19 @@
 .career-import-warnings li { margin-top: 4px; font-size: 12px; line-height: 1.55; }
 .career-ai-context-note { margin: -4px 0 0; padding: 11px 13px; display: flex; align-items: flex-start; gap: 8px; color: #51675c; border: 1px solid #dbe7e0; border-radius: 13px; background: #f2f7f4; font-size: 12px; line-height: 1.55; }
 .career-ai-context-note svg { margin-top: 1px; flex: 0 0 auto; color: #367358; }
+.career-ai-disclosure { min-width: 0; margin: 0; padding: 11px 13px; display: flex; align-items: flex-start; gap: 8px; color: #51675c; border: 1px solid #dbe7e0; border-radius: 13px; background: #f2f7f4; font-size: 12px; line-height: 1.55; overflow-wrap: anywhere; }
+.career-ai-disclosure svg { margin-top: 1px; flex: 0 0 auto; color: #367358; }
+.career-ai-disclosure span { min-width: 0; }
+.career-ai-trigger { min-height: 44px; }
+.career-focus-card > .career-ai-disclosure { grid-column: 1 / -1; }
+.career-ai-disclosure.on-dark { color: #d5e5dc; border-color: #ffffff25; background: #ffffff0d; }
+.career-ai-disclosure.on-dark svg { color: #b8d8c8; }
+.career-interview-ai .career-ai-disclosure { margin-top: 10px; }
+.career-detail-actions { flex-wrap: wrap; }
+.career-detail-actions > .career-ai-disclosure { width: 100%; margin-top: 1px; text-align: left; }
+.career-experience-toolbar + .career-ai-disclosure { margin-top: -4px; }
+.career-ai-disclosure.in-preview { margin-bottom: 13px; }
+.career-ai-preview .career-button { min-height: 44px; }
 .career-ai-applied-note { padding: 13px 14px; display: flex; align-items: center; justify-content: space-between; gap: 14px; color: #2f5c48; border: 1px solid #cee0d6; border-radius: 14px; background: #edf6f1; }
 .career-ai-applied-note > span { min-width: 0; display: flex; align-items: flex-start; gap: 9px; }
 .career-ai-applied-note > span > svg { margin-top: 2px; flex: 0 0 auto; }
@@ -352,6 +365,14 @@
   .career-ai-applied-note > button { min-height: 44px; justify-content: center; }
   .career-ai-preview .career-form-actions { display: grid; grid-template-columns: 1fr; }
   .career-ai-preview .career-form-actions .career-button { min-height: 44px; }
+  .career-ai-disclosure { max-width: 100%; }
+  .career-interview-actions { flex-wrap: wrap; }
+}
+
+@media (max-width: 420px) {
+  .career-experience-toolbar { align-items: stretch; flex-direction: column; gap: 8px; }
+  .career-experience-toolbar select,
+  .career-experience-toolbar .career-ai-trigger { width: 100%; }
 }
 
 .career-data-actions > label {
