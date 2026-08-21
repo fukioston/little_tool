@@ -82,6 +82,12 @@ import {
 import { useFitnessDialog } from "./useFitnessDialog";
 import { EquipmentPhotos, FitnessDataControls } from "./data-panels";
 import {
+  FITNESS_FILE_OPERATION_PREFIX,
+  readFitnessFileOperationJournal,
+  type FitnessFileOperationEntry,
+  type FitnessFileOperationJournal,
+} from "./file-operation-journal";
+import {
   formatFitnessStorageBytes,
   resolveFitnessNavigationBehavior,
   resolveFitnessPainDraftAfterRecord,
@@ -275,7 +281,6 @@ type DialogState =
   | null
   | "venue"
   | "equipment"
-  | "equipment-photos"
   | "profile"
   | "constraint"
   | "plan-preview"
@@ -293,6 +298,21 @@ type ScheduledStartChoice = Readonly<{
 }>;
 
 type FitnessStorageReadStatus = "loading" | "ready" | "error";
+type EquipmentPanel = "details" | "photos";
+type EquipmentPhotoTarget = Readonly<{
+  id: string;
+  name: string;
+  recoveryOnly: boolean;
+}>;
+
+type FitnessFileJournalView = FitnessFileOperationJournal & Readonly<{ loaded: boolean }>;
+
+const EMPTY_FILE_JOURNAL: FitnessFileJournalView = {
+  loaded: false,
+  entries: [],
+  unreadable: [],
+  unavailable: false,
+};
 
 export default function FitnessApp() {
   const [snapshot, setSnapshot] = useState<FitnessSnapshot>(emptySnapshot);
@@ -303,6 +323,10 @@ export default function FitnessApp() {
   const [dialog, setDialog] = useState<DialogState>(null);
   const [editingVenue, setEditingVenue] = useState<FitnessVenue | null>(null);
   const [editingEquipment, setEditingEquipment] = useState<FitnessEquipment | null>(null);
+  const [equipmentPanel, setEquipmentPanel] = useState<EquipmentPanel>("details");
+  const [equipmentPhotoBusy, setEquipmentPhotoBusy] = useState(false);
+  const [equipmentPhotoTarget, setEquipmentPhotoTarget] = useState<EquipmentPhotoTarget | null>(null);
+  const [fileJournal, setFileJournal] = useState<FitnessFileJournalView>(EMPTY_FILE_JOURNAL);
   const [editingConstraint, setEditingConstraint] = useState<FitnessConstraint | null>(null);
   const [planDraft, setPlanDraft] = useState<FitnessPlanDraft | null>(null);
   const [aiDraft, setAiDraft] = useState<AiPlanDraft | null>(null);
@@ -334,11 +358,39 @@ export default function FitnessApp() {
   const scheduledStartSequence = useRef(0);
   const navigationFrame = useRef<number | null>(null);
   const storageActionRef = useRef(false);
+  const equipmentPhotoOpener = useRef<HTMLButtonElement | null>(null);
+  const equipmentPhotoBusyRef = useRef(false);
+  const equipmentPanelRef = useRef<EquipmentPanel>("details");
+  const equipmentPhotoTargetRef = useRef<EquipmentPhotoTarget | null>(null);
+  const globalFileRecoveryAction = useRef<HTMLButtonElement | null>(null);
+  const returnFromFileRecovery = useRef(false);
 
   const rememberScheduledStartChoice = useCallback((choice: ScheduledStartChoice | null) => {
     scheduledStartChoiceRef.current = choice;
     setScheduledStartChoice(choice);
   }, []);
+
+  const showEquipmentPanel = useCallback((next: EquipmentPanel) => {
+    equipmentPanelRef.current = next;
+    setEquipmentPanel(next);
+  }, []);
+
+  const rememberEquipmentPhotoTarget = useCallback((next: EquipmentPhotoTarget | null) => {
+    equipmentPhotoTargetRef.current = next;
+    setEquipmentPhotoTarget(next);
+  }, []);
+
+  const rememberFileJournal = useCallback((next: FitnessFileOperationJournal) => {
+    setFileJournal({ ...next, loaded: true });
+  }, []);
+
+  const reloadFileJournal = useCallback(() => {
+    try {
+      rememberFileJournal(readFitnessFileOperationJournal());
+    } catch {
+      rememberFileJournal({ entries: [], unreadable: [], unavailable: true });
+    }
+  }, [rememberFileJournal]);
 
   const navigateToFitnessView = useCallback((next: FitnessView) => {
     setView(next);
@@ -391,7 +443,7 @@ export default function FitnessApp() {
     setStorageActionMessage("");
     const hadReadableStatus = storageReadStatus === "ready" && storage !== null;
     if (!supportsPersistentLocalStorage()) {
-      const message = "这个浏览器没有提供保护申请接口；现有资料和容量信息没有因此改变，请继续保留定期备份。";
+      const message = "这个浏览器没有提供保护申请接口；它保护的是当前完整网址与浏览器资料对应的空间。现有资料和容量信息没有因此改变，请继续保留定期备份。";
       setStorageActionMessage(message);
       setToast(message);
       storageActionRef.current = false;
@@ -461,6 +513,17 @@ export default function FitnessApp() {
   }, []);
 
   useEffect(() => subscribeFitnessChanges(() => { void refresh().catch(() => undefined); }), [refresh]);
+  useEffect(() => {
+    const timer = window.setTimeout(reloadFileJournal, 0);
+    const onStorage = (event: StorageEvent) => {
+      if (event.key === null || event.key.startsWith(FITNESS_FILE_OPERATION_PREFIX)) reloadFileJournal();
+    };
+    window.addEventListener("storage", onStorage);
+    return () => {
+      window.clearTimeout(timer);
+      window.removeEventListener("storage", onStorage);
+    };
+  }, [reloadFileJournal]);
   useEffect(() => () => {
     if (navigationFrame.current !== null) window.cancelAnimationFrame(navigationFrame.current);
   }, []);
@@ -492,8 +555,17 @@ export default function FitnessApp() {
     }
     if (!dialogWasOpen.current) return;
     dialogWasOpen.current = false;
+    const shouldReturnToFileRecovery = returnFromFileRecovery.current;
+    returnFromFileRecovery.current = false;
     const frame = window.requestAnimationFrame(() => {
       if (document.activeElement !== document.body) return;
+      if (shouldReturnToFileRecovery) {
+        const recoveryAction = globalFileRecoveryAction.current;
+        if (recoveryAction?.isConnected && recoveryAction.getClientRects().length > 0) {
+          recoveryAction.focus({ preventScroll: true });
+          return;
+        }
+      }
       const candidates = Array.from(document.querySelectorAll<HTMLButtonElement>(
         ".sl-topbar nav button[aria-current='page'], .sl-mobile-tabs button[aria-current='page']",
       ));
@@ -511,16 +583,60 @@ export default function FitnessApp() {
     setDialogMutationBusy(next);
   }, []);
 
+  const setEquipmentPhotosBusy = useCallback((next: boolean) => {
+    equipmentPhotoBusyRef.current = next;
+    setEquipmentPhotoBusy(next);
+  }, []);
+
   const closeDialog = useCallback(() => {
     setDialog(null); setError(""); setEditingEquipment(null); setEditingVenue(null); setEditingConstraint(null);
     setRescheduleEvent(null); setSessionExerciseId(null); setHistorySessionId(null);
     rememberScheduledStartChoice(null);
+    showEquipmentPanel("details");
+    rememberEquipmentPhotoTarget(null);
+    setEquipmentPhotosBusy(false);
     setDialogBusy(false);
-  }, [rememberScheduledStartChoice, setDialogBusy]);
+  }, [rememberEquipmentPhotoTarget, rememberScheduledStartChoice, setDialogBusy, setEquipmentPhotosBusy, showEquipmentPanel]);
 
   const requestDialogClose = useCallback(() => {
     if (!dialogMutationBusyRef.current) closeDialog();
   }, [closeDialog]);
+
+  const showEquipmentDetails = useCallback(() => {
+    if (equipmentPhotoBusyRef.current) return;
+    if (equipmentPhotoTargetRef.current?.recoveryOnly) {
+      closeDialog();
+      return;
+    }
+    showEquipmentPanel("details");
+    rememberEquipmentPhotoTarget(null);
+    window.requestAnimationFrame(() => equipmentPhotoOpener.current?.focus({ preventScroll: true }));
+  }, [closeDialog, rememberEquipmentPhotoTarget, showEquipmentPanel]);
+
+  const requestEquipmentDialogClose = useCallback(() => {
+    if (dialogMutationBusyRef.current || equipmentPhotoBusyRef.current) return;
+    if (equipmentPanelRef.current === "photos") {
+      showEquipmentDetails();
+      return;
+    }
+    closeDialog();
+  }, [closeDialog, showEquipmentDetails]);
+
+  const openFitnessFileRecovery = useCallback((entry?: FitnessFileOperationEntry) => {
+    const equipmentId = entry?.ticket.receipt.expectedRow.entity_id ?? "unreadable-fitness-file-operation";
+    const knownEquipment = entry
+      ? snapshot.equipment.find((candidate) => candidate.id === equipmentId) ?? null
+      : null;
+    setEditingEquipment(null);
+    rememberEquipmentPhotoTarget({
+      id: equipmentId,
+      name: knownEquipment?.name ?? (entry ? "已不在当前器材清单的记录" : "无法验证归属的附件提醒"),
+      recoveryOnly: true,
+    });
+    returnFromFileRecovery.current = true;
+    showEquipmentPanel("photos");
+    setDialog("equipment");
+  }, [rememberEquipmentPhotoTarget, showEquipmentPanel, snapshot.equipment]);
 
   const requestScheduledStartChoiceClose = useCallback(() => {
     if (!scheduledStartMutationRef.current) closeDialog();
@@ -790,6 +906,7 @@ export default function FitnessApp() {
     <nav className="sl-mobile-tabs" aria-label="适练页面">{navigation.map((item) => <button key={item.id} aria-current={view === item.id ? "page" : undefined} className={view === item.id ? "active" : ""} onClick={() => navigateToFitnessView(item.id)}><i>{item.glyph}</i><span>{item.label}</span></button>)}</nav>
 
     <section className="sl-workspace">
+    {fileJournal.loaded && (fileJournal.entries.length > 0 || fileJournal.unreadable.length > 0 || (fileJournal.unavailable && (view === "venues" || view === "settings"))) && <section className="sl-global-file-recovery" role="status" aria-live="polite"><div><b>{fileJournal.unavailable ? "附件核对线索暂时无法安全读取" : fileJournal.entries.length > 0 ? `有 ${fileJournal.entries.length} 条照片操作待核对` : "有无法验证的照片操作提醒"}</b><p>{fileJournal.unavailable ? "新保存与移除保持停用；打开说明不会自动改动照片。" : `这些线索属于当前完整网址与浏览器资料。${fileJournal.unreadable.length > 0 ? `其中 ${fileJournal.unreadable.length} 条无法验证；` : ""}由你逐条打开后才会核对或选择下一步。`}</p></div>{fileJournal.unreadable.length > 0 || fileJournal.unavailable ? <button ref={globalFileRecoveryAction} type="button" onClick={() => openFitnessFileRecovery()}>查看安全说明</button> : <button ref={globalFileRecoveryAction} type="button" onClick={() => openFitnessFileRecovery(fileJournal.entries[0])}>打开下一条</button>}</section>}
       {view === "today" && <TodayView
         now={elapsedNow}
         snapshot={snapshot}
@@ -799,20 +916,31 @@ export default function FitnessApp() {
         onAddVenue={() => setDialog("venue")}
         onStart={requestFitnessStart}
       />}
-      {view === "venues" && <VenuesView snapshot={snapshot} venue={venue} busy={busy} onSelect={setVenueId} onAdd={() => { setEditingVenue(null); setDialog("venue"); }} onEditVenue={(entry) => { setEditingVenue(entry); setDialog("venue"); }} onArchive={(entry) => { if (!window.confirm(`归档「${entry.name}」吗？它的未来计划会停用，尚未开始的安排会取消；历史记录会保留。`)) return; void run(async () => { await archiveVenue(entry.id); }, `「${entry.name}」已归档，历史仍保留`); }} onRestore={(entry) => void run(async () => { await restoreVenue(entry.id); }, `「${entry.name}」已恢复为可用场地；旧计划和已取消安排没有被复活`)} onAddEquipment={() => setDialog("equipment")} onEditEquipment={(entry) => { setEditingEquipment(entry); setDialog("equipment"); }} onStatus={(entry, status) => void run(async () => { await setEquipmentStatus(entry.id, status); }, status === "maintenance" ? "已标记为临时停用，未来计划会避开它" : "器材状态已更新")} />}
-      {view === "plan" && <PlanView snapshot={snapshot} venue={venue} busy={busy} error={error} onProfile={() => setDialog("profile")} onVenue={() => setDialog("venue")} onEquipment={() => setDialog("equipment")} onGenerate={generateLocal} onAi={() => void generateAi()} onSchedule={(program) => void run(async () => { await scheduleProgramWeek(program.id); }, "这一周已放入日历；随时可以改期或不进行")} />}
+      {view === "venues" && <VenuesView snapshot={snapshot} venue={venue} busy={busy} onSelect={setVenueId} onAdd={() => { setEditingVenue(null); setDialog("venue"); }} onEditVenue={(entry) => { setEditingVenue(entry); setDialog("venue"); }} onArchive={(entry) => { if (!window.confirm(`归档「${entry.name}」吗？它的未来计划会停用，尚未开始的安排会取消；历史记录会保留。`)) return; void run(async () => { await archiveVenue(entry.id); }, `「${entry.name}」已归档，历史仍保留`); }} onRestore={(entry) => void run(async () => { await restoreVenue(entry.id); }, `「${entry.name}」已恢复为可用场地；旧计划和已取消安排没有被复活`)} onAddEquipment={() => { rememberEquipmentPhotoTarget(null); showEquipmentPanel("details"); setDialog("equipment"); }} onEditEquipment={(entry) => { rememberEquipmentPhotoTarget(null); showEquipmentPanel("details"); setEditingEquipment(entry); setDialog("equipment"); }} onStatus={(entry, status) => void run(async () => { await setEquipmentStatus(entry.id, status); }, status === "maintenance" ? "已标记为临时停用，未来计划会避开它" : "器材状态已更新")} />}
+      {view === "plan" && <PlanView snapshot={snapshot} venue={venue} busy={busy} error={error} onProfile={() => setDialog("profile")} onVenue={() => setDialog("venue")} onEquipment={() => { rememberEquipmentPhotoTarget(null); showEquipmentPanel("details"); setDialog("equipment"); }} onGenerate={generateLocal} onAi={() => void generateAi()} onSchedule={(program) => void run(async () => { await scheduleProgramWeek(program.id); }, "这一周已放入日历；随时可以改期或不进行")} />}
       {view === "calendar" && <CalendarView snapshot={snapshot} startBusy={scheduledStartBusy} onPlan={() => navigateToFitnessView("plan")} onStart={requestFitnessStart} onReschedule={(event) => { setRescheduleEvent(event); setDialog("reschedule"); }} onSkip={(event) => { if (window.confirm("只记录“这次未进行”，不会把它变成欠账，也不会自动堆到明天。继续吗？")) void run(async () => { await markCalendarEventNotPerformed(event.id); }, "已记为这次未进行，其他安排没有改变"); }} />}
       {view === "history" && <HistoryView snapshot={snapshot} onOpen={(sessionId) => { setHistorySessionId(sessionId); setDialog("history-detail"); }} onStart={() => requestFitnessStart(null)} />}
       {view === "exercises" && <ExercisesView equipment={venueEquipment} equipmentLoads={snapshot.equipmentLoads} venue={venue} />}
       {view === "profile" && <ProfileView snapshot={snapshot} busy={busy} onProfile={() => setDialog("profile")} onConstraint={(entry) => { setEditingConstraint(entry); setDialog("constraint"); }} onToggleConstraint={(entry) => void run(async () => { await setFitnessConstraintActive(entry.id, !entry.active); }, entry.active ? "这条身体边界已暂时结束；记录仍保留" : "这条身体边界已重新启用；它只影响未来草稿和现场选项，不改写历史")} />}
-      {view === "settings" && <SettingsView snapshot={snapshot} storage={storage} storageReadStatus={storageReadStatus} storageBusy={storageActionBusy} storageActionMessage={storageActionMessage} currentOrigin={currentOrigin} onPersist={requestStorageProtection} onRecheck={recheckStorage} onChange={(settings) => void run(async () => { await saveFitnessSettings(settings); }, "设置已保存在当前浏览器")} onRestored={refresh} />}
+      {view === "settings" && <SettingsView snapshot={snapshot} storage={storage} storageReadStatus={storageReadStatus} storageBusy={storageActionBusy} storageActionMessage={storageActionMessage} currentOrigin={currentOrigin} onPersist={requestStorageProtection} onRecheck={recheckStorage} onChange={(settings) => void run(async () => { await saveFitnessSettings(settings); }, "设置已保存在当前完整网址与浏览器资料对应的本地空间")} onRestored={refresh} />}
     </section>
 
     {!snapshot.venues.length && !firstRunDismissed && <FirstRun onStart={() => { setFirstRunDismissed(true); setDialog("venue"); }} onExercises={() => { setFirstRunDismissed(true); navigateToFitnessView("exercises"); }} />}
 
     <FitnessDialog open={dialog === "venue"} eyebrow="REAL PLACE FIRST" title={editingVenue ? "编辑场地" : "建立训练场地"} busy={dialogMutationBusy} onClose={requestDialogClose}><VenueForm venue={editingVenue} onBusyChange={setDialogBusy} onClose={requestDialogClose} onSave={async (input: SaveVenueInput) => { const id = await saveVenue(input); await finalizePersistedDialogWrite("场地已保存。接下来可以从眼前看得到的器材开始录入", () => setVenueId(id)); }} /></FitnessDialog>
-    <FitnessDialog open={dialog === "equipment"} eyebrow="WHAT IS ACTUALLY HERE" title={editingEquipment ? "编辑器材" : "录入器材"} busy={dialogMutationBusy} onClose={requestDialogClose} wide>{venue ? <><EquipmentForm venueId={venue.id} equipment={editingEquipment} loads={snapshot.equipmentLoads.filter((entry) => entry.equipment_id === editingEquipment?.id)} unit={snapshot.profile?.unit ?? snapshot.settings.unit} onBusyChange={setDialogBusy} onClose={requestDialogClose} onSave={async (input: SaveEquipmentInput) => { await saveEquipmentWithLoads(input); await finalizePersistedDialogWrite("器材与真实重量档位已保存"); }} />{editingEquipment && <div className="sl-equipment-photo-entry"><span><b>器材照片</b><small>{snapshot.files.filter((file) => file.entity_type === "equipment" && file.entity_id === editingEquipment.id && file.status === "ready").length} 张本地照片 · 不会发送给 AI</small></span><button type="button" disabled={dialogMutationBusy} onClick={() => setDialog("equipment-photos")}>查看与添加</button></div>}</> : <DialogNeed copy="先建立或选择一个场地，器材才有明确归属。" action={() => { closeDialog(); setDialog("venue"); }} label="建立场地" />}</FitnessDialog>
-    <FitnessDialog open={dialog === "equipment-photos"} eyebrow="LOCAL EQUIPMENT REFERENCE" title={editingEquipment ? `${editingEquipment.name}的照片` : "器材照片"} onClose={closeDialog} wide>{editingEquipment && <EquipmentPhotos equipment={editingEquipment} onChanged={refresh}/>}</FitnessDialog>
+    <FitnessDialog
+      open={dialog === "equipment"}
+      eyebrow={equipmentPanel === "photos" ? "LOCAL EQUIPMENT REFERENCE" : "WHAT IS ACTUALLY HERE"}
+      title={equipmentPanel === "photos" && equipmentPhotoTarget ? `${equipmentPhotoTarget.name}的照片` : editingEquipment ? "编辑器材" : "录入器材"}
+      busy={dialogMutationBusy || equipmentPhotoBusy}
+      onClose={requestEquipmentDialogClose}
+      wide
+    >
+      {!equipmentPhotoTarget?.recoveryOnly && (venue
+        ? <div hidden={equipmentPanel !== "details"}><EquipmentForm venueId={venue.id} equipment={editingEquipment} loads={snapshot.equipmentLoads.filter((entry) => entry.equipment_id === editingEquipment?.id)} unit={snapshot.profile?.unit ?? snapshot.settings.unit} onBusyChange={setDialogBusy} onClose={requestEquipmentDialogClose} onSave={async (input: SaveEquipmentInput) => { await saveEquipmentWithLoads(input); await finalizePersistedDialogWrite("器材与真实重量档位已保存"); }} />{editingEquipment && <div className="sl-equipment-photo-entry"><span><b>器材照片</b><small>{snapshot.files.filter((file) => file.entity_type === "equipment" && file.entity_id === editingEquipment.id).length} 条照片记录 · 打开后核对本地原件</small></span><button ref={equipmentPhotoOpener} type="button" disabled={dialogMutationBusy} onClick={() => { rememberEquipmentPhotoTarget({ id: editingEquipment.id, name: editingEquipment.name, recoveryOnly: false }); showEquipmentPanel("photos"); }}>查看与添加</button></div>}</div>
+        : <DialogNeed copy="先建立或选择一个场地，器材才有明确归属。" action={() => { closeDialog(); setDialog("venue"); }} label="建立场地" />)}
+      {equipmentPanel === "photos" && equipmentPhotoTarget && <EquipmentPhotos equipment={equipmentPhotoTarget} currentOrigin={currentOrigin} recoveryOnly={equipmentPhotoTarget.recoveryOnly} onBusyChange={setEquipmentPhotosBusy} onJournalChange={rememberFileJournal} onChanged={refresh} onBack={showEquipmentDetails}/>}
+    </FitnessDialog>
     <FitnessDialog open={dialog === "profile"} eyebrow="YOUR TIME & PREFERENCES" title="训练偏好" busy={dialogMutationBusy} onClose={requestDialogClose} wide><ProfileForm profile={snapshot.profile} onBusyChange={setDialogBusy} onClose={requestDialogClose} onSave={async (input: SaveFitnessProfileInput) => { await saveFitnessProfile(input); await finalizePersistedDialogWrite("偏好已保存；它是规划输入，不是必须完成的配额"); }} /></FitnessDialog>
     <FitnessDialog open={dialog === "constraint"} eyebrow="BODY BOUNDARIES" title={editingConstraint ? "编辑身体边界" : "记录身体边界"} busy={dialogMutationBusy} onClose={requestDialogClose} wide><ConstraintForm constraint={editingConstraint} onBusyChange={setDialogBusy} onClose={requestDialogClose} onSave={async (input: SaveConstraintInput) => { await saveConstraint(input); await finalizePersistedDialogWrite(!input.active ? "内容已保存；这条边界仍是已结束状态" : input.severity === "avoid" ? "身体边界已保存；未来草稿与现场选项会避开指定范围，历史不会被改写" : "身体边界已保存；现场会显示原文提醒，不会自动推断调整方式"); }} /></FitnessDialog>
     <FitnessDialog open={dialog === "plan-preview"} eyebrow="LOCAL · VERIFIED" title="可执行计划草稿" busy={dialogMutationBusy} onClose={requestDialogClose} wide>{planDraft && <PlanDraftPreview draft={planDraft} snapshot={snapshot} busy={busy} onSave={() => void saveAndSchedulePlanDraft()} />}</FitnessDialog>
@@ -1105,7 +1233,7 @@ function SettingsView({ snapshot, storage, storageReadStatus, storageBusy, stora
   onRestored: () => Promise<void>;
 }) {
   const settings = snapshot.settings;
-  return <div className="sl-page"><header className="sl-page-title"><div><span>PRIVACY & DATA</span><h1>设置</h1><p>训练和身体资料留在当前浏览器；AI 只在你点击时收到最小草稿上下文。</p></div></header><div className="sl-settings">
+  return <div className="sl-page"><header className="sl-page-title"><div><span>PRIVACY & DATA</span><h1>设置</h1><p>训练和身体资料留在当前完整网址与浏览器资料对应的本地空间；AI 只在你点击时收到最小草稿上下文。</p></div></header><div className="sl-settings">
     <section><header><h2>AI 与隐私</h2><p>没有 AI 时，器材、计划、日历与训练记录仍可使用。</p></header><SettingSwitch label="允许 AI 草稿" copy="只发送结构化器材、频次与能力数字；不发送用户填写的自由文本" checked={settings.ai_enabled} onChange={(value) => onChange({ ...settings, ai_enabled: value })}/><div className="sl-privacy-fact"><i/><span><b>DeepSeek Key 只在服务端</b><small>不会进入 SQLite、完整备份或浏览器资源</small></span></div></section>
     <section className="sl-local-space"><header><h2>这套本地空间</h2><p>当前完整地址与当前浏览器资料（profile）共同决定资料放在哪里。</p></header>
       <div className="sl-origin-fact"><span>当前完整地址</span><code>{currentOrigin || "正在确认当前地址…"}</code><p>协议、主机名（hostname）或端口不同，就是另一套地址；更换浏览器资料（profile），也会打开另一套本地空间。</p></div>
