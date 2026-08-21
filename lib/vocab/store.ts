@@ -254,6 +254,102 @@ export type VocabSettingsStorageRuntime = Readonly<{
   broadcast(reason: string): void;
 }>;
 
+export type VocabItemWriteKind =
+  | "progress-checkpoint"
+  | "complete"
+  | "archive"
+  | "restore";
+
+export type VocabItemWriteSnapshot = Readonly<{
+  generationId: string;
+  generationSequence: number;
+  item: LibraryItem;
+}>;
+
+type VocabItemReceiptBase<Kind extends VocabItemWriteKind> = Readonly<{
+  purpose: "vocab-item-write";
+  version: 1;
+  kind: Kind;
+  operationId: string;
+  generationId: string;
+  generationSequence: number;
+  before: VocabItemWriteSnapshot;
+  after: VocabItemWriteSnapshot;
+  projectionSha256: string;
+}>;
+
+export type VocabItemProgressCheckpointReceipt =
+  VocabItemReceiptBase<"progress-checkpoint">;
+export type VocabItemCompleteReceipt = VocabItemReceiptBase<"complete">;
+export type VocabItemArchiveReceipt = VocabItemReceiptBase<"archive">;
+export type VocabItemRestoreReceipt = VocabItemReceiptBase<"restore">;
+
+export type VocabItemWriteReceipt =
+  | VocabItemProgressCheckpointReceipt
+  | VocabItemCompleteReceipt
+  | VocabItemArchiveReceipt
+  | VocabItemRestoreReceipt;
+
+export type VocabItemWriteInspection =
+  | "exact_saved"
+  | "expected"
+  | "changed"
+  | "still_unknown"
+  | "invalid_receipt";
+
+export type VocabItemWriteResult =
+  | Readonly<{
+      outcome: "saved" | "already_saved";
+      receipt: VocabItemWriteReceipt;
+      entityId: string;
+      updatedAt: number;
+    }>
+  | Readonly<{
+      outcome: "changed";
+      receipt: VocabItemWriteReceipt;
+      entityId: string;
+      retryable: false;
+    }>
+  | Readonly<{
+      outcome: "outcome_uncertain";
+      receipt: VocabItemWriteReceipt;
+      entityId: string;
+      retryable: true;
+    }>;
+
+export type VocabItemMutationErrorCode =
+  | "invalid_input"
+  | "invalid_receipt"
+  | "changed"
+  | "inspect_failed"
+  | "write_failed";
+
+export class VocabItemMutationError extends Error {
+  readonly name = "VocabItemMutationError";
+
+  constructor(
+    readonly code: VocabItemMutationErrorCode,
+    message: string,
+    readonly receipt?: VocabItemWriteReceipt,
+  ) {
+    super(message);
+  }
+}
+
+export type VocabItemStorageRuntime = Readonly<{
+  withReadLock?<Result>(operation: () => Promise<Result>): Promise<Result>;
+  withExclusiveLock<Result>(operation: () => Promise<Result>): Promise<Result>;
+  query<Result extends object>(
+    sql: string,
+    params?: SqlValue[],
+  ): Promise<VocabSettingsQueryResult<Result>>;
+  batch(statements: readonly Statement[]): Promise<unknown>;
+  currentGeneration(): Promise<Readonly<{ generationId: string; sequence: number }>>;
+  now(): number;
+  randomUUID(): string;
+  broadcast(reason: string): void;
+}>;
+
 export class VocabReviewConflictError extends Error {
   readonly code = "VOCAB_REVIEW_CONFLICT";
 
@@ -3972,6 +4068,622 @@ export const inspectVocabSettingsWrite =
 export const commitVocabSettingsWrite =
   defaultVocabSettingsStorageService.commitVocabSettingsWrite;
 
+const VOCAB_ITEM_MAX_JSON_BYTES = 1_048_576;
+const VOCAB_ITEM_OPERATION_ID_PATTERN =
+  /^vocab-item-operation-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const VOCAB_ITEM_STATUSES: readonly LibraryItem["status"][] = [
+  "unread",
+  "in_progress",
+  "complete",
+  "archived",
+];
+const VOCAB_ITEM_KINDS: readonly VocabItemWriteKind[] = [
+  "progress-checkpoint",
+  "complete",
+  "archive",
+  "restore",
+];
+const VOCAB_ITEM_ROW_KEYS = [
+  "id",
+  "kind",
+  "title",
+  "description",
+  "source",
+  "source_url",
+  "author",
+  "published_at",
+  "duration_ms",
+  "audio_url",
+  "status",
+  "progress",
+  "created_at",
+  "updated_at",
+] as const;
+
+function vocabItemError(
+  code: VocabItemMutationErrorCode,
+  message: string,
+  receipt?: VocabItemWriteReceipt,
+): VocabItemMutationError {
+  return new VocabItemMutationError(code, message, receipt);
+}
+
+function isVocabItemRow(value: unknown): value is LibraryItem {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const item = value as Partial<LibraryItem>;
+  return settingsExactObjectKeys(value, VOCAB_ITEM_ROW_KEYS) &&
+    isSafeOpaqueReviewCardId(item.id) &&
+    (item.kind === "article" || item.kind === "podcast") &&
+    typeof item.title === "string" &&
+    typeof item.description === "string" &&
+    typeof item.source === "string" &&
+    (item.source_url === null || typeof item.source_url === "string") &&
+    typeof item.author === "string" &&
+    typeof item.published_at === "string" &&
+    settingsSafeInteger(item.duration_ms) &&
+    (item.audio_url === null || typeof item.audio_url === "string") &&
+    VOCAB_ITEM_STATUSES.includes(item.status as LibraryItem["status"]) &&
+    typeof item.progress === "number" && Number.isFinite(item.progress) &&
+    item.progress >= 0 && item.progress <= 1 &&
+    settingsSafeInteger(item.created_at) &&
+    settingsSafeInteger(item.updated_at);
+}
+
+function isVocabItemWriteSnapshot(
+  value: unknown,
+): value is VocabItemWriteSnapshot {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const snapshot = value as Partial<VocabItemWriteSnapshot>;
+  return settingsExactObjectKeys(value, [
+    "generationId", "generationSequence", "item",
+  ]) &&
+    typeof snapshot.generationId === "string" &&
+    VOCAB_SETTINGS_GENERATION_ID_PATTERN.test(snapshot.generationId) &&
+    settingsSafeInteger(snapshot.generationSequence) &&
+    isVocabItemRow(snapshot.item);
+}
+
+function sameVocabItemImmutableFields(
+  before: LibraryItem,
+  after: LibraryItem,
+): boolean {
+  return before.id === after.id && before.kind === after.kind &&
+    before.title === after.title && before.description === after.description &&
+    before.source === after.source && before.source_url === after.source_url &&
+    before.author === after.author && before.published_at === after.published_at &&
+    before.duration_ms === after.duration_ms && before.audio_url === after.audio_url &&
+    before.created_at === after.created_at;
+}
+
+function restoredVocabItemStatus(progress: number): LibraryItem["status"] {
+  return progress >= 1 ? "complete" : progress > 0 ? "in_progress" : "unread";
+}
+
+function isVocabItemTransition(
+  kind: VocabItemWriteKind,
+  beforeValue: unknown,
+  afterValue: unknown,
+): boolean {
+  if (
+    !isVocabItemWriteSnapshot(beforeValue) ||
+    !isVocabItemWriteSnapshot(afterValue)
+  ) return false;
+  const before = beforeValue;
+  const after = afterValue;
+  if (
+    before.generationId !== after.generationId ||
+    before.generationSequence !== after.generationSequence ||
+    !sameVocabItemImmutableFields(before.item, after.item) ||
+    after.item.updated_at <= before.item.updated_at
+  ) return false;
+  switch (kind) {
+    case "progress-checkpoint":
+      return (before.item.status === "unread" || before.item.status === "in_progress") &&
+        after.item.progress < 1 &&
+        after.item.status === restoredVocabItemStatus(after.item.progress);
+    case "complete":
+      return before.item.status !== "archived" &&
+        after.item.status === "complete" && after.item.progress === 1;
+    case "archive":
+      return before.item.status !== "archived" &&
+        after.item.status === "archived" &&
+        after.item.progress === before.item.progress;
+    case "restore":
+      return before.item.status === "archived" &&
+        after.item.progress === before.item.progress &&
+        after.item.status === restoredVocabItemStatus(before.item.progress);
+  }
+}
+
+function isVocabItemWriteReceiptUnchecked(
+  value: unknown,
+): value is VocabItemWriteReceipt {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const receipt = value as Partial<VocabItemWriteReceipt>;
+  if (
+    !settingsExactObjectKeys(value, [
+      "purpose", "version", "kind", "operationId", "generationId",
+      "generationSequence", "before", "after", "projectionSha256",
+    ]) ||
+    receipt.purpose !== "vocab-item-write" || receipt.version !== 1 ||
+    !VOCAB_ITEM_KINDS.includes(receipt.kind as VocabItemWriteKind) ||
+    typeof receipt.operationId !== "string" ||
+    !VOCAB_ITEM_OPERATION_ID_PATTERN.test(receipt.operationId) ||
+    typeof receipt.generationId !== "string" ||
+    !VOCAB_SETTINGS_GENERATION_ID_PATTERN.test(receipt.generationId) ||
+    !settingsSafeInteger(receipt.generationSequence) ||
+    typeof receipt.projectionSha256 !== "string" ||
+    !RECEIPT_HASH_PATTERN.test(receipt.projectionSha256) ||
+    !isVocabItemTransition(
+      receipt.kind as VocabItemWriteKind,
+      receipt.before,
+      receipt.after,
+    )
+  ) return false;
+  return receipt.generationId === receipt.before?.generationId &&
+    receipt.generationSequence === receipt.before.generationSequence &&
+    receipt.generationId === receipt.after?.generationId &&
+    receipt.generationSequence === receipt.after.generationSequence &&
+    new TextEncoder().encode(JSON.stringify(value)).byteLength <=
+      VOCAB_ITEM_MAX_JSON_BYTES;
+}
+
+export function isVocabItemWriteReceipt(
+  value: unknown,
+): value is VocabItemWriteReceipt {
+  try {
+    return settingsJsonSafe(value) && isVocabItemWriteReceiptUnchecked(value);
+  } catch {
+    return false;
+  }
+}
+
+async function sealVocabItemReceipt<Receipt extends VocabItemWriteReceipt>(
+  draft: Omit<Receipt, "projectionSha256">,
+): Promise<Receipt> {
+  const projectionSha256 = await settingsSha256Hex(settingsCanonicalJson(draft));
+  const receipt = { ...draft, projectionSha256 } as Receipt;
+  if (!isVocabItemWriteReceipt(receipt)) {
+    throw vocabItemError("invalid_input", "无法生成有效的条目写入回执。");
+  }
+  return receipt;
+}
+
+async function vocabItemReceiptHashIsValid(
+  receipt: VocabItemWriteReceipt,
+): Promise<boolean> {
+  const { projectionSha256, ...projection } = receipt;
+  return projectionSha256 ===
+    await settingsSha256Hex(settingsCanonicalJson(projection));
+}
+
+function cloneVocabItemChecked<Result>(
+  value: unknown,
+  guard: (candidate: unknown) => candidate is Result,
+  label: string,
+): Result {
+  let snapshot: unknown;
+  try {
+    snapshot = settingsSnapshotInput(value);
+  } catch {
+    throw vocabItemError("invalid_input", `${label}必须是安全、有限的 JSON 数据。`);
+  }
+  if (!guard(snapshot)) {
+    throw vocabItemError("invalid_input", `${label}格式不正确。`);
+  }
+  return snapshot;
+}
+
+async function readVocabItemGeneration(
+  runtime: VocabItemStorageRuntime,
+): Promise<Readonly<{ generationId: string; generationSequence: number }>> {
+  const current = await runtime.currentGeneration();
+  if (
+    !current || typeof current.generationId !== "string" ||
+    !VOCAB_SETTINGS_GENERATION_ID_PATTERN.test(current.generationId) ||
+    !settingsSafeInteger(current.sequence)
+  ) throw new Error("无法确认当前拾词数据库世代。");
+  return {
+    generationId: current.generationId,
+    generationSequence: current.sequence,
+  };
+}
+
+async function readVocabItemWriteSnapshot(
+  runtime: VocabItemStorageRuntime,
+  generation: Readonly<{ generationId: string; generationSequence: number }>,
+  itemId: string,
+): Promise<VocabItemWriteSnapshot | null> {
+  const rows = (await runtime.query<LibraryItem>(
+    `SELECT id,kind,title,description,source,source_url,author,published_at,
+      duration_ms,audio_url,status,progress,created_at,updated_at
+      FROM vocab_items WHERE id=? LIMIT 2`,
+    [itemId],
+  )).rows;
+  if (rows.length === 0) return null;
+  if (rows.length !== 1 || !isVocabItemRow(rows[0])) {
+    throw new Error("条目存储行不符合 canonical 格式。");
+  }
+  const snapshot: VocabItemWriteSnapshot = {
+    ...generation,
+    item: { ...rows[0] },
+  };
+  if (!isVocabItemWriteSnapshot(snapshot)) {
+    throw new Error("无法构造可信的条目读取快照。");
+  }
+  return snapshot;
+}
+
+function nextVocabItemTimestamp(latest: number, now: number): number {
+  if (!settingsSafeInteger(now)) {
+    throw vocabItemError("invalid_input", "设备时间不在可接受范围。");
+  }
+  const timestamp = Math.max(now, latest + 1);
+  if (!settingsSafeInteger(timestamp)) {
+    throw vocabItemError("invalid_input", "条目版本时间超出可接受范围。");
+  }
+  return timestamp;
+}
+
+function generatedVocabItemOperationId(runtime: VocabItemStorageRuntime): string {
+  const id = `vocab-item-operation-${runtime.randomUUID()}`;
+  if (!VOCAB_ITEM_OPERATION_ID_PATTERN.test(id)) {
+    throw vocabItemError("invalid_input", "无法生成可靠的条目操作标识。");
+  }
+  return id;
+}
+
+function safeVocabItemBroadcast(
+  runtime: VocabItemStorageRuntime,
+  reason: string,
+): void {
+  try {
+    runtime.broadcast(reason);
+  } catch {
+    // A refresh hint is advisory and cannot reverse a durable commit.
+  }
+}
+
+function withRequiredVocabItemWriteLock<Result>(
+  operation: () => Promise<Result>,
+): Promise<Result> {
+  const locks = typeof navigator === "undefined"
+    ? null
+    : (navigator as Navigator & { locks?: unknown }).locks ?? null;
+  if (!locks) {
+    throw new Error(
+      "当前浏览器不支持安全的跨标签页写入锁，请使用最新版 Chrome、Edge 或 Safari。",
+    );
+  }
+  return withVocabWriteLock(operation);
+}
+
+function vocabItemBroadcastReason(kind: VocabItemWriteKind): string {
+  switch (kind) {
+    case "progress-checkpoint": return "item-progress-changed";
+    case "complete": return "item-completed";
+    case "archive": return "item-archived";
+    case "restore": return "item-restored";
+  }
+}
+
+export function createVocabItemStorageService(
+  runtime: VocabItemStorageRuntime = {
+    withReadLock: (operation) => withVocabReadLock(operation),
+    withExclusiveLock: withRequiredVocabItemWriteLock,
+    query: async <Result extends object>(sql: string, params?: SqlValue[]) => ({
+      rows: await rawQuery<Result>(sql, params),
+    }),
+    batch: (statements) => localDb.batch(DB, statements, { transaction: true }),
+    currentGeneration: () => localDb.currentGeneration(DB),
+    now: () => Date.now(),
+    randomUUID: () => crypto.randomUUID(),
+    broadcast: broadcastVocabChange,
+  },
+) {
+  async function readLocked<Result>(operation: () => Promise<Result>): Promise<Result> {
+    try {
+      return await (runtime.withReadLock
+        ? runtime.withReadLock(operation)
+        : runtime.withExclusiveLock(operation));
+    } catch (error) {
+      if (error instanceof VocabItemMutationError) throw error;
+      throw vocabItemError("inspect_failed", "暂时无法读取最新条目；没有开始写入。");
+    }
+  }
+
+  async function prepareLocked<Result>(operation: () => Promise<Result>): Promise<Result> {
+    try {
+      return await runtime.withExclusiveLock(operation);
+    } catch (error) {
+      if (error instanceof VocabItemMutationError) throw error;
+      throw vocabItemError("inspect_failed", "暂时无法核对最新条目；没有开始写入。");
+    }
+  }
+
+  async function loadExpectedState(itemIdValue: string): Promise<VocabItemWriteSnapshot> {
+    const itemId = cloneVocabItemChecked(
+      itemIdValue,
+      isSafeOpaqueReviewCardId,
+      "条目标识",
+    );
+    return readLocked(async () => {
+      const generation = await readVocabItemGeneration(runtime);
+      const snapshot = await readVocabItemWriteSnapshot(runtime, generation, itemId);
+      if (!snapshot) {
+        throw vocabItemError("changed", "这个条目已经不存在；没有开始写入。");
+      }
+      return settingsSnapshotInput(snapshot) as VocabItemWriteSnapshot;
+    });
+  }
+
+  async function prepareTransition<Receipt extends VocabItemWriteReceipt>(
+    kind: Receipt["kind"],
+    expectedValue: VocabItemWriteSnapshot,
+    progressValue?: number,
+  ): Promise<Receipt> {
+    const expected = cloneVocabItemChecked(
+      expectedValue,
+      isVocabItemWriteSnapshot,
+      "条目读取快照",
+    );
+    const progress = progressValue;
+    if (
+      kind === "progress-checkpoint" &&
+      (typeof progress !== "number" || !Number.isFinite(progress) ||
+        progress < 0 || progress >= 1)
+    ) {
+      throw vocabItemError("invalid_input", "阅读进度必须在 0（含）到 1（不含）之间。");
+    }
+    if (
+      kind === "progress-checkpoint" &&
+      expected.item.status !== "unread" && expected.item.status !== "in_progress"
+    ) {
+      throw vocabItemError("invalid_input", "已完成或已归档的条目不能写入阅读中进度。");
+    }
+    if (kind === "complete" && expected.item.status === "archived") {
+      throw vocabItemError("invalid_input", "请先恢复已归档条目，再标记完成。");
+    }
+    if (kind === "archive" && expected.item.status === "archived") {
+      throw vocabItemError("invalid_input", "这个条目已经归档。");
+    }
+    if (kind === "restore" && expected.item.status !== "archived") {
+      throw vocabItemError("invalid_input", "只能恢复已归档条目。");
+    }
+    return prepareLocked(async () => {
+      const generation = await readVocabItemGeneration(runtime);
+      if (
+        expected.generationId !== generation.generationId ||
+        expected.generationSequence !== generation.generationSequence
+      ) {
+        throw vocabItemError("changed", "条目所在数据库已经更换；没有准备写入。");
+      }
+      const current = await readVocabItemWriteSnapshot(
+        runtime,
+        generation,
+        expected.item.id,
+      );
+      if (!current || !sameSettingsProjection(current, expected)) {
+        throw vocabItemError("changed", "这个条目已在别处变化；没有准备写入。");
+      }
+      const updatedAt = nextVocabItemTimestamp(expected.item.updated_at, runtime.now());
+      let status: LibraryItem["status"];
+      let nextProgress: number;
+      switch (kind) {
+        case "progress-checkpoint":
+          nextProgress = progress!;
+          status = restoredVocabItemStatus(nextProgress);
+          break;
+        case "complete":
+          nextProgress = 1;
+          status = "complete";
+          break;
+        case "archive":
+          nextProgress = expected.item.progress;
+          status = "archived";
+          break;
+        case "restore":
+          nextProgress = expected.item.progress;
+          status = restoredVocabItemStatus(nextProgress);
+          break;
+      }
+      const after: VocabItemWriteSnapshot = {
+        ...generation,
+        item: {
+          ...expected.item,
+          progress: nextProgress,
+          status,
+          updated_at: updatedAt,
+        },
+      };
+      return sealVocabItemReceipt<Receipt>({
+        purpose: "vocab-item-write",
+        version: 1,
+        kind,
+        operationId: generatedVocabItemOperationId(runtime),
+        ...generation,
+        before: expected,
+        after,
+      } as Omit<Receipt, "projectionSha256">);
+    });
+  }
+
+  async function receiptStateUnlocked(
+    receipt: VocabItemWriteReceipt,
+  ): Promise<Exclude<
+    VocabItemWriteInspection,
+    "still_unknown" | "invalid_receipt"
+  >> {
+    const generation = await readVocabItemGeneration(runtime);
+    if (
+      generation.generationId !== receipt.generationId ||
+      generation.generationSequence !== receipt.generationSequence
+    ) return "changed";
+    const current = await readVocabItemWriteSnapshot(
+      runtime,
+      generation,
+      receipt.before.item.id,
+    );
+    if (!current) return "changed";
+    if (sameSettingsProjection(current, receipt.after)) return "exact_saved";
+    return sameSettingsProjection(current, receipt.before) ? "expected" : "changed";
+  }
+
+  function itemRowPredicate(item: LibraryItem): Readonly<{
+    sql: string;
+    params: SqlValue[];
+  }> {
+    return {
+      sql: `EXISTS(SELECT 1 FROM vocab_items WHERE id IS ? AND kind IS ?
+        AND title IS ? AND description IS ? AND source IS ? AND source_url IS ?
+        AND author IS ? AND published_at IS ? AND duration_ms IS ?
+        AND audio_url IS ? AND status IS ? AND progress IS ?
+        AND created_at IS ? AND updated_at IS ?)`,
+      params: [
+        item.id, item.kind, item.title, item.description, item.source,
+        item.source_url, item.author, item.published_at, item.duration_ms,
+        item.audio_url, item.status, item.progress, item.created_at, item.updated_at,
+      ],
+    };
+  }
+
+  function receiptStatements(receipt: VocabItemWriteReceipt): Statement[] {
+    const predicate = itemRowPredicate(receipt.before.item);
+    return [
+      {
+        sql: `INSERT INTO vocab_items(id,kind,title,created_at,updated_at)
+          SELECT '__vocab_item_cas_abort__','article',NULL,0,0
+          WHERE NOT (${predicate.sql})`,
+        params: predicate.params,
+      },
+      {
+        sql: `UPDATE vocab_items SET progress=?,status=?,updated_at=?
+          WHERE id=?`,
+        params: [
+          receipt.after.item.progress,
+          receipt.after.item.status,
+          receipt.after.item.updated_at,
+          receipt.after.item.id,
+        ],
+      },
+    ];
+  }
+
+  async function inspectWrite(value: unknown): Promise<VocabItemWriteInspection> {
+    let receipt: VocabItemWriteReceipt;
+    try {
+      const stable = settingsSnapshotInput(value);
+      if (!isVocabItemWriteReceipt(stable)) return "invalid_receipt";
+      receipt = stable;
+      if (!await vocabItemReceiptHashIsValid(receipt)) return "invalid_receipt";
+    } catch {
+      return "invalid_receipt";
+    }
+    try {
+      return await runtime.withExclusiveLock(() => receiptStateUnlocked(receipt));
+    } catch {
+      return "still_unknown";
+    }
+  }
+
+  async function commitWrite(value: unknown): Promise<VocabItemWriteResult> {
+    let receipt: VocabItemWriteReceipt;
+    try {
+      const stable = settingsSnapshotInput(value);
+      if (!isVocabItemWriteReceipt(stable)) {
+        throw vocabItemError("invalid_receipt", "条目写入回执无效；没有改动资料。");
+      }
+      receipt = stable;
+      if (!await vocabItemReceiptHashIsValid(receipt)) {
+        throw vocabItemError("invalid_receipt", "条目写入回执无法验证；没有改动资料。");
+      }
+    } catch (error) {
+      if (
+        error instanceof VocabItemMutationError &&
+        error.code === "invalid_receipt"
+      ) throw error;
+      throw vocabItemError("invalid_receipt", "条目写入回执无法验证；没有改动资料。");
+    }
+    const entityId = receipt.after.item.id;
+    const updatedAt = receipt.after.item.updated_at;
+    try {
+      return await runtime.withExclusiveLock(async () => {
+        const before = await receiptStateUnlocked(receipt);
+        if (before === "exact_saved") {
+          safeVocabItemBroadcast(runtime, vocabItemBroadcastReason(receipt.kind));
+          return { outcome: "already_saved", receipt, entityId, updatedAt };
+        }
+        if (before === "changed") {
+          return { outcome: "changed", receipt, entityId, retryable: false };
+        }
+        try {
+          await runtime.batch(receiptStatements(receipt));
+        } catch {
+          // The transaction may have committed even though its response was lost.
+        }
+        const after = await receiptStateUnlocked(receipt);
+        if (after === "exact_saved") {
+          safeVocabItemBroadcast(runtime, vocabItemBroadcastReason(receipt.kind));
+          return { outcome: "saved", receipt, entityId, updatedAt };
+        }
+        if (after === "expected") {
+          throw vocabItemError(
+            "write_failed",
+            "这次条目修改确定没有写入；保留原回执后可以重试。",
+            receipt,
+          );
+        }
+        return { outcome: "changed", receipt, entityId, retryable: false };
+      });
+    } catch (error) {
+      if (error instanceof VocabItemMutationError) throw error;
+      return {
+        outcome: "outcome_uncertain",
+        receipt,
+        entityId,
+        retryable: true,
+      };
+    }
+  }
+
+  return {
+    loadVocabItemExpectedState: loadExpectedState,
+    prepareVocabItemProgressCheckpoint: (
+      progress: number,
+      expected: VocabItemWriteSnapshot,
+    ) => prepareTransition<VocabItemProgressCheckpointReceipt>(
+      "progress-checkpoint",
+      expected,
+      progress,
+    ),
+    prepareVocabItemComplete: (expected: VocabItemWriteSnapshot) =>
+      prepareTransition<VocabItemCompleteReceipt>("complete", expected),
+    prepareVocabItemArchive: (expected: VocabItemWriteSnapshot) =>
+      prepareTransition<VocabItemArchiveReceipt>("archive", expected),
+    prepareVocabItemRestore: (expected: VocabItemWriteSnapshot) =>
+      prepareTransition<VocabItemRestoreReceipt>("restore", expected),
+    inspectVocabItemWrite: inspectWrite,
+    commitVocabItemWrite: commitWrite,
+  } as const;
+}
+
+const defaultVocabItemStorageService = createVocabItemStorageService();
+
+export const loadVocabItemExpectedState =
+  defaultVocabItemStorageService.loadVocabItemExpectedState;
+export const prepareVocabItemProgressCheckpoint =
+  defaultVocabItemStorageService.prepareVocabItemProgressCheckpoint;
+export const prepareVocabItemComplete =
+  defaultVocabItemStorageService.prepareVocabItemComplete;
+export const prepareVocabItemArchive =
+  defaultVocabItemStorageService.prepareVocabItemArchive;
+export const prepareVocabItemRestore =
+  defaultVocabItemStorageService.prepareVocabItemRestore;
+export const inspectVocabItemWrite =
+  defaultVocabItemStorageService.inspectVocabItemWrite;
+export const commitVocabItemWrite =
+  defaultVocabItemStorageService.commitVocabItemWrite;
+
 export async function saveSettings(settings: VocabSettings): Promise<void> {
   await withWrite("settings-saved", async () => {
     const now = Date.now();
@@ -3986,33 +4698,27 @@ export async function saveSettings(settings: VocabSettings): Promise<void> {
 }
 
 export async function recordStudySeconds(
-  itemId: string,
+  _itemId: string,
   kind: "read" | "listen",
   seconds: number,
 ): Promise<void> {
   if (seconds < 1) return;
   await withWrite("study-time-recorded", async () => {
     const now = Date.now();
-    await rawBatch([
-      {
-        sql: `INSERT INTO vocab_activity(
-          id,day,read_seconds,listen_seconds,review_count,lookups,created_at
-        ) VALUES (?,?,?,?,?,?,?)`,
-        params: [
-          uid("activity"),
-          localDayKey(now),
-          kind === "read" ? seconds : 0,
-          kind === "listen" ? seconds : 0,
-          0,
-          0,
-          now,
-        ],
-      },
-      {
-        sql: "UPDATE vocab_items SET updated_at=? WHERE id=?",
-        params: [now, itemId],
-      },
-    ]);
+    await rawBatch([{
+      sql: `INSERT INTO vocab_activity(
+        id,day,read_seconds,listen_seconds,review_count,lookups,created_at
+      ) VALUES (?,?,?,?,?,?,?)`,
+      params: [
+        uid("activity"),
+        localDayKey(now),
+        kind === "read" ? seconds : 0,
+        kind === "listen" ? seconds : 0,
+        0,
+        0,
+        now,
+      ],
+    }]);
   });
 }
 
