@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import "./globals.css";
 import OfflineRegistration from "./OfflineRegistration";
+import { suiteSpaces } from "./suite-spaces";
 
 export const metadata: Metadata = {
   title: { default: "私人工作台", template: "%s · 私人工作台" },
@@ -12,7 +13,9 @@ export default function RootLayout({
 }: Readonly<{
   children: React.ReactNode;
 }>) {
+  const offlineRoutes = suiteSpaces.map((space) => space.href);
+
   return (
-    <html lang="zh-CN"><body>{children}<OfflineRegistration /></body></html>
+    <html lang="zh-CN"><body>{children}<OfflineRegistration routes={offlineRoutes} /></body></html>
   );
 }

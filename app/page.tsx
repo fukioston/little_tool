@@ -6,7 +6,7 @@ export default function Home() {
     <main className="suite-home">
       <header className="suite-nav">
         <span className="suite-mark"><i>私</i><b>私人工作台</b></span>
-        <p><i /><span>本地优先 · AI 仅在你主动使用时出现</span><b>本地优先</b></p>
+        <p><i /><span>默认保存在本浏览器 · 主动使用 AI 时才发送该次所需的最少上下文</span><b>默认本地</b></p>
       </header>
       <section className="suite-intro">
         <p className="suite-kicker">PRIVATE · LOCAL · YOURS</p>
@@ -35,7 +35,7 @@ export default function Home() {
           </Link>
         ))}
       </section>
-      <footer className="suite-trust"><span><i>SQLite</i><b>每个空间一份独立本地数据库</b></span><p>清除浏览器站点数据仍会影响资料；请使用各应用内的完整备份。</p></footer>
+      <footer className="suite-trust"><span><i>SQLite</i><b>每个空间一份独立本地数据库</b></span><p>资料默认保存在当前浏览器；只有你主动使用 AI 功能时，才会发送完成该次请求所需的最少上下文。清除站点数据仍会影响资料，请定期完整备份。</p></footer>
     </main>
   );
 }
