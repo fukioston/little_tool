@@ -213,3 +213,29 @@ export function buildCareerInterviewPrepPayload(
   const selectedInterview = selectedInterviewFields as CareerInterviewPrepPayload["interview"];
   return Object.freeze({ job: selectedJob, interview: selectedInterview });
 }
+
+function normalizeCareerAiAction(action: string): string {
+  return action
+    .trim()
+    .replace(/[A-Z]/g, (character) => `_${character.toLowerCase()}`)
+    .replace(/-/g, "_");
+}
+
+/**
+ * Rebuild privacy-sensitive AI inputs at the server boundary. Callers are
+ * intentionally treated as untrusted even when the UI already used a builder.
+ * Actions whose contracts have not yet been narrowed retain their payload.
+ */
+export function sanitizeCareerAiRequestPayload(action: string, payload: unknown): unknown {
+  const normalizedAction = normalizeCareerAiAction(action);
+  if (normalizedAction === "fit_analysis") {
+    return buildCareerRequirementsPayload(read(record(payload), "job"));
+  }
+  if (normalizedAction === "interview_prep") {
+    return buildCareerInterviewPrepPayload(
+      read(record(payload), "job"),
+      read(record(payload), "interview"),
+    );
+  }
+  return payload;
+}
