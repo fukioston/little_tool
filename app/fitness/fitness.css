@@ -4665,3 +4665,249 @@
     border-top-color: var(--sl-blue);
   }
 }
+
+/* Configuration writes: durable receipt, recovery, and truthful stale-read states. */
+.sl-global-config-recovery,
+.sl-config-snapshot-stale {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 16px;
+  margin-top: 78px;
+  padding: 15px 17px;
+  border: 1px solid rgba(63, 95, 153, 0.25);
+  border-radius: 15px;
+  background: var(--sl-soft-blue);
+}
+
+.sl-config-snapshot-stale {
+  border-color: rgba(138, 90, 25, 0.24);
+  background: var(--sl-warning-soft);
+}
+
+.sl-global-file-recovery + .sl-global-config-recovery,
+.sl-global-file-recovery + .sl-config-snapshot-stale,
+.sl-global-config-recovery + .sl-config-snapshot-stale {
+  margin-top: 12px;
+}
+
+.sl-global-config-recovery + .sl-page,
+.sl-config-snapshot-stale + .sl-page {
+  padding-top: 24px;
+}
+
+.sl-global-config-recovery > div,
+.sl-config-snapshot-stale > div {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.sl-global-config-recovery :is(b, p),
+.sl-config-snapshot-stale :is(b, p) {
+  overflow-wrap: anywhere;
+}
+
+.sl-global-config-recovery b,
+.sl-config-snapshot-stale b {
+  color: var(--sl-blue-dark);
+  font-size: 13px;
+}
+
+.sl-global-config-recovery p,
+.sl-config-snapshot-stale p {
+  color: var(--sl-muted);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.sl-global-config-recovery > button,
+.sl-config-snapshot-stale > button {
+  padding: 0 14px;
+  border: 1px solid var(--sl-line-strong);
+  background: #fff;
+  color: var(--sl-blue-dark);
+  font-size: 12px;
+  font-weight: 680;
+}
+
+.sl-config-recovery,
+.sl-dirty-close {
+  display: grid;
+  gap: 18px;
+  padding: 24px;
+}
+
+.sl-config-confirm {
+  display: grid;
+  gap: 18px;
+  padding: 24px;
+}
+
+.sl-config-confirm > p {
+  color: var(--sl-muted);
+  font-size: 14px;
+  line-height: 1.7;
+}
+
+.sl-config-confirm > footer {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.sl-config-confirm > footer button {
+  min-width: 150px;
+  padding: 0 16px;
+  border: 1px solid var(--sl-line-strong);
+  background: #fff;
+  font-size: 13px;
+  font-weight: 680;
+}
+
+.sl-config-confirm .sl-danger-action {
+  border-color: rgba(169, 68, 54, 0.36);
+  color: #923a30;
+}
+
+.sl-config-receipt-draft {
+  padding: 14px;
+  border: 1px solid var(--sl-line);
+  border-radius: 13px;
+  background: #fff;
+}
+
+.sl-config-receipt-draft summary {
+  min-height: 44px;
+  color: var(--sl-blue-dark);
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.sl-config-receipt-draft p,
+.sl-config-receipt-draft small {
+  display: block;
+  color: var(--sl-muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.sl-config-receipt-draft pre {
+  max-height: 260px;
+  margin: 12px 0;
+  padding: 12px;
+  overflow: auto;
+  border-radius: 10px;
+  background: var(--sl-soft);
+  color: #343b47;
+  font: 11px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.sl-config-receipt-draft button {
+  padding: 0 14px;
+  border: 1px solid var(--sl-line-strong);
+  background: #fff;
+  font-size: 12px;
+  font-weight: 680;
+}
+
+.sl-config-recovery > header,
+.sl-dirty-close > div {
+  display: grid;
+  gap: 7px;
+}
+
+.sl-config-recovery > header > span,
+.sl-dirty-close b {
+  color: var(--sl-blue-dark);
+  font-size: 18px;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.sl-config-recovery > header > p,
+.sl-dirty-close p {
+  color: var(--sl-muted);
+  font-size: 14px;
+  line-height: 1.65;
+  overflow-wrap: anywhere;
+}
+
+.sl-config-recovery > footer,
+.sl-dirty-close > footer {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.sl-config-recovery > footer button,
+.sl-dirty-close > footer button {
+  min-width: 150px;
+  padding: 0 16px;
+  border: 1px solid var(--sl-line-strong);
+  background: #fff;
+  font-size: 13px;
+  font-weight: 680;
+}
+
+.sl-config-recovery > footer .sl-primary {
+  border-color: var(--sl-blue);
+  background: var(--sl-blue);
+  color: #fff;
+}
+
+.sl-config-recovery > footer .sl-danger-action {
+  border-color: rgba(169, 68, 54, 0.36);
+  color: #923a30;
+}
+
+.sl-dirty-close .sl-danger-action {
+  border-color: rgba(169, 68, 54, 0.36);
+  color: #923a30;
+}
+
+@media (max-width: 700px) {
+  .sl-global-config-recovery,
+  .sl-config-snapshot-stale {
+    grid-template-columns: 1fr;
+    margin-top: 54px;
+  }
+
+  .sl-global-file-recovery + .sl-global-config-recovery,
+  .sl-global-file-recovery + .sl-config-snapshot-stale,
+  .sl-global-config-recovery + .sl-config-snapshot-stale {
+    margin-top: 12px;
+  }
+
+  .sl-global-config-recovery > button,
+  .sl-config-snapshot-stale > button {
+    width: 100%;
+  }
+
+  .sl-config-recovery,
+  .sl-dirty-close,
+  .sl-config-confirm {
+    padding: 20px 16px calc(22px + env(safe-area-inset-bottom));
+  }
+}
+
+@media (max-width: 370px) {
+  .sl-config-recovery > footer,
+  .sl-dirty-close > footer,
+  .sl-config-confirm > footer {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .sl-config-recovery > footer button,
+  .sl-dirty-close > footer button,
+  .sl-config-confirm > footer button {
+    width: 100%;
+    min-width: 0;
+  }
+}

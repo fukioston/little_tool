@@ -21,7 +21,6 @@ import {
 } from "@/lib/fitness/planner";
 import {
   addSessionExercise,
-  archiveVenue,
   cancelEmptyFitnessSession,
   completeSessionExercise,
   finishFitnessSession,
@@ -30,20 +29,23 @@ import {
   markCalendarEventNotPerformed,
   recordFitnessSet,
   rescheduleCalendarEvent,
-  restoreVenue,
-  saveConstraint,
-  saveEquipmentWithLoads,
-  saveFitnessProfile,
   saveFitnessSettings,
   saveProgramDraft,
-  saveVenue,
   scheduleProgramWeek,
-  setFitnessConstraintActive,
-  setEquipmentStatus,
   startFitnessSession,
   substituteSessionExercise,
   undoFitnessSet,
   updateSessionReflection,
+  prepareFitnessProfileSave,
+  prepareFitnessVenueSave,
+  prepareFitnessVenueArchive,
+  prepareFitnessVenueRestore,
+  prepareFitnessEquipmentSave,
+  prepareFitnessEquipmentStatus,
+  prepareFitnessConstraintSave,
+  prepareFitnessConstraintActive,
+  type FitnessConfigWriteReceipt,
+  type FitnessEquipmentWriteSnapshot,
   type SaveConstraintInput,
   type SaveEquipmentInput,
   type SaveFitnessProfileInput,
@@ -81,6 +83,11 @@ import {
 } from "./forms";
 import { useFitnessDialog } from "./useFitnessDialog";
 import { EquipmentPhotos, FitnessDataControls } from "./data-panels";
+import {
+  FitnessConfigWriteBanner,
+  FitnessConfigWriteRecovery,
+  useFitnessConfigWriteFlow,
+} from "./FitnessConfigWriteFlow";
 import {
   FITNESS_FILE_OPERATION_PREFIX,
   readFitnessFileOperationJournal,
@@ -171,6 +178,21 @@ function equipmentSummary(equipment: FitnessEquipment, loads: readonly FitnessEq
   }
   if (equipment.load_mode === "none") return "无需录入重量";
   return "重量档位待确认";
+}
+
+function equipmentWriteSnapshot(
+  snapshot: FitnessSnapshot,
+  equipment: FitnessEquipment,
+): FitnessEquipmentWriteSnapshot {
+  return {
+    equipment,
+    loads: snapshot.equipmentLoads
+      .filter((entry) => entry.equipment_id === equipment.id)
+      .sort((left, right) =>
+        left.load_grams - right.load_grams ||
+        left.label.localeCompare(right.label) ||
+        left.id.localeCompare(right.id)),
+  };
 }
 
 function dayStart(value = Date.now()) {
@@ -283,6 +305,7 @@ type DialogState =
   | "equipment"
   | "profile"
   | "constraint"
+  | "venue-archive"
   | "plan-preview"
   | "ai-preview"
   | "exercise-picker"
@@ -290,6 +313,7 @@ type DialogState =
   | "reschedule"
   | "venue-start-choice"
   | "history-detail"
+  | "config-recovery"
   | "more";
 
 type ScheduledStartChoice = Readonly<{
@@ -298,6 +322,7 @@ type ScheduledStartChoice = Readonly<{
 }>;
 
 type FitnessStorageReadStatus = "loading" | "ready" | "error";
+type FitnessSnapshotReadStatus = "ready" | "stale";
 type EquipmentPanel = "details" | "photos";
 type EquipmentPhotoTarget = Readonly<{
   id: string;
@@ -321,8 +346,11 @@ export default function FitnessApp() {
   const [view, setView] = useState<FitnessView>("today");
   const [venueId, setVenueId] = useState<string | null>(null);
   const [dialog, setDialog] = useState<DialogState>(null);
+  const [editingProfile, setEditingProfile] = useState<FitnessSnapshot["profile"]>(null);
   const [editingVenue, setEditingVenue] = useState<FitnessVenue | null>(null);
+  const [archivingVenue, setArchivingVenue] = useState<FitnessVenue | null>(null);
   const [editingEquipment, setEditingEquipment] = useState<FitnessEquipment | null>(null);
+  const [editingEquipmentExpected, setEditingEquipmentExpected] = useState<FitnessEquipmentWriteSnapshot | null>(null);
   const [equipmentPanel, setEquipmentPanel] = useState<EquipmentPanel>("details");
   const [equipmentPhotoBusy, setEquipmentPhotoBusy] = useState(false);
   const [equipmentPhotoTarget, setEquipmentPhotoTarget] = useState<EquipmentPhotoTarget | null>(null);
@@ -348,11 +376,18 @@ export default function FitnessApp() {
   const [sessionExerciseId, setSessionExerciseId] = useState<string | null>(null);
   const [historySessionId, setHistorySessionId] = useState<string | null>(null);
   const [dialogMutationBusy, setDialogMutationBusy] = useState(false);
+  const [dialogDirty, setDialogDirty] = useState(false);
+  const [confirmDirtyClose, setConfirmDirtyClose] = useState(false);
+  const [configRecoveryReturnsToVenue, setConfigRecoveryReturnsToVenue] = useState(false);
+  const [snapshotReadStatus, setSnapshotReadStatus] = useState<FitnessSnapshotReadStatus>("ready");
   const [elapsedNow, setElapsedNow] = useState(() => Date.now());
   const [firstRunDismissed, setFirstRunDismissed] = useState(false);
   const dialogWasOpen = useRef(false);
   const activeDialog = useRef<DialogState>(dialog);
   const dialogMutationBusyRef = useRef(false);
+  const dialogDirtyRef = useRef(false);
+  const dirtyReturnFocus = useRef<HTMLElement | null>(null);
+  const venueArchiveReturnFocus = useRef<HTMLButtonElement | null>(null);
   const scheduledStartChoiceRef = useRef<ScheduledStartChoice | null>(null);
   const scheduledStartMutationRef = useRef<symbol | null>(null);
   const scheduledStartSequence = useRef(0);
@@ -408,11 +443,51 @@ export default function FitnessApp() {
   }, []);
 
   const refresh = useCallback(async () => {
-    const next = await loadFitnessSnapshot();
-    setSnapshot(next);
-    setVenueId((current) => current && next.venues.some((venue) => venue.id === current && venue.status === "active")
-      ? current
-      : next.venues.find((venue) => venue.is_default && venue.status === "active")?.id ?? next.venues.find((venue) => venue.status === "active")?.id ?? null);
+    try {
+      const next = await loadFitnessSnapshot();
+      setSnapshot(next);
+      setVenueId((current) => current && next.venues.some((venue) => venue.id === current && venue.status === "active")
+        ? current
+        : next.venues.find((venue) => venue.is_default && venue.status === "active")?.id ?? next.venues.find((venue) => venue.status === "active")?.id ?? null);
+      setSnapshotReadStatus("ready");
+    } catch (reason) {
+      setSnapshotReadStatus("stale");
+      throw reason;
+    }
+  }, []);
+
+  const openConfigRecovery = useCallback(() => {
+    const fromVenueArchive = activeDialog.current === "venue-archive";
+    dialogDirtyRef.current = false;
+    setDialogDirty(false);
+    setConfirmDirtyClose(false);
+    setConfigRecoveryReturnsToVenue(fromVenueArchive);
+    if (fromVenueArchive) setArchivingVenue(null);
+    setDialog("config-recovery");
+  }, []);
+
+  const configWrites = useFitnessConfigWriteFlow({
+    refresh,
+    onToast: setToast,
+    onAttention: openConfigRecovery,
+  });
+
+  useEffect(() => {
+    if (!dialogDirty) return;
+    const rememberFocus = (event: FocusEvent) => {
+      const target = event.target;
+      if (target instanceof HTMLElement && target.matches(".sl-dialog .sl-form :is(input, select, textarea, button)")) {
+        dirtyReturnFocus.current = target;
+      }
+    };
+    document.addEventListener("focusin", rememberFocus, true);
+    return () => document.removeEventListener("focusin", rememberFocus, true);
+  }, [dialogDirty]);
+
+  const rememberDialogDirty = useCallback((next: boolean) => {
+    dialogDirtyRef.current = next;
+    setDialogDirty(next);
+    if (!next) setConfirmDirtyClose(false);
   }, []);
 
   const recheckStorage = useCallback(async () => {
@@ -514,6 +589,23 @@ export default function FitnessApp() {
 
   useEffect(() => subscribeFitnessChanges(() => { void refresh().catch(() => undefined); }), [refresh]);
   useEffect(() => {
+    let frame: number | null = null;
+    const refreshVisibleFacts = () => {
+      if (document.visibilityState !== "visible" || frame !== null) return;
+      frame = window.requestAnimationFrame(() => {
+        frame = null;
+        void refresh().catch(() => undefined);
+      });
+    };
+    window.addEventListener("focus", refreshVisibleFacts);
+    document.addEventListener("visibilitychange", refreshVisibleFacts);
+    return () => {
+      if (frame !== null) window.cancelAnimationFrame(frame);
+      window.removeEventListener("focus", refreshVisibleFacts);
+      document.removeEventListener("visibilitychange", refreshVisibleFacts);
+    };
+  }, [refresh]);
+  useEffect(() => {
     const timer = window.setTimeout(reloadFileJournal, 0);
     const onStorage = (event: StorageEvent) => {
       if (event.key === null || event.key.startsWith(FITNESS_FILE_OPERATION_PREFIX)) reloadFileJournal();
@@ -535,6 +627,15 @@ export default function FitnessApp() {
     const timer = window.setTimeout(() => setToast(""), 3200);
     return () => window.clearTimeout(timer);
   }, [toast]);
+  useEffect(() => {
+    if (!dialogDirty) return;
+    const protect = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", protect);
+    return () => window.removeEventListener("beforeunload", protect);
+  }, [dialogDirty]);
   useEffect(() => {
     const active = snapshot.sessions.some((session) => session.status === "active");
     if (!active) return;
@@ -589,18 +690,74 @@ export default function FitnessApp() {
   }, []);
 
   const closeDialog = useCallback(() => {
-    setDialog(null); setError(""); setEditingEquipment(null); setEditingVenue(null); setEditingConstraint(null);
+    setDialog(null); setError(""); setEditingProfile(null); setEditingEquipment(null); setEditingEquipmentExpected(null); setEditingVenue(null); setArchivingVenue(null); setEditingConstraint(null);
     setRescheduleEvent(null); setSessionExerciseId(null); setHistorySessionId(null);
     rememberScheduledStartChoice(null);
     showEquipmentPanel("details");
     rememberEquipmentPhotoTarget(null);
     setEquipmentPhotosBusy(false);
     setDialogBusy(false);
-  }, [rememberEquipmentPhotoTarget, rememberScheduledStartChoice, setDialogBusy, setEquipmentPhotosBusy, showEquipmentPanel]);
+    dirtyReturnFocus.current = null;
+    venueArchiveReturnFocus.current = null;
+    setConfigRecoveryReturnsToVenue(false);
+    rememberDialogDirty(false);
+  }, [rememberDialogDirty, rememberEquipmentPhotoTarget, rememberScheduledStartChoice, setDialogBusy, setEquipmentPhotosBusy, showEquipmentPanel]);
 
   const requestDialogClose = useCallback(() => {
-    if (!dialogMutationBusyRef.current) closeDialog();
+    if (dialogMutationBusyRef.current || configWrites.busy) return;
+    if (dialogDirtyRef.current) {
+      const active = document.activeElement;
+      if (active instanceof HTMLElement && active.matches(".sl-dialog .sl-form :is(input, select, textarea, button)")) {
+        dirtyReturnFocus.current = active;
+      }
+      setConfirmDirtyClose(true);
+      return;
+    }
+    closeDialog();
+  }, [closeDialog, configWrites.busy]);
+
+  const closeVenueArchiveDialog = useCallback(() => {
+    const target = venueArchiveReturnFocus.current;
+    venueArchiveReturnFocus.current = null;
+    closeDialog();
+    window.requestAnimationFrame(() => {
+      if (target?.isConnected) {
+        target.focus({ preventScroll: true });
+        return;
+      }
+      document.querySelector<HTMLButtonElement>(".sl-venue-tabs button[aria-pressed='true'], .sl-page-title .sl-primary")
+        ?.focus({ preventScroll: true });
+    });
   }, [closeDialog]);
+
+  const closeConfigRecoveryDialog = useCallback(() => {
+    if (configRecoveryReturnsToVenue) {
+      closeVenueArchiveDialog();
+      return;
+    }
+    requestDialogClose();
+  }, [closeVenueArchiveDialog, configRecoveryReturnsToVenue, requestDialogClose]);
+
+  const discardDirtyDialog = useCallback(() => {
+    dialogDirtyRef.current = false;
+    setDialogDirty(false);
+    setConfirmDirtyClose(false);
+    closeDialog();
+  }, [closeDialog]);
+
+  const keepEditingDialog = useCallback(() => {
+    setConfirmDirtyClose(false);
+    const target = dirtyReturnFocus.current;
+    dirtyReturnFocus.current = null;
+    window.requestAnimationFrame(() => {
+      if (target?.isConnected) {
+        target.focus({ preventScroll: true });
+        return;
+      }
+      document.querySelector<HTMLElement>(".sl-dialog .sl-form :is(input, select, textarea, button)")
+        ?.focus({ preventScroll: true });
+    });
+  }, []);
 
   const showEquipmentDetails = useCallback(() => {
     if (equipmentPhotoBusyRef.current) return;
@@ -619,8 +776,8 @@ export default function FitnessApp() {
       showEquipmentDetails();
       return;
     }
-    closeDialog();
-  }, [closeDialog, showEquipmentDetails]);
+    requestDialogClose();
+  }, [requestDialogClose, showEquipmentDetails]);
 
   const openFitnessFileRecovery = useCallback((entry?: FitnessFileOperationEntry) => {
     const equipmentId = entry?.ticket.receipt.expectedRow.entity_id ?? "unreadable-fitness-file-operation";
@@ -628,6 +785,7 @@ export default function FitnessApp() {
       ? snapshot.equipment.find((candidate) => candidate.id === equipmentId) ?? null
       : null;
     setEditingEquipment(null);
+    setEditingEquipmentExpected(null);
     rememberEquipmentPhotoTarget({
       id: equipmentId,
       name: knownEquipment?.name ?? (entry ? "已不在当前器材清单的记录" : "无法验证归属的附件提醒"),
@@ -660,6 +818,22 @@ export default function FitnessApp() {
       setBusy(false);
     }
   }, [refresh]);
+
+  const runConfigAction = useCallback(async (
+    prepare: () => Promise<FitnessConfigWriteReceipt>,
+    success: string,
+  ) => {
+    if (snapshotReadStatus !== "ready") {
+      setError("暂时没有读到最新资料；仍显示上次成功读取的内容。请先只重新读取，再决定是否修改。");
+      return;
+    }
+    setError("");
+    try {
+      await configWrites.start(prepare, success);
+    } catch (reason) {
+      setError(errorMessage(reason));
+    }
+  }, [configWrites, snapshotReadStatus]);
 
   const performFitnessStart = useCallback(async (
     event: FitnessCalendarEvent | null,
@@ -731,6 +905,7 @@ export default function FitnessApp() {
     if (scheduledStartMutationRef.current) return;
     if (!event) {
       if (!venue) {
+        setEditingVenue(null);
         setDialog("venue");
         return;
       }
@@ -758,18 +933,6 @@ export default function FitnessApp() {
     rememberScheduledStartChoice(choice);
     setDialog("venue-start-choice");
   }, [performFitnessStart, rememberScheduledStartChoice, snapshot.venues, venue]);
-
-  const finalizePersistedDialogWrite = useCallback(async (success: string, apply?: () => void) => {
-    apply?.();
-    try {
-      await refresh();
-      setToast(success);
-    } catch {
-      setError("更改已经保存在本地，但当前页面没有重新读取成功。请刷新页面，不要重复提交。");
-    } finally {
-      closeDialog();
-    }
-  }, [closeDialog, refresh]);
 
   const runDialogMutation = useCallback(async (
     expectedDialog: Exclude<DialogState, null>,
@@ -907,42 +1070,86 @@ export default function FitnessApp() {
 
     <section className="sl-workspace">
     {fileJournal.loaded && (fileJournal.entries.length > 0 || fileJournal.unreadable.length > 0 || (fileJournal.unavailable && (view === "venues" || view === "settings"))) && <section className="sl-global-file-recovery" role="status" aria-live="polite"><div><b>{fileJournal.unavailable ? "附件核对线索暂时无法安全读取" : fileJournal.entries.length > 0 ? `有 ${fileJournal.entries.length} 条照片操作待核对` : "有无法验证的照片操作提醒"}</b><p>{fileJournal.unavailable ? "新保存与移除保持停用；打开说明不会自动改动照片。" : `这些线索属于当前完整网址与浏览器资料。${fileJournal.unreadable.length > 0 ? `其中 ${fileJournal.unreadable.length} 条无法验证；` : ""}由你逐条打开后才会核对或选择下一步。`}</p></div>{fileJournal.unreadable.length > 0 || fileJournal.unavailable ? <button ref={globalFileRecoveryAction} type="button" onClick={() => openFitnessFileRecovery()}>查看安全说明</button> : <button ref={globalFileRecoveryAction} type="button" onClick={() => openFitnessFileRecovery(fileJournal.entries[0])}>打开下一条</button>}</section>}
+      <FitnessConfigWriteBanner controller={configWrites} onOpen={() => configWrites.open()} />
+      {snapshotReadStatus === "stale" && <section className="sl-config-snapshot-stale" role="status" aria-live="polite"><div><b>当前显示的是上次成功读取的资料</b><p>刚才没有读到最新状态，所以资料修改暂时停用。重新读取只会刷新页面事实，不会重复任何写入。</p></div><button type="button" disabled={configWrites.busy} onClick={() => void refresh().catch(() => undefined)}>只重新读取</button></section>}
       {view === "today" && <TodayView
         now={elapsedNow}
         snapshot={snapshot}
         venue={venue}
         startBusy={scheduledStartBusy}
         onView={navigateToFitnessView}
-        onAddVenue={() => setDialog("venue")}
+        onAddVenue={() => { setEditingVenue(null); setDialog("venue"); }}
         onStart={requestFitnessStart}
       />}
-      {view === "venues" && <VenuesView snapshot={snapshot} venue={venue} busy={busy} onSelect={setVenueId} onAdd={() => { setEditingVenue(null); setDialog("venue"); }} onEditVenue={(entry) => { setEditingVenue(entry); setDialog("venue"); }} onArchive={(entry) => { if (!window.confirm(`归档「${entry.name}」吗？它的未来计划会停用，尚未开始的安排会取消；历史记录会保留。`)) return; void run(async () => { await archiveVenue(entry.id); }, `「${entry.name}」已归档，历史仍保留`); }} onRestore={(entry) => void run(async () => { await restoreVenue(entry.id); }, `「${entry.name}」已恢复为可用场地；旧计划和已取消安排没有被复活`)} onAddEquipment={() => { rememberEquipmentPhotoTarget(null); showEquipmentPanel("details"); setDialog("equipment"); }} onEditEquipment={(entry) => { rememberEquipmentPhotoTarget(null); showEquipmentPanel("details"); setEditingEquipment(entry); setDialog("equipment"); }} onStatus={(entry, status) => void run(async () => { await setEquipmentStatus(entry.id, status); }, status === "maintenance" ? "已标记为临时停用，未来计划会避开它" : "器材状态已更新")} />}
-      {view === "plan" && <PlanView snapshot={snapshot} venue={venue} busy={busy} error={error} onProfile={() => setDialog("profile")} onVenue={() => setDialog("venue")} onEquipment={() => { rememberEquipmentPhotoTarget(null); showEquipmentPanel("details"); setDialog("equipment"); }} onGenerate={generateLocal} onAi={() => void generateAi()} onSchedule={(program) => void run(async () => { await scheduleProgramWeek(program.id); }, "这一周已放入日历；随时可以改期或不进行")} />}
+      {view === "venues" && <VenuesView snapshot={snapshot} venue={venue} busy={busy || configWrites.writeLocked} onSelect={setVenueId} onAdd={() => { setEditingVenue(null); setDialog("venue"); }} onEditVenue={(entry) => { setEditingVenue(entry); setDialog("venue"); }} onArchive={(entry, trigger) => { setArchivingVenue(entry); venueArchiveReturnFocus.current = trigger; setDialog("venue-archive"); }} onRestore={(entry) => void runConfigAction(() => prepareFitnessVenueRestore(entry), `「${entry.name}」已恢复为可用场地；旧计划和已取消安排没有被复活`)} onAddEquipment={() => { setEditingEquipment(null); setEditingEquipmentExpected(null); rememberEquipmentPhotoTarget(null); showEquipmentPanel("details"); setDialog("equipment"); }} onEditEquipment={(entry) => { setEditingEquipment(entry); setEditingEquipmentExpected(equipmentWriteSnapshot(snapshot, entry)); rememberEquipmentPhotoTarget(null); showEquipmentPanel("details"); setDialog("equipment"); }} onStatus={(entry, status) => void runConfigAction(() => prepareFitnessEquipmentStatus(entry, status), status === "maintenance" ? "已标记为临时停用，未来计划会避开它" : "器材状态已更新")} />}
+      {view === "plan" && <PlanView snapshot={snapshot} venue={venue} busy={busy} configWriteLocked={configWrites.writeLocked} error={error} onProfile={() => { setEditingProfile(snapshot.profile); setDialog("profile"); }} onVenue={() => { setEditingVenue(null); setDialog("venue"); }} onEquipment={() => { setEditingEquipment(null); setEditingEquipmentExpected(null); rememberEquipmentPhotoTarget(null); showEquipmentPanel("details"); setDialog("equipment"); }} onGenerate={generateLocal} onAi={() => void generateAi()} onSchedule={(program) => void run(async () => { await scheduleProgramWeek(program.id); }, "这一周已放入日历；随时可以改期或不进行")} />}
       {view === "calendar" && <CalendarView snapshot={snapshot} startBusy={scheduledStartBusy} onPlan={() => navigateToFitnessView("plan")} onStart={requestFitnessStart} onReschedule={(event) => { setRescheduleEvent(event); setDialog("reschedule"); }} onSkip={(event) => { if (window.confirm("只记录“这次未进行”，不会把它变成欠账，也不会自动堆到明天。继续吗？")) void run(async () => { await markCalendarEventNotPerformed(event.id); }, "已记为这次未进行，其他安排没有改变"); }} />}
       {view === "history" && <HistoryView snapshot={snapshot} onOpen={(sessionId) => { setHistorySessionId(sessionId); setDialog("history-detail"); }} onStart={() => requestFitnessStart(null)} />}
       {view === "exercises" && <ExercisesView equipment={venueEquipment} equipmentLoads={snapshot.equipmentLoads} venue={venue} />}
-      {view === "profile" && <ProfileView snapshot={snapshot} busy={busy} onProfile={() => setDialog("profile")} onConstraint={(entry) => { setEditingConstraint(entry); setDialog("constraint"); }} onToggleConstraint={(entry) => void run(async () => { await setFitnessConstraintActive(entry.id, !entry.active); }, entry.active ? "这条身体边界已暂时结束；记录仍保留" : "这条身体边界已重新启用；它只影响未来草稿和现场选项，不改写历史")} />}
+      {view === "profile" && <ProfileView snapshot={snapshot} busy={busy || configWrites.writeLocked} onProfile={() => { setEditingProfile(snapshot.profile); setDialog("profile"); }} onConstraint={(entry) => { setEditingConstraint(entry); setDialog("constraint"); }} onToggleConstraint={(entry) => void runConfigAction(() => prepareFitnessConstraintActive(entry, !entry.active), entry.active ? "这条身体边界已暂时结束；记录仍保留" : "这条身体边界已重新启用；它只影响未来草稿和现场选项，不改写历史")} />}
       {view === "settings" && <SettingsView snapshot={snapshot} storage={storage} storageReadStatus={storageReadStatus} storageBusy={storageActionBusy} storageActionMessage={storageActionMessage} currentOrigin={currentOrigin} onPersist={requestStorageProtection} onRecheck={recheckStorage} onChange={(settings) => void run(async () => { await saveFitnessSettings(settings); }, "设置已保存在当前完整网址与浏览器资料对应的本地空间")} onRestored={refresh} />}
     </section>
 
-    {!snapshot.venues.length && !firstRunDismissed && <FirstRun onStart={() => { setFirstRunDismissed(true); setDialog("venue"); }} onExercises={() => { setFirstRunDismissed(true); navigateToFitnessView("exercises"); }} />}
+    {!snapshot.venues.length && !firstRunDismissed && <FirstRun onStart={() => { setFirstRunDismissed(true); setEditingVenue(null); setDialog("venue"); }} onExercises={() => { setFirstRunDismissed(true); navigateToFitnessView("exercises"); }} />}
 
-    <FitnessDialog open={dialog === "venue"} eyebrow="REAL PLACE FIRST" title={editingVenue ? "编辑场地" : "建立训练场地"} busy={dialogMutationBusy} onClose={requestDialogClose}><VenueForm venue={editingVenue} onBusyChange={setDialogBusy} onClose={requestDialogClose} onSave={async (input: SaveVenueInput) => { const id = await saveVenue(input); await finalizePersistedDialogWrite("场地已保存。接下来可以从眼前看得到的器材开始录入", () => setVenueId(id)); }} /></FitnessDialog>
+    <FitnessDialog open={dialog === "venue"} eyebrow="REAL PLACE FIRST" title={editingVenue ? "编辑场地" : "建立训练场地"} busy={dialogMutationBusy || configWrites.busy} confirmClose={confirmDirtyClose} onKeepEditing={keepEditingDialog} onDiscard={discardDirtyDialog} onClose={requestDialogClose}><VenueForm venue={editingVenue} writeBlocked={configWrites.writeLocked || snapshotReadStatus !== "ready"} onBusyChange={setDialogBusy} onDirtyChange={rememberDialogDirty} onClose={requestDialogClose} onSave={async (input: SaveVenueInput) => {
+      if (snapshotReadStatus !== "ready") throw new Error("暂时没有读到最新资料；请先只重新读取，再决定是否保存。");
+      const draft = { ...input };
+      delete draft.id;
+      let savedVenueId: string | null = null;
+      const result = await configWrites.start(async () => {
+        const receipt = await prepareFitnessVenueSave(draft, editingVenue);
+        savedVenueId = receipt.after.id;
+        return receipt;
+      }, "场地已保存。接下来可以从眼前看得到的器材开始录入");
+      if (result === "fresh") {
+        if (savedVenueId) setVenueId(savedVenueId);
+        closeDialog();
+      }
+    }} /></FitnessDialog>
     <FitnessDialog
       open={dialog === "equipment"}
       eyebrow={equipmentPanel === "photos" ? "LOCAL EQUIPMENT REFERENCE" : "WHAT IS ACTUALLY HERE"}
       title={equipmentPanel === "photos" && equipmentPhotoTarget ? `${equipmentPhotoTarget.name}的照片` : editingEquipment ? "编辑器材" : "录入器材"}
       busy={dialogMutationBusy || equipmentPhotoBusy}
+      confirmClose={confirmDirtyClose}
+      onKeepEditing={keepEditingDialog}
+      onDiscard={discardDirtyDialog}
       onClose={requestEquipmentDialogClose}
       wide
     >
       {!equipmentPhotoTarget?.recoveryOnly && (venue
-        ? <div hidden={equipmentPanel !== "details"}><EquipmentForm venueId={venue.id} equipment={editingEquipment} loads={snapshot.equipmentLoads.filter((entry) => entry.equipment_id === editingEquipment?.id)} unit={snapshot.profile?.unit ?? snapshot.settings.unit} onBusyChange={setDialogBusy} onClose={requestEquipmentDialogClose} onSave={async (input: SaveEquipmentInput) => { await saveEquipmentWithLoads(input); await finalizePersistedDialogWrite("器材与真实重量档位已保存"); }} />{editingEquipment && <div className="sl-equipment-photo-entry"><span><b>器材照片</b><small>{snapshot.files.filter((file) => file.entity_type === "equipment" && file.entity_id === editingEquipment.id).length} 条照片记录 · 打开后核对本地原件</small></span><button ref={equipmentPhotoOpener} type="button" disabled={dialogMutationBusy} onClick={() => { rememberEquipmentPhotoTarget({ id: editingEquipment.id, name: editingEquipment.name, recoveryOnly: false }); showEquipmentPanel("photos"); }}>查看与添加</button></div>}</div>
+        ? <div hidden={equipmentPanel !== "details"}><EquipmentForm venueId={venue.id} equipment={editingEquipment} loads={editingEquipmentExpected?.loads ?? []} unit={snapshot.profile?.unit ?? snapshot.settings.unit} writeBlocked={configWrites.writeLocked || snapshotReadStatus !== "ready"} onBusyChange={setDialogBusy} onDirtyChange={rememberDialogDirty} onClose={requestEquipmentDialogClose} onSave={async (input: SaveEquipmentInput) => {
+          if (snapshotReadStatus !== "ready") throw new Error("暂时没有读到最新资料；请先只重新读取，再决定是否保存。");
+          const draft = { ...input };
+          delete draft.id;
+          const result = await configWrites.start(() => prepareFitnessEquipmentSave(draft, editingEquipmentExpected), "器材与真实重量档位已保存");
+          if (result === "fresh") closeDialog();
+        }} />{editingEquipment && <div className="sl-equipment-photo-entry"><span><b>器材照片</b><small>{snapshot.files.filter((file) => file.entity_type === "equipment" && file.entity_id === editingEquipment.id).length} 条照片记录 · 打开后核对本地原件</small></span><button ref={equipmentPhotoOpener} type="button" disabled={dialogMutationBusy || configWrites.busy} onClick={() => { rememberEquipmentPhotoTarget({ id: editingEquipment.id, name: editingEquipment.name, recoveryOnly: false }); showEquipmentPanel("photos"); }}>查看与添加</button></div>}</div>
         : <DialogNeed copy="先建立或选择一个场地，器材才有明确归属。" action={() => { closeDialog(); setDialog("venue"); }} label="建立场地" />)}
       {equipmentPanel === "photos" && equipmentPhotoTarget && <EquipmentPhotos equipment={equipmentPhotoTarget} currentOrigin={currentOrigin} recoveryOnly={equipmentPhotoTarget.recoveryOnly} onBusyChange={setEquipmentPhotosBusy} onJournalChange={rememberFileJournal} onChanged={refresh} onBack={showEquipmentDetails}/>}
     </FitnessDialog>
-    <FitnessDialog open={dialog === "profile"} eyebrow="YOUR TIME & PREFERENCES" title="训练偏好" busy={dialogMutationBusy} onClose={requestDialogClose} wide><ProfileForm profile={snapshot.profile} onBusyChange={setDialogBusy} onClose={requestDialogClose} onSave={async (input: SaveFitnessProfileInput) => { await saveFitnessProfile(input); await finalizePersistedDialogWrite("偏好已保存；它是规划输入，不是必须完成的配额"); }} /></FitnessDialog>
-    <FitnessDialog open={dialog === "constraint"} eyebrow="BODY BOUNDARIES" title={editingConstraint ? "编辑身体边界" : "记录身体边界"} busy={dialogMutationBusy} onClose={requestDialogClose} wide><ConstraintForm constraint={editingConstraint} onBusyChange={setDialogBusy} onClose={requestDialogClose} onSave={async (input: SaveConstraintInput) => { await saveConstraint(input); await finalizePersistedDialogWrite(!input.active ? "内容已保存；这条边界仍是已结束状态" : input.severity === "avoid" ? "身体边界已保存；未来草稿与现场选项会避开指定范围，历史不会被改写" : "身体边界已保存；现场会显示原文提醒，不会自动推断调整方式"); }} /></FitnessDialog>
+    <FitnessDialog open={dialog === "profile"} eyebrow="YOUR TIME & PREFERENCES" title="训练偏好" busy={dialogMutationBusy || configWrites.busy} confirmClose={confirmDirtyClose} onKeepEditing={keepEditingDialog} onDiscard={discardDirtyDialog} onClose={requestDialogClose} wide><ProfileForm profile={editingProfile} writeBlocked={configWrites.writeLocked || snapshotReadStatus !== "ready"} onBusyChange={setDialogBusy} onDirtyChange={rememberDialogDirty} onClose={requestDialogClose} onSave={async (input: SaveFitnessProfileInput) => {
+      if (snapshotReadStatus !== "ready") throw new Error("暂时没有读到最新资料；请先只重新读取，再决定是否保存。");
+      const result = await configWrites.start(() => prepareFitnessProfileSave(input, editingProfile), "偏好已保存；它是规划输入，不是必须完成的配额");
+      if (result === "fresh") closeDialog();
+    }} /></FitnessDialog>
+    <FitnessDialog open={dialog === "constraint"} eyebrow="BODY BOUNDARIES" title={editingConstraint ? "编辑身体边界" : "记录身体边界"} busy={dialogMutationBusy || configWrites.busy} confirmClose={confirmDirtyClose} onKeepEditing={keepEditingDialog} onDiscard={discardDirtyDialog} onClose={requestDialogClose} wide><ConstraintForm constraint={editingConstraint} writeBlocked={configWrites.writeLocked || snapshotReadStatus !== "ready"} onBusyChange={setDialogBusy} onDirtyChange={rememberDialogDirty} onClose={requestDialogClose} onSave={async (input: SaveConstraintInput) => {
+      if (snapshotReadStatus !== "ready") throw new Error("暂时没有读到最新资料；请先只重新读取，再决定是否保存。");
+      const draft = { ...input };
+      delete draft.id;
+      const result = await configWrites.start(() => prepareFitnessConstraintSave(draft, editingConstraint), !input.active ? "内容已保存；这条边界仍是已结束状态" : input.severity === "avoid" ? "身体边界已保存；未来草稿与现场选项会避开指定范围，历史不会被改写" : "身体边界已保存；现场会显示原文提醒，不会自动推断调整方式");
+      if (result === "fresh") closeDialog();
+    }} /></FitnessDialog>
+    <FitnessDialog open={dialog === "venue-archive"} eyebrow="KEEP HISTORY, CHANGE AVAILABILITY" title="确认归档场地" busy={configWrites.busy} initialFocus="[data-archive-keep]" onClose={closeVenueArchiveDialog}>
+      {archivingVenue && <section className="sl-config-confirm"><p>归档「{archivingVenue.name}」会停用它关联的启用中或草稿计划，并取消尚未开始的日历安排。训练历史、器材和已经发生的记录都会保留。</p>{configWrites.writeLocked && <p className="sl-form-hint" role="status">资料核对线索处理完成前不能归档。</p>}<footer><button type="button" data-archive-keep onClick={closeVenueArchiveDialog}>继续保留场地</button><button className="sl-danger-action" type="button" disabled={configWrites.writeLocked} onClick={() => {
+        void (async () => {
+          const result = await configWrites.start(() => prepareFitnessVenueArchive(archivingVenue), `「${archivingVenue.name}」已归档，历史仍保留`);
+          if (result === "fresh") closeVenueArchiveDialog();
+        })().catch((reason) => setError(errorMessage(reason)));
+      }}>确认归档</button></footer></section>}
+    </FitnessDialog>
+    <FitnessDialog open={dialog === "config-recovery"} eyebrow="SAFE WRITE RECEIPT" title="核对资料写入" busy={configWrites.busy} onClose={closeConfigRecoveryDialog} wide><FitnessConfigWriteRecovery controller={configWrites} /></FitnessDialog>
     <FitnessDialog open={dialog === "plan-preview"} eyebrow="LOCAL · VERIFIED" title="可执行计划草稿" busy={dialogMutationBusy} onClose={requestDialogClose} wide>{planDraft && <PlanDraftPreview draft={planDraft} snapshot={snapshot} busy={busy} onSave={() => void saveAndSchedulePlanDraft()} />}</FitnessDialog>
     <FitnessDialog open={dialog === "ai-preview"} eyebrow="AI DRAFT · NOT SAVED" title="AI 计划草稿" onClose={closeDialog} wide>{aiDraft && <AiDraftPreview draft={aiDraft} busy={busy} onApply={() => { try { const local = aiDraftToLocal(aiDraft, snapshot, venue!); const validation = validateFitnessPlanDraft(local, plannerContext(snapshot, venue!, venueEquipment)); if (!validation.valid) throw new Error(validation.errors[0] ?? "AI 草稿没有通过本地校验"); setPlanDraft(local); setDialog("plan-preview"); } catch (reason) { setError(errorMessage(reason)); } }} />}</FitnessDialog>
     <FitnessDialog open={dialog === "venue-start-choice"} eyebrow="START WHERE YOU ACTUALLY ARE" title="先确认这次从哪里开始" busy={scheduledStartBusy} onClose={requestScheduledStartChoiceClose}>
@@ -1030,7 +1237,7 @@ function VenuesView({ snapshot, venue, busy, onSelect, onAdd, onEditVenue, onArc
   onSelect: (id: string) => void;
   onAdd: () => void;
   onEditVenue: (venue: FitnessVenue) => void;
-  onArchive: (venue: FitnessVenue) => void;
+  onArchive: (venue: FitnessVenue, trigger: HTMLButtonElement) => void;
   onRestore: (venue: FitnessVenue) => void;
   onAddEquipment: () => void;
   onEditEquipment: (equipment: FitnessEquipment) => void;
@@ -1043,7 +1250,7 @@ function VenuesView({ snapshot, venue, busy, onSelect, onAdd, onEditVenue, onArc
     <header className="sl-page-title"><div><span>REAL EQUIPMENT, REAL LOADS</span><h1>场地与器材</h1><p>只录真实存在的器材；重量不确定时可以先留空。</p></div><button className="sl-primary" onClick={onAdd}>＋ 新建场地</button></header>
     <div className="sl-venue-tabs" role="group" aria-label="选择训练场地">{activeVenues.map((entry) => <button aria-pressed={venue?.id === entry.id} className={venue?.id === entry.id ? "active" : ""} key={entry.id} onClick={() => onSelect(entry.id)}><i>{entry.name.slice(0, 1)}</i><span><strong>{entry.name}</strong><small>{entry.venue_type === "home" ? "家中" : entry.venue_type === "office" ? "公司" : "训练场地"}</small></span></button>)}</div>
     {venue ? <>
-      <section className="sl-venue-overview"><div><span>当前场地</span><h2>{venue.name}</h2><p>{venue.location || "位置没有记录"}</p></div><dl><div><dt>通常时长</dt><dd>{venue.default_session_minutes} 分钟</dd></div><div><dt>上次核对</dt><dd>{venue.last_verified_at ? formatDate(venue.last_verified_at) : "待核对"}</dd></div><div><dt>跨器材组合</dt><dd>{venue.supersets_allowed ? "可以" : "尽量避免"}</dd></div></dl><footer><button onClick={() => onEditVenue(venue)}>编辑场地</button><button disabled={busy} onClick={() => onArchive(venue)}>归档</button></footer></section>
+      <section className="sl-venue-overview"><div><span>当前场地</span><h2>{venue.name}</h2><p>{venue.location || "位置没有记录"}</p></div><dl><div><dt>通常时长</dt><dd>{venue.default_session_minutes} 分钟</dd></div><div><dt>上次核对</dt><dd>{venue.last_verified_at ? formatDate(venue.last_verified_at) : "待核对"}</dd></div><div><dt>跨器材组合</dt><dd>{venue.supersets_allowed ? "可以" : "尽量避免"}</dd></div></dl><footer><button onClick={() => onEditVenue(venue)}>编辑场地</button><button disabled={busy} onClick={(event) => onArchive(venue, event.currentTarget)}>归档</button></footer></section>
       <section className="sl-equipment-head"><div><span>器材清单</span><p>{equipment.length ? `${equipment.length} 条真实记录，不用一次补完。` : "从眼前看得到的开始，不必一次录完。"}</p></div><button className="sl-primary" onClick={onAddEquipment}>＋ 录入器材</button></section>
       {equipment.length ? <div className="sl-equipment-grid">{equipment.map((entry) => <article key={entry.id} className={entry.status}><header><i>{EQUIPMENT_KIND_LABELS[entry.kind].slice(0, 1)}</i><span><small>{EQUIPMENT_KIND_LABELS[entry.kind]} · {entry.area || "区域待记录"}</small><h3>{entry.name}</h3></span><button aria-label={`编辑${entry.name}`} onClick={() => onEditEquipment(entry)}>•••</button></header><div className="sl-load-summary"><strong>{equipmentSummary(entry, snapshot.equipmentLoads, snapshot.profile?.unit ?? snapshot.settings.unit)}</strong><span>{entry.quantity} 件 · {entry.load_semantics === "per_hand" ? "每只手" : entry.load_semantics === "per_side" ? "每侧" : entry.load_semantics === "stack_label" ? "面板档位" : "总负荷"}</span></div><p>{entry.notes || "还没有个人设置备注。"}</p><footer><span className={`sl-status ${entry.status}`}>{entry.status === "available" ? "已确认可用" : entry.status === "limited" ? "部分可用" : "临时停用"}</span>{entry.status === "maintenance" ? <button onClick={() => onStatus(entry, "available")}>恢复可用</button> : <button onClick={() => onStatus(entry, "maintenance")}>临时停用</button>}</footer></article>)}</div> : <div className="sl-empty-card"><i>场</i><h3>这里还没有器材记录</h3><p>先保存名称也可以；重量档位以后在现场慢慢补。</p><button className="sl-primary" onClick={onAddEquipment}>录入第一件器材</button></div>}
     </> : <div className="sl-empty-card"><i>＋</i><h3>{archivedVenues.length ? "当前没有可用场地" : "先建立一个训练场地"}</h3><p>{archivedVenues.length ? "可以建立新的场地，也可以从下方恢复一条旧记录。" : "每个场地都有独立器材清单，计划不会把不同健身房混在一起。"}</p><button className="sl-primary" onClick={onAdd}>建立场地</button></div>}
@@ -1065,7 +1272,7 @@ function calendarEventHasBoundaryConflict(event: FitnessCalendarEvent, snapshot:
     item.program_day_id === event.program_day_id && exerciseMatchesActiveAvoid(item.exercise_id, snapshot.constraints));
 }
 
-function PlanView({ snapshot, venue, busy, error, onProfile, onVenue, onEquipment, onGenerate, onAi, onSchedule }: { snapshot: FitnessSnapshot; venue: FitnessVenue | null; busy: boolean; error: string; onProfile: () => void; onVenue: () => void; onEquipment: () => void; onGenerate: () => void; onAi: () => void; onSchedule: (program: FitnessSnapshot["programs"][number]) => void }) {
+function PlanView({ snapshot, venue, busy, configWriteLocked, error, onProfile, onVenue, onEquipment, onGenerate, onAi, onSchedule }: { snapshot: FitnessSnapshot; venue: FitnessVenue | null; busy: boolean; configWriteLocked: boolean; error: string; onProfile: () => void; onVenue: () => void; onEquipment: () => void; onGenerate: () => void; onAi: () => void; onSchedule: (program: FitnessSnapshot["programs"][number]) => void }) {
   const active = snapshot.programs.find((entry) => entry.status === "active") ?? null;
   const days = active ? snapshot.programDays.filter((entry) => entry.program_id === active.id) : [];
   const activeDayIds = new Set(days.map((day) => day.id));
@@ -1076,7 +1283,7 @@ function PlanView({ snapshot, venue, busy, error, onProfile, onVenue, onEquipmen
   const hasBoundaryConflict = conflictNames.length > 0;
   const ready = Boolean(snapshot.profile && venue && snapshot.equipment.some((entry) => entry.venue_id === venue.id && (entry.status === "available" || entry.status === "limited")));
   return <div className="sl-page"><header className="sl-page-title"><div><span>AN EXECUTABLE WEEK</span><h1>周蓝图</h1><p>计划是可协商的版本，不是必须偿还的训练清单。</p></div>{ready && <div className="sl-title-actions"><button disabled={busy || !snapshot.settings.ai_enabled} onClick={onAi}>AI 草稿</button><button className="sl-primary" disabled={busy} onClick={onGenerate}>生成本地计划</button></div>}</header>
-    {!ready && <section className="sl-prerequisites"><header><span>让计划先认识现实</span><h2>还需要几项真实输入</h2></header><div><button className={snapshot.profile ? "done" : ""} onClick={onProfile}><i>{snapshot.profile ? "✓" : "1"}</i><span><b>训练偏好</b><small>{snapshot.profile ? `${snapshot.profile.resistance_days_per_week} 次力量 · ${snapshot.profile.cardio_days_per_week} 次有氧` : "频次、时间、经验与目标"}</small></span></button><button className={venue ? "done" : ""} onClick={onVenue}><i>{venue ? "✓" : "2"}</i><span><b>训练场地</b><small>{venue?.name ?? "你实际在哪里练"}</small></span></button><button className={venue && snapshot.equipment.some((entry) => entry.venue_id === venue.id) ? "done" : ""} onClick={onEquipment}><i>{venue && snapshot.equipment.some((entry) => entry.venue_id === venue.id) ? "✓" : "3"}</i><span><b>真实器材</b><small>{venue ? `${snapshot.equipment.filter((entry) => entry.venue_id === venue.id).length} 条记录` : "器材与重量档位"}</small></span></button></div></section>}
+    {!ready && <section className="sl-prerequisites"><header><span>让计划先认识现实</span><h2>还需要几项真实输入</h2></header><div><button disabled={configWriteLocked} className={snapshot.profile ? "done" : ""} onClick={onProfile}><i>{snapshot.profile ? "✓" : "1"}</i><span><b>训练偏好</b><small>{snapshot.profile ? `${snapshot.profile.resistance_days_per_week} 次力量 · ${snapshot.profile.cardio_days_per_week} 次有氧` : "频次、时间、经验与目标"}</small></span></button><button disabled={configWriteLocked} className={venue ? "done" : ""} onClick={onVenue}><i>{venue ? "✓" : "2"}</i><span><b>训练场地</b><small>{venue?.name ?? "你实际在哪里练"}</small></span></button><button disabled={configWriteLocked} className={venue && snapshot.equipment.some((entry) => entry.venue_id === venue.id) ? "done" : ""} onClick={onEquipment}><i>{venue && snapshot.equipment.some((entry) => entry.venue_id === venue.id) ? "✓" : "3"}</i><span><b>真实器材</b><small>{venue ? `${snapshot.equipment.filter((entry) => entry.venue_id === venue.id).length} 条记录` : "器材与重量档位"}</small></span></button></div></section>}
     {error && <p className="sl-inline-error" role="alert">{error}</p>}
     {ready && <p className="sl-ai-privacy"><b>AI 输入边界</b>只发送器材类型、数量、状态、明确重量、训练频次与能力数字。场地名、器材备注、偏好备注和身体边界文字都留在本地；避用动作会先由本地规则移出动作池。</p>}
     {active ? <><section className={`sl-program-summary${hasBoundaryConflict ? " conflict" : ""}`}><div><span>ACTIVE VERSION · V{active.version}</span><h2>{active.name}</h2><p>{goalLabels[active.goal]} · {active.split === "full_body" ? "全身" : active.split === "upper_lower" ? "上下肢" : active.split === "push_pull_legs" ? "推拉腿" : "自适应分化"} · {snapshot.venues.find((entry) => entry.id === active.venue_id)?.name}</p></div><aside><span>{hasBoundaryConflict ? "身体边界已更新" : "生成依据"}</span><p>{hasBoundaryConflict ? `这版包含现在避用的动作：${conflictNames.join("、")}` : active.assumptions[0] || "来自当前场地、时间与身体边界。"}</p></aside><button disabled={busy || hasBoundaryConflict} onClick={() => onSchedule(active)}>{hasBoundaryConflict ? "先生成适用版本" : "放入接下来一周"}</button></section>{hasBoundaryConflict && <p className="sl-plan-conflict" role="status">旧版会原样保留作参考，也不会计作失败；重新生成后才会允许排期。</p>}<div className="sl-program-days">{days.map((day) => <ProgramDayCard key={day.id} day={day} items={snapshot.programItems.filter((item) => item.program_day_id === day.id)} equipment={snapshot.equipment} unit={snapshot.profile?.unit ?? snapshot.settings.unit} conflictingExerciseIds={conflictingExerciseIds} />)}</div></> : ready && <div className="sl-empty-card"><i>划</i><h3>还没有启用的计划</h3><p>本地规则可以离线生成；AI 只生成待核对草稿，最终仍要通过同一器材校验。</p><div><button className="sl-primary" onClick={onGenerate}>用本地规则生成</button><button disabled={!snapshot.settings.ai_enabled} onClick={onAi}>让 AI 提一个草稿</button></div></div>}
