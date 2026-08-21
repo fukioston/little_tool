@@ -166,5 +166,10 @@ test("legacy uncertainty is disclosed without deleting or accusing", () => {
   assert.match(source, /legacyResolution === CAREER_LEGACY_DEMO_REVIEW_NEEDED/);
   assert.match(source, /旧版可能含示例内容，未自动删除以保护你的编辑/);
   assert.match(source, /不会替你判断哪些记录属于你，也不会自行清理/);
+  const contentStart = source.indexOf('<div className="career-content">');
+  const viewStart = source.indexOf('{view === "today"', contentStart);
+  const globalNotice = source.indexOf('legacyReviewNeeded && <div className="career-legacy-review-note"', contentStart);
+  assert.ok(contentStart >= 0 && globalNotice > contentStart && globalNotice < viewStart,
+    "legacy uncertainty must be visible before every Career view, not buried in Settings");
   assert.doesNotMatch(source, /一键删除示例|确认这些是假数据/);
 });
