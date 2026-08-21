@@ -43,9 +43,15 @@ async function withFallbackLock<Result>(operation: () => Promise<Result>) {
 function withFitnessLock<Result>(
   mode: "shared" | "exclusive",
   operation: () => Promise<Result>,
+  options: Readonly<{ requireSupport?: boolean }> = {},
 ): Promise<Result> {
   const locks = browserLockManager();
-  if (!locks) return withFallbackLock(operation);
+  if (!locks) {
+    if (options.requireSupport) {
+      throw new Error("当前浏览器不支持安全的跨标签页写入锁，请使用最新版 Chrome、Edge 或 Safari。");
+    }
+    return withFallbackLock(operation);
+  }
   return locks.request(FITNESS_LOCK_NAME, { mode }, operation);
 }
 
@@ -75,8 +81,9 @@ export function withFitnessReadLock<Result>(
 
 export function withFitnessWriteLock<Result>(
   operation: () => Promise<Result>,
+  options: Readonly<{ requireSupport?: boolean }> = {},
 ): Promise<Result> {
-  return withFitnessLock("exclusive", operation);
+  return withFitnessLock("exclusive", operation, options);
 }
 
 export function requireFitnessWebLocks(): void {

@@ -79,6 +79,28 @@ const MOVEMENT_PATTERNS = new Set([
   "isolation",
   "cardio",
 ]);
+const FITNESS_EQUIPMENT_KINDS = new Set([
+  "barbell",
+  "plates",
+  "rack",
+  "bench",
+  "dumbbell",
+  "kettlebell",
+  "cable",
+  "fixed_machine",
+  "smith_machine",
+  "pullup_bar",
+  "dip_station",
+  "bands",
+  "mat",
+  "treadmill",
+  "bike",
+  "rower",
+  "elliptical",
+  "stair_climber",
+  "open_space",
+  "other",
+]);
 
 type Row = Record<string, unknown>;
 
@@ -446,7 +468,11 @@ export async function loadFitnessSnapshot(): Promise<FitnessSnapshot> {
 async function write<Result>(reason: string, operation: () => Promise<Result>) {
   return withFitnessWriteLock(async () => {
     const result = await operation();
-    broadcastFitnessChange(reason);
+    try {
+      broadcastFitnessChange(reason);
+    } catch {
+      // Cross-view refresh is advisory; it cannot reverse a durable commit.
+    }
     return result;
   });
 }
@@ -733,6 +759,2049 @@ export async function setFitnessConstraintActive(
     }]);
   });
 }
+
+type FitnessConfigTransition = Readonly<{
+  id: string;
+  status: string;
+  updated_at: number;
+}>;
+
+export type FitnessEquipmentWriteSnapshot = Readonly<{
+  equipment: FitnessEquipment;
+  loads: readonly FitnessEquipmentLoad[];
+}>;
+
+type FitnessConfigReceiptBase<Kind extends string> = Readonly<{
+  purpose: "fitness-config-write";
+  version: 1;
+  operationId: string;
+  generationId: string;
+  generationSequence: number;
+  kind: Kind;
+  projectionSha256: string;
+}>;
+
+export type FitnessProfileSaveReceipt = FitnessConfigReceiptBase<"profile-save"> & Readonly<{
+  before: FitnessProfile | null;
+  after: FitnessProfile;
+}>;
+
+export type FitnessVenueSaveReceipt = FitnessConfigReceiptBase<"venue-save"> & Readonly<{
+  before: FitnessVenue | null;
+  after: FitnessVenue;
+  defaultResets: readonly Readonly<{ before: FitnessVenue; after: FitnessVenue }>[];
+}>;
+
+export type FitnessVenueArchiveReceipt = FitnessConfigReceiptBase<"venue-archive"> & Readonly<{
+  before: FitnessVenue;
+  after: FitnessVenue;
+  programs: readonly Readonly<{
+    before: FitnessConfigTransition;
+    after: FitnessConfigTransition;
+  }>[];
+  events: readonly Readonly<{
+    before: FitnessConfigTransition;
+    after: FitnessConfigTransition;
+  }>[];
+}>;
+
+export type FitnessVenueRestoreReceipt = FitnessConfigReceiptBase<"venue-restore"> & Readonly<{
+  before: FitnessVenue;
+  after: FitnessVenue;
+}>;
+
+export type FitnessEquipmentSaveReceipt = FitnessConfigReceiptBase<"equipment-save"> & Readonly<{
+  before: FitnessEquipmentWriteSnapshot | null;
+  after: FitnessEquipmentWriteSnapshot;
+  venue: Readonly<{ id: string; status: "active"; updated_at: number }>;
+}>;
+
+export type FitnessEquipmentStatusReceipt = FitnessConfigReceiptBase<"equipment-status"> & Readonly<{
+  before: FitnessEquipment;
+  after: FitnessEquipment;
+}>;
+
+export type FitnessConstraintSaveReceipt = FitnessConfigReceiptBase<"constraint-save"> & Readonly<{
+  before: FitnessConstraint | null;
+  after: FitnessConstraint;
+}>;
+
+export type FitnessConstraintActiveReceipt = FitnessConfigReceiptBase<"constraint-active"> & Readonly<{
+  before: FitnessConstraint;
+  after: FitnessConstraint;
+}>;
+
+export type FitnessConfigWriteReceipt =
+  | FitnessProfileSaveReceipt
+  | FitnessVenueSaveReceipt
+  | FitnessVenueArchiveReceipt
+  | FitnessVenueRestoreReceipt
+  | FitnessEquipmentSaveReceipt
+  | FitnessEquipmentStatusReceipt
+  | FitnessConstraintSaveReceipt
+  | FitnessConstraintActiveReceipt;
+
+export type FitnessConfigWriteInspection =
+  | "exact_saved"
+  | "expected"
+  | "changed"
+  | "still_unknown"
+  | "invalid_receipt";
+
+export type FitnessConfigWriteResult =
+  | Readonly<{
+      outcome: "saved" | "already_saved";
+      receipt: FitnessConfigWriteReceipt;
+      entityId: string;
+      updatedAt: number;
+    }>
+  | Readonly<{
+      outcome: "changed";
+      receipt: FitnessConfigWriteReceipt;
+      entityId: string;
+      retryable: false;
+    }>
+  | Readonly<{
+      outcome: "outcome_uncertain";
+      receipt: FitnessConfigWriteReceipt;
+      entityId: string;
+      retryable: true;
+    }>;
+
+export type FitnessConfigMutationErrorCode =
+  | "invalid_input"
+  | "invalid_receipt"
+  | "conflict"
+  | "changed"
+  | "inspect_failed"
+  | "write_failed";
+
+export class FitnessConfigMutationError extends Error {
+  readonly name = "FitnessConfigMutationError";
+
+  constructor(
+    readonly code: FitnessConfigMutationErrorCode,
+    message: string,
+    readonly receipt?: FitnessConfigWriteReceipt,
+  ) {
+    super(message);
+  }
+}
+
+type FitnessConfigQueryResult<Result extends object> = Readonly<{
+  rows: readonly Result[];
+}>;
+
+export type FitnessConfigStorageRuntime = Readonly<{
+  withExclusiveLock<Result>(operation: () => Promise<Result>): Promise<Result>;
+  query<Result extends object>(
+    sql: string,
+    params?: SqlParams,
+  ): Promise<FitnessConfigQueryResult<Result>>;
+  batch(statements: readonly SqlStatement[]): Promise<Readonly<{ changes: number }>>;
+  currentGeneration(): Promise<Readonly<{ generationId: string; sequence: number }>>;
+  now(): number;
+  randomUUID(): string;
+  broadcast(reason: string): void;
+}>;
+
+export type SaveFitnessEquipmentSafelyInput = Omit<
+  SaveEquipmentInput,
+  "id" | "loads"
+> & Readonly<{
+  loads: readonly Omit<FitnessEquipmentLoad, "id" | "equipment_id" | "created_at">[];
+}>;
+
+const CONFIG_OPERATION_ID_PATTERN =
+  /^fitness-operation-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const CONFIG_HASH_PATTERN = /^[0-9a-f]{64}$/;
+const CONFIG_MAX_ATOMIC_ROWS = 500;
+const CONFIG_GENERATION_ID_PATTERN =
+  /^(?:legacy|[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/i;
+const CONFIG_ID_PATTERN =
+  /^(venue|equipment|constraint|load)-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function configError(
+  code: FitnessConfigMutationErrorCode,
+  message: string,
+  receipt?: FitnessConfigWriteReceipt,
+): FitnessConfigMutationError {
+  return new FitnessConfigMutationError(code, message, receipt);
+}
+
+function exactObjectKeys(value: object, keys: readonly string[]): boolean {
+  const actual = Object.keys(value).sort();
+  const expected = [...keys].sort();
+  return actual.length === expected.length &&
+    actual.every((key, index) => key === expected[index]);
+}
+
+function safeTimestamp(value: unknown): value is number {
+  return Number.isSafeInteger(value) && Number(value) >= 0;
+}
+
+function safeOpaqueId(value: unknown): value is string {
+  if (
+    typeof value !== "string" || value.length === 0 || value.length > 512 ||
+    value.trim().length === 0 || Array.from(value).length > 256
+  ) return false;
+  for (let index = 0; index < value.length; index += 1) {
+    const unit = value.charCodeAt(index);
+    if (unit <= 0x1f || (unit >= 0x7f && unit <= 0x9f)) return false;
+    if (unit >= 0xd800 && unit <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (index + 1 >= value.length || next < 0xdc00 || next > 0xdfff) return false;
+      index += 1;
+    } else if (unit >= 0xdc00 && unit <= 0xdfff) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function safeString(value: unknown, maximum = 100_000): value is string {
+  return typeof value === "string" && value.length <= maximum;
+}
+
+function safeStringArray(value: unknown, maximum = 10_000): value is readonly string[] {
+  return Array.isArray(value) && value.length <= maximum &&
+    value.every((entry) => safeString(entry, 10_000));
+}
+
+function uniqueExactStrings(value: readonly string[]): boolean {
+  return new Set(value).size === value.length &&
+    value.every((entry) => entry.length > 0 && entry === entry.trim());
+}
+
+function generatedIdMatches(value: string, prefix: "venue" | "equipment" | "constraint" | "load") {
+  return value.startsWith(`${prefix}-`) && CONFIG_ID_PATTERN.test(value);
+}
+
+function safePrimitiveObject(
+  value: unknown,
+): value is Readonly<Record<string, string | number | boolean>> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value) &&
+    Object.keys(value as object).length <= 100 &&
+    Object.entries(value as Record<string, unknown>).every(([key, entry]) =>
+      key.length <= 256 && (
+        (typeof entry === "string" && entry.length <= 10_000) || typeof entry === "boolean" ||
+        (typeof entry === "number" && Number.isFinite(entry))
+      )
+    );
+}
+
+function isFitnessProfileRow(value: unknown): value is FitnessProfile {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const row = value as Partial<FitnessProfile>;
+  return exactObjectKeys(value, [
+    "id", "goals", "experience", "resistance_days_per_week",
+    "cardio_days_per_week", "session_minutes", "split", "preferred_weekdays",
+    "preferred_rir", "rest_seconds", "unit", "notes", "created_at", "updated_at",
+  ]) && row.id === "profile" && safeStringArray(row.goals, 20) &&
+    row.goals.length > 0 && uniqueExactStrings(row.goals) &&
+    row.goals.every((goal) => FITNESS_GOALS.has(goal)) &&
+    ["new", "returning", "consistent", "advanced"].includes(String(row.experience)) &&
+    typeof row.resistance_days_per_week === "number" &&
+    Number.isSafeInteger(row.resistance_days_per_week) && row.resistance_days_per_week >= 0 &&
+    row.resistance_days_per_week <= 7 && Number.isSafeInteger(row.cardio_days_per_week) &&
+    typeof row.cardio_days_per_week === "number" && row.cardio_days_per_week >= 0 &&
+    row.cardio_days_per_week <= 7 && typeof row.session_minutes === "number" &&
+    Number.isSafeInteger(row.session_minutes) && row.session_minutes >= 10 &&
+    row.session_minutes <= 240 &&
+    ["auto", "full_body", "upper_lower", "push_pull_legs", "custom"].includes(String(row.split)) &&
+    Array.isArray(row.preferred_weekdays) && row.preferred_weekdays.length <= 7 &&
+    row.preferred_weekdays.every((day) => Number.isSafeInteger(day) && day >= 0 && day <= 6) &&
+    new Set(row.preferred_weekdays).size === row.preferred_weekdays.length &&
+    typeof row.preferred_rir === "number" && Number.isSafeInteger(row.preferred_rir) &&
+    row.preferred_rir >= 0 && row.preferred_rir <= 5 &&
+    typeof row.rest_seconds === "number" && Number.isSafeInteger(row.rest_seconds) &&
+    row.rest_seconds >= 15 && row.rest_seconds <= 600 &&
+    (row.unit === "kg" || row.unit === "lb") && safeString(row.notes) &&
+    safeTimestamp(row.created_at) && safeTimestamp(row.updated_at) &&
+    row.updated_at >= row.created_at;
+}
+
+function isFitnessVenueRow(value: unknown): value is FitnessVenue {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const row = value as Partial<FitnessVenue>;
+  return exactObjectKeys(value, [
+    "id", "name", "venue_type", "location", "area_notes", "busy_notes",
+    "default_session_minutes", "supersets_allowed", "is_default", "status",
+    "last_verified_at", "created_at", "updated_at",
+  ]) && safeOpaqueId(row.id) && safeString(row.name, 120) && row.name.length > 0 &&
+    ["commercial", "home", "office", "hotel", "outdoor", "other"].includes(String(row.venue_type)) &&
+    safeString(row.location) && safeString(row.area_notes) && safeString(row.busy_notes) &&
+    typeof row.default_session_minutes === "number" &&
+    Number.isSafeInteger(row.default_session_minutes) && row.default_session_minutes >= 10 &&
+    row.default_session_minutes <= 240 &&
+    typeof row.supersets_allowed === "boolean" && typeof row.is_default === "boolean" &&
+    (row.status === "active" || row.status === "archived") &&
+    (row.last_verified_at === null || safeTimestamp(row.last_verified_at)) &&
+    safeTimestamp(row.created_at) && safeTimestamp(row.updated_at) &&
+    row.updated_at >= row.created_at;
+}
+
+function isFitnessEquipmentRow(value: unknown): value is FitnessEquipment {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const row = value as Partial<FitnessEquipment>;
+  return exactObjectKeys(value, [
+    "id", "venue_id", "name", "kind", "area", "quantity", "status", "load_mode",
+    "load_semantics", "min_load_grams", "max_load_grams", "increment_grams",
+    "bar_weight_grams", "unilateral", "busy_level", "settings", "attachments",
+    "notes", "created_at", "updated_at",
+  ]) && safeOpaqueId(row.id) && safeOpaqueId(row.venue_id) && safeString(row.name, 160) &&
+    row.name.length > 0 && safeString(row.area) && typeof row.quantity === "number" &&
+    Number.isSafeInteger(row.quantity) &&
+    row.quantity >= 1 && row.quantity <= 1_000 &&
+    FITNESS_EQUIPMENT_KINDS.has(String(row.kind)) &&
+    ["available", "limited", "maintenance", "removed"].includes(String(row.status)) &&
+    ["none", "discrete", "range", "plate_loaded"].includes(String(row.load_mode)) &&
+    ["total", "per_hand", "per_side", "stack_label", "resistance_level"].includes(String(row.load_semantics)) &&
+    [row.min_load_grams, row.max_load_grams, row.bar_weight_grams]
+      .every((entry) => entry === null || (
+        Number.isSafeInteger(entry) && Number(entry) >= 0 && Number(entry) <= 10_000_000
+    )) && (row.increment_grams === null || (
+        typeof row.increment_grams === "number" && Number.isSafeInteger(row.increment_grams) &&
+        row.increment_grams >= 1 &&
+        row.increment_grams <= 10_000_000
+      )) && (row.min_load_grams === null || row.max_load_grams === null ||
+        (typeof row.min_load_grams === "number" && typeof row.max_load_grams === "number" &&
+        row.max_load_grams >= row.min_load_grams)) &&
+    typeof row.unilateral === "boolean" &&
+    ["unknown", "low", "medium", "high"].includes(String(row.busy_level)) &&
+    safePrimitiveObject(row.settings) && safeStringArray(row.attachments, 100) &&
+    uniqueExactStrings(row.attachments) &&
+    safeString(row.notes) && safeTimestamp(row.created_at) && safeTimestamp(row.updated_at) &&
+    row.updated_at >= row.created_at;
+}
+
+function isFitnessEquipmentLoadRow(value: unknown): value is FitnessEquipmentLoad {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const row = value as Partial<FitnessEquipmentLoad>;
+  return exactObjectKeys(value, [
+    "id", "equipment_id", "load_grams", "quantity", "label", "available", "created_at",
+  ]) && safeOpaqueId(row.id) && safeOpaqueId(row.equipment_id) &&
+    Number.isSafeInteger(row.load_grams) && Number(row.load_grams) >= 0 &&
+    Number(row.load_grams) <= 10_000_000 && Number.isSafeInteger(row.quantity) &&
+    Number(row.quantity) >= 1 && Number(row.quantity) <= 1_000 &&
+    safeString(row.label, 120) && row.label.length > 0 &&
+    row.label === row.label.trim() && typeof row.available === "boolean" &&
+    safeTimestamp(row.created_at);
+}
+
+function isEquipmentSnapshot(value: unknown): value is FitnessEquipmentWriteSnapshot {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const snapshot = value as Partial<FitnessEquipmentWriteSnapshot>;
+  return exactObjectKeys(value, ["equipment", "loads"]) &&
+    isFitnessEquipmentRow(snapshot.equipment) && Array.isArray(snapshot.loads) &&
+    snapshot.loads.length <= CONFIG_MAX_ATOMIC_ROWS &&
+    snapshot.loads.every((load) =>
+      isFitnessEquipmentLoadRow(load) && load.equipment_id === snapshot.equipment?.id
+    ) && new Set(snapshot.loads.map(({ id }) => id)).size === snapshot.loads.length &&
+    new Set(snapshot.loads.map(({ load_grams, label }) => `${load_grams}\u0000${label}`)).size ===
+      snapshot.loads.length &&
+    (snapshot.equipment.load_mode === "discrete" || snapshot.loads.length === 0) &&
+    snapshot.loads.every(({ load_grams }) =>
+      (snapshot.equipment!.min_load_grams === null ||
+        load_grams >= snapshot.equipment!.min_load_grams) &&
+      (snapshot.equipment!.max_load_grams === null ||
+        load_grams <= snapshot.equipment!.max_load_grams)
+    );
+}
+
+function isFitnessConstraintRow(value: unknown): value is FitnessConstraint {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const row = value as Partial<FitnessConstraint>;
+  return exactObjectKeys(value, [
+    "id", "label", "body_area", "severity", "movement_patterns", "exercise_ids",
+    "note", "active", "created_at", "updated_at",
+  ]) && safeOpaqueId(row.id) && safeString(row.label, 160) && row.label.length > 0 &&
+    safeString(row.body_area) && ["monitor", "modify", "avoid"].includes(String(row.severity)) &&
+    safeStringArray(row.movement_patterns, 20) && uniqueExactStrings(row.movement_patterns) &&
+    row.movement_patterns.every((pattern) => MOVEMENT_PATTERNS.has(pattern)) &&
+    safeStringArray(row.exercise_ids, 10_000) && uniqueExactStrings(row.exercise_ids) &&
+    row.exercise_ids.every((id) => Boolean(getFitnessExercise(id))) && safeString(row.note) &&
+    typeof row.active === "boolean" && safeTimestamp(row.created_at) &&
+    safeTimestamp(row.updated_at) && row.updated_at >= row.created_at &&
+    (!row.active || row.movement_patterns.length > 0 || row.exercise_ids.length > 0);
+}
+
+function isTransition(value: unknown): value is FitnessConfigTransition {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const transition = value as Partial<FitnessConfigTransition>;
+  return exactObjectKeys(value, ["id", "status", "updated_at"]) &&
+    safeOpaqueId(transition.id) && safeString(transition.status, 32) &&
+    safeTimestamp(transition.updated_at);
+}
+
+function isTransitionPair(value: unknown): value is Readonly<{
+  before: FitnessConfigTransition;
+  after: FitnessConfigTransition;
+}> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const pair = value as { before?: unknown; after?: unknown };
+  return exactObjectKeys(value, ["before", "after"]) &&
+    isTransition(pair.before) && isTransition(pair.after) &&
+    pair.before.id === pair.after.id;
+}
+
+function hasValidReceiptBase(
+  value: object,
+  kind: string,
+  additionalKeys: readonly string[],
+): boolean {
+  const receipt = value as Partial<FitnessConfigWriteReceipt>;
+  return exactObjectKeys(value, [
+    "purpose", "version", "operationId", "generationId", "generationSequence",
+    "kind", "projectionSha256", ...additionalKeys,
+  ]) && receipt.purpose === "fitness-config-write" && receipt.version === 1 &&
+    receipt.kind === kind && typeof receipt.operationId === "string" &&
+    CONFIG_OPERATION_ID_PATTERN.test(receipt.operationId) &&
+    typeof receipt.generationId === "string" &&
+    CONFIG_GENERATION_ID_PATTERN.test(receipt.generationId) &&
+    safeTimestamp(receipt.generationSequence) &&
+    typeof receipt.projectionSha256 === "string" &&
+    CONFIG_HASH_PATTERN.test(receipt.projectionSha256);
+}
+
+function isStrictTarget<Before extends { updated_at: number }>(
+  before: Before,
+  after: Before,
+  changes: Partial<Before>,
+): boolean {
+  return after.updated_at > before.updated_at &&
+    sameProjection(after, { ...before, ...changes, updated_at: after.updated_at });
+}
+
+function uniqueTransitionIds(
+  pairs: readonly Readonly<{
+    before: FitnessConfigTransition;
+    after: FitnessConfigTransition;
+  }>[],
+): boolean {
+  return new Set(pairs.map(({ before }) => before.id)).size === pairs.length;
+}
+
+function isFitnessConfigWriteReceiptUnchecked(
+  value: unknown,
+): value is FitnessConfigWriteReceipt {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const receipt = value as Record<string, unknown>;
+  switch (receipt.kind) {
+    case "profile-save":
+      return hasValidReceiptBase(value, receipt.kind, ["before", "after"]) &&
+        (receipt.before === null || isFitnessProfileRow(receipt.before)) &&
+        isFitnessProfileRow(receipt.after) &&
+        (receipt.before === null
+          ? receipt.after.created_at === receipt.after.updated_at
+          : receipt.before.created_at === receipt.after.created_at &&
+            receipt.after.updated_at > receipt.before.updated_at);
+    case "venue-save": {
+      const resets = receipt.defaultResets as readonly Readonly<{
+        before: FitnessVenue;
+        after: FitnessVenue;
+      }>[];
+      return hasValidReceiptBase(value, receipt.kind, ["before", "after", "defaultResets"]) &&
+        (receipt.before === null || isFitnessVenueRow(receipt.before)) &&
+        isFitnessVenueRow(receipt.after) && Array.isArray(receipt.defaultResets) &&
+        receipt.defaultResets.length <= CONFIG_MAX_ATOMIC_ROWS &&
+        ((receipt.after as FitnessVenue).is_default || resets.length === 0) &&
+        new Set(resets.map(({ before }) => before.id)).size === resets.length &&
+        resets.every((pair) =>
+          Boolean(pair) && typeof pair === "object" && !Array.isArray(pair) &&
+          exactObjectKeys(pair, ["before", "after"]) &&
+          isFitnessVenueRow(pair.before) && isFitnessVenueRow(pair.after) &&
+          pair.before.id !== (receipt.after as FitnessVenue).id &&
+          pair.before.is_default &&
+          isStrictTarget(pair.before, pair.after, { is_default: false })
+        ) && (receipt.before === null
+          ? generatedIdMatches((receipt.after as FitnessVenue).id, "venue") &&
+            (receipt.after as FitnessVenue).status === "active" &&
+            (receipt.after as FitnessVenue).created_at === (receipt.after as FitnessVenue).updated_at
+          : (receipt.before as FitnessVenue).id === (receipt.after as FitnessVenue).id &&
+            (receipt.before as FitnessVenue).status === (receipt.after as FitnessVenue).status &&
+            (receipt.before as FitnessVenue).created_at === (receipt.after as FitnessVenue).created_at &&
+            (receipt.after as FitnessVenue).updated_at > (receipt.before as FitnessVenue).updated_at);
+    }
+    case "venue-archive": {
+      const programs = receipt.programs as readonly Readonly<{
+        before: FitnessConfigTransition;
+        after: FitnessConfigTransition;
+      }>[];
+      const events = receipt.events as readonly Readonly<{
+        before: FitnessConfigTransition;
+        after: FitnessConfigTransition;
+      }>[];
+      return hasValidReceiptBase(value, receipt.kind, ["before", "after", "programs", "events"]) &&
+        isFitnessVenueRow(receipt.before) && isFitnessVenueRow(receipt.after) &&
+        Array.isArray(receipt.programs) && Array.isArray(receipt.events) &&
+        receipt.programs.length + receipt.events.length <= CONFIG_MAX_ATOMIC_ROWS &&
+        programs.every(isTransitionPair) && events.every(isTransitionPair) &&
+        uniqueTransitionIds(programs) && uniqueTransitionIds(events) &&
+        receipt.before.status === "active" &&
+        isStrictTarget(receipt.before, receipt.after, {
+          status: "archived",
+          is_default: false,
+        }) && programs.every(({ before, after }) =>
+          (before.status === "active" || before.status === "draft") &&
+          after.status === "archived" && after.updated_at > before.updated_at
+        ) && events.every(({ before, after }) =>
+          before.status === "planned" && after.status === "cancelled" &&
+          after.updated_at > before.updated_at
+        );
+    }
+    case "venue-restore":
+      return hasValidReceiptBase(value, receipt.kind, ["before", "after"]) &&
+        isFitnessVenueRow(receipt.before) && isFitnessVenueRow(receipt.after) &&
+        receipt.before.status === "archived" &&
+        isStrictTarget(receipt.before, receipt.after, { status: "active" });
+    case "equipment-save": {
+      const venue = receipt.venue as Record<string, unknown> | undefined;
+      const before = receipt.before as FitnessEquipmentWriteSnapshot | null;
+      const after = receipt.after as FitnessEquipmentWriteSnapshot;
+      return hasValidReceiptBase(value, receipt.kind, ["before", "after", "venue"]) &&
+        (before === null || isEquipmentSnapshot(before)) &&
+        isEquipmentSnapshot(after) && Boolean(venue) &&
+        exactObjectKeys(venue!, ["id", "status", "updated_at"]) &&
+        safeOpaqueId(venue!.id) && venue!.status === "active" && safeTimestamp(venue!.updated_at) &&
+        venue!.id === after.equipment.venue_id &&
+        after.loads.every(({ id, created_at, equipment_id }) =>
+          generatedIdMatches(id, "load") && created_at === after.equipment.updated_at &&
+          equipment_id === after.equipment.id
+        ) && (before === null
+          ? generatedIdMatches(after.equipment.id, "equipment") &&
+            after.equipment.created_at === after.equipment.updated_at
+          : before.equipment.id === after.equipment.id &&
+            before.equipment.status === after.equipment.status &&
+            before.equipment.created_at === after.equipment.created_at &&
+            after.equipment.updated_at > before.equipment.updated_at);
+    }
+    case "equipment-status":
+      return hasValidReceiptBase(value, receipt.kind, ["before", "after"]) &&
+        isFitnessEquipmentRow(receipt.before) && isFitnessEquipmentRow(receipt.after) &&
+        receipt.before.status !== receipt.after.status &&
+        isStrictTarget(receipt.before, receipt.after, { status: receipt.after.status });
+    case "constraint-save":
+      return hasValidReceiptBase(value, receipt.kind, ["before", "after"]) &&
+        (receipt.before === null || isFitnessConstraintRow(receipt.before)) &&
+        isFitnessConstraintRow(receipt.after) &&
+        (receipt.before === null
+          ? generatedIdMatches(receipt.after.id, "constraint") &&
+            receipt.after.created_at === receipt.after.updated_at
+          : receipt.before.id === receipt.after.id &&
+            receipt.before.active === receipt.after.active &&
+            receipt.before.created_at === receipt.after.created_at &&
+            receipt.after.updated_at > receipt.before.updated_at);
+    case "constraint-active":
+      return hasValidReceiptBase(value, receipt.kind, ["before", "after"]) &&
+        isFitnessConstraintRow(receipt.before) && isFitnessConstraintRow(receipt.after) &&
+        receipt.before.active !== receipt.after.active &&
+        isStrictTarget(receipt.before, receipt.after, { active: receipt.after.active });
+    default:
+      return false;
+  }
+}
+
+export function isFitnessConfigWriteReceipt(
+  value: unknown,
+): value is FitnessConfigWriteReceipt {
+  try {
+    return isFitnessConfigWriteReceiptUnchecked(value);
+  } catch {
+    return false;
+  }
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value).sort().map((key) =>
+      `${JSON.stringify(key)}:${canonicalJson((value as Record<string, unknown>)[key])}`
+    ).join(",")}}`;
+  }
+  const encoded = JSON.stringify(value);
+  if (encoded === undefined) throw configError("invalid_receipt", "写入回执包含不可序列化的值。");
+  return encoded;
+}
+
+async function sha256Hex(value: string): Promise<string> {
+  const digest = new Uint8Array(await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(value),
+  ));
+  return Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function sealConfigReceipt<Receipt extends FitnessConfigWriteReceipt>(
+  draft: Omit<Receipt, "projectionSha256">,
+): Promise<Receipt> {
+  const projectionSha256 = await sha256Hex(canonicalJson(draft));
+  return { ...draft, projectionSha256 } as Receipt;
+}
+
+async function receiptHashIsValid(receipt: FitnessConfigWriteReceipt): Promise<boolean> {
+  const { projectionSha256, ...projection } = receipt;
+  return projectionSha256 === await sha256Hex(canonicalJson(projection));
+}
+
+function sameProjection(left: unknown, right: unknown): boolean {
+  return canonicalJson(left) === canonicalJson(right);
+}
+
+function nextConfigTimestamp(before: number | null, now: number): number {
+  if (!safeTimestamp(now)) throw configError("invalid_input", "设备时间不在可接受范围。");
+  const next = before === null ? now : Math.max(now, before + 1);
+  if (!safeTimestamp(next)) {
+    throw configError("invalid_input", "资料版本时间已经超出可接受范围。");
+  }
+  return next;
+}
+
+function generatedConfigId(runtime: FitnessConfigStorageRuntime, prefix: string): string {
+  const id = `${prefix}-${runtime.randomUUID()}`;
+  if (!CONFIG_ID_PATTERN.test(id)) {
+    throw configError("invalid_input", "无法生成可靠的写入标识。");
+  }
+  return id;
+}
+
+function generatedOperationId(runtime: FitnessConfigStorageRuntime): string {
+  const id = `fitness-operation-${runtime.randomUUID()}`;
+  if (!CONFIG_OPERATION_ID_PATTERN.test(id)) {
+    throw configError("invalid_input", "无法生成可靠的操作标识。");
+  }
+  return id;
+}
+
+function safeConfigBroadcast(runtime: FitnessConfigStorageRuntime, reason: string): void {
+  try {
+    runtime.broadcast(reason);
+  } catch {
+    // A refresh hint is advisory and cannot reverse a durable commit.
+  }
+}
+
+async function configRows<Result extends object>(
+  runtime: FitnessConfigStorageRuntime,
+  sql: string,
+  params: SqlParams = [],
+): Promise<readonly Result[]> {
+  return (await runtime.query<Result>(sql, params)).rows;
+}
+
+async function readConfigGeneration(
+  runtime: FitnessConfigStorageRuntime,
+): Promise<Readonly<{ generationId: string; generationSequence: number }>> {
+  const current = await runtime.currentGeneration();
+  if (
+    !current || !CONFIG_GENERATION_ID_PATTERN.test(current.generationId) ||
+    !safeTimestamp(current.sequence)
+  ) throw new Error("无法确认当前适练数据库世代");
+  return {
+    generationId: current.generationId,
+    generationSequence: current.sequence,
+  };
+}
+
+async function readConfigProfile(
+  runtime: FitnessConfigStorageRuntime,
+): Promise<FitnessProfile | null> {
+  return mapProfile((await configRows<Row>(
+    runtime,
+    "SELECT * FROM fitness_profiles WHERE id='profile' LIMIT 1",
+  ))[0]);
+}
+
+async function readConfigVenue(
+  runtime: FitnessConfigStorageRuntime,
+  id: string,
+): Promise<FitnessVenue | null> {
+  const row = (await configRows<Row>(
+    runtime,
+    "SELECT * FROM fitness_venues WHERE id=? LIMIT 1",
+    [id],
+  ))[0];
+  return row ? mapVenue(row) : null;
+}
+
+async function readDefaultConfigVenues(
+  runtime: FitnessConfigStorageRuntime,
+  exceptId: string,
+): Promise<FitnessVenue[]> {
+  return (await configRows<Row>(
+    runtime,
+    "SELECT * FROM fitness_venues WHERE is_default=1 AND id<>? ORDER BY id",
+    [exceptId],
+  )).map(mapVenue);
+}
+
+async function readConfigVenuesByIds(
+  runtime: FitnessConfigStorageRuntime,
+  ids: readonly string[],
+): Promise<FitnessVenue[]> {
+  if (ids.length === 0) return [];
+  const placeholders = ids.map(() => "?").join(",");
+  return (await configRows<Row>(
+    runtime,
+    `SELECT * FROM fitness_venues WHERE id IN (${placeholders}) ORDER BY id`,
+    ids,
+  )).map(mapVenue);
+}
+
+async function readConfigEquipment(
+  runtime: FitnessConfigStorageRuntime,
+  id: string,
+): Promise<FitnessEquipmentWriteSnapshot | null> {
+  const row = (await configRows<Row>(
+    runtime,
+    "SELECT * FROM fitness_equipment WHERE id=? LIMIT 1",
+    [id],
+  ))[0];
+  if (!row) return null;
+  const loads = (await configRows<Row>(
+    runtime,
+    `SELECT * FROM fitness_equipment_loads
+      WHERE equipment_id=? ORDER BY load_grams,label,id`,
+    [id],
+  )).map(mapEquipmentLoad);
+  return { equipment: mapEquipment(row), loads };
+}
+
+async function readConfigConstraint(
+  runtime: FitnessConfigStorageRuntime,
+  id: string,
+): Promise<FitnessConstraint | null> {
+  const row = (await configRows<Row>(
+    runtime,
+    "SELECT * FROM fitness_constraints WHERE id=? LIMIT 1",
+    [id],
+  ))[0];
+  return row ? mapConstraint(row) : null;
+}
+
+async function readConfigVenueGuard(
+  runtime: FitnessConfigStorageRuntime,
+  id: string,
+): Promise<Readonly<{ id: string; status: "active"; updated_at: number }> | null> {
+  const row = (await configRows<{
+    id: string;
+    status: string;
+    updated_at: number;
+  }>(
+    runtime,
+    "SELECT id,status,updated_at FROM fitness_venues WHERE id=? LIMIT 1",
+    [id],
+  ))[0];
+  return row?.status === "active"
+    ? { id: row.id, status: "active", updated_at: Number(row.updated_at) }
+    : null;
+}
+
+async function readVenueProgramTransitions(
+  runtime: FitnessConfigStorageRuntime,
+  venueId: string,
+  statuses: readonly string[],
+): Promise<FitnessConfigTransition[]> {
+  const placeholders = statuses.map(() => "?").join(",");
+  return (await configRows<FitnessConfigTransition>(
+    runtime,
+    `SELECT id,status,updated_at FROM fitness_programs
+      WHERE venue_id=? AND status IN (${placeholders}) ORDER BY id`,
+    [venueId, ...statuses],
+  )).map((entry) => ({
+    id: entry.id,
+    status: entry.status,
+    updated_at: Number(entry.updated_at),
+  }));
+}
+
+async function readVenueEventTransitions(
+  runtime: FitnessConfigStorageRuntime,
+  venueId: string,
+  statuses: readonly string[],
+): Promise<FitnessConfigTransition[]> {
+  const placeholders = statuses.map(() => "?").join(",");
+  return (await configRows<FitnessConfigTransition>(
+    runtime,
+    `SELECT id,status,updated_at FROM fitness_calendar_events
+      WHERE venue_id=? AND status IN (${placeholders}) ORDER BY id`,
+    [venueId, ...statuses],
+  )).map((entry) => ({
+    id: entry.id,
+    status: entry.status,
+    updated_at: Number(entry.updated_at),
+  }));
+}
+
+function cloneChecked<RowType>(
+  value: RowType,
+  guard: (candidate: unknown) => candidate is RowType,
+  label: string,
+): RowType {
+  try {
+    if (!guard(value)) throw configError("invalid_input", `${label}快照格式不正确。`);
+    const cloned = JSON.parse(JSON.stringify(value)) as unknown;
+    if (!guard(cloned)) throw configError("invalid_input", `${label}快照不能安全保存。`);
+    return cloned;
+  } catch (error) {
+    if (error instanceof FitnessConfigMutationError) throw error;
+    throw configError("invalid_input", `${label}快照格式不正确。`);
+  }
+}
+
+function cloneExpectedEquipment(
+  value: FitnessEquipmentWriteSnapshot | null,
+): FitnessEquipmentWriteSnapshot | null {
+  return value === null
+    ? null
+    : cloneChecked(value, isEquipmentSnapshot, "器材");
+}
+
+function normalizedProfileTarget(
+  input: SaveFitnessProfileInput,
+  before: FitnessProfile | null,
+  timestamp: number,
+): FitnessProfile {
+  requireUniqueStrings(input.goals, "训练目标");
+  if (input.goals.length === 0 || input.goals.some((goal) => !FITNESS_GOALS.has(goal))) {
+    throw configError("invalid_input", "请选择至少一个可识别的训练目标。");
+  }
+  requireInteger(input.resistance_days_per_week, "每周无氧次数", 0, 7);
+  requireInteger(input.cardio_days_per_week, "每周有氧次数", 0, 7);
+  requireInteger(input.session_minutes, "单次训练时长", 10, 240);
+  requireInteger(input.preferred_rir, "目标 RIR", 0, 5);
+  requireInteger(input.rest_seconds, "组间休息", 15, 600);
+  const weekdays = [...input.preferred_weekdays];
+  if (
+    new Set(weekdays).size !== weekdays.length ||
+    weekdays.some((weekday) => !Number.isInteger(weekday) || weekday < 0 || weekday > 6)
+  ) throw configError("invalid_input", "常用训练日格式不正确。");
+  const target: FitnessProfile = {
+    id: "profile",
+    goals: [...input.goals],
+    experience: input.experience,
+    resistance_days_per_week: input.resistance_days_per_week,
+    cardio_days_per_week: input.cardio_days_per_week,
+    session_minutes: input.session_minutes,
+    split: input.split,
+    preferred_weekdays: weekdays,
+    preferred_rir: input.preferred_rir,
+    rest_seconds: input.rest_seconds,
+    unit: input.unit,
+    notes: input.notes.trim(),
+    created_at: before?.created_at ?? timestamp,
+    updated_at: timestamp,
+  };
+  if (!isFitnessProfileRow(target)) throw configError("invalid_input", "训练偏好格式不正确。");
+  return target;
+}
+
+function normalizedVenueTarget(
+  input: Omit<SaveVenueInput, "id">,
+  id: string,
+  before: FitnessVenue | null,
+  timestamp: number,
+): FitnessVenue {
+  const target: FitnessVenue = {
+    id,
+    name: requireNonEmpty(input.name, "场地名称", 120),
+    venue_type: input.venue_type,
+    location: input.location.trim(),
+    area_notes: input.area_notes.trim(),
+    busy_notes: input.busy_notes.trim(),
+    default_session_minutes: requireInteger(
+      input.default_session_minutes,
+      "场地默认训练时长",
+      10,
+      240,
+    ),
+    supersets_allowed: input.supersets_allowed,
+    is_default: input.is_default,
+    status: input.status,
+    last_verified_at: input.last_verified_at,
+    created_at: before?.created_at ?? timestamp,
+    updated_at: timestamp,
+  };
+  if (!isFitnessVenueRow(target)) throw configError("invalid_input", "场地内容格式不正确。");
+  if (target.is_default && target.status !== "active") {
+    throw configError("invalid_input", "已归档场地不能设为默认场地。");
+  }
+  return target;
+}
+
+function normalizedEquipmentTarget(
+  runtime: FitnessConfigStorageRuntime,
+  input: SaveFitnessEquipmentSafelyInput,
+  id: string,
+  before: FitnessEquipmentWriteSnapshot | null,
+  timestamp: number,
+): FitnessEquipmentWriteSnapshot {
+  requireInteger(input.quantity, "器材数量", 1, 1000);
+  for (const [value, label, minimum] of [
+    [input.min_load_grams, "器材最低重量", 0],
+    [input.max_load_grams, "器材最高重量", 0],
+    [input.increment_grams, "器材重量增量", 1],
+    [input.bar_weight_grams, "空杆重量", 0],
+  ] as const) {
+    if (value !== null) requireInteger(value, label, minimum, 10_000_000);
+  }
+  if (
+    input.min_load_grams !== null && input.max_load_grams !== null &&
+    input.max_load_grams < input.min_load_grams
+  ) throw configError("invalid_input", "器材重量范围前后颠倒。");
+  if (input.load_mode !== "discrete" && input.loads.length > 0) {
+    throw configError("invalid_input", "只有离散档位器材可以录入重量阶梯。");
+  }
+  if (input.loads.length > CONFIG_MAX_ATOMIC_ROWS) {
+    throw configError("invalid_input", "器材重量档位过多，无法一次安全保存。");
+  }
+  requireUniqueStrings(input.attachments, "器材附件");
+  const keys = new Set<string>();
+  const loads = input.loads.map((load) => {
+    const loadGrams = requireInteger(load.load_grams, "器材重量", 0, 10_000_000);
+    const quantity = requireInteger(load.quantity, "该档位数量", 1, 1000);
+    const label = requireNonEmpty(load.label, "重量档位名称", 120);
+    if (
+      (input.min_load_grams !== null && loadGrams < input.min_load_grams) ||
+      (input.max_load_grams !== null && loadGrams > input.max_load_grams)
+    ) throw configError("invalid_input", "器材档位超出已记录的重量范围。");
+    const key = `${loadGrams}\u0000${label}`;
+    if (keys.has(key)) throw configError("invalid_input", "器材重量档位不能重复。");
+    keys.add(key);
+    return {
+      id: generatedConfigId(runtime, "load"),
+      equipment_id: id,
+      load_grams: loadGrams,
+      quantity,
+      label,
+      available: load.available,
+      created_at: timestamp,
+    } satisfies FitnessEquipmentLoad;
+  }).sort((left, right) =>
+    left.load_grams - right.load_grams || left.label.localeCompare(right.label) ||
+    left.id.localeCompare(right.id)
+  );
+  const equipment: FitnessEquipment = {
+    id,
+    venue_id: input.venue_id,
+    name: requireNonEmpty(input.name, "器材名称"),
+    kind: input.kind,
+    area: input.area.trim(),
+    quantity: input.quantity,
+    status: input.status,
+    load_mode: input.load_mode,
+    load_semantics: input.load_semantics,
+    min_load_grams: input.min_load_grams,
+    max_load_grams: input.max_load_grams,
+    increment_grams: input.increment_grams,
+    bar_weight_grams: input.bar_weight_grams,
+    unilateral: input.unilateral,
+    busy_level: input.busy_level,
+    settings: { ...input.settings },
+    attachments: [...input.attachments],
+    notes: input.notes.trim(),
+    created_at: before?.equipment.created_at ?? timestamp,
+    updated_at: timestamp,
+  };
+  const target = { equipment, loads };
+  if (!isEquipmentSnapshot(target)) throw configError("invalid_input", "器材内容格式不正确。");
+  return target;
+}
+
+function normalizedConstraintTarget(
+  input: Omit<SaveConstraintInput, "id">,
+  id: string,
+  before: FitnessConstraint | null,
+  timestamp: number,
+): FitnessConstraint {
+  const label = requireNonEmpty(input.label, "身体限制名称");
+  requireUniqueStrings(input.movement_patterns, "受影响动作模式");
+  requireUniqueStrings(input.exercise_ids, "受影响动作");
+  if (input.active && input.movement_patterns.length === 0 && input.exercise_ids.length === 0) {
+    throw configError("invalid_input", "启用的身体边界必须至少包含一个受影响范围。");
+  }
+  if (input.movement_patterns.some((pattern) => !MOVEMENT_PATTERNS.has(pattern))) {
+    throw configError("invalid_input", "身体限制包含未知的动作模式。");
+  }
+  if (input.exercise_ids.some((exerciseId) => !getFitnessExercise(exerciseId))) {
+    throw configError("invalid_input", "身体限制包含未知动作。");
+  }
+  const target: FitnessConstraint = {
+    id,
+    label,
+    body_area: input.body_area.trim(),
+    severity: input.severity,
+    movement_patterns: [...input.movement_patterns],
+    exercise_ids: [...input.exercise_ids],
+    note: input.note.trim(),
+    active: input.active,
+    created_at: before?.created_at ?? timestamp,
+    updated_at: timestamp,
+  };
+  if (!isFitnessConstraintRow(target)) {
+    throw configError("invalid_input", "身体边界内容格式不正确。");
+  }
+  return target;
+}
+
+async function readTransitionsByIds(
+  runtime: FitnessConfigStorageRuntime,
+  table: "fitness_programs" | "fitness_calendar_events",
+  ids: readonly string[],
+): Promise<FitnessConfigTransition[]> {
+  if (ids.length === 0) return [];
+  const placeholders = ids.map(() => "?").join(",");
+  return (await configRows<FitnessConfigTransition>(
+    runtime,
+    `SELECT id,status,updated_at FROM ${table} WHERE id IN (${placeholders}) ORDER BY id`,
+    ids,
+  )).map((entry) => ({
+    id: entry.id,
+    status: entry.status,
+    updated_at: Number(entry.updated_at),
+  }));
+}
+
+async function receiptStateUnlocked(
+  runtime: FitnessConfigStorageRuntime,
+  receipt: FitnessConfigWriteReceipt,
+): Promise<Exclude<FitnessConfigWriteInspection, "still_unknown" | "invalid_receipt">> {
+  const generation = await readConfigGeneration(runtime);
+  if (
+    generation.generationId !== receipt.generationId ||
+    generation.generationSequence !== receipt.generationSequence
+  ) return "changed";
+  switch (receipt.kind) {
+    case "profile-save": {
+      const current = await readConfigProfile(runtime);
+      if (sameProjection(current, receipt.after)) return "exact_saved";
+      return sameProjection(current, receipt.before) ? "expected" : "changed";
+    }
+    case "venue-save": {
+      const current = await readConfigVenue(runtime, receipt.after.id);
+      const beforeDefaults = receipt.defaultResets.map(({ before }) => before);
+      const afterDefaults = receipt.defaultResets.map(({ after }) => after);
+      const [resetRows, currentDefaults] = receipt.after.is_default
+        ? await Promise.all([
+            readConfigVenuesByIds(
+              runtime,
+              receipt.defaultResets.map(({ before }) => before.id),
+            ),
+            readDefaultConfigVenues(runtime, receipt.after.id),
+          ])
+        : [[], []];
+      if (
+        sameProjection(current, receipt.after) &&
+        sameProjection(resetRows, afterDefaults) &&
+        currentDefaults.length === 0
+      ) return "exact_saved";
+      return sameProjection(current, receipt.before) &&
+          sameProjection(resetRows, beforeDefaults) &&
+          sameProjection(currentDefaults, beforeDefaults)
+        ? "expected"
+        : "changed";
+    }
+    case "venue-archive": {
+      const current = await readConfigVenue(runtime, receipt.before.id);
+      const programIds = receipt.programs.map(({ before }) => before.id);
+      const eventIds = receipt.events.map(({ before }) => before.id);
+      const [programs, events, activePrograms, plannedEvents, activeSessions] = await Promise.all([
+        readTransitionsByIds(runtime, "fitness_programs", programIds),
+        readTransitionsByIds(runtime, "fitness_calendar_events", eventIds),
+        readVenueProgramTransitions(runtime, receipt.before.id, ["active", "draft"]),
+        readVenueEventTransitions(runtime, receipt.before.id, ["planned"]),
+        configRows<{ id: string }>(
+          runtime,
+          "SELECT id FROM fitness_sessions WHERE venue_id=? AND status='active' ORDER BY id",
+          [receipt.before.id],
+        ),
+      ]);
+      const expectedPrograms = receipt.programs.map(({ before }) => before);
+      const expectedEvents = receipt.events.map(({ before }) => before);
+      const targetPrograms = receipt.programs.map(({ after }) => after);
+      const targetEvents = receipt.events.map(({ after }) => after);
+      if (
+        sameProjection(current, receipt.after) &&
+        sameProjection(programs, targetPrograms) &&
+        sameProjection(events, targetEvents) &&
+        activePrograms.length === 0 && plannedEvents.length === 0 &&
+        activeSessions.length === 0
+      ) return "exact_saved";
+      return sameProjection(current, receipt.before) && activeSessions.length === 0 &&
+          sameProjection(programs, expectedPrograms) &&
+          sameProjection(events, expectedEvents) &&
+          sameProjection(activePrograms, expectedPrograms) &&
+          sameProjection(plannedEvents, expectedEvents)
+        ? "expected"
+        : "changed";
+    }
+    case "venue-restore": {
+      const current = await readConfigVenue(runtime, receipt.before.id);
+      if (sameProjection(current, receipt.after)) return "exact_saved";
+      return sameProjection(current, receipt.before) ? "expected" : "changed";
+    }
+    case "equipment-save": {
+      const current = await readConfigEquipment(runtime, receipt.after.equipment.id);
+      if (sameProjection(current, receipt.after)) return "exact_saved";
+      const venue = await readConfigVenueGuard(runtime, receipt.venue.id);
+      return sameProjection(current, receipt.before) && sameProjection(venue, receipt.venue)
+        ? "expected"
+        : "changed";
+    }
+    case "equipment-status": {
+      const current = (await readConfigEquipment(runtime, receipt.before.id))?.equipment ?? null;
+      if (sameProjection(current, receipt.after)) return "exact_saved";
+      return sameProjection(current, receipt.before) ? "expected" : "changed";
+    }
+    case "constraint-save": {
+      const current = await readConfigConstraint(runtime, receipt.after.id);
+      if (sameProjection(current, receipt.after)) return "exact_saved";
+      return sameProjection(current, receipt.before) ? "expected" : "changed";
+    }
+    case "constraint-active": {
+      const current = await readConfigConstraint(runtime, receipt.before.id);
+      if (sameProjection(current, receipt.after)) return "exact_saved";
+      return sameProjection(current, receipt.before) ? "expected" : "changed";
+    }
+  }
+}
+
+async function inspectReceiptUnlocked(
+  runtime: FitnessConfigStorageRuntime,
+  receipt: FitnessConfigWriteReceipt,
+): Promise<FitnessConfigWriteInspection> {
+  try {
+    return await receiptStateUnlocked(runtime, receipt);
+  } catch {
+    return "still_unknown";
+  }
+}
+
+function snapshotInput<Input>(value: Input): Input {
+  try {
+    return JSON.parse(JSON.stringify(value)) as Input;
+  } catch {
+    throw configError("invalid_input", "写入内容不能安全复制。");
+  }
+}
+
+function assertPreparedExpected(
+  current: unknown,
+  expected: unknown,
+  label: string,
+): void {
+  if (!sameProjection(current, expected)) {
+    throw configError("changed", `${label}已在别处变化；没有准备这次写入。`);
+  }
+}
+
+function receiptEntity(receipt: FitnessConfigWriteReceipt): {
+  id: string;
+  updatedAt: number;
+  reason: string;
+} {
+  switch (receipt.kind) {
+    case "profile-save":
+      return { id: "profile", updatedAt: receipt.after.updated_at, reason: "profile-saved" };
+    case "venue-save":
+      return { id: receipt.after.id, updatedAt: receipt.after.updated_at, reason: "venue-saved" };
+    case "venue-archive":
+      return { id: receipt.after.id, updatedAt: receipt.after.updated_at, reason: "venue-archived" };
+    case "venue-restore":
+      return { id: receipt.after.id, updatedAt: receipt.after.updated_at, reason: "venue-restored" };
+    case "equipment-save":
+      return {
+        id: receipt.after.equipment.id,
+        updatedAt: receipt.after.equipment.updated_at,
+        reason: "equipment-saved",
+      };
+    case "equipment-status":
+      return { id: receipt.after.id, updatedAt: receipt.after.updated_at, reason: "equipment-status" };
+    case "constraint-save":
+      return { id: receipt.after.id, updatedAt: receipt.after.updated_at, reason: "constraint-saved" };
+    case "constraint-active":
+      return {
+        id: receipt.after.id,
+        updatedAt: receipt.after.updated_at,
+        reason: receipt.after.active ? "constraint-activated" : "constraint-deactivated",
+      };
+  }
+}
+
+export function createFitnessConfigStorageService(
+  runtime: FitnessConfigStorageRuntime = {
+    withExclusiveLock: (operation) => withFitnessWriteLock(operation, { requireSupport: true }),
+    query: async <Result extends object>(sql: string, params?: SqlParams) => ({
+      rows: await rawQuery<Result>(sql, params),
+    }),
+    batch: (statements) => rawBatch(statements),
+    currentGeneration: () => localDb.currentGeneration(DB),
+    now: () => Date.now(),
+    randomUUID: () => crypto.randomUUID(),
+    broadcast: broadcastFitnessChange,
+  },
+) {
+  async function prepareLocked<Result>(operation: () => Promise<Result>): Promise<Result> {
+    try {
+      return await runtime.withExclusiveLock(operation);
+    } catch (error) {
+      if (error instanceof FitnessConfigMutationError) throw error;
+      if (error instanceof TypeError) {
+        throw configError("invalid_input", error.message);
+      }
+      throw configError("inspect_failed", "暂时无法核对最新资料；没有开始写入。");
+    }
+  }
+
+  async function prepareProfileSave(
+    inputValue: SaveFitnessProfileInput,
+    expectedValue: FitnessProfile | null,
+  ): Promise<FitnessProfileSaveReceipt> {
+    const input = snapshotInput(inputValue);
+    const expected = expectedValue === null
+      ? null
+      : cloneChecked(expectedValue, isFitnessProfileRow, "训练偏好");
+    return prepareLocked(async () => {
+      const generation = await readConfigGeneration(runtime);
+      const current = await readConfigProfile(runtime);
+      assertPreparedExpected(current, expected, "训练偏好");
+      const timestamp = nextConfigTimestamp(expected?.updated_at ?? null, runtime.now());
+      const after = normalizedProfileTarget(input, expected, timestamp);
+      return sealConfigReceipt<FitnessProfileSaveReceipt>({
+        purpose: "fitness-config-write",
+        version: 1,
+        operationId: generatedOperationId(runtime),
+        ...generation,
+        kind: "profile-save",
+        before: expected,
+        after,
+      });
+    });
+  }
+
+  async function prepareVenueSave(
+    inputValue: Omit<SaveVenueInput, "id">,
+    expectedValue: FitnessVenue | null,
+  ): Promise<FitnessVenueSaveReceipt> {
+    const input = snapshotInput(inputValue);
+    const expected = expectedValue === null
+      ? null
+      : cloneChecked(expectedValue, isFitnessVenueRow, "场地");
+    if (
+      (expected === null && input.status !== "active") ||
+      (expected !== null && input.status !== expected.status)
+    ) {
+      throw configError("invalid_input", "场地状态请通过归档或恢复操作修改。");
+    }
+    return prepareLocked(async () => {
+      const generation = await readConfigGeneration(runtime);
+      const id = expected?.id ?? generatedConfigId(runtime, "venue");
+      const current = await readConfigVenue(runtime, id);
+      if (expected === null && current !== null) {
+        throw configError("conflict", "新场地标识已经对应另一份内容；没有覆盖原资料。");
+      }
+      assertPreparedExpected(current, expected, "场地");
+      const now = runtime.now();
+      const timestamp = nextConfigTimestamp(expected?.updated_at ?? null, now);
+      const after = normalizedVenueTarget(input, id, expected, timestamp);
+      const defaults = after.is_default
+        ? await readDefaultConfigVenues(runtime, id)
+        : [];
+      if (defaults.length > CONFIG_MAX_ATOMIC_ROWS) {
+        throw configError("invalid_input", "默认场地状态异常，无法一次安全整理。");
+      }
+      const defaultResets = defaults.map((before) => ({
+        before,
+        after: {
+          ...before,
+          is_default: false,
+          updated_at: nextConfigTimestamp(before.updated_at, now),
+        },
+      }));
+      return sealConfigReceipt<FitnessVenueSaveReceipt>({
+        purpose: "fitness-config-write",
+        version: 1,
+        operationId: generatedOperationId(runtime),
+        ...generation,
+        kind: "venue-save",
+        before: expected,
+        after,
+        defaultResets,
+      });
+    });
+  }
+
+  async function prepareVenueArchive(
+    expectedValue: FitnessVenue,
+  ): Promise<FitnessVenueArchiveReceipt> {
+    const expected = cloneChecked(expectedValue, isFitnessVenueRow, "场地");
+    if (expected.status !== "active") {
+      throw configError("invalid_input", "只能归档当前可用的场地。");
+    }
+    return prepareLocked(async () => {
+      const generation = await readConfigGeneration(runtime);
+      const current = await readConfigVenue(runtime, expected.id);
+      assertPreparedExpected(current, expected, "场地");
+      const activeSessions = await configRows<{ id: string }>(
+        runtime,
+        "SELECT id FROM fitness_sessions WHERE venue_id=? AND status='active' LIMIT 1",
+        [expected.id],
+      );
+      if (activeSessions.length > 0) {
+        throw configError("changed", "这个场地仍有正在进行的训练；没有准备归档。");
+      }
+      const [programBefore, eventBefore] = await Promise.all([
+        readVenueProgramTransitions(runtime, expected.id, ["active", "draft"]),
+        readVenueEventTransitions(runtime, expected.id, ["planned"]),
+      ]);
+      if (programBefore.length + eventBefore.length > CONFIG_MAX_ATOMIC_ROWS) {
+        throw configError("invalid_input", "这个场地关联的待处理安排过多，无法一次安全归档。");
+      }
+      const now = runtime.now();
+      const after: FitnessVenue = {
+        ...expected,
+        status: "archived",
+        is_default: false,
+        updated_at: nextConfigTimestamp(expected.updated_at, now),
+      };
+      const programs = programBefore.map((before) => ({
+        before,
+        after: {
+          ...before,
+          status: "archived",
+          updated_at: nextConfigTimestamp(before.updated_at, now),
+        },
+      }));
+      const events = eventBefore.map((before) => ({
+        before,
+        after: {
+          ...before,
+          status: "cancelled",
+          updated_at: nextConfigTimestamp(before.updated_at, now),
+        },
+      }));
+      return sealConfigReceipt<FitnessVenueArchiveReceipt>({
+        purpose: "fitness-config-write",
+        version: 1,
+        operationId: generatedOperationId(runtime),
+        ...generation,
+        kind: "venue-archive",
+        before: expected,
+        after,
+        programs,
+        events,
+      });
+    });
+  }
+
+  async function prepareVenueRestore(
+    expectedValue: FitnessVenue,
+  ): Promise<FitnessVenueRestoreReceipt> {
+    const expected = cloneChecked(expectedValue, isFitnessVenueRow, "场地");
+    if (expected.status !== "archived") {
+      throw configError("invalid_input", "只能恢复已归档的场地。");
+    }
+    return prepareLocked(async () => {
+      const generation = await readConfigGeneration(runtime);
+      const current = await readConfigVenue(runtime, expected.id);
+      assertPreparedExpected(current, expected, "场地");
+      const after: FitnessVenue = {
+        ...expected,
+        status: "active",
+        updated_at: nextConfigTimestamp(expected.updated_at, runtime.now()),
+      };
+      return sealConfigReceipt<FitnessVenueRestoreReceipt>({
+        purpose: "fitness-config-write",
+        version: 1,
+        operationId: generatedOperationId(runtime),
+        ...generation,
+        kind: "venue-restore",
+        before: expected,
+        after,
+      });
+    });
+  }
+
+  async function prepareEquipmentSave(
+    inputValue: SaveFitnessEquipmentSafelyInput,
+    expectedValue: FitnessEquipmentWriteSnapshot | null,
+  ): Promise<FitnessEquipmentSaveReceipt> {
+    const input = snapshotInput(inputValue);
+    const expected = cloneExpectedEquipment(expectedValue);
+    if (expected !== null && input.status !== expected.equipment.status) {
+      throw configError("invalid_input", "器材状态请通过状态操作修改。");
+    }
+    return prepareLocked(async () => {
+      const generation = await readConfigGeneration(runtime);
+      const id = expected?.equipment.id ?? generatedConfigId(runtime, "equipment");
+      const current = await readConfigEquipment(runtime, id);
+      if (expected === null && current !== null) {
+        throw configError("conflict", "新器材标识已经对应另一份内容；没有覆盖原资料。");
+      }
+      assertPreparedExpected(current, expected, "器材");
+      const venue = await readConfigVenueGuard(runtime, input.venue_id);
+      if (!venue) {
+        throw configError("changed", "目标场地不存在或已经归档；没有准备器材写入。");
+      }
+      const timestamp = nextConfigTimestamp(
+        expected?.equipment.updated_at ?? null,
+        runtime.now(),
+      );
+      const after = normalizedEquipmentTarget(runtime, input, id, expected, timestamp);
+      return sealConfigReceipt<FitnessEquipmentSaveReceipt>({
+        purpose: "fitness-config-write",
+        version: 1,
+        operationId: generatedOperationId(runtime),
+        ...generation,
+        kind: "equipment-save",
+        before: expected,
+        after,
+        venue,
+      });
+    });
+  }
+
+  async function prepareEquipmentStatus(
+    expectedValue: FitnessEquipment,
+    status: FitnessEquipment["status"],
+  ): Promise<FitnessEquipmentStatusReceipt> {
+    const expected = cloneChecked(expectedValue, isFitnessEquipmentRow, "器材");
+    if (!["available", "limited", "maintenance", "removed"].includes(status)) {
+      throw configError("invalid_input", "器材状态不受支持。");
+    }
+    if (expected.status === status) {
+      throw configError("invalid_input", "器材已经处于目标状态。");
+    }
+    return prepareLocked(async () => {
+      const generation = await readConfigGeneration(runtime);
+      const current = (await readConfigEquipment(runtime, expected.id))?.equipment ?? null;
+      assertPreparedExpected(current, expected, "器材");
+      const after: FitnessEquipment = {
+        ...expected,
+        status,
+        updated_at: nextConfigTimestamp(expected.updated_at, runtime.now()),
+      };
+      return sealConfigReceipt<FitnessEquipmentStatusReceipt>({
+        purpose: "fitness-config-write",
+        version: 1,
+        operationId: generatedOperationId(runtime),
+        ...generation,
+        kind: "equipment-status",
+        before: expected,
+        after,
+      });
+    });
+  }
+
+  async function prepareConstraintSave(
+    inputValue: Omit<SaveConstraintInput, "id">,
+    expectedValue: FitnessConstraint | null,
+  ): Promise<FitnessConstraintSaveReceipt> {
+    const input = snapshotInput(inputValue);
+    const expected = expectedValue === null
+      ? null
+      : cloneChecked(expectedValue, isFitnessConstraintRow, "身体边界");
+    if (expected !== null && input.active !== expected.active) {
+      throw configError("invalid_input", "身体边界启用状态请通过状态操作修改。");
+    }
+    return prepareLocked(async () => {
+      const generation = await readConfigGeneration(runtime);
+      const id = expected?.id ?? generatedConfigId(runtime, "constraint");
+      const current = await readConfigConstraint(runtime, id);
+      if (expected === null && current !== null) {
+        throw configError("conflict", "新身体边界标识已经对应另一份内容；没有覆盖原资料。");
+      }
+      assertPreparedExpected(current, expected, "身体边界");
+      const timestamp = nextConfigTimestamp(expected?.updated_at ?? null, runtime.now());
+      const after = normalizedConstraintTarget(input, id, expected, timestamp);
+      return sealConfigReceipt<FitnessConstraintSaveReceipt>({
+        purpose: "fitness-config-write",
+        version: 1,
+        operationId: generatedOperationId(runtime),
+        ...generation,
+        kind: "constraint-save",
+        before: expected,
+        after,
+      });
+    });
+  }
+
+  async function prepareConstraintActive(
+    expectedValue: FitnessConstraint,
+    active: boolean,
+  ): Promise<FitnessConstraintActiveReceipt> {
+    const expected = cloneChecked(expectedValue, isFitnessConstraintRow, "身体边界");
+    if (typeof active !== "boolean" || expected.active === active) {
+      throw configError("invalid_input", "身体边界已经处于目标状态。");
+    }
+    if (active && expected.movement_patterns.length === 0 && expected.exercise_ids.length === 0) {
+      throw configError("invalid_input", "这条身体边界没有受影响范围，不能启用。");
+    }
+    return prepareLocked(async () => {
+      const generation = await readConfigGeneration(runtime);
+      const current = await readConfigConstraint(runtime, expected.id);
+      assertPreparedExpected(current, expected, "身体边界");
+      const after: FitnessConstraint = {
+        ...expected,
+        active,
+        updated_at: nextConfigTimestamp(expected.updated_at, runtime.now()),
+      };
+      return sealConfigReceipt<FitnessConstraintActiveReceipt>({
+        purpose: "fitness-config-write",
+        version: 1,
+        operationId: generatedOperationId(runtime),
+        ...generation,
+        kind: "constraint-active",
+        before: expected,
+        after,
+      });
+    });
+  }
+
+  type ConfigPredicate = Readonly<{ sql: string; params: readonly unknown[] }>;
+
+  function joinedPredicate(predicates: readonly ConfigPredicate[]): ConfigPredicate {
+    return {
+      sql: predicates.length === 0
+        ? "1"
+        : predicates.map(({ sql }) => `(${sql})`).join(" AND "),
+      params: predicates.flatMap(({ params }) => [...params]),
+    };
+  }
+
+  function absentPredicate(table: string, id: string): ConfigPredicate {
+    return {
+      sql: `NOT EXISTS(SELECT 1 FROM ${table} WHERE id=?)`,
+      params: [id],
+    };
+  }
+
+  function profilePredicate(row: FitnessProfile): ConfigPredicate {
+    return {
+      sql: `EXISTS(SELECT 1 FROM fitness_profiles WHERE id='profile'
+        AND json(goals_json)=json(?) AND experience IS ?
+        AND resistance_days_per_week IS ? AND cardio_days_per_week IS ?
+        AND session_minutes IS ? AND split IS ?
+        AND json(preferred_weekdays_json)=json(?) AND preferred_rir IS ?
+        AND rest_seconds IS ? AND unit IS ? AND notes IS ?
+        AND created_at IS ? AND updated_at IS ?)`,
+      params: [
+        JSON.stringify(row.goals), row.experience, row.resistance_days_per_week,
+        row.cardio_days_per_week, row.session_minutes, row.split,
+        JSON.stringify(row.preferred_weekdays), row.preferred_rir, row.rest_seconds,
+        row.unit, row.notes, row.created_at, row.updated_at,
+      ],
+    };
+  }
+
+  function venuePredicate(row: FitnessVenue): ConfigPredicate {
+    return {
+      sql: `EXISTS(SELECT 1 FROM fitness_venues WHERE id=? AND name IS ?
+        AND venue_type IS ? AND location IS ? AND area_notes IS ? AND busy_notes IS ?
+        AND default_session_minutes IS ? AND supersets_allowed IS ?
+        AND is_default IS ? AND status IS ? AND last_verified_at IS ?
+        AND created_at IS ? AND updated_at IS ?)`,
+      params: [
+        row.id, row.name, row.venue_type, row.location, row.area_notes, row.busy_notes,
+        row.default_session_minutes, Number(row.supersets_allowed), Number(row.is_default),
+        row.status, row.last_verified_at, row.created_at, row.updated_at,
+      ],
+    };
+  }
+
+  function equipmentPredicate(row: FitnessEquipment): ConfigPredicate {
+    return {
+      sql: `EXISTS(SELECT 1 FROM fitness_equipment WHERE id=? AND venue_id IS ?
+        AND name IS ? AND kind IS ? AND area IS ? AND quantity IS ? AND status IS ?
+        AND load_mode IS ? AND load_semantics IS ? AND min_load_grams IS ?
+        AND max_load_grams IS ? AND increment_grams IS ? AND bar_weight_grams IS ?
+        AND unilateral IS ? AND busy_level IS ? AND json(settings_json)=json(?)
+        AND json(attachments_json)=json(?) AND notes IS ? AND created_at IS ?
+        AND updated_at IS ?)`,
+      params: [
+        row.id, row.venue_id, row.name, row.kind, row.area, row.quantity, row.status,
+        row.load_mode, row.load_semantics, row.min_load_grams, row.max_load_grams,
+        row.increment_grams, row.bar_weight_grams, Number(row.unilateral), row.busy_level,
+        JSON.stringify(row.settings), JSON.stringify(row.attachments), row.notes,
+        row.created_at, row.updated_at,
+      ],
+    };
+  }
+
+  function constraintPredicate(row: FitnessConstraint): ConfigPredicate {
+    return {
+      sql: `EXISTS(SELECT 1 FROM fitness_constraints WHERE id=? AND label IS ?
+        AND body_area IS ? AND severity IS ? AND json(movement_patterns_json)=json(?)
+        AND json(exercise_ids_json)=json(?) AND note IS ? AND active IS ?
+        AND created_at IS ? AND updated_at IS ?)`,
+      params: [
+        row.id, row.label, row.body_area, row.severity,
+        JSON.stringify(row.movement_patterns), JSON.stringify(row.exercise_ids),
+        row.note, Number(row.active), row.created_at, row.updated_at,
+      ],
+    };
+  }
+
+  function loadSetPredicate(
+    equipmentId: string,
+    loads: readonly FitnessEquipmentLoad[],
+  ): ConfigPredicate {
+    const predicates: ConfigPredicate[] = [{
+      sql: "(SELECT COUNT(*) FROM fitness_equipment_loads WHERE equipment_id=?)=?",
+      params: [equipmentId, loads.length],
+    }];
+    for (const load of loads) {
+      predicates.push({
+        sql: `EXISTS(SELECT 1 FROM fitness_equipment_loads WHERE id=?
+          AND equipment_id IS ? AND load_grams IS ? AND quantity IS ?
+          AND label IS ? AND available IS ? AND created_at IS ?)`,
+        params: [
+          load.id, load.equipment_id, load.load_grams, load.quantity, load.label,
+          Number(load.available), load.created_at,
+        ],
+      });
+    }
+    return joinedPredicate(predicates);
+  }
+
+  function transitionSetPredicate(
+    table: "fitness_programs" | "fitness_calendar_events",
+    venueId: string,
+    affectedStatuses: readonly string[],
+    rows: readonly FitnessConfigTransition[],
+  ): ConfigPredicate {
+    const placeholders = affectedStatuses.map(() => "?").join(",");
+    const predicates: ConfigPredicate[] = [{
+      sql: `(SELECT COUNT(*) FROM ${table} WHERE venue_id=?
+        AND status IN (${placeholders}))=?`,
+      params: [venueId, ...affectedStatuses, rows.length],
+    }];
+    for (const row of rows) {
+      predicates.push({
+        sql: `EXISTS(SELECT 1 FROM ${table} WHERE id=? AND venue_id=?
+          AND status IS ? AND updated_at IS ?)`,
+        params: [row.id, venueId, row.status, row.updated_at],
+      });
+    }
+    return joinedPredicate(predicates);
+  }
+
+  function defaultSetPredicate(
+    targetId: string,
+    defaults: readonly FitnessVenue[],
+  ): ConfigPredicate {
+    return joinedPredicate([
+      {
+        sql: "(SELECT COUNT(*) FROM fitness_venues WHERE is_default=1 AND id<>?)=?",
+        params: [targetId, defaults.length],
+      },
+      ...defaults.map(venuePredicate),
+    ]);
+  }
+
+  function configCasSentinel(predicate: ConfigPredicate): SqlStatement {
+    return {
+      sql: `INSERT INTO fitness_settings(key,value,updated_at)
+        SELECT '__fitness_config_cas_abort__',NULL,0 WHERE NOT (${predicate.sql})`,
+      params: predicate.params,
+    };
+  }
+
+  function insertProfile(row: FitnessProfile): SqlStatement {
+    return {
+      sql: `INSERT INTO fitness_profiles(
+        id,goals_json,experience,resistance_days_per_week,cardio_days_per_week,
+        session_minutes,split,preferred_weekdays_json,preferred_rir,rest_seconds,
+        unit,notes,created_at,updated_at
+      ) VALUES('profile',?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      params: [
+        JSON.stringify(row.goals), row.experience, row.resistance_days_per_week,
+        row.cardio_days_per_week, row.session_minutes, row.split,
+        JSON.stringify(row.preferred_weekdays), row.preferred_rir, row.rest_seconds,
+        row.unit, row.notes, row.created_at, row.updated_at,
+      ],
+    };
+  }
+
+  function updateProfile(row: FitnessProfile): SqlStatement {
+    return {
+      sql: `UPDATE fitness_profiles SET goals_json=?,experience=?,
+        resistance_days_per_week=?,cardio_days_per_week=?,session_minutes=?,split=?,
+        preferred_weekdays_json=?,preferred_rir=?,rest_seconds=?,unit=?,notes=?,updated_at=?
+        WHERE id='profile'`,
+      params: [
+        JSON.stringify(row.goals), row.experience, row.resistance_days_per_week,
+        row.cardio_days_per_week, row.session_minutes, row.split,
+        JSON.stringify(row.preferred_weekdays), row.preferred_rir, row.rest_seconds,
+        row.unit, row.notes, row.updated_at,
+      ],
+    };
+  }
+
+  function insertVenue(row: FitnessVenue): SqlStatement {
+    return {
+      sql: `INSERT INTO fitness_venues(
+        id,name,venue_type,location,area_notes,busy_notes,default_session_minutes,
+        supersets_allowed,is_default,status,last_verified_at,created_at,updated_at
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      params: [
+        row.id, row.name, row.venue_type, row.location, row.area_notes, row.busy_notes,
+        row.default_session_minutes, Number(row.supersets_allowed), Number(row.is_default),
+        row.status, row.last_verified_at, row.created_at, row.updated_at,
+      ],
+    };
+  }
+
+  function updateVenue(row: FitnessVenue): SqlStatement {
+    return {
+      sql: `UPDATE fitness_venues SET name=?,venue_type=?,location=?,area_notes=?,
+        busy_notes=?,default_session_minutes=?,supersets_allowed=?,is_default=?,
+        status=?,last_verified_at=?,updated_at=? WHERE id=?`,
+      params: [
+        row.name, row.venue_type, row.location, row.area_notes, row.busy_notes,
+        row.default_session_minutes, Number(row.supersets_allowed), Number(row.is_default),
+        row.status, row.last_verified_at, row.updated_at, row.id,
+      ],
+    };
+  }
+
+  function insertEquipment(row: FitnessEquipment): SqlStatement {
+    return {
+      sql: `INSERT INTO fitness_equipment(
+        id,venue_id,name,kind,area,quantity,status,load_mode,load_semantics,
+        min_load_grams,max_load_grams,increment_grams,bar_weight_grams,unilateral,
+        busy_level,settings_json,attachments_json,notes,created_at,updated_at
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      params: [
+        row.id, row.venue_id, row.name, row.kind, row.area, row.quantity, row.status,
+        row.load_mode, row.load_semantics, row.min_load_grams, row.max_load_grams,
+        row.increment_grams, row.bar_weight_grams, Number(row.unilateral), row.busy_level,
+        JSON.stringify(row.settings), JSON.stringify(row.attachments), row.notes,
+        row.created_at, row.updated_at,
+      ],
+    };
+  }
+
+  function updateEquipment(row: FitnessEquipment): SqlStatement {
+    return {
+      sql: `UPDATE fitness_equipment SET venue_id=?,name=?,kind=?,area=?,quantity=?,
+        status=?,load_mode=?,load_semantics=?,min_load_grams=?,max_load_grams=?,
+        increment_grams=?,bar_weight_grams=?,unilateral=?,busy_level=?,settings_json=?,
+        attachments_json=?,notes=?,updated_at=? WHERE id=?`,
+      params: [
+        row.venue_id, row.name, row.kind, row.area, row.quantity, row.status,
+        row.load_mode, row.load_semantics, row.min_load_grams, row.max_load_grams,
+        row.increment_grams, row.bar_weight_grams, Number(row.unilateral), row.busy_level,
+        JSON.stringify(row.settings), JSON.stringify(row.attachments), row.notes,
+        row.updated_at, row.id,
+      ],
+    };
+  }
+
+  function insertLoad(row: FitnessEquipmentLoad): SqlStatement {
+    return {
+      sql: `INSERT INTO fitness_equipment_loads(
+        id,equipment_id,load_grams,quantity,label,available,created_at
+      ) VALUES(?,?,?,?,?,?,?)`,
+      params: [
+        row.id, row.equipment_id, row.load_grams, row.quantity, row.label,
+        Number(row.available), row.created_at,
+      ],
+    };
+  }
+
+  function insertConstraint(row: FitnessConstraint): SqlStatement {
+    return {
+      sql: `INSERT INTO fitness_constraints(
+        id,label,body_area,severity,movement_patterns_json,exercise_ids_json,
+        note,active,created_at,updated_at
+      ) VALUES(?,?,?,?,?,?,?,?,?,?)`,
+      params: [
+        row.id, row.label, row.body_area, row.severity,
+        JSON.stringify(row.movement_patterns), JSON.stringify(row.exercise_ids),
+        row.note, Number(row.active), row.created_at, row.updated_at,
+      ],
+    };
+  }
+
+  function updateConstraint(row: FitnessConstraint): SqlStatement {
+    return {
+      sql: `UPDATE fitness_constraints SET label=?,body_area=?,severity=?,
+        movement_patterns_json=?,exercise_ids_json=?,note=?,active=?,updated_at=? WHERE id=?`,
+      params: [
+        row.label, row.body_area, row.severity, JSON.stringify(row.movement_patterns),
+        JSON.stringify(row.exercise_ids), row.note, Number(row.active), row.updated_at, row.id,
+      ],
+    };
+  }
+
+  function receiptCasPredicate(receipt: FitnessConfigWriteReceipt): ConfigPredicate {
+    switch (receipt.kind) {
+      case "profile-save":
+        return receipt.before
+          ? profilePredicate(receipt.before)
+          : absentPredicate("fitness_profiles", "profile");
+      case "venue-save":
+        return joinedPredicate([
+          receipt.before
+            ? venuePredicate(receipt.before)
+            : absentPredicate("fitness_venues", receipt.after.id),
+          ...(receipt.after.is_default
+            ? [defaultSetPredicate(
+                receipt.after.id,
+                receipt.defaultResets.map(({ before }) => before),
+              )]
+            : []),
+        ]);
+      case "venue-archive":
+        return joinedPredicate([
+          venuePredicate(receipt.before),
+          {
+            sql: "NOT EXISTS(SELECT 1 FROM fitness_sessions WHERE venue_id=? AND status='active')",
+            params: [receipt.before.id],
+          },
+          transitionSetPredicate(
+            "fitness_programs",
+            receipt.before.id,
+            ["active", "draft"],
+            receipt.programs.map(({ before }) => before),
+          ),
+          transitionSetPredicate(
+            "fitness_calendar_events",
+            receipt.before.id,
+            ["planned"],
+            receipt.events.map(({ before }) => before),
+          ),
+        ]);
+      case "venue-restore":
+        return venuePredicate(receipt.before);
+      case "equipment-save":
+        return joinedPredicate([
+          receipt.before
+            ? joinedPredicate([
+                equipmentPredicate(receipt.before.equipment),
+                loadSetPredicate(receipt.before.equipment.id, receipt.before.loads),
+              ])
+            : absentPredicate("fitness_equipment", receipt.after.equipment.id),
+          {
+            sql: `EXISTS(SELECT 1 FROM fitness_venues
+              WHERE id=? AND status='active' AND updated_at=?)`,
+            params: [receipt.venue.id, receipt.venue.updated_at],
+          },
+        ]);
+      case "equipment-status":
+        return equipmentPredicate(receipt.before);
+      case "constraint-save":
+        return receipt.before
+          ? constraintPredicate(receipt.before)
+          : absentPredicate("fitness_constraints", receipt.after.id);
+      case "constraint-active":
+        return constraintPredicate(receipt.before);
+    }
+  }
+
+  function receiptStatements(receipt: FitnessConfigWriteReceipt): SqlStatement[] {
+    const statements: SqlStatement[] = [configCasSentinel(receiptCasPredicate(receipt))];
+    switch (receipt.kind) {
+      case "profile-save":
+        statements.push(receipt.before ? updateProfile(receipt.after) : insertProfile(receipt.after));
+        break;
+      case "venue-save":
+        for (const reset of receipt.defaultResets) {
+          statements.push({
+            sql: "UPDATE fitness_venues SET is_default=0,updated_at=? WHERE id=?",
+            params: [reset.after.updated_at, reset.after.id],
+          });
+        }
+        statements.push(receipt.before ? updateVenue(receipt.after) : insertVenue(receipt.after));
+        break;
+      case "venue-archive":
+        for (const program of receipt.programs) {
+          statements.push({
+            sql: "UPDATE fitness_programs SET status='archived',updated_at=? WHERE id=?",
+            params: [program.after.updated_at, program.after.id],
+          });
+        }
+        for (const event of receipt.events) {
+          statements.push({
+            sql: "UPDATE fitness_calendar_events SET status='cancelled',updated_at=? WHERE id=?",
+            params: [event.after.updated_at, event.after.id],
+          });
+        }
+        statements.push({
+          sql: "UPDATE fitness_venues SET status='archived',is_default=0,updated_at=? WHERE id=?",
+          params: [receipt.after.updated_at, receipt.after.id],
+        });
+        break;
+      case "venue-restore":
+        statements.push({
+          sql: "UPDATE fitness_venues SET status='active',updated_at=? WHERE id=?",
+          params: [receipt.after.updated_at, receipt.after.id],
+        });
+        break;
+      case "equipment-save":
+        statements.push(receipt.before
+          ? updateEquipment(receipt.after.equipment)
+          : insertEquipment(receipt.after.equipment));
+        if (receipt.before) {
+          statements.push({
+            sql: "DELETE FROM fitness_equipment_loads WHERE equipment_id=?",
+            params: [receipt.after.equipment.id],
+          });
+        }
+        statements.push(...receipt.after.loads.map(insertLoad));
+        break;
+      case "equipment-status":
+        statements.push({
+          sql: "UPDATE fitness_equipment SET status=?,updated_at=? WHERE id=?",
+          params: [receipt.after.status, receipt.after.updated_at, receipt.after.id],
+        });
+        break;
+      case "constraint-save":
+        statements.push(receipt.before
+          ? updateConstraint(receipt.after)
+          : insertConstraint(receipt.after));
+        break;
+      case "constraint-active":
+        statements.push({
+          sql: "UPDATE fitness_constraints SET active=?,updated_at=? WHERE id=?",
+          params: [Number(receipt.after.active), receipt.after.updated_at, receipt.after.id],
+        });
+        break;
+    }
+    return statements;
+  }
+
+  async function inspectWrite(value: unknown): Promise<FitnessConfigWriteInspection> {
+    if (!isFitnessConfigWriteReceipt(value)) return "invalid_receipt";
+    try {
+      if (!await receiptHashIsValid(value)) return "invalid_receipt";
+    } catch {
+      return "invalid_receipt";
+    }
+    try {
+      return await runtime.withExclusiveLock(() => inspectReceiptUnlocked(runtime, value));
+    } catch {
+      return "still_unknown";
+    }
+  }
+
+  async function commitWrite(value: unknown): Promise<FitnessConfigWriteResult> {
+    if (!isFitnessConfigWriteReceipt(value)) {
+      throw configError("invalid_receipt", "写入回执无效；没有改动任何资料。");
+    }
+    try {
+      if (!await receiptHashIsValid(value)) {
+        throw configError("invalid_receipt", "写入回执无效；没有改动任何资料。");
+      }
+    } catch (error) {
+      if (error instanceof FitnessConfigMutationError) throw error;
+      throw configError("invalid_receipt", "写入回执无法验证；没有改动任何资料。");
+    }
+    const receipt = value;
+    const entity = receiptEntity(receipt);
+    try {
+      return await runtime.withExclusiveLock(async () => {
+        const before = await inspectReceiptUnlocked(runtime, receipt);
+        if (before === "exact_saved") {
+          safeConfigBroadcast(runtime, entity.reason);
+          return {
+            outcome: "already_saved",
+            receipt,
+            entityId: entity.id,
+            updatedAt: entity.updatedAt,
+          };
+        }
+        if (before === "changed") {
+          return { outcome: "changed", receipt, entityId: entity.id, retryable: false };
+        }
+        if (before === "still_unknown") {
+          return {
+            outcome: "outcome_uncertain",
+            receipt,
+            entityId: entity.id,
+            retryable: true,
+          };
+        }
+        try {
+          await runtime.batch(receiptStatements(receipt));
+        } catch {
+          // The transaction may have committed even though its response was lost.
+        }
+        const after = await inspectReceiptUnlocked(runtime, receipt);
+        if (after === "exact_saved") {
+          safeConfigBroadcast(runtime, entity.reason);
+          return {
+            outcome: "saved",
+            receipt,
+            entityId: entity.id,
+            updatedAt: entity.updatedAt,
+          };
+        }
+        if (after === "expected") {
+          throw configError(
+            "write_failed",
+            "这次资料确定没有写入；保留当前内容后可以重试。",
+            receipt,
+          );
+        }
+        if (after === "changed") {
+          return { outcome: "changed", receipt, entityId: entity.id, retryable: false };
+        }
+        return {
+          outcome: "outcome_uncertain",
+          receipt,
+          entityId: entity.id,
+          retryable: true,
+        };
+      });
+    } catch (error) {
+      if (error instanceof FitnessConfigMutationError) throw error;
+      return {
+        outcome: "outcome_uncertain",
+        receipt,
+        entityId: entity.id,
+        retryable: true,
+      };
+    }
+  }
+
+  return {
+    prepareFitnessProfileSave: prepareProfileSave,
+    prepareFitnessVenueSave: prepareVenueSave,
+    prepareFitnessVenueArchive: prepareVenueArchive,
+    prepareFitnessVenueRestore: prepareVenueRestore,
+    prepareFitnessEquipmentSave: prepareEquipmentSave,
+    prepareFitnessEquipmentStatus: prepareEquipmentStatus,
+    prepareFitnessConstraintSave: prepareConstraintSave,
+    prepareFitnessConstraintActive: prepareConstraintActive,
+    inspectFitnessConfigWrite: inspectWrite,
+    commitFitnessConfigWrite: commitWrite,
+  } as const;
+}
+
+const defaultFitnessConfigStorageService = createFitnessConfigStorageService();
+
+export const prepareFitnessProfileSave =
+  defaultFitnessConfigStorageService.prepareFitnessProfileSave;
+export const prepareFitnessVenueSave =
+  defaultFitnessConfigStorageService.prepareFitnessVenueSave;
+export const prepareFitnessVenueArchive =
+  defaultFitnessConfigStorageService.prepareFitnessVenueArchive;
+export const prepareFitnessVenueRestore =
+  defaultFitnessConfigStorageService.prepareFitnessVenueRestore;
+export const prepareFitnessEquipmentSave =
+  defaultFitnessConfigStorageService.prepareFitnessEquipmentSave;
+export const prepareFitnessEquipmentStatus =
+  defaultFitnessConfigStorageService.prepareFitnessEquipmentStatus;
+export const prepareFitnessConstraintSave =
+  defaultFitnessConfigStorageService.prepareFitnessConstraintSave;
+export const prepareFitnessConstraintActive =
+  defaultFitnessConfigStorageService.prepareFitnessConstraintActive;
+export const inspectFitnessConfigWrite =
+  defaultFitnessConfigStorageService.inspectFitnessConfigWrite;
+export const commitFitnessConfigWrite =
+  defaultFitnessConfigStorageService.commitFitnessConfigWrite;
 
 function canComposePlateLoadedWeight(
   targetGrams: number,
