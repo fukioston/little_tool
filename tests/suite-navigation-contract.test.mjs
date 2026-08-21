@@ -72,7 +72,7 @@ test("landing privacy copy distinguishes local defaults from deliberate AI conte
   assert.match(source, /默认保存在本浏览器/);
   assert.match(source, /只有你主动使用 AI 功能时/);
   assert.match(source, /该次请求所需的最少上下文/);
-  assert.match(source, /清除站点数据仍会影响资料/);
+  assert.match(source, /清除这个网址的站点数据仍会影响资料/);
 });
 
 test("global CSS contains only reset and suite landing styles", async () => {
