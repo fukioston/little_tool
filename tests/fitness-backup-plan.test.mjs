@@ -64,21 +64,32 @@ function executePlan(database, statements) {
 const [plan, schema] = await loadModules();
 const sqlite3Promise = sqlite3InitModule();
 
-async function databaseFixture() {
+async function databaseFixture(version = 2) {
+  assert.ok(version === 1 || version === 2);
   const sqlite3 = await sqlite3Promise;
   const database = new sqlite3.oo1.DB(":memory:", "c");
   database.exec("PRAGMA foreign_keys=ON");
   database.transaction("IMMEDIATE", () => {
-    for (const { sql } of schema.SHILIAN_SCHEMA_STATEMENTS) {
+    const statements = version === 1
+      ? schema.SHILIAN_V1_SCHEMA_STATEMENTS
+      : schema.SHILIAN_SCHEMA_STATEMENTS;
+    for (const { sql } of statements) {
       database.exec(sql);
     }
     executeRun(
       database,
       "INSERT INTO fitness_schema_migrations(version,name,applied_at) VALUES(?,?,?)",
-      [1, schema.SHILIAN_MIGRATION_NAME, 1_777_000_000_000],
+      [1, schema.SHILIAN_V1_MIGRATION_NAME, 1_777_000_000_000],
     );
+    if (version === 2) {
+      executeRun(
+        database,
+        "INSERT INTO fitness_schema_migrations(version,name,applied_at) VALUES(?,?,?)",
+        [2, schema.SHILIAN_V2_MIGRATION_NAME, 1_777_000_000_001],
+      );
+    }
     database.exec(`PRAGMA application_id=${SHLN}`);
-    database.exec("PRAGMA user_version=1");
+    database.exec(`PRAGMA user_version=${version}`);
   });
   return database;
 }
@@ -156,7 +167,39 @@ function identity(database) {
   };
 }
 
-test("complete restore accepts zero ready files and the exact canonical v1 schema", async () => {
+function insertV1ProgramDay(database) {
+  executeRun(
+    database,
+    "INSERT INTO fitness_venues(id,name,venue_type,location,area_notes,busy_notes,default_session_minutes,supersets_allowed,is_default,status,last_verified_at,created_at,updated_at) VALUES('venue-v1','旧场地','home','','','',60,0,0,'active',NULL,1,1)",
+  );
+  executeRun(
+    database,
+    "INSERT INTO fitness_programs(id,name,venue_id,goal,split,status,version,source,assumptions_json,created_at,updated_at) VALUES('program-v1','旧计划','venue-v1','strength','full_body','active',1,'local','[]',1,1)",
+  );
+  executeRun(
+    database,
+    "INSERT INTO fitness_program_days(id,program_id,day_index,weekday,kind,name,focus,estimated_minutes,variant,created_at) VALUES('day-v1','program-v1',0,1,'resistance','周一','全身',45,'standard',1)",
+  );
+}
+
+function insertV1Event(database, id, startsAt, status = "planned") {
+  executeRun(
+    database,
+    "INSERT INTO fitness_calendar_events(id,program_day_id,venue_id,title,kind,starts_at,planned_minutes,status,rescheduled_from_id,note,created_at,updated_at) VALUES(?,'day-v1','venue-v1','周一','resistance',?,45,?,NULL,'历史备注',2,3)",
+    [id, startsAt, status],
+  );
+}
+
+function localDateKey(timestamp) {
+  const date = new Date(timestamp);
+  return [
+    date.getFullYear(),
+    String(date.getMonth() + 1).padStart(2, "0"),
+    String(date.getDate()).padStart(2, "0"),
+  ].join("-");
+}
+
+test("complete restore accepts zero ready files and the exact canonical v2 schema", async () => {
   const database = await databaseFixture();
   try {
     insertFile(database, metadata(9, {
@@ -165,10 +208,84 @@ test("complete restore accepts zero ready files and the exact canonical v1 schem
       status: "missing",
     }));
     executePlan(database, plan.createCompleteFitnessRestoreStatements([]));
-    assert.deepEqual(identity(database), { applicationId: SHLN, userVersion: 1 });
+    assert.deepEqual(identity(database), { applicationId: SHLN, userVersion: 2 });
     assert.equal(fileRows(database).length, 1);
     assert.equal(fileRows(database)[0].status, "missing");
     assert.deepEqual(database.selectObjects("PRAGMA foreign_key_check"), []);
+  } finally {
+    database.close();
+  }
+});
+
+test("complete v1 restore derives immutable occurrences and finishes as exact v2", async () => {
+  const database = await databaseFixture(1);
+  try {
+    insertV1ProgramDay(database);
+    const startsAt = new Date(2026, 7, 24, 19, 0, 0, 0).getTime();
+    insertV1Event(database, "event-v1", startsAt, "completed");
+
+    executePlan(database, plan.createCompleteFitnessRestoreStatements([], 1));
+
+    assert.deepEqual(identity(database), { applicationId: SHLN, userVersion: 2 });
+    assert.deepEqual(
+      database.selectObjects(
+        "SELECT id,starts_at,occurrence_key,status,note,created_at,updated_at FROM fitness_calendar_events",
+      ).map((row) => ({ ...row })),
+      [{
+        id: "event-v1",
+        starts_at: startsAt,
+        occurrence_key: localDateKey(startsAt),
+        status: "completed",
+        note: "历史备注",
+        created_at: 2,
+        updated_at: 3,
+      }],
+    );
+    assert.deepEqual(
+      database.selectObjects("PRAGMA table_info(fitness_calendar_events)").map(({ name }) => name),
+      [...schema.SHILIAN_TABLE_COLUMNS.fitness_calendar_events],
+    );
+    assert.equal(
+      database.selectValue(
+        "SELECT name FROM sqlite_schema WHERE type='index' AND name='fitness_events_occurrence_idx'",
+      ),
+      "fitness_events_occurrence_idx",
+    );
+  } finally {
+    database.close();
+  }
+});
+
+test("complete v1 restore rolls back entirely when occurrence identities collide", async () => {
+  const database = await databaseFixture(1);
+  try {
+    insertV1ProgramDay(database);
+    const startsAt = new Date(2026, 7, 24, 9, 0, 0, 0).getTime();
+    insertV1Event(database, "event-a", startsAt);
+    insertV1Event(database, "event-b", startsAt + 3_600_000);
+    const before = database.selectObjects("SELECT * FROM fitness_calendar_events ORDER BY id")
+      .map((row) => ({ ...row }));
+
+    assert.throws(
+      () => executePlan(database, plan.createCompleteFitnessRestoreStatements([], 1)),
+      /CHECK constraint failed/,
+    );
+
+    assert.deepEqual(identity(database), { applicationId: SHLN, userVersion: 1 });
+    assert.deepEqual(
+      database.selectObjects("SELECT * FROM fitness_calendar_events ORDER BY id")
+        .map((row) => ({ ...row })),
+      before,
+    );
+    assert.deepEqual(
+      database.selectObjects("PRAGMA table_info(fitness_calendar_events)").map(({ name }) => name),
+      [...schema.SHILIAN_V1_TABLE_COLUMNS.fitness_calendar_events],
+    );
+    assert.deepEqual(
+      database.selectObjects("SELECT version,name FROM fitness_schema_migrations")
+        .map((row) => ({ ...row })),
+      [{ version: 1, name: schema.SHILIAN_V1_MIGRATION_NAME }],
+    );
   } finally {
     database.close();
   }
@@ -264,7 +381,7 @@ test("exact schema and identity guard rejects altered candidates", async (t) => 
     },
     {
       name: "future user version",
-      mutate(database) { database.exec("PRAGMA user_version=2"); },
+      mutate(database) { database.exec("PRAGMA user_version=3"); },
     },
     {
       name: "unknown table",
@@ -289,7 +406,7 @@ test("exact schema and identity guard rejects altered candidates", async (t) => 
     {
       name: "altered migration ledger",
       mutate(database) {
-        database.exec("UPDATE fitness_schema_migrations SET name='invented-schema'");
+        database.exec("UPDATE fitness_schema_migrations SET name='invented-schema' WHERE version=2");
       },
     },
   ];
@@ -312,12 +429,34 @@ test("exact schema and identity guard rejects altered candidates", async (t) => 
     });
   }
 
+  await t.test("altered exact v1 source", async () => {
+    const database = await databaseFixture(1);
+    try {
+      database.exec("CREATE TABLE unexpected_v1_object(id TEXT) STRICT");
+      assert.throws(
+        () => executePlan(
+          database,
+          plan.createCompleteFitnessRestoreStatements([], 1),
+        ),
+        /CHECK constraint failed/,
+      );
+      assert.deepEqual(identity(database), { applicationId: SHLN, userVersion: 1 });
+      assert.deepEqual(
+        database.selectObjects("PRAGMA table_info(fitness_calendar_events)")
+          .map(({ name }) => name),
+        [...schema.SHILIAN_V1_TABLE_COLUMNS.fitness_calendar_events],
+      );
+    } finally {
+      database.close();
+    }
+  });
+
   assert.throws(
     () => plan.createCompleteFitnessRestoreStatements([], 0),
     /Unsupported Fitness restore source user_version/,
   );
   assert.throws(
-    () => plan.createLegacyFitnessRestoreStatements(2),
+    () => plan.createLegacyFitnessRestoreStatements(3),
     /Unsupported Fitness restore source user_version/,
   );
 });
@@ -362,15 +501,23 @@ test("duplicate, overlapping, stale, and mutated staged mappings are rejected be
   );
 });
 
-test("legacy raw SQLite restore removes all OPFS-binding rows", async () => {
-  const database = await databaseFixture();
+test("legacy raw v1 SQLite restore migrates to v2 and removes all OPFS-binding rows", async () => {
+  const database = await databaseFixture(1);
   try {
     insertFile(database, mapping(0).original);
     insertFile(database, metadata(1, { status: "missing" }));
     insertFile(database, metadata(2, { status: "deleting" }));
-    executePlan(database, plan.createLegacyFitnessRestoreStatements());
+    executePlan(database, plan.createLegacyFitnessRestoreStatements(1));
     assert.deepEqual(fileRows(database), []);
-    assert.deepEqual(identity(database), { applicationId: SHLN, userVersion: 1 });
+    assert.deepEqual(identity(database), { applicationId: SHLN, userVersion: 2 });
+    assert.deepEqual(
+      database.selectObjects("SELECT version,name FROM fitness_schema_migrations ORDER BY version")
+        .map((row) => ({ ...row })),
+      [
+        { version: 1, name: schema.SHILIAN_V1_MIGRATION_NAME },
+        { version: 2, name: schema.SHILIAN_V2_MIGRATION_NAME },
+      ],
+    );
   } finally {
     database.close();
   }
@@ -387,10 +534,12 @@ test("restore SQL keeps file values parameterized and staged requirements canoni
   assert.ok(!update.sql.includes(one.staged.key));
 
   assert.equal(plan.FITNESS_APPLICATION_ID, SHLN);
-  assert.equal(plan.FITNESS_USER_VERSION, 1);
-  assert.equal(plan.FITNESS_SCHEMA_REQUIREMENTS.minimumUserVersion, 1);
-  assert.equal(plan.FITNESS_SCHEMA_REQUIREMENTS.maximumUserVersion, 1);
+  assert.equal(plan.FITNESS_USER_VERSION, 2);
+  assert.equal(plan.FITNESS_SCHEMA_REQUIREMENTS.minimumUserVersion, 2);
+  assert.equal(plan.FITNESS_SCHEMA_REQUIREMENTS.maximumUserVersion, 2);
   assert.deepEqual(plan.FITNESS_SCHEMA_REQUIREMENTS.sourceApplicationIds, [SHLN]);
+  assert.equal(plan.FITNESS_SCHEMA_REQUIREMENTS.sourceMinimumUserVersion, 1);
+  assert.equal(plan.FITNESS_SCHEMA_REQUIREMENTS.sourceMaximumUserVersion, 2);
   assert.deepEqual(
     plan.FITNESS_SCHEMA_REQUIREMENTS.requiredTables.map(({ name }) => name),
     schema.SHILIAN_TABLES,
@@ -400,6 +549,12 @@ test("restore SQL keeps file values parameterized and staged requirements canoni
       ({ name }) => name === "fitness_files",
     )?.columns,
     schema.SHILIAN_TABLE_COLUMNS.fitness_files,
+  );
+  assert.deepEqual(
+    plan.FITNESS_SCHEMA_REQUIREMENTS.sourceRequiredTables.find(
+      ({ name }) => name === "fitness_calendar_events",
+    )?.columns,
+    schema.SHILIAN_V1_TABLE_COLUMNS.fitness_calendar_events,
   );
   assert.deepEqual(plan.FITNESS_SCHEMA_REQUIREMENTS.allowedViews, []);
   assert.deepEqual(plan.FITNESS_SCHEMA_REQUIREMENTS.allowedTriggers, []);

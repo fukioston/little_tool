@@ -2,8 +2,11 @@ import type { LocalDatabaseSchema } from "./types";
 
 /** SQLite application_id for the ASCII marker "SHLN" (适练 / shilian). */
 export const SHILIAN_APPLICATION_ID = 0x53484c4e;
-export const SHILIAN_USER_VERSION = 1;
-export const SHILIAN_MIGRATION_NAME = "initial-truthful-fitness-runtime";
+export const SHILIAN_USER_VERSION = 2;
+export const SHILIAN_V1_MIGRATION_NAME = "initial-truthful-fitness-runtime";
+export const SHILIAN_V2_MIGRATION_NAME = "calendar-occurrence-identity";
+/** @deprecated Prefer the versioned migration-name exports. */
+export const SHILIAN_MIGRATION_NAME = SHILIAN_V1_MIGRATION_NAME;
 
 export const SHILIAN_TABLE_COLUMNS = {
   fitness_schema_migrations: ["version", "name", "applied_at"],
@@ -15,7 +18,7 @@ export const SHILIAN_TABLE_COLUMNS = {
   fitness_programs: ["id", "name", "venue_id", "goal", "split", "status", "version", "source", "assumptions_json", "created_at", "updated_at"],
   fitness_program_days: ["id", "program_id", "day_index", "weekday", "kind", "name", "focus", "estimated_minutes", "variant", "created_at"],
   fitness_program_items: ["id", "program_day_id", "exercise_id", "equipment_id", "resource_equipment_ids_json", "order_index", "sets", "rep_min", "rep_max", "duration_seconds", "target_rir", "rest_seconds", "load_grams", "load_guidance", "rationale", "substitution_exercise_ids_json", "equipment_snapshot", "created_at"],
-  fitness_calendar_events: ["id", "program_day_id", "venue_id", "title", "kind", "starts_at", "planned_minutes", "status", "rescheduled_from_id", "note", "created_at", "updated_at"],
+  fitness_calendar_events: ["id", "program_day_id", "venue_id", "title", "kind", "starts_at", "occurrence_key", "planned_minutes", "status", "rescheduled_from_id", "note", "created_at", "updated_at"],
   fitness_sessions: ["id", "event_id", "venue_id", "program_day_id", "started_at", "ended_at", "status", "available_minutes", "energy_note", "soreness_note", "reflection", "created_at", "updated_at"],
   fitness_session_exercises: ["id", "session_id", "exercise_id", "equipment_id", "planned_item_id", "order_index", "status", "substituted_for_exercise_id", "substitution_reason", "equipment_snapshot", "note", "created_at", "updated_at"],
   fitness_sets: ["id", "session_exercise_id", "set_index", "set_kind", "load_grams", "reps", "duration_seconds", "rir", "rpe", "completed", "pain_note", "completed_at", "client_mutation_id", "created_at", "updated_at"],
@@ -27,16 +30,26 @@ export const SHILIAN_TABLE_COLUMNS = {
 
 export const SHILIAN_TABLES = Object.keys(SHILIAN_TABLE_COLUMNS) as ReadonlyArray<keyof typeof SHILIAN_TABLE_COLUMNS>;
 
+export const SHILIAN_V1_TABLE_COLUMNS = {
+  ...SHILIAN_TABLE_COLUMNS,
+  fitness_calendar_events: ["id", "program_day_id", "venue_id", "title", "kind", "starts_at", "planned_minutes", "status", "rescheduled_from_id", "note", "created_at", "updated_at"],
+} as const;
+
 export const SHILIAN_INDEXES = [
   "fitness_equipment_venue_idx",
   "fitness_loads_equipment_idx",
   "fitness_events_date_idx",
+  "fitness_events_occurrence_idx",
   "fitness_sessions_date_idx",
   "fitness_session_exercises_idx",
   "fitness_sets_exercise_idx",
   "fitness_capabilities_idx",
   "fitness_files_entity_idx",
 ] as const;
+
+export const SHILIAN_V1_INDEXES = SHILIAN_INDEXES.filter(
+  (name) => name !== "fitness_events_occurrence_idx",
+);
 
 /** Pure SQL shared by the runtime installer and the reference contract. */
 export const SHILIAN_SCHEMA_STATEMENTS: readonly Readonly<{ sql: string }>[] = [
@@ -177,12 +190,14 @@ export const SHILIAN_SCHEMA_STATEMENTS: readonly Readonly<{ sql: string }>[] = [
       title TEXT NOT NULL,
       kind TEXT NOT NULL CHECK(kind IN ('resistance','cardio','rest','note')),
       starts_at INTEGER NOT NULL CHECK(starts_at>=0),
+      occurrence_key TEXT,
       planned_minutes INTEGER NOT NULL CHECK(planned_minutes BETWEEN 0 AND 1440),
       status TEXT NOT NULL CHECK(status IN ('planned','in_progress','completed','not_performed','cancelled')),
       rescheduled_from_id TEXT REFERENCES fitness_calendar_events(id),
       note TEXT NOT NULL,
       created_at INTEGER NOT NULL CHECK(created_at>=0),
-      updated_at INTEGER NOT NULL CHECK(updated_at>=created_at)
+      updated_at INTEGER NOT NULL CHECK(updated_at>=created_at),
+      CHECK(program_day_id IS NULL OR occurrence_key IS NOT NULL)
     ) STRICT` },
   { sql: `CREATE TABLE fitness_sessions(
       id TEXT PRIMARY KEY,
@@ -282,6 +297,7 @@ export const SHILIAN_SCHEMA_STATEMENTS: readonly Readonly<{ sql: string }>[] = [
   { sql: "CREATE INDEX fitness_equipment_venue_idx ON fitness_equipment(venue_id,status,kind)" },
   { sql: "CREATE INDEX fitness_loads_equipment_idx ON fitness_equipment_loads(equipment_id,available,load_grams)" },
   { sql: "CREATE INDEX fitness_events_date_idx ON fitness_calendar_events(starts_at,status)" },
+  { sql: "CREATE UNIQUE INDEX fitness_events_occurrence_idx ON fitness_calendar_events(program_day_id,occurrence_key) WHERE program_day_id IS NOT NULL AND occurrence_key IS NOT NULL" },
   { sql: "CREATE INDEX fitness_sessions_date_idx ON fitness_sessions(started_at DESC,status)" },
   { sql: "CREATE INDEX fitness_session_exercises_idx ON fitness_session_exercises(session_id,order_index)" },
   { sql: "CREATE INDEX fitness_sets_exercise_idx ON fitness_sets(session_exercise_id,set_index)" },
@@ -289,20 +305,102 @@ export const SHILIAN_SCHEMA_STATEMENTS: readonly Readonly<{ sql: string }>[] = [
   { sql: "CREATE INDEX fitness_files_entity_idx ON fitness_files(entity_type,entity_id,status)" },
 ];
 
-export const SHILIAN_OBJECT_SQL: Readonly<Record<string, string>> = Object.fromEntries(
-  SHILIAN_SCHEMA_STATEMENTS.map(({ sql }) => {
+const SHILIAN_V1_CALENDAR_EVENTS_SQL = `CREATE TABLE fitness_calendar_events(
+      id TEXT PRIMARY KEY,
+      program_day_id TEXT REFERENCES fitness_program_days(id),
+      venue_id TEXT REFERENCES fitness_venues(id),
+      title TEXT NOT NULL,
+      kind TEXT NOT NULL CHECK(kind IN ('resistance','cardio','rest','note')),
+      starts_at INTEGER NOT NULL CHECK(starts_at>=0),
+      planned_minutes INTEGER NOT NULL CHECK(planned_minutes BETWEEN 0 AND 1440),
+      status TEXT NOT NULL CHECK(status IN ('planned','in_progress','completed','not_performed','cancelled')),
+      rescheduled_from_id TEXT REFERENCES fitness_calendar_events(id),
+      note TEXT NOT NULL,
+      created_at INTEGER NOT NULL CHECK(created_at>=0),
+      updated_at INTEGER NOT NULL CHECK(updated_at>=created_at)
+    ) STRICT`;
+
+export const SHILIAN_V1_SCHEMA_STATEMENTS: readonly Readonly<{ sql: string }>[] =
+  SHILIAN_SCHEMA_STATEMENTS.flatMap(({ sql }) => {
+    if (sql.includes("CREATE TABLE fitness_calendar_events(")) {
+      return [{ sql: SHILIAN_V1_CALENDAR_EVENTS_SQL }];
+    }
+    if (sql.includes("CREATE UNIQUE INDEX fitness_events_occurrence_idx")) {
+      return [];
+    }
+    return [{ sql }];
+  });
+
+function objectSql(statements: readonly Readonly<{ sql: string }>[]) {
+  return Object.fromEntries(statements.map(({ sql }) => {
     const match = /^CREATE\s+(?:UNIQUE\s+)?(?:TABLE|INDEX)\s+([A-Za-z_][A-Za-z0-9_]*)/i.exec(
       sql.trim(),
     );
     if (!match) throw new Error("适练参考结构包含无法识别的 SQL");
     return [match[1], sql] as const;
-  }),
+  }));
+}
+
+export const SHILIAN_OBJECT_SQL: Readonly<Record<string, string>> = objectSql(
+  SHILIAN_SCHEMA_STATEMENTS,
 );
 
-const referenceMigrationSql = [
+export const SHILIAN_V1_OBJECT_SQL: Readonly<Record<string, string>> = objectSql(
+  SHILIAN_V1_SCHEMA_STATEMENTS,
+);
+
+export const SHILIAN_OCCURRENCE_KEY_SQL =
+  "strftime('%Y-%m-%d',starts_at / 1000,'unixepoch','localtime')";
+
+export const SHILIAN_V2_SCHEMA_MIGRATION_STATEMENTS: readonly Readonly<{ sql: string }>[] = [
+  {
+    sql: `CREATE TEMP TABLE __fitness_occurrence_migration_guard(
+      value INTEGER NOT NULL CHECK(value=1)
+    )`,
+  },
+  {
+    sql: `INSERT INTO temp.__fitness_occurrence_migration_guard(value)
+      SELECT CASE WHEN NOT EXISTS (
+        SELECT 1 FROM fitness_calendar_events
+        WHERE program_day_id IS NOT NULL
+        GROUP BY program_day_id,${SHILIAN_OCCURRENCE_KEY_SQL}
+        HAVING COUNT(*)>1
+      ) THEN 1 ELSE 0 END`,
+  },
+  { sql: "DROP TABLE temp.__fitness_occurrence_migration_guard" },
+  { sql: "PRAGMA defer_foreign_keys=ON" },
+  {
+    sql: `CREATE TEMP TABLE __fitness_calendar_events_v2_stage AS
+      SELECT id,program_day_id,venue_id,title,kind,starts_at,
+        CASE WHEN program_day_id IS NULL THEN NULL
+          ELSE ${SHILIAN_OCCURRENCE_KEY_SQL} END occurrence_key,
+        planned_minutes,status,rescheduled_from_id,note,created_at,updated_at
+      FROM fitness_calendar_events`,
+  },
+  { sql: "DROP TABLE fitness_calendar_events" },
+  { sql: SHILIAN_OBJECT_SQL.fitness_calendar_events },
+  {
+    sql: `INSERT INTO fitness_calendar_events(
+        id,program_day_id,venue_id,title,kind,starts_at,occurrence_key,
+        planned_minutes,status,rescheduled_from_id,note,created_at,updated_at
+      ) SELECT id,program_day_id,venue_id,title,kind,starts_at,occurrence_key,
+        planned_minutes,status,rescheduled_from_id,note,created_at,updated_at
+      FROM temp.__fitness_calendar_events_v2_stage`,
+  },
+  { sql: "DROP TABLE temp.__fitness_calendar_events_v2_stage" },
+  { sql: SHILIAN_OBJECT_SQL.fitness_events_date_idx },
+  { sql: SHILIAN_OBJECT_SQL.fitness_events_occurrence_idx },
+];
+
+const referenceMigrationV1Sql = [
   `PRAGMA application_id=${SHILIAN_APPLICATION_ID}`,
-  ...SHILIAN_SCHEMA_STATEMENTS.map(({ sql }) => sql),
-  `INSERT INTO fitness_schema_migrations(version,name,applied_at) VALUES(1,'${SHILIAN_MIGRATION_NAME}',0)`,
+  ...SHILIAN_V1_SCHEMA_STATEMENTS.map(({ sql }) => sql),
+  `INSERT INTO fitness_schema_migrations(version,name,applied_at) VALUES(1,'${SHILIAN_V1_MIGRATION_NAME}',0)`,
+].join(";\n");
+
+const referenceMigrationV2Sql = [
+  ...SHILIAN_V2_SCHEMA_MIGRATION_STATEMENTS.map(({ sql }) => sql),
+  `INSERT INTO fitness_schema_migrations(version,name,applied_at) VALUES(2,'${SHILIAN_V2_MIGRATION_NAME}',0)`,
 ].join(";\n");
 
 export const shilianSchema: LocalDatabaseSchema = {
@@ -311,9 +409,13 @@ export const shilianSchema: LocalDatabaseSchema = {
   applicationId: SHILIAN_APPLICATION_ID,
   seedVersion: 0,
   migrations: [{
-    version: SHILIAN_USER_VERSION,
+    version: 1,
     description: "Create the truthful equipment-constrained fitness runtime",
-    sql: referenceMigrationSql,
+    sql: referenceMigrationV1Sql,
+  }, {
+    version: SHILIAN_USER_VERSION,
+    description: "Give every scheduled program occurrence an immutable identity",
+    sql: referenceMigrationV2Sql,
   }],
   seedSql: "",
 };

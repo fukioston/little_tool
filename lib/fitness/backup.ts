@@ -205,14 +205,15 @@ function sqliteIdentity(database: Uint8Array) {
   };
 }
 
-function assertCanonicalFitnessIdentity(database: Uint8Array): void {
+function assertSupportedFitnessIdentity(database: Uint8Array): 1 | 2 {
   const identity = sqliteIdentity(database);
   if (
     identity.applicationId !== FITNESS_APPLICATION_ID ||
-    identity.userVersion !== FITNESS_USER_VERSION
+    (identity.userVersion !== 1 && identity.userVersion !== FITNESS_USER_VERSION)
   ) {
-    throw new Error("这份 SQLite 不是当前支持的适练 v1 数据库，当前数据没有被改动");
+    throw new Error("这份 SQLite 不是当前支持的适练 v1/v2 数据库，当前数据没有被改动");
   }
+  return identity.userVersion as 1 | 2;
 }
 
 function isString(value: unknown): value is string {
@@ -537,11 +538,11 @@ export function createFitnessBackupService(
         throw new Error("旧版 SQLite 备份超过 512 MB，已在读取前拒绝");
       }
       const database = new Uint8Array(await backup.arrayBuffer());
-      assertCanonicalFitnessIdentity(database);
+      const sourceUserVersion = assertSupportedFitnessIdentity(database);
       return runtime.withExclusiveLock(async () => {
         await stageAndActivate(
           database,
-          createLegacyFitnessRestoreStatements(FITNESS_USER_VERSION),
+          createLegacyFitnessRestoreStatements(sourceUserVersion),
           [],
           runtime,
         );

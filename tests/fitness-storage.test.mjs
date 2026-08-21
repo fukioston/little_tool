@@ -157,6 +157,28 @@ async function databaseFixture() {
   return { database, state };
 }
 
+function installV1Schema(database, appliedAt = 1_700_000_000_000) {
+  database.transaction("IMMEDIATE", () => {
+    for (const { sql } of schema.SHILIAN_V1_SCHEMA_STATEMENTS) executeRun(database, sql);
+    executeRun(
+      database,
+      "INSERT INTO fitness_schema_migrations(version,name,applied_at) VALUES(1,?,?)",
+      [schema.SHILIAN_V1_MIGRATION_NAME, appliedAt],
+    );
+    executeRun(database, `PRAGMA application_id=${schema.SHILIAN_APPLICATION_ID}`);
+    executeRun(database, "PRAGMA user_version=1");
+  });
+}
+
+function localDateKey(timestamp) {
+  const date = new Date(timestamp);
+  return [
+    date.getFullYear(),
+    String(date.getMonth() + 1).padStart(2, "0"),
+    String(date.getDate()).padStart(2, "0"),
+  ].join("-");
+}
+
 const profileInput = {
   goals: ["strength", "general_health"],
   experience: "returning",
@@ -274,11 +296,14 @@ test("fresh initialization has exact identity, exact objects, and zero personal 
   try {
     await store.initializeFitnessDatabase();
     assert.equal(Number(database.selectValue("PRAGMA application_id")), 0x53484c4e);
-    assert.equal(Number(database.selectValue("PRAGMA user_version")), 1);
+    assert.equal(Number(database.selectValue("PRAGMA user_version")), 2);
     assert.deepEqual(
-      database.selectObjects("SELECT version,name FROM fitness_schema_migrations")
+      database.selectObjects("SELECT version,name FROM fitness_schema_migrations ORDER BY version")
         .map((row) => ({ ...row })),
-      [{ version: 1, name: schema.SHILIAN_MIGRATION_NAME }],
+      [
+        { version: 1, name: schema.SHILIAN_V1_MIGRATION_NAME },
+        { version: 2, name: schema.SHILIAN_V2_MIGRATION_NAME },
+      ],
     );
     assert.deepEqual(
       database.selectObjects(
@@ -318,6 +343,166 @@ test("fresh initialization has exact identity, exact objects, and zero personal 
     );
     database.exec("PRAGMA writable_schema=OFF");
     await assert.rejects(store.initializeFitnessDatabase(), /定义与当前版本不一致/);
+  } finally {
+    database.close();
+  }
+});
+
+test("exact v1 databases migrate atomically to v2 without rewriting calendar facts", async () => {
+  const { database } = await databaseFixture();
+  try {
+    installV1Schema(database, 1234);
+    const startsAt = new Date(2026, 7, 24, 19, 0, 0, 0).getTime();
+    executeRun(
+      database,
+      "INSERT INTO fitness_venues(id,name,venue_type,location,area_notes,busy_notes,default_session_minutes,supersets_allowed,is_default,status,last_verified_at,created_at,updated_at) VALUES('venue-v1','旧场地','home','','','',60,0,0,'active',NULL,1,1)",
+    );
+    executeRun(
+      database,
+      "INSERT INTO fitness_programs(id,name,venue_id,goal,split,status,version,source,assumptions_json,created_at,updated_at) VALUES('program-v1','旧计划','venue-v1','strength','full_body','active',1,'local','[]',1,1)",
+    );
+    executeRun(
+      database,
+      "INSERT INTO fitness_program_days(id,program_id,day_index,weekday,kind,name,focus,estimated_minutes,variant,created_at) VALUES('day-v1','program-v1',0,1,'resistance','周一','全身',45,'standard',1)",
+    );
+    executeRun(
+      database,
+      "INSERT INTO fitness_calendar_events(id,program_day_id,venue_id,title,kind,starts_at,planned_minutes,status,rescheduled_from_id,note,created_at,updated_at) VALUES('event-v1','day-v1','venue-v1','周一','resistance',?,45,'completed',NULL,'保留事实',2,3)",
+      [startsAt],
+    );
+    executeRun(
+      database,
+      "INSERT INTO fitness_calendar_events(id,program_day_id,venue_id,title,kind,starts_at,planned_minutes,status,rescheduled_from_id,note,created_at,updated_at) VALUES('manual-v1',NULL,'venue-v1','自由训练','note',?,30,'cancelled','event-v1','手动安排',4,5)",
+      [startsAt + 60_000],
+    );
+    executeRun(
+      database,
+      "INSERT INTO fitness_sessions(id,event_id,venue_id,program_day_id,started_at,ended_at,status,available_minutes,energy_note,soreness_note,reflection,created_at,updated_at) VALUES('session-v1','event-v1','venue-v1','day-v1',?,?, 'completed',45,'usual','','保留训练事实',6,7)",
+      [startsAt, startsAt + 2_700_000],
+    );
+
+    await store.initializeFitnessDatabase();
+
+    assert.equal(Number(database.selectValue("PRAGMA user_version")), 2);
+    assert.deepEqual(
+      database.selectObjects("SELECT version,name,applied_at FROM fitness_schema_migrations ORDER BY version")
+        .map((row) => ({ ...row })),
+      [
+        { version: 1, name: schema.SHILIAN_V1_MIGRATION_NAME, applied_at: 1234 },
+        {
+          version: 2,
+          name: schema.SHILIAN_V2_MIGRATION_NAME,
+          applied_at: database.selectValue(
+            "SELECT applied_at FROM fitness_schema_migrations WHERE version=2",
+          ),
+        },
+      ],
+    );
+    assert.deepEqual(
+      database.selectObjects(
+        "SELECT id,starts_at,occurrence_key,status,note,created_at,updated_at FROM fitness_calendar_events ORDER BY id",
+      ).map((row) => ({ ...row })),
+      [
+        {
+          id: "event-v1",
+          starts_at: startsAt,
+          occurrence_key: localDateKey(startsAt),
+          status: "completed",
+          note: "保留事实",
+          created_at: 2,
+          updated_at: 3,
+        },
+        {
+          id: "manual-v1",
+          starts_at: startsAt + 60_000,
+          occurrence_key: null,
+          status: "cancelled",
+          note: "手动安排",
+          created_at: 4,
+          updated_at: 5,
+        },
+      ],
+    );
+    assert.deepEqual(
+      database.selectObjects("PRAGMA table_info(fitness_calendar_events)").map(({ name }) => name),
+      [...schema.SHILIAN_TABLE_COLUMNS.fitness_calendar_events],
+    );
+    assert.equal(
+      database.selectValue(
+        "SELECT name FROM sqlite_schema WHERE type='index' AND name='fitness_events_occurrence_idx'",
+      ),
+      "fitness_events_occurrence_idx",
+    );
+    assert.deepEqual(
+      database.selectObjects(
+        "SELECT event_id,program_day_id,status,reflection,created_at,updated_at FROM fitness_sessions",
+      ).map((row) => ({ ...row })),
+      [{
+        event_id: "event-v1",
+        program_day_id: "day-v1",
+        status: "completed",
+        reflection: "保留训练事实",
+        created_at: 6,
+        updated_at: 7,
+      }],
+    );
+    assert.equal(
+      database.selectValue(
+        "SELECT rescheduled_from_id FROM fitness_calendar_events WHERE id='manual-v1'",
+      ),
+      "event-v1",
+      "self-references survive the table rebuild",
+    );
+  } finally {
+    database.close();
+  }
+});
+
+test("v1 occurrence collisions reject migration without changing bytes or ledger", async () => {
+  const { database } = await databaseFixture();
+  try {
+    installV1Schema(database, 4321);
+    const startsAt = new Date(2026, 7, 24, 9, 0, 0, 0).getTime();
+    executeRun(
+      database,
+      "INSERT INTO fitness_venues(id,name,venue_type,location,area_notes,busy_notes,default_session_minutes,supersets_allowed,is_default,status,last_verified_at,created_at,updated_at) VALUES('venue-v1','旧场地','home','','','',60,0,0,'active',NULL,1,1)",
+    );
+    executeRun(
+      database,
+      "INSERT INTO fitness_programs(id,name,venue_id,goal,split,status,version,source,assumptions_json,created_at,updated_at) VALUES('program-v1','旧计划','venue-v1','strength','full_body','active',1,'local','[]',1,1)",
+    );
+    executeRun(
+      database,
+      "INSERT INTO fitness_program_days(id,program_id,day_index,weekday,kind,name,focus,estimated_minutes,variant,created_at) VALUES('day-v1','program-v1',0,1,'resistance','周一','全身',45,'standard',1)",
+    );
+    for (const [id, offset] of [["event-a", 0], ["event-b", 3_600_000]]) {
+      executeRun(
+        database,
+        "INSERT INTO fitness_calendar_events(id,program_day_id,venue_id,title,kind,starts_at,planned_minutes,status,rescheduled_from_id,note,created_at,updated_at) VALUES(?,'day-v1','venue-v1','周一','resistance',?,45,'planned',NULL,'',2,2)",
+        [id, startsAt + offset],
+      );
+    }
+    const beforeEvents = database.selectObjects(
+      "SELECT * FROM fitness_calendar_events ORDER BY id",
+    ).map((row) => ({ ...row }));
+
+    await assert.rejects(store.initializeFitnessDatabase(), /重复日期.*原数据没有被改动/);
+
+    assert.equal(Number(database.selectValue("PRAGMA user_version")), 1);
+    assert.deepEqual(
+      database.selectObjects("SELECT version,name,applied_at FROM fitness_schema_migrations")
+        .map((row) => ({ ...row })),
+      [{ version: 1, name: schema.SHILIAN_V1_MIGRATION_NAME, applied_at: 4321 }],
+    );
+    assert.deepEqual(
+      database.selectObjects("PRAGMA table_info(fitness_calendar_events)").map(({ name }) => name),
+      [...schema.SHILIAN_V1_TABLE_COLUMNS.fitness_calendar_events],
+    );
+    assert.deepEqual(
+      database.selectObjects("SELECT * FROM fitness_calendar_events ORDER BY id")
+        .map((row) => ({ ...row })),
+      beforeEvents,
+    );
   } finally {
     database.close();
   }
@@ -857,7 +1042,8 @@ test("an archived venue can be restored without reviving plans or rewriting hist
     const followingWeek = new Date(from.getTime() + 7 * 86_400_000);
     const [notPerformedEventId] = await store.scheduleProgramWeek(programId, followingWeek);
     await store.markCalendarEventNotPerformed(notPerformedEventId, "当天休息");
-    const [cancelledEventId] = await store.scheduleProgramWeek(programId, followingWeek);
+    const thirdWeek = new Date(from.getTime() + 14 * 86_400_000);
+    const [cancelledEventId] = await store.scheduleProgramWeek(programId, thirdWeek);
 
     let broadcastCount = globalThis.__fitnessLockState.broadcasts.length;
     await assert.rejects(store.restoreVenue("venue-does-not-exist"), /场地不存在/);
@@ -1016,6 +1202,51 @@ test("a planned event from an earlier rolling week never blocks the next week", 
   }
 });
 
+test("Monday after the 18:00 slot schedules next Monday and occurrence identity is unique", async () => {
+  const { database } = await databaseFixture();
+  try {
+    await store.initializeFitnessDatabase();
+    const venueId = await store.saveVenue(venueInput);
+    const equipmentId = await store.saveEquipmentWithLoads(
+      dumbbellInput(venueId, [load(10000), load(12500)]),
+    );
+    const programId = await store.saveProgramDraft(draftFor(venueId, equipmentId));
+    const mondayAtNineteen = new Date(2026, 7, 24, 19, 0, 0, 0);
+    const [nextMondayId] = await store.scheduleProgramWeek(programId, mondayAtNineteen);
+    const expectedNextMonday = new Date(2026, 7, 31, 18, 0, 0, 0);
+    const nextMonday = database.selectObjects(
+      "SELECT program_day_id,starts_at,occurrence_key FROM fitness_calendar_events WHERE id=?",
+      [nextMondayId],
+    ).map((row) => ({ ...row }))[0];
+
+    assert.equal(nextMonday.starts_at, expectedNextMonday.getTime());
+    assert.equal(nextMonday.occurrence_key, localDateKey(expectedNextMonday.getTime()));
+    const mondayBeforeSlot = new Date(2026, 7, 24, 17, 59, 59, 999);
+    const [sameMondayId] = await store.scheduleProgramWeek(programId, mondayBeforeSlot);
+    assert.notEqual(sameMondayId, nextMondayId);
+    assert.equal(
+      database.selectValue(
+        "SELECT occurrence_key FROM fitness_calendar_events WHERE id=?",
+        [sameMondayId],
+      ),
+      "2026-08-24",
+    );
+    assert.throws(
+      () => executeRun(
+        database,
+        `INSERT INTO fitness_calendar_events(
+          id,program_day_id,venue_id,title,kind,starts_at,occurrence_key,
+          planned_minutes,status,rescheduled_from_id,note,created_at,updated_at
+        ) VALUES('duplicate-occurrence',? ,?,'重复','resistance',?, ?,45,'cancelled',NULL,'',1,1)`,
+        [nextMonday.program_day_id, venueId, expectedNextMonday.getTime() + 3_600_000, nextMonday.occurrence_key],
+      ),
+      /UNIQUE constraint failed/,
+    );
+  } finally {
+    database.close();
+  }
+});
+
 test("week scheduling follows program-day state after rescheduling and preserves event truth", async () => {
   const { database } = await databaseFixture();
   try {
@@ -1027,6 +1258,10 @@ test("week scheduling follows program-day state after rescheduling and preserves
     const programId = await store.saveProgramDraft(draftFor(venueId, equipmentId));
     const from = new Date(2026, 7, 24, 9, 0, 0, 0);
     const [originalId] = await store.scheduleProgramWeek(programId, from);
+    const originalOccurrence = database.selectValue(
+      "SELECT occurrence_key FROM fitness_calendar_events WHERE id=?",
+      [originalId],
+    );
     const movedAt = from.getTime() + 3 * 86_400_000;
     await store.rescheduleCalendarEvent(originalId, movedAt);
 
@@ -1036,6 +1271,14 @@ test("week scheduling follows program-day state after rescheduling and preserves
       Number(database.selectValue("SELECT starts_at FROM fitness_calendar_events WHERE id=?", [originalId])),
       movedAt,
       "scheduling again must not undo a user's reschedule",
+    );
+    assert.equal(
+      database.selectValue(
+        "SELECT occurrence_key FROM fitness_calendar_events WHERE id=?",
+        [originalId],
+      ),
+      originalOccurrence,
+      "rescheduling changes the appointment time, never its immutable occurrence identity",
     );
 
     const sessionId = await store.startFitnessSession({ eventId: originalId, venueId });
@@ -1057,23 +1300,33 @@ test("week scheduling follows program-day state after rescheduling and preserves
     assert.notEqual(afterCompletedId, originalId);
     await store.markCalendarEventNotPerformed(afterCompletedId, "当天休息");
     const [afterNotPerformedId] = await store.scheduleProgramWeek(programId, followingWeek);
-    assert.notEqual(afterNotPerformedId, afterCompletedId);
+    assert.equal(
+      afterNotPerformedId,
+      afterCompletedId,
+      "a final not-performed occurrence must not be silently recreated",
+    );
     executeRun(
       database,
       "UPDATE fitness_calendar_events SET status='cancelled',updated_at=updated_at+1 WHERE id=?",
       [afterNotPerformedId],
     );
     const [afterCancelledId] = await store.scheduleProgramWeek(programId, followingWeek);
-    assert.notEqual(afterCancelledId, afterNotPerformedId);
+    assert.equal(
+      afterCancelledId,
+      afterNotPerformedId,
+      "a cancelled occurrence must not be silently recreated",
+    );
+    const thirdWeek = new Date(from.getTime() + 14 * 86_400_000);
+    const [nextOccurrenceId] = await store.scheduleProgramWeek(programId, thirdWeek);
+    assert.notEqual(nextOccurrenceId, afterCancelledId);
 
     const snapshot = await store.loadFitnessSnapshot();
     assert.deepEqual(
       Object.fromEntries(snapshot.events.map(({ id, status }) => [id, status])),
       {
         [originalId]: "completed",
-        [afterCompletedId]: "not_performed",
-        [afterNotPerformedId]: "cancelled",
-        [afterCancelledId]: "planned",
+        [afterCompletedId]: "cancelled",
+        [nextOccurrenceId]: "planned",
       },
       "agenda data must preserve historical and current statuses exactly",
     );

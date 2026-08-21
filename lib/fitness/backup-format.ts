@@ -5,7 +5,8 @@ const MAGIC = "FITNESS-BACKUP\r\n\u001a";
 const SQLITE_HEADER = "SQLite format 3\u0000";
 const SQLITE_IDENTITY_BYTES = 72;
 const APPLICATION_ID = 0x5348_4c4e;
-const USER_VERSION = 1;
+const CANONICAL_USER_VERSION = 2 as const;
+type SupportedUserVersion = 1 | typeof CANONICAL_USER_VERSION;
 
 const encoder = new TextEncoder();
 const magicBytes = encoder.encode(MAGIC);
@@ -20,7 +21,7 @@ export const FITNESS_BACKUP_MIME_TYPE =
   "application/vnd.shilian.fitness-backup";
 export const FITNESS_BACKUP_PREFIX_BYTES = magicBytes.byteLength + 4;
 export const FITNESS_BACKUP_APPLICATION_ID = APPLICATION_ID;
-export const FITNESS_BACKUP_USER_VERSION = USER_VERSION;
+export const FITNESS_BACKUP_USER_VERSION = CANONICAL_USER_VERSION;
 export const FITNESS_BACKUP_LIMITS = Object.freeze({
   manifestBytes: 2 * 1024 * 1024,
   databaseBytes: 512 * 1024 * 1024,
@@ -59,7 +60,7 @@ export type FitnessBackupManifest = Readonly<{
     byteSize: number;
     sha256: string;
     applicationId: typeof APPLICATION_ID;
-    userVersion: typeof USER_VERSION;
+    userVersion: SupportedUserVersion;
   }>;
   files: readonly FitnessBackupFileMetadata[];
   manifestSha256: string;
@@ -303,16 +304,33 @@ function readSqliteIdentity(database: Uint8Array) {
   };
 }
 
-function assertFitnessIdentity(identity: Readonly<{
+function isSupportedUserVersion(value: number): value is SupportedUserVersion {
+  return value === 1 || value === CANONICAL_USER_VERSION;
+}
+
+function assertSupportedFitnessIdentity(identity: Readonly<{
   applicationId: number;
   userVersion: number;
 }>): void {
   if (
     identity.applicationId !== APPLICATION_ID ||
-    identity.userVersion !== USER_VERSION
+    !isSupportedUserVersion(identity.userVersion)
   ) {
     fail(
       "The SQLite payload is not the supported Fitness database.",
+      "UNSUPPORTED_DATABASE_IDENTITY",
+    );
+  }
+}
+
+function assertCanonicalFitnessIdentity(identity: Readonly<{
+  applicationId: number;
+  userVersion: number;
+}>): void {
+  assertSupportedFitnessIdentity(identity);
+  if (identity.userVersion !== CANONICAL_USER_VERSION) {
+    fail(
+      "Only the current Fitness database can be exported.",
       "UNSUPPORTED_DATABASE_IDENTITY",
     );
   }
@@ -337,8 +355,8 @@ function unsignedProjection(
     database: {
       byteSize: manifest.database.byteSize,
       sha256: manifest.database.sha256,
-      applicationId: APPLICATION_ID,
-      userVersion: USER_VERSION,
+      applicationId: manifest.database.applicationId,
+      userVersion: manifest.database.userVersion,
     },
     files: manifest.files.map((metadata) => ({ ...metadata })),
   };
@@ -392,7 +410,8 @@ function validateManifest(value: unknown): FitnessBackupManifest {
   assertSha256(value.database.sha256, "manifest.database.sha256");
   if (
     value.database.applicationId !== APPLICATION_ID ||
-    value.database.userVersion !== USER_VERSION
+    typeof value.database.userVersion !== "number" ||
+    !isSupportedUserVersion(value.database.userVersion)
   ) {
     fail(
       "The manifest declares an unsupported Fitness database identity.",
@@ -429,7 +448,7 @@ function validateManifest(value: unknown): FitnessBackupManifest {
       byteSize: value.database.byteSize,
       sha256: value.database.sha256,
       applicationId: APPLICATION_ID,
-      userVersion: USER_VERSION,
+      userVersion: value.database.userVersion,
     },
     files,
     manifestSha256: value.manifestSha256,
@@ -491,7 +510,7 @@ export async function createFitnessBackupBlob(
     fail("The backup contains too many files.", "TOO_MANY_FILES");
   }
   const identity = readSqliteIdentity(input.database);
-  assertFitnessIdentity(identity);
+  assertCanonicalFitnessIdentity(identity);
   const exportedAt = input.exportedAt ?? new Date().toISOString();
   assertIsoTimestamp(exportedAt, "exportedAt");
   const databaseBlob = new Blob([copyBuffer(input.database)]);
@@ -538,7 +557,7 @@ export async function createFitnessBackupBlob(
       byteSize: databaseBlob.size,
       sha256: "0".repeat(64),
       applicationId: APPLICATION_ID,
-      userVersion: USER_VERSION,
+      userVersion: CANONICAL_USER_VERSION,
     },
     files: prepared.map(({ metadata }) => metadata),
   };
@@ -694,7 +713,7 @@ export async function parseFitnessBackupBlob(
   ) {
     fail("The SQLite identity does not match the manifest.", "DATABASE_IDENTITY_MISMATCH");
   }
-  assertFitnessIdentity(identity);
+  assertSupportedFitnessIdentity(identity);
   if (await trustedHash(databaseBlob, hashBlob) !== manifest.database.sha256) {
     fail("The database SHA-256 digest does not match.", "DATABASE_HASH_MISMATCH");
   }

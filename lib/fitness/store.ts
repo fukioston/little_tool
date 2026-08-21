@@ -3,12 +3,18 @@ import type { SqlParams, SqlStatement } from "@/lib/local-db/types";
 import {
   SHILIAN_APPLICATION_ID,
   SHILIAN_INDEXES,
-  SHILIAN_MIGRATION_NAME,
   SHILIAN_OBJECT_SQL,
+  SHILIAN_OCCURRENCE_KEY_SQL,
   SHILIAN_SCHEMA_STATEMENTS,
   SHILIAN_TABLE_COLUMNS,
   SHILIAN_TABLES,
   SHILIAN_USER_VERSION,
+  SHILIAN_V1_INDEXES,
+  SHILIAN_V1_MIGRATION_NAME,
+  SHILIAN_V1_OBJECT_SQL,
+  SHILIAN_V1_TABLE_COLUMNS,
+  SHILIAN_V2_MIGRATION_NAME,
+  SHILIAN_V2_SCHEMA_MIGRATION_STATEMENTS,
 } from "@/lib/schemas/shilian";
 import {
   equipmentSupportsExercise,
@@ -155,14 +161,18 @@ function normalizedSchemaSql(value: string): string {
   return value.trim().replace(/;$/, "").replace(/\s+/g, " ");
 }
 
-async function assertRuntimeIdentity() {
+async function assertRuntimeContract(version: 1 | 2) {
   const identity = (await rawQuery<{ application_id: number; user_version: number }>(
     "SELECT (SELECT application_id FROM pragma_application_id) application_id, (SELECT user_version FROM pragma_user_version) user_version",
   ))[0];
   if (!identity) throw new Error("无法读取适练数据库身份");
-  if (identity.application_id !== FITNESS_APPLICATION_ID || identity.user_version !== FITNESS_USER_VERSION) {
+  if (identity.application_id !== FITNESS_APPLICATION_ID || identity.user_version !== version) {
     throw new Error("适练数据库身份或版本不受支持；当前数据没有被改动");
   }
+  const expectedIndexes = version === 1 ? SHILIAN_V1_INDEXES : SHILIAN_INDEXES;
+  const expectedObjectSql = version === 1 ? SHILIAN_V1_OBJECT_SQL : SHILIAN_OBJECT_SQL;
+  const expectedTableColumns: Readonly<Record<string, readonly string[]>> =
+    version === 1 ? SHILIAN_V1_TABLE_COLUMNS : SHILIAN_TABLE_COLUMNS;
   const objects = await rawQuery<{ type: string; name: string; sql: string | null }>(
     `SELECT type,name,sql FROM sqlite_schema
       WHERE type IN ('table','index','view','trigger')
@@ -174,13 +184,13 @@ async function assertRuntimeIdentity() {
   const unsafeObjects = objects.filter(({ type }) => type === "view" || type === "trigger");
   if (
     !sameStrings(actualTables, [...SHILIAN_TABLES].sort()) ||
-    !sameStrings(actualIndexes, [...SHILIAN_INDEXES].sort()) ||
+    !sameStrings(actualIndexes, [...expectedIndexes].sort()) ||
     unsafeObjects.length > 0
   ) {
     throw new Error("适练数据库结构与当前版本不一致；已停止打开以保护数据");
   }
   for (const object of objects) {
-    const expected = SHILIAN_OBJECT_SQL[object.name];
+    const expected = expectedObjectSql[object.name];
     if (
       !expected || object.sql === null ||
       normalizedSchemaSql(object.sql) !== normalizedSchemaSql(expected)
@@ -191,18 +201,23 @@ async function assertRuntimeIdentity() {
   for (const table of SHILIAN_TABLES) {
     const escaped = table.replaceAll('"', '""');
     const columns = await rawQuery<{ name: string }>(`PRAGMA table_info("${escaped}")`);
-    if (!sameStrings(columns.map(({ name }) => name), SHILIAN_TABLE_COLUMNS[table])) {
+    if (!sameStrings(columns.map(({ name }) => name), expectedTableColumns[table] ?? [])) {
       throw new Error(`适练数据库表 ${table} 的列结构不完整；已停止打开以保护数据`);
     }
   }
   const ledger = await rawQuery<{ version: number; name: string }>(
     "SELECT version,name FROM fitness_schema_migrations ORDER BY version",
   );
-  if (
-    ledger.length !== 1 ||
-    Number(ledger[0]?.version) !== FITNESS_USER_VERSION ||
-    ledger[0]?.name !== SHILIAN_MIGRATION_NAME
-  ) {
+  const expectedLedger = version === 1
+    ? [{ version: 1, name: SHILIAN_V1_MIGRATION_NAME }]
+    : [
+      { version: 1, name: SHILIAN_V1_MIGRATION_NAME },
+      { version: 2, name: SHILIAN_V2_MIGRATION_NAME },
+    ];
+  if (ledger.length !== expectedLedger.length || ledger.some((entry, index) =>
+    Number(entry.version) !== expectedLedger[index]?.version ||
+    entry.name !== expectedLedger[index]?.name
+  )) {
     throw new Error("适练数据库迁移记录不完整；已停止打开以保护数据");
   }
   const integrity = await rawQuery<{ integrity_check: string }>("PRAGMA integrity_check");
@@ -212,6 +227,31 @@ async function assertRuntimeIdentity() {
   if ((await rawQuery<Row>("PRAGMA foreign_key_check")).length > 0) {
     throw new Error("适练数据库存在断开的关联；已停止打开以保护数据");
   }
+}
+
+async function migrateFitnessV1ToV2(): Promise<void> {
+  await assertRuntimeContract(1);
+  const conflicts = await rawQuery<{ program_day_id: string; occurrence_key: string; count: number }>(
+    `SELECT program_day_id,${SHILIAN_OCCURRENCE_KEY_SQL} occurrence_key,COUNT(*) count
+      FROM fitness_calendar_events
+      WHERE program_day_id IS NOT NULL
+      GROUP BY program_day_id,${SHILIAN_OCCURRENCE_KEY_SQL}
+      HAVING COUNT(*)>1
+      ORDER BY program_day_id,occurrence_key
+      LIMIT 1`,
+  );
+  if (conflicts.length > 0) {
+    throw new Error("旧版日历中同一计划日存在重复日期；迁移已停止，原数据没有被改动");
+  }
+  const now = Date.now();
+  await rawBatch([
+    ...SHILIAN_V2_SCHEMA_MIGRATION_STATEMENTS,
+    {
+      sql: "INSERT INTO fitness_schema_migrations(version,name,applied_at) VALUES(?,?,?)",
+      params: [2, SHILIAN_V2_MIGRATION_NAME, now],
+    },
+    { sql: `PRAGMA user_version=${FITNESS_USER_VERSION}` },
+  ]);
 }
 
 export async function initializeFitnessDatabase(): Promise<void> {
@@ -233,13 +273,27 @@ export async function initializeFitnessDatabase(): Promise<void> {
         ...SHILIAN_SCHEMA_STATEMENTS,
         {
           sql: "INSERT INTO fitness_schema_migrations(version,name,applied_at) VALUES(?,?,?)",
-          params: [FITNESS_USER_VERSION, SHILIAN_MIGRATION_NAME, now],
+          params: [1, SHILIAN_V1_MIGRATION_NAME, now],
+        },
+        {
+          sql: "INSERT INTO fitness_schema_migrations(version,name,applied_at) VALUES(?,?,?)",
+          params: [2, SHILIAN_V2_MIGRATION_NAME, now],
         },
         { sql: `PRAGMA application_id=${FITNESS_APPLICATION_ID}` },
         { sql: `PRAGMA user_version=${FITNESS_USER_VERSION}` },
       ]);
+    } else if (
+      identity.application_id === FITNESS_APPLICATION_ID &&
+      identity.user_version === 1
+    ) {
+      await migrateFitnessV1ToV2();
+    } else if (
+      identity.application_id !== FITNESS_APPLICATION_ID ||
+      identity.user_version !== FITNESS_USER_VERSION
+    ) {
+      throw new Error("适练数据库身份或版本不受支持；当前数据没有被改动");
     }
-    await assertRuntimeIdentity();
+    await assertRuntimeContract(2);
   });
 }
 
@@ -1022,6 +1076,16 @@ function nextDateForWeekday(start: Date, weekday: number) {
   return next.getTime();
 }
 
+function occurrenceKeyFor(timestamp: number): string {
+  const date = new Date(timestamp);
+  if (!Number.isFinite(date.getTime())) throw new TypeError("排期日期无效");
+  return [
+    date.getFullYear(),
+    String(date.getMonth() + 1).padStart(2, "0"),
+    String(date.getDate()).padStart(2, "0"),
+  ].join("-");
+}
+
 export async function scheduleProgramWeek(programId: string, from = new Date()): Promise<string[]> {
   return write("program-scheduled", async () => {
     if (!Number.isFinite(from.getTime())) throw new TypeError("排期起始日期无效");
@@ -1051,28 +1115,22 @@ export async function scheduleProgramWeek(programId: string, from = new Date()):
     if (conflicts.length > 0) {
       throw new Error(`身体边界已更新，这版计划含有需要避开的动作「${[...new Set(conflicts)].join("、")}」；计划会保留，请生成适用版本后再排期`);
     }
-    const windowStartDate = new Date(from);
-    windowStartDate.setHours(0, 0, 0, 0);
-    const windowEndDate = new Date(windowStartDate);
-    windowEndDate.setDate(windowEndDate.getDate() + 7);
-    const windowStart = windowStartDate.getTime();
-    const windowEnd = windowEndDate.getTime();
     const now = Date.now();
     const ids: string[] = [];
     const statements: SqlStatement[] = [];
     for (const day of days) {
       if (day.weekday === null || day.kind === "rest") continue;
       const startsAt = nextDateForWeekday(from, day.weekday);
+      const occurrenceKey = occurrenceKeyFor(startsAt);
       const duplicate = (await rawQuery<{ id: string }>(
         `SELECT e.id
           FROM fitness_calendar_events e
           JOIN fitness_program_days d ON d.id=e.program_day_id
           WHERE d.program_id=? AND e.program_day_id=?
-            AND e.status IN ('planned','in_progress')
-            AND e.starts_at>=? AND e.starts_at<?
-          ORDER BY CASE e.status WHEN 'in_progress' THEN 0 ELSE 1 END,e.updated_at DESC
+            AND e.occurrence_key=?
+          ORDER BY e.created_at,e.id
           LIMIT 1`,
-        [programId, day.id, windowStart, windowEnd],
+        [programId, day.id, occurrenceKey],
       ))[0];
       if (duplicate) {
         ids.push(duplicate.id);
@@ -1081,8 +1139,8 @@ export async function scheduleProgramWeek(programId: string, from = new Date()):
       const id = uid("event");
       ids.push(id);
       statements.push({
-        sql: "INSERT INTO fitness_calendar_events(id,program_day_id,venue_id,title,kind,starts_at,planned_minutes,status,rescheduled_from_id,note,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-        params: [id, day.id, program.venue_id, day.name, day.kind, startsAt, day.estimated_minutes, "planned", null, "", now, now],
+        sql: "INSERT INTO fitness_calendar_events(id,program_day_id,venue_id,title,kind,starts_at,occurrence_key,planned_minutes,status,rescheduled_from_id,note,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        params: [id, day.id, program.venue_id, day.name, day.kind, startsAt, occurrenceKey, day.estimated_minutes, "planned", null, "", now, now],
       });
     }
     if (statements.length) await rawBatch(statements);

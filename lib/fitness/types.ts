@@ -231,6 +231,7 @@ export type FitnessCalendarEvent = Readonly<{
   title: string;
   kind: ProgramDayKind | "note";
   starts_at: number;
+  occurrence_key: string | null;
   planned_minutes: number;
   status: CalendarEventStatus;
   rescheduled_from_id: string | null;

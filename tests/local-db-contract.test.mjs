@@ -132,7 +132,10 @@ for (const contract of [
           database.selectObjects(
             "SELECT version,name FROM fitness_schema_migrations ORDER BY version",
           ).map((row) => ({ ...row })),
-          [{ version: 1, name: "initial-truthful-fitness-runtime" }],
+          [
+            { version: 1, name: "initial-truthful-fitness-runtime" },
+            { version: 2, name: "calendar-occurrence-identity" },
+          ],
         );
       }
       assert.equal(database.selectValue("PRAGMA integrity_check"), "ok");

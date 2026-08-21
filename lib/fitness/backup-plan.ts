@@ -5,11 +5,16 @@ import type {
 import {
   SHILIAN_APPLICATION_ID,
   SHILIAN_INDEXES,
-  SHILIAN_MIGRATION_NAME,
   SHILIAN_OBJECT_SQL,
   SHILIAN_TABLE_COLUMNS,
   SHILIAN_TABLES,
   SHILIAN_USER_VERSION,
+  SHILIAN_V1_INDEXES,
+  SHILIAN_V1_MIGRATION_NAME,
+  SHILIAN_V1_OBJECT_SQL,
+  SHILIAN_V1_TABLE_COLUMNS,
+  SHILIAN_V2_MIGRATION_NAME,
+  SHILIAN_V2_SCHEMA_MIGRATION_STATEMENTS,
 } from "../schemas/shilian";
 import type { FitnessBackupFileMetadata } from "./backup-format";
 
@@ -20,15 +25,19 @@ const REQUIRED_TABLES = SHILIAN_TABLES.map((name) => ({
   name,
   columns: SHILIAN_TABLE_COLUMNS[name],
 }));
+const V1_REQUIRED_TABLES = SHILIAN_TABLES.map((name) => ({
+  name,
+  columns: SHILIAN_V1_TABLE_COLUMNS[name],
+}));
 
 export const FITNESS_SCHEMA_REQUIREMENTS = {
   applicationId: FITNESS_APPLICATION_ID,
   minimumUserVersion: FITNESS_USER_VERSION,
   maximumUserVersion: FITNESS_USER_VERSION,
   sourceApplicationIds: [FITNESS_APPLICATION_ID],
-  sourceMinimumUserVersion: FITNESS_USER_VERSION,
+  sourceMinimumUserVersion: 1,
   sourceMaximumUserVersion: FITNESS_USER_VERSION,
-  sourceRequiredTables: REQUIRED_TABLES,
+  sourceRequiredTables: V1_REQUIRED_TABLES,
   requiredTables: REQUIRED_TABLES,
   allowedViews: [],
   allowedTriggers: [],
@@ -216,32 +225,42 @@ function assertMappings(
 }
 
 function assertSourceVersion(sourceUserVersion: number): void {
-  if (sourceUserVersion !== FITNESS_USER_VERSION) {
+  if (sourceUserVersion !== 1 && sourceUserVersion !== FITNESS_USER_VERSION) {
     throw new TypeError("Unsupported Fitness restore source user_version.");
   }
 }
 
-function expectedSchemaObjects() {
+function expectedSchemaObjects(version: 1 | 2) {
+  const objectSql = version === 1 ? SHILIAN_V1_OBJECT_SQL : SHILIAN_OBJECT_SQL;
+  const indexes = version === 1 ? SHILIAN_V1_INDEXES : SHILIAN_INDEXES;
   return [
     ...SHILIAN_TABLES.map((name) => ({
       type: "table" as const,
       name,
-      sql: SHILIAN_OBJECT_SQL[name],
+      sql: objectSql[name],
     })),
-    ...SHILIAN_INDEXES.map((name) => ({
+    ...indexes.map((name) => ({
       type: "index" as const,
       name,
-      sql: SHILIAN_OBJECT_SQL[name],
+      sql: objectSql[name],
     })),
   ];
 }
 
 /**
- * Verifies the whole v1 DDL rather than accepting a database which merely has
+ * Verifies the whole versioned DDL rather than accepting a database which merely has
  * familiar table names. These statements run inside the candidate transaction.
  */
-function exactSchemaGuardStatements(): SqlStatement[] {
-  const objects = expectedSchemaObjects();
+function exactSchemaGuardStatements(version: 1 | 2): SqlStatement[] {
+  const objects = expectedSchemaObjects(version);
+  const tableColumns: Readonly<Record<string, readonly string[]>> =
+    version === 1 ? SHILIAN_V1_TABLE_COLUMNS : SHILIAN_TABLE_COLUMNS;
+  const expectedLedger = version === 1
+    ? [{ version: 1, name: SHILIAN_V1_MIGRATION_NAME }]
+    : [
+      { version: 1, name: SHILIAN_V1_MIGRATION_NAME },
+      { version: 2, name: SHILIAN_V2_MIGRATION_NAME },
+    ];
   const expectedRows = objects.map(() => "(?, ?, ?)").join(", ");
   const statements: SqlStatement[] = [
     {
@@ -255,7 +274,7 @@ function exactSchemaGuardStatements(): SqlStatement[] {
           (SELECT application_id FROM pragma_application_id) = ?
           AND (SELECT user_version FROM pragma_user_version) = ?
         THEN 1 ELSE 0 END`,
-      params: [FITNESS_APPLICATION_ID, FITNESS_USER_VERSION],
+      params: [FITNESS_APPLICATION_ID, version],
     },
     {
       sql: `WITH expected(type, name, sql) AS (VALUES ${expectedRows}),
@@ -299,18 +318,28 @@ function exactSchemaGuardStatements(): SqlStatement[] {
             SELECT name FROM pragma_table_info(?) ORDER BY cid
           )
         ) = ? THEN 1 ELSE 0 END`,
-      params: [name, SHILIAN_TABLE_COLUMNS[name].join(String.fromCharCode(31))],
+      params: [name, tableColumns[name].join(String.fromCharCode(31))],
     })),
     {
       sql: `INSERT INTO ${SCHEMA_GUARD_TABLE}(value)
         SELECT CASE WHEN
-          (SELECT COUNT(*) FROM fitness_schema_migrations) = 1
-          AND EXISTS (
-            SELECT 1 FROM fitness_schema_migrations
-            WHERE version = ? AND name = ? AND applied_at >= 0
+          (SELECT COUNT(*) FROM fitness_schema_migrations) = ?
+          AND NOT EXISTS (
+            SELECT 1 FROM fitness_schema_migrations actual
+            WHERE actual.applied_at < 0
+              OR NOT EXISTS (
+                SELECT 1 FROM (
+                  ${expectedLedger.map(() => "SELECT ? version, ? name").join(" UNION ALL ")}
+                ) expected
+                WHERE expected.version = actual.version
+                  AND expected.name = actual.name
+              )
           )
         THEN 1 ELSE 0 END`,
-      params: [FITNESS_USER_VERSION, SHILIAN_MIGRATION_NAME],
+      params: [
+        expectedLedger.length,
+        ...expectedLedger.flatMap(({ version: migrationVersion, name }) => [migrationVersion, name]),
+      ],
     },
     {
       sql: `INSERT INTO ${SCHEMA_GUARD_TABLE}(value)
@@ -321,6 +350,17 @@ function exactSchemaGuardStatements(): SqlStatement[] {
     { sql: `DROP TABLE ${SCHEMA_GUARD_TABLE}` },
   ];
   return statements;
+}
+
+function migrationStatements(sourceUserVersion: 1 | 2): SqlStatement[] {
+  if (sourceUserVersion === FITNESS_USER_VERSION) return [];
+  return [
+    ...SHILIAN_V2_SCHEMA_MIGRATION_STATEMENTS,
+    {
+      sql: "INSERT INTO fitness_schema_migrations(version,name,applied_at) VALUES(?,?,?)",
+      params: [2, SHILIAN_V2_MIGRATION_NAME, Date.now()],
+    },
+  ];
 }
 
 function fileMetadataValues(metadata: FitnessRestoreFileMetadata) {
@@ -423,12 +463,13 @@ export function createCompleteFitnessRestoreStatements(
   sourceUserVersion = FITNESS_USER_VERSION,
 ): SqlStatement[] {
   assertSourceVersion(sourceUserVersion);
+  const sourceVersion = sourceUserVersion as 1 | 2;
   assertMappings(mappings);
   const original = mappings.map(({ original: metadata }) => metadata);
   const staged = mappings.map(({ staged: metadata }) => metadata);
 
   return [
-    ...exactSchemaGuardStatements(),
+    ...exactSchemaGuardStatements(sourceVersion),
     {
       sql: `CREATE TEMP TABLE __fitness_restore_file_guard (
         value INTEGER NOT NULL CHECK (value = 1)
@@ -467,8 +508,9 @@ export function createCompleteFitnessRestoreStatements(
     })),
     readyFileGuardStatement(staged),
     { sql: `DROP TABLE ${FILE_GUARD_TABLE}` },
+    ...migrationStatements(sourceVersion),
     ...canonicalIdentityStatements(),
-    ...exactSchemaGuardStatements(),
+    ...exactSchemaGuardStatements(2),
   ];
 }
 
@@ -480,10 +522,12 @@ export function createLegacyFitnessRestoreStatements(
   sourceUserVersion = FITNESS_USER_VERSION,
 ): SqlStatement[] {
   assertSourceVersion(sourceUserVersion);
+  const sourceVersion = sourceUserVersion as 1 | 2;
   return [
-    ...exactSchemaGuardStatements(),
+    ...exactSchemaGuardStatements(sourceVersion),
     { sql: "DELETE FROM fitness_files" },
+    ...migrationStatements(sourceVersion),
     ...canonicalIdentityStatements(),
-    ...exactSchemaGuardStatements(),
+    ...exactSchemaGuardStatements(2),
   ];
 }

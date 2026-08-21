@@ -37,7 +37,7 @@ async function hashBlob(blob) {
 
 function sqliteBytes({
   applicationId = SHLN,
-  userVersion = 1,
+  userVersion = 2,
   length = 512,
 } = {}) {
   const bytes = new Uint8Array(length);
@@ -56,12 +56,43 @@ async function realSqliteBytes() {
       CREATE TABLE fitness_backup_probe(id TEXT PRIMARY KEY, value TEXT) STRICT;
       INSERT INTO fitness_backup_probe VALUES('probe','kept byte-for-byte');
       PRAGMA application_id=${SHLN};
-      PRAGMA user_version=1;
+      PRAGMA user_version=2;
     `);
     return sqlite3.capi.sqlite3_js_db_export(database).slice();
   } finally {
     database.close();
   }
+}
+
+async function legacyV1Container(format, database = sqliteBytes({ userVersion: 1 })) {
+  const exportedAt = "2026-08-20T06:07:08.000Z";
+  const unsigned = {
+    format: "fitness-backup",
+    version: 1,
+    product: "shilian",
+    exportedAt,
+    database: {
+      byteSize: database.byteLength,
+      sha256: await hashBlob(new Blob([database])),
+      applicationId: SHLN,
+      userVersion: 1,
+    },
+    files: [],
+  };
+  const manifest = {
+    ...unsigned,
+    manifestSha256: await hashBlob(new Blob([
+      new TextEncoder().encode(JSON.stringify(unsigned)),
+    ])),
+  };
+  const manifestBytes = new TextEncoder().encode(JSON.stringify(manifest));
+  const magicBytes = new TextEncoder().encode(format.FITNESS_BACKUP_MAGIC);
+  const prefix = new Uint8Array(magicBytes.byteLength + 4);
+  prefix.set(magicBytes);
+  new DataView(prefix.buffer).setUint32(magicBytes.byteLength, manifestBytes.byteLength, false);
+  return new Blob([prefix, manifestBytes, database], {
+    type: format.FITNESS_BACKUP_MIME_TYPE,
+  });
 }
 
 const entityTypes = ["venue", "equipment", "exercise", "session"];
@@ -145,11 +176,25 @@ test("Fitness complete backup round-trips a canonical empty container", async ()
   assert.equal(parsed.files.length, 0);
   assert.equal(parsed.manifest.product, "shilian");
   assert.deepEqual(parsed.manifest.database.applicationId, SHLN);
-  assert.deepEqual(parsed.manifest.database.userVersion, 1);
+  assert.deepEqual(parsed.manifest.database.userVersion, 2);
+  assert.equal(format.FITNESS_BACKUP_USER_VERSION, 2);
   assert.match(parsed.manifest.manifestSha256, /^[0-9a-f]{64}$/);
   assert.equal(format.FITNESS_BACKUP_LIMITS.databaseBytes, 512 * 1024 * 1024);
   assert.equal(format.FITNESS_BACKUP_LIMITS.fileBytes, 512 * 1024 * 1024);
   assert.equal(format.FITNESS_BACKUP_LIMITS.totalBytes, 2 * 1024 * 1024 * 1024);
+});
+
+test("Fitness parser keeps the signed v1 database version for legacy containers", async () => {
+  const format = await loadFormat();
+  const database = sqliteBytes({ userVersion: 1 });
+  const parsed = await format.parseFitnessBackupBlob(
+    await legacyV1Container(format, database),
+    hashBlob,
+  );
+
+  assert.equal(parsed.manifest.version, 1, "container format remains v1");
+  assert.equal(parsed.manifest.database.userVersion, 1);
+  assert.deepEqual(parsed.database, database);
 });
 
 test("Fitness backup preserves every supported entity file and exact row metadata", async () => {
@@ -210,6 +255,11 @@ test("Fitness parser rejects manifest, database, payload, identity, and product 
       code: "DATABASE_IDENTITY_MISMATCH",
     },
     {
+      name: "database version differs from manifest",
+      mutate(bytes) { bytes[databaseStart + 63] = 1; },
+      code: "DATABASE_IDENTITY_MISMATCH",
+    },
+    {
       name: "file payload",
       mutate(bytes) { bytes[fileStart] ^= 0xff; },
       code: "FILE_HASH_MISMATCH",
@@ -242,6 +292,16 @@ test("Fitness parser rejects manifest, database, payload, identity, and product 
     {
       name: "wrong declared identity",
       mutate(manifest) { manifest.database.applicationId = 0; },
+      code: "UNSUPPORTED_DATABASE_IDENTITY",
+    },
+    {
+      name: "zero database version",
+      mutate(manifest) { manifest.database.userVersion = 0; },
+      code: "UNSUPPORTED_DATABASE_IDENTITY",
+    },
+    {
+      name: "future database version",
+      mutate(manifest) { manifest.database.userVersion = 3; },
       code: "UNSUPPORTED_DATABASE_IDENTITY",
     },
   ];
@@ -359,6 +419,13 @@ test("Fitness export rejects non-ready, duplicate, mismatched, and non-canonical
   await assert.rejects(
     format.createFitnessBackupBlob({
       database: sqliteBytes({ applicationId: 0 }),
+      files: [],
+    }, hashBlob),
+    (error) => error?.code === "UNSUPPORTED_DATABASE_IDENTITY",
+  );
+  await assert.rejects(
+    format.createFitnessBackupBlob({
+      database: sqliteBytes({ userVersion: 1 }),
       files: [],
     }, hashBlob),
     (error) => error?.code === "UNSUPPORTED_DATABASE_IDENTITY",

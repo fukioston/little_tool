@@ -84,7 +84,7 @@ async function hashBlob(blob) {
   return Buffer.from(digest).toString("hex");
 }
 
-function sqliteBytes({ applicationId = SHLN, userVersion = 1 } = {}) {
+function sqliteBytes({ applicationId = SHLN, userVersion = 2 } = {}) {
   const bytes = new Uint8Array(512);
   bytes.set(new TextEncoder().encode("SQLite format 3\0"));
   const view = new DataView(bytes.buffer);
@@ -164,6 +164,37 @@ async function completeContainer(sources = []) {
   }, hashBlob);
 }
 
+async function legacyV1CompleteContainer() {
+  const database = sqliteBytes({ userVersion: 1 });
+  const unsigned = {
+    format: "fitness-backup",
+    version: 1,
+    product: "shilian",
+    exportedAt: "2026-08-20T06:07:08.000Z",
+    database: {
+      byteSize: database.byteLength,
+      sha256: await hashBlob(new Blob([database])),
+      applicationId: SHLN,
+      userVersion: 1,
+    },
+    files: [],
+  };
+  const manifest = {
+    ...unsigned,
+    manifestSha256: await hashBlob(new Blob([
+      new TextEncoder().encode(JSON.stringify(unsigned)),
+    ])),
+  };
+  const manifestBytes = new TextEncoder().encode(JSON.stringify(manifest));
+  const magic = new TextEncoder().encode(format.FITNESS_BACKUP_MAGIC);
+  const prefix = new Uint8Array(magic.byteLength + 4);
+  prefix.set(magic);
+  new DataView(prefix.buffer).setUint32(magic.byteLength, manifestBytes.byteLength, false);
+  return new Blob([prefix, manifestBytes, database], {
+    type: format.FITNESS_BACKUP_MIME_TYPE,
+  });
+}
+
 async function runtimeFixture(options = {}) {
   const {
     sourceCount = 1,
@@ -194,7 +225,7 @@ async function runtimeFixture(options = {}) {
     filename: `shilian.${GENERATION_ID}.sqlite3`,
     activationToken: ACTIVATION_TOKEN,
     importedBytes: 512,
-    schemaVersion: 1,
+    schemaVersion: 2,
   };
   const runtime = {
     async withExclusiveLock(task) {
@@ -400,6 +431,24 @@ test("complete restore stages all authenticated files, remaps, activates, and br
   ));
 });
 
+test("complete v1 container is authenticated then staged with the fixed v2 migration", async () => {
+  const { runtime, state } = await runtimeFixture({ sourceCount: 0 });
+  await backup.createFitnessBackupService(runtime)
+    .restoreCompleteBackup(await legacyV1CompleteContainer());
+
+  assert.equal(state.staged.length, 1);
+  assert.ok(state.staged[0].statements.some(({ sql }) =>
+    sql.includes("occurrence_key")
+  ));
+  assert.ok(state.staged[0].statements.some(({ sql, params = [] }) =>
+    sql.includes("fitness_schema_migrations") &&
+    Array.isArray(params) &&
+    params.includes(2) &&
+    params.includes("calendar-occurrence-identity")
+  ));
+  assert.deepEqual(state.broadcasts, [GENERATION_ID]);
+});
+
 test("a corrupt complete container fails before lock, save, or database staging", async () => {
   const { runtime, state, sources } = await runtimeFixture();
   const valid = await completeContainer(sources);
@@ -563,7 +612,7 @@ test("partially successful or metadata-corrupt OPFS writes are cleaned", async (
 test("wrong-product or malformed staged results are discarded before activation", async (t) => {
   for (const [label, change] of [
     ["database", { database: "zhiji" }],
-    ["schema version", { schemaVersion: 2 }],
+    ["schema version", { schemaVersion: 1 }],
     ["byte count", { importedBytes: 1 }],
   ]) {
     await t.test(label, async () => {
@@ -585,13 +634,14 @@ test("wrong-product or malformed staged results are discarded before activation"
   }
 });
 
-test("legacy restore accepts only canonical SHLN v1 before taking the lock", async () => {
+test("legacy restore accepts only exact SHLN v1/v2 identities before taking the lock", async () => {
   const { runtime, state } = await runtimeFixture({ sourceCount: 0 });
   const service = backup.createFitnessBackupService(runtime);
 
   for (const invalid of [
     sqliteBytes({ applicationId: 0 }),
-    sqliteBytes({ userVersion: 2 }),
+    sqliteBytes({ userVersion: 0 }),
+    sqliteBytes({ userVersion: 3 }),
     new Uint8Array(512),
     new Uint8Array(60),
   ]) {
@@ -600,16 +650,24 @@ test("legacy restore accepts only canonical SHLN v1 before taking the lock", asy
   assert.equal(state.lockCalls, 0);
   assert.deepEqual(state.staged, []);
 
-  const result = await service.restoreLegacyDatabase(new Blob([sqliteBytes()]));
-  assert.equal(result.byteSize, 512);
-  assert.equal(state.lockCalls, 1);
-  assert.equal(state.staged.length, 1);
-  assert.ok(state.staged[0].statements.some(({ sql }) =>
+  const v1Result = await service.restoreLegacyDatabase(
+    new Blob([sqliteBytes({ userVersion: 1 })]),
+  );
+  const v2Result = await service.restoreLegacyDatabase(new Blob([sqliteBytes()]));
+  assert.equal(v1Result.byteSize, 512);
+  assert.equal(v2Result.byteSize, 512);
+  assert.equal(state.lockCalls, 2);
+  assert.equal(state.staged.length, 2);
+  assert.ok(state.staged.every(({ statements }) => statements.some(({ sql }) =>
     sql.includes("DELETE FROM fitness_files")
+  )));
+  assert.ok(state.staged[0].statements.some(({ sql }) => sql.includes("occurrence_key")));
+  assert.ok(!state.staged[1].statements.some(({ sql }) =>
+    sql.includes("CREATE TEMP TABLE __fitness_calendar_events_v2_stage")
   ));
   assert.deepEqual(state.saved, []);
   assert.deepEqual(state.deleted, []);
-  assert.deepEqual(state.broadcasts, [GENERATION_ID]);
+  assert.deepEqual(state.broadcasts, [GENERATION_ID, GENERATION_ID]);
 });
 
 test("broadcast failure cannot turn a durable activation into a destructive retry", async () => {
