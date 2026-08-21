@@ -1,12 +1,13 @@
 import { localDb } from "@/lib/local-db/client";
 import type { SqlStatement } from "@/lib/local-db/types";
 import {
+  withCareerBackupLock,
   withCareerReadLock,
   withCareerWriteLock,
   type CareerLockContext,
 } from "./lock";
 import { ZHIJI_V3_SCHEMA_MIGRATION_STATEMENTS } from "../schemas/zhiji";
-import type { Interview, Job, Task } from "./types";
+import type { Interview, Job, Stage, Task } from "./types";
 
 const DB = "career" as const;
 
@@ -16,6 +17,106 @@ export type CareerRelatedRestoreAction = "keep-paused" | "restore-paused";
 export type CareerStageRelatedAction =
   | CareerRelatedPauseAction
   | CareerRelatedRestoreAction;
+
+export type CareerLifecycleChoice = CareerStageRelatedAction;
+
+export type CareerLifecycleIntent =
+  | Readonly<{
+      kind: "stage";
+      jobId: string;
+      nextStageId: string;
+      operationId?: string;
+    }>
+  | Readonly<{
+      kind: "archive";
+      jobId: string;
+      operationId?: string;
+    }>
+  | Readonly<{
+      kind: "restore";
+      jobId: string;
+      operationId?: string;
+    }>;
+
+export type CareerPreparedLifecycleIntent =
+  | Readonly<{
+      kind: "stage";
+      jobId: string;
+      nextStageId: string;
+      operationId: string;
+    }>
+  | Readonly<{
+      kind: "archive";
+      jobId: string;
+      operationId: string;
+    }>
+  | Readonly<{
+      kind: "restore";
+      jobId: string;
+      operationId: string;
+    }>;
+
+export type CareerLifecycleImpactItem = Readonly<{
+  entityType: "task" | "interview";
+  id: string;
+  /** A task title or interview round only; private notes are never returned. */
+  label: string;
+  scheduledAt: string | null;
+  status: string;
+  classification: "affected" | "elapsed" | "edited";
+  effect: "pause" | "restore";
+}>;
+
+export type CareerLifecycleTransition =
+  | "active-to-active"
+  | "active-to-terminal"
+  | "terminal-to-active"
+  | "terminal-to-terminal"
+  | "archive"
+  | "restore-active"
+  | "restore-terminal";
+
+export type CareerLifecycleStageSummary = Readonly<{
+  id: string;
+  name: string;
+  isTerminal: boolean;
+}>;
+
+export type CareerPreparedLifecycleChange = Readonly<{
+  intent: CareerPreparedLifecycleIntent;
+  operationId: string;
+  preparedAt: string;
+  transition: CareerLifecycleTransition;
+  job: Readonly<{
+    id: string;
+    company: string;
+    role: string;
+    archived: boolean;
+    currentStage: CareerLifecycleStageSummary;
+    nextStage: CareerLifecycleStageSummary | null;
+  }>;
+  impact: readonly CareerLifecycleImpactItem[];
+  counts: Readonly<{
+    affected: number;
+    elapsed: number;
+    edited: number;
+  }>;
+  requiresChoice: boolean;
+  allowedChoices: readonly CareerLifecycleChoice[];
+  /** Opaque digest of every fact used to produce this preview. */
+  fingerprint: string;
+}>;
+
+export type CareerLifecycleCommitResult =
+  | Readonly<{
+      status: "committed";
+      operationId: string;
+      committedAt: string;
+    }>
+  | Readonly<{
+      status: "changed";
+      prepared: CareerPreparedLifecycleChange;
+    }>;
 
 export type CareerLifecycleOptions<Action extends string> = Readonly<{
   relatedAction: Action;
@@ -1047,6 +1148,511 @@ async function query<T>(
 ): Promise<T[]> {
   void context;
   return unwrapRows<T>(await localDb.query(DB, sql, params));
+}
+
+type CareerPauseSource = Readonly<{
+  operationId: string;
+  reason: "job_archived" | "job_ended";
+  action: "auto_pause_job_archived" | "auto_pause_job_ended";
+}>;
+
+function normalizeLifecycleIntent(
+  intent: CareerLifecycleIntent,
+): CareerPreparedLifecycleIntent {
+  if (!intent || typeof intent !== "object") {
+    throw new TypeError("职位变更意图无效");
+  }
+  const operationId = intent.operationId === undefined
+    ? uid("lifecycle")
+    : requireId(intent.operationId, "操作 ID");
+  switch (intent.kind) {
+    case "stage":
+      return {
+        kind: "stage",
+        jobId: requireId(intent.jobId, "职位 ID"),
+        nextStageId: requireId(intent.nextStageId, "阶段 ID"),
+        operationId,
+      };
+    case "archive":
+      return {
+        kind: "archive",
+        jobId: requireId(intent.jobId, "职位 ID"),
+        operationId,
+      };
+    case "restore":
+      return {
+        kind: "restore",
+        jobId: requireId(intent.jobId, "职位 ID"),
+        operationId,
+      };
+    default:
+      throw new TypeError("职位变更意图无效");
+  }
+}
+
+function canonicalJson(value: unknown): string {
+  if (value === null) return "null";
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
+  }
+  switch (typeof value) {
+    case "string":
+    case "boolean":
+      return JSON.stringify(value);
+    case "number":
+      return Number.isFinite(value) ? JSON.stringify(value) : JSON.stringify(String(value));
+    case "bigint":
+      return JSON.stringify(value.toString());
+    case "undefined":
+      return "null";
+    case "object": {
+      const record = value as Record<string, unknown>;
+      return `{${Object.keys(record)
+        .sort()
+        .map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
+        .join(",")}}`;
+    }
+    default:
+      return JSON.stringify(String(value));
+  }
+}
+
+async function fingerprintLifecycleFacts(value: unknown): Promise<string> {
+  const bytes = new TextEncoder().encode(canonicalJson(value));
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  const hex = Array.from(new Uint8Array(digest), (byte) =>
+    byte.toString(16).padStart(2, "0")).join("");
+  return `sha256:${hex}`;
+}
+
+function sortedById<T extends { id: string }>(rows: readonly T[]): T[] {
+  return [...rows].sort((left, right) => left.id.localeCompare(right.id));
+}
+
+function sortedImpact(
+  impact: readonly CareerLifecycleImpactItem[],
+): CareerLifecycleImpactItem[] {
+  return [...impact].sort((left, right) =>
+    left.entityType.localeCompare(right.entityType) ||
+    left.id.localeCompare(right.id));
+}
+
+function pauseImpact(
+  tasks: readonly Task[],
+  interviews: readonly Interview[],
+  now: string,
+): CareerLifecycleImpactItem[] {
+  const impact: CareerLifecycleImpactItem[] = [];
+  for (const task of tasks) {
+    if (
+      task.status !== "todo" ||
+      task.due_at === null ||
+      task.lifecycle_operation_id !== null
+    ) continue;
+    impact.push({
+      entityType: "task",
+      id: task.id,
+      label: task.title,
+      scheduledAt: task.due_at,
+      status: task.status,
+      classification: task.due_at > now ? "affected" : "elapsed",
+      effect: "pause",
+    });
+  }
+  for (const interview of interviews) {
+    if (
+      interview.status !== "scheduled" ||
+      interview.scheduled_at === null ||
+      interview.lifecycle_operation_id !== null
+    ) continue;
+    impact.push({
+      entityType: "interview",
+      id: interview.id,
+      label: interview.round_name,
+      scheduledAt: interview.scheduled_at,
+      status: interview.status,
+      classification: interview.scheduled_at > now ? "affected" : "elapsed",
+      effect: "pause",
+    });
+  }
+  return sortedImpact(impact);
+}
+
+function matchingPauseEvent(
+  events: readonly CareerLifecycleEvent[],
+  source: CareerPauseSource,
+  entityType: "task" | "interview",
+  entityId: string,
+): CareerLifecycleEvent | undefined {
+  return events.find((event) =>
+    event.id === `${source.operationId}_${entityType}_${entityId}` &&
+    event.entity_type === entityType &&
+    event.entity_id === entityId);
+}
+
+function restoreClassification(
+  row: Task | Interview,
+  entityType: "task" | "interview",
+  scheduledAt: string | null,
+  sources: readonly CareerPauseSource[],
+  events: readonly CareerLifecycleEvent[],
+  now: string,
+): CareerLifecycleImpactItem["classification"] | null {
+  let associated = false;
+  let elapsed = false;
+  for (const source of sources) {
+    const event = matchingPauseEvent(events, source, entityType, row.id);
+    const belongsToSource = row.lifecycle_operation_id === source.operationId ||
+      event !== undefined;
+    if (!belongsToSource) continue;
+    associated = true;
+    const expectedPreviousStatus = entityType === "task" ? "todo" : "scheduled";
+    const exactPauseFingerprint =
+      row.status === "canceled" &&
+      row.cancellation_reason === source.reason &&
+      row.lifecycle_operation_id === source.operationId &&
+      row.lifecycle_previous_status === expectedPreviousStatus &&
+      row.canceled_at !== null &&
+      row.updated_at === row.canceled_at &&
+      scheduledAt !== null &&
+      event !== undefined &&
+      event.job_id === row.job_id &&
+      event.action === source.action &&
+      event.previous_status === expectedPreviousStatus &&
+      event.next_status === row.status &&
+      event.previous_due_at === scheduledAt &&
+      event.next_due_at === scheduledAt &&
+      event.reason === source.reason &&
+      event.created_at === row.canceled_at;
+    if (!exactPauseFingerprint) continue;
+    if (scheduledAt > now) return "affected";
+    elapsed = true;
+  }
+  if (elapsed) return "elapsed";
+  return associated ? "edited" : null;
+}
+
+function restoreImpact(
+  tasks: readonly Task[],
+  interviews: readonly Interview[],
+  sources: readonly CareerPauseSource[],
+  events: readonly CareerLifecycleEvent[],
+  now: string,
+): CareerLifecycleImpactItem[] {
+  const impact: CareerLifecycleImpactItem[] = [];
+  for (const task of tasks) {
+    const classification = restoreClassification(
+      task,
+      "task",
+      task.due_at,
+      sources,
+      events,
+      now,
+    );
+    if (classification === null) continue;
+    impact.push({
+      entityType: "task",
+      id: task.id,
+      label: task.title,
+      scheduledAt: task.due_at,
+      status: task.status,
+      classification,
+      effect: "restore",
+    });
+  }
+  for (const interview of interviews) {
+    const classification = restoreClassification(
+      interview,
+      "interview",
+      interview.scheduled_at,
+      sources,
+      events,
+      now,
+    );
+    if (classification === null) continue;
+    impact.push({
+      entityType: "interview",
+      id: interview.id,
+      label: interview.round_name,
+      scheduledAt: interview.scheduled_at,
+      status: interview.status,
+      classification,
+      effect: "restore",
+    });
+  }
+  return sortedImpact(impact);
+}
+
+function pauseSource(
+  operationId: string | null,
+  reason: CareerPauseSource["reason"],
+): CareerPauseSource | null {
+  if (!operationId) return null;
+  return {
+    operationId,
+    reason,
+    action: reason === "job_archived"
+      ? "auto_pause_job_archived"
+      : "auto_pause_job_ended",
+  };
+}
+
+function stageSummary(stage: Stage): CareerLifecycleStageSummary {
+  return {
+    id: stage.id,
+    name: stage.name,
+    isTerminal: stage.is_terminal === 1,
+  };
+}
+
+async function prepareCareerLifecycleChangeInLock(
+  intent: CareerPreparedLifecycleIntent,
+  now: string,
+  context: CareerLockContext,
+): Promise<CareerPreparedLifecycleChange> {
+  const jobs = await query<Job>(
+    "SELECT * FROM career_jobs WHERE id = ?",
+    [intent.jobId],
+    context,
+  );
+  if (jobs.length !== 1) throw new Error("没有找到这个职位");
+  const job = jobs[0];
+  const [currentStages, tasks, interviews, events] = await Promise.all([
+    query<Stage>(
+      "SELECT * FROM career_stages WHERE id = ?",
+      [job.stage_id],
+      context,
+    ),
+    query<Task>(
+      "SELECT * FROM career_tasks WHERE job_id = ? ORDER BY id",
+      [job.id],
+      context,
+    ),
+    query<Interview>(
+      "SELECT * FROM career_interviews WHERE job_id = ? ORDER BY id",
+      [job.id],
+      context,
+    ),
+    query<CareerLifecycleEvent>(
+      "SELECT * FROM career_lifecycle_events WHERE job_id = ? ORDER BY id",
+      [job.id],
+      context,
+    ),
+  ]);
+  if (currentStages.length !== 1) throw new Error("职位当前阶段不存在");
+  const currentStage = currentStages[0];
+  let nextStage: Stage | null = null;
+  if (intent.kind === "stage") {
+    const nextStages = await query<Stage>(
+      "SELECT * FROM career_stages WHERE id = ?",
+      [intent.nextStageId],
+      context,
+    );
+    if (nextStages.length !== 1) throw new Error("目标阶段不存在");
+    nextStage = nextStages[0];
+    if (nextStage.id === currentStage.id) {
+      throw new Error("这个职位已经在当前阶段，不需要重复记录");
+    }
+  }
+
+  let transition: CareerLifecycleTransition;
+  let impact: CareerLifecycleImpactItem[];
+  let allowedChoices: readonly CareerLifecycleChoice[];
+  let requiresChoice: boolean;
+  const currentIsTerminal = currentStage.is_terminal === 1;
+
+  if (intent.kind === "archive") {
+    if (job.archived !== 0) throw new Error("这个职位已经归档");
+    transition = "archive";
+    impact = pauseImpact(tasks, interviews, now);
+    requiresChoice = impact.some(({ classification }) => classification === "affected");
+    allowedChoices = requiresChoice ? ["keep", "pause"] : ["keep"];
+  } else if (intent.kind === "restore") {
+    if (job.archived !== 1) throw new Error("这个职位没有归档");
+    transition = currentIsTerminal ? "restore-terminal" : "restore-active";
+    const source = pauseSource(job.archived_operation_id, "job_archived");
+    impact = restoreImpact(
+      tasks,
+      interviews,
+      source === null ? [] : [source],
+      events,
+      now,
+    );
+    requiresChoice = !currentIsTerminal &&
+      impact.some(({ classification }) => classification === "affected");
+    allowedChoices = requiresChoice
+      ? ["keep-paused", "restore-paused"]
+      : ["keep-paused"];
+  } else {
+    if (job.archived !== 0) {
+      throw new Error("请先从归档中恢复这个职位，再调整阶段");
+    }
+    const nextIsTerminal = nextStage!.is_terminal === 1;
+    if (!currentIsTerminal && nextIsTerminal) {
+      transition = "active-to-terminal";
+      impact = pauseImpact(tasks, interviews, now);
+      requiresChoice = impact.some(({ classification }) =>
+        classification === "affected");
+      allowedChoices = requiresChoice ? ["keep", "pause"] : ["keep"];
+    } else if (currentIsTerminal && !nextIsTerminal) {
+      transition = "terminal-to-active";
+      const sources = [
+        pauseSource(job.ended_operation_id, "job_ended"),
+        pauseSource(job.archived_operation_id, "job_archived"),
+      ].filter((source): source is CareerPauseSource => source !== null);
+      impact = restoreImpact(tasks, interviews, sources, events, now);
+      requiresChoice = impact.some(({ classification }) =>
+        classification === "affected");
+      allowedChoices = requiresChoice
+        ? ["keep-paused", "restore-paused"]
+        : ["keep-paused"];
+    } else {
+      transition = currentIsTerminal
+        ? "terminal-to-terminal"
+        : "active-to-active";
+      impact = [];
+      requiresChoice = false;
+      allowedChoices = ["keep"];
+    }
+  }
+
+  const counts = {
+    affected: impact.filter(({ classification }) =>
+      classification === "affected").length,
+    elapsed: impact.filter(({ classification }) =>
+      classification === "elapsed").length,
+    edited: impact.filter(({ classification }) =>
+      classification === "edited").length,
+  };
+  const fingerprint = await fingerprintLifecycleFacts({
+    version: 1,
+    intent,
+    job,
+    currentStage,
+    nextStage,
+    tasks: sortedById(tasks),
+    interviews: sortedById(interviews),
+    events: sortedById(events),
+    transition,
+    impact,
+    allowedChoices,
+  });
+  return {
+    intent,
+    operationId: intent.operationId,
+    preparedAt: now,
+    transition,
+    job: {
+      id: job.id,
+      company: job.company,
+      role: job.role,
+      archived: job.archived === 1,
+      currentStage: stageSummary(currentStage),
+      nextStage: nextStage === null ? null : stageSummary(nextStage),
+    },
+    impact,
+    counts,
+    requiresChoice,
+    allowedChoices,
+    fingerprint,
+  };
+}
+
+export async function prepareCareerLifecycleChange(
+  intentInput: CareerLifecycleIntent,
+  nowInput?: string,
+): Promise<CareerPreparedLifecycleChange> {
+  const intent = normalizeLifecycleIntent(intentInput);
+  const requestedNow = nowInput === undefined
+    ? null
+    : requireTimestamp(nowInput, "预览时间");
+  return withCareerReadLock((context) => {
+    const now = requestedNow ?? new Date().toISOString();
+    return prepareCareerLifecycleChangeInLock(intent, now, context);
+  });
+}
+
+function planPreparedLifecycleChange(
+  prepared: CareerPreparedLifecycleChange,
+  choice: CareerLifecycleChoice,
+  now: string,
+): SqlStatement[] {
+  const options = {
+    relatedAction: choice,
+    operationId: prepared.operationId,
+    now,
+  };
+  switch (prepared.intent.kind) {
+    case "stage":
+      return planTransitionCareerJobStage(
+        prepared.intent.jobId,
+        prepared.intent.nextStageId,
+        options,
+      );
+    case "archive":
+      requirePauseAction(choice);
+      return planArchiveCareerJob(prepared.intent.jobId, {
+        ...options,
+        relatedAction: choice,
+      });
+    case "restore":
+      requireRestoreAction(choice);
+      return planRestoreCareerJob(prepared.intent.jobId, {
+        ...options,
+        relatedAction: choice,
+      });
+  }
+}
+
+export async function commitPreparedCareerLifecycleChange(
+  prepared: CareerPreparedLifecycleChange,
+  choice: CareerLifecycleChoice,
+): Promise<CareerLifecycleCommitResult> {
+  if (
+    !prepared ||
+    typeof prepared !== "object" ||
+    typeof prepared.fingerprint !== "string" ||
+    prepared.operationId !== prepared.intent?.operationId
+  ) {
+    throw new TypeError("职位变更预览无效，请重新预览");
+  }
+  const intent = normalizeLifecycleIntent(prepared.intent);
+  try {
+    return await withCareerBackupLock(async (context) => {
+      // Capture time only after the exclusive lock is acquired. A schedule can
+      // cross the future boundary while this tab is waiting for another tab.
+      const committedAt = new Date().toISOString();
+      const current = await prepareCareerLifecycleChangeInLock(
+        intent,
+        committedAt,
+        context,
+      );
+      if (current.fingerprint !== prepared.fingerprint) {
+        return { status: "changed", prepared: current };
+      }
+      if (!current.allowedChoices.includes(choice)) {
+        throw new TypeError("请选择当前预览中可用的处理方式");
+      }
+      await localDb.batch(
+        DB,
+        planPreparedLifecycleChange(current, choice, committedAt),
+        { transaction: true },
+      );
+      return {
+        status: "committed",
+        operationId: current.operationId,
+        committedAt,
+      };
+    });
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      error.message.includes("不支持安全的跨标签页备份锁")
+    ) {
+      throw new Error("当前浏览器不支持安全的跨标签页职位变更，请升级浏览器后重试");
+    }
+    throw error;
+  }
 }
 
 function scopeCondition(scope: CareerLifecycleScope): string {
