@@ -90,12 +90,20 @@ function adapterFor(database) {
       return executeRun(database, sql, params);
     },
     async batch(_name, statements, options = {}) {
+      if (globalThis.__vocabBatchFault === "before_commit") {
+        globalThis.__vocabBatchFault = null;
+        throw new Error("injected batch failure before commit");
+      }
       const operation = () => statements.map(({ sql, params = [] }) =>
         executeRun(database, sql, params)
       );
       const results = options.transaction === false
         ? operation()
         : database.transaction("IMMEDIATE", operation);
+      if (globalThis.__vocabBatchFault === "after_commit") {
+        globalThis.__vocabBatchFault = null;
+        throw new Error("injected worker response loss after commit");
+      }
       return {
         results,
         changes: results.reduce((sum, result) => sum + result.changes, 0),
@@ -185,6 +193,7 @@ async function databaseFixture() {
   const sqlite3 = await sqlite3InitModule();
   const database = new sqlite3.oo1.DB(":memory:", "c");
   database.exec("PRAGMA foreign_keys=ON");
+  globalThis.__vocabBatchFault = null;
   globalThis.__vocabLocalDbAdapter = adapterFor(database);
   return database;
 }
@@ -718,6 +727,219 @@ test("bookmark creation is idempotent for an item and locator", async () => {
       1,
     );
   } finally {
+    database.close();
+  }
+});
+
+test("article and podcast receipts recover response loss and reject changed projections", async () => {
+  const database = await databaseFixture();
+  try {
+    await store.initializeVocabDatabase();
+    const article = {
+      title: "Receipt article",
+      description: "saved once",
+      author: "",
+      source: "local",
+      blocks: [
+        { kind: "heading", text: "One" },
+        { kind: "paragraph", text: "The durable paragraph." },
+      ],
+    };
+    const articleReceipt = await store.prepareVocabArticleWrite(article, "paste");
+    globalThis.__vocabBatchFault = "after_commit";
+    assert.equal(
+      await store.saveArticle(article, "paste", articleReceipt),
+      articleReceipt.itemId,
+    );
+    assert.equal(
+      await store.inspectVocabImportWrite(articleReceipt),
+      "exact_saved",
+    );
+    assert.equal(
+      await store.saveArticle(article, "paste", articleReceipt),
+      articleReceipt.itemId,
+    );
+    assert.equal(Number(database.selectValue(
+      "SELECT COUNT(*) FROM vocab_items WHERE id=?",
+      [articleReceipt.itemId],
+    )), 1);
+    assert.equal(Number(database.selectValue(
+      "SELECT COUNT(*) FROM vocab_blocks WHERE item_id=?",
+      [articleReceipt.itemId],
+    )), 2);
+    assert.equal(Number(database.selectValue(
+      "SELECT COUNT(*) FROM vocab_imports WHERE id=?",
+      [articleReceipt.importId],
+    )), 1);
+    await store.updateItemProgress(articleReceipt.itemId, 0.5);
+    assert.equal(
+      await store.inspectVocabImportWrite(articleReceipt),
+      "exact_saved",
+    );
+    assert.equal(
+      await store.saveArticle(article, "paste", articleReceipt),
+      articleReceipt.itemId,
+    );
+    assert.equal(Number(database.selectValue(
+      "SELECT progress FROM vocab_items WHERE id=?",
+      [articleReceipt.itemId],
+    )), 0.5);
+    await assert.rejects(
+      store.saveArticle(
+        { ...article, title: "Changed after checkpoint" },
+        "paste",
+        articleReceipt,
+      ),
+      (error) => error?.code === "VOCAB_WRITE_CONFLICT",
+    );
+
+    const podcast = {
+      title: "Receipt podcast",
+      description: "saved once",
+      source: "local",
+      durationMs: 2_000,
+      segments: [
+        { start_ms: 0, end_ms: 2_000, text: "Only one segment." },
+      ],
+    };
+    const podcastReceipt = await store.prepareVocabPodcastWrite(podcast, "rss");
+    globalThis.__vocabBatchFault = "after_commit";
+    assert.equal(
+      await store.savePodcast(podcast, "rss", podcastReceipt),
+      podcastReceipt.itemId,
+    );
+    assert.equal(
+      await store.savePodcast(podcast, "rss", podcastReceipt),
+      podcastReceipt.itemId,
+    );
+    assert.equal(Number(database.selectValue(
+      "SELECT COUNT(*) FROM vocab_items WHERE id=?",
+      [podcastReceipt.itemId],
+    )), 1);
+    assert.equal(Number(database.selectValue(
+      "SELECT COUNT(*) FROM vocab_transcript_segments WHERE item_id=?",
+      [podcastReceipt.itemId],
+    )), 1);
+    await assert.rejects(
+      store.savePodcast(
+        { ...podcast, segments: [{ ...podcast.segments[0], text: "Changed" }] },
+        "rss",
+        podcastReceipt,
+      ),
+      (error) => error?.code === "VOCAB_WRITE_CONFLICT",
+    );
+    assert.deepEqual(database.selectObjects("PRAGMA foreign_key_check"), []);
+  } finally {
+    globalThis.__vocabBatchFault = null;
+    database.close();
+  }
+});
+
+test("one occurrence receipt atomically saves its note and lookup activity exactly once", async () => {
+  const database = await databaseFixture();
+  try {
+    await store.initializeVocabDatabase();
+    const itemId = await store.saveArticle({
+      title: "Atomic occurrence",
+      description: "",
+      author: "",
+      source: "local",
+      blocks: [{ kind: "paragraph", text: "Steady practice compounds." }],
+    }, "paste");
+    const target = {
+      surface: "Steady",
+      sentence: "Steady practice compounds.",
+      before: "",
+      after: "",
+      itemId,
+      startUtf16: 0,
+      endUtf16: 6,
+    };
+    const explanation = usefulExplanation("steady", "consistent and reliable");
+    const receipt = await store.prepareVocabOccurrenceWrite(
+      target,
+      explanation,
+      "Remember the calm rhythm.",
+    );
+    globalThis.__vocabBatchFault = "after_commit";
+    const first = await store.saveOccurrence(target, explanation, {
+      note: "Remember the calm rhythm.",
+      receipt,
+    });
+    assert.equal(first.occurrenceId, receipt.occurrenceId);
+    assert.equal(
+      await store.inspectVocabOccurrenceWrite(receipt),
+      "exact_saved",
+    );
+    const repeated = await store.saveOccurrence(target, explanation, {
+      note: "Remember the calm rhythm.",
+      receipt,
+    });
+    assert.deepEqual(repeated, first);
+    assert.deepEqual(
+      database.selectObjects(
+        "SELECT note,created_at FROM vocab_occurrences WHERE id=?",
+        [receipt.occurrenceId],
+      ).map((row) => ({ ...row })),
+      [{ note: "Remember the calm rhythm.", created_at: receipt.createdAt }],
+    );
+    assert.equal(Number(database.selectValue(
+      "SELECT lookup_count FROM vocab_lexemes WHERE id=?",
+      [first.lexemeId],
+    )), 1);
+    assert.equal(Number(database.selectValue(
+      "SELECT COUNT(*) FROM vocab_activity WHERE id=? AND lookups=1",
+      [receipt.activityId],
+    )), 1);
+    await assert.rejects(
+      store.saveOccurrence(target, explanation, {
+        note: "A changed note must not reuse the old operation.",
+        receipt,
+      }),
+      (error) => error?.code === "VOCAB_WRITE_CONFLICT",
+    );
+    assert.equal(Number(database.selectValue(
+      "SELECT lookup_count FROM vocab_lexemes WHERE id=?",
+      [first.lexemeId],
+    )), 1);
+
+    const failingTarget = {
+      ...target,
+      surface: "Rollbackonly",
+      sentence: "Rollbackonly must not leave partial rows.",
+      itemId: "missing-item",
+      endUtf16: 12,
+    };
+    const failingReceipt = await store.prepareVocabOccurrenceWrite(
+      failingTarget,
+      null,
+      "This note must roll back too.",
+    );
+    await assert.rejects(
+      store.saveOccurrence(failingTarget, null, {
+        note: "This note must roll back too.",
+        receipt: failingReceipt,
+      }),
+      (error) => error?.code === "VOCAB_WRITE_NOT_SAVED",
+    );
+    assert.equal(Number(database.selectValue(
+      "SELECT COUNT(*) FROM vocab_lexemes WHERE normalized_key='rollbackonly'",
+    )), 0);
+    assert.equal(Number(database.selectValue(
+      "SELECT COUNT(*) FROM vocab_occurrences WHERE id=?",
+      [failingReceipt.occurrenceId],
+    )), 0);
+    assert.equal(Number(database.selectValue(
+      "SELECT COUNT(*) FROM vocab_activity WHERE id=?",
+      [failingReceipt.activityId],
+    )), 0);
+    assert.equal(Number(database.selectValue(
+      "SELECT COUNT(*) FROM vocab_review_cards WHERE id=?",
+      [failingReceipt.cardId],
+    )), 0);
+    assert.deepEqual(database.selectObjects("PRAGMA foreign_key_check"), []);
+  } finally {
+    globalThis.__vocabBatchFault = null;
     database.close();
   }
 });

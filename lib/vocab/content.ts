@@ -170,20 +170,37 @@ export function normalizePodcastApi(value: unknown): ParsedPodcast[] {
   });
 }
 
+const SENTENCE_BOUNDARY = /[.!?。！？；;\n]/;
+
+export function adjacentSentence(text: string, edge: "preceding" | "following") {
+  const sentences = text
+    .split(SENTENCE_BOUNDARY)
+    .map((part) => part.trim())
+    .filter(Boolean);
+  return edge === "preceding" ? sentences.at(-1) ?? "" : sentences[0] ?? "";
+}
+
 export function sentenceContext(text: string, start: number, end: number) {
-  const boundary = /[.!?。！？；;\n]/;
+  const boundary = SENTENCE_BOUNDARY;
   let sentenceStart = start;
   let sentenceEnd = end;
   while (sentenceStart > 0 && !boundary.test(text[sentenceStart - 1])) sentenceStart -= 1;
   while (sentenceEnd < text.length && !boundary.test(text[sentenceEnd])) sentenceEnd += 1;
   if (sentenceEnd < text.length) sentenceEnd += 1;
-  const sentence = text.slice(sentenceStart, sentenceEnd).trim();
-  const beforeText = text.slice(0, sentenceStart).trim();
-  const afterText = text.slice(sentenceEnd).trim();
+  const rawSentence = text.slice(sentenceStart, sentenceEnd);
+  const leadingWhitespace = rawSentence.length - rawSentence.trimStart().length;
+  const trailingWhitespace = rawSentence.length - rawSentence.trimEnd().length;
+  const trimmedSentenceStart = sentenceStart + leadingWhitespace;
+  const trimmedSentenceEnd = sentenceEnd - trailingWhitespace;
+  const sentence = text.slice(trimmedSentenceStart, trimmedSentenceEnd);
+  const beforeText = text.slice(0, trimmedSentenceStart).trim();
+  const afterText = text.slice(trimmedSentenceEnd).trim();
   return {
     sentence,
-    before: beforeText.split(/[.!?。！？]/).filter(Boolean).at(-1)?.trim() ?? "",
-    after: afterText.split(/[.!?。！？]/).find(Boolean)?.trim() ?? "",
+    before: adjacentSentence(beforeText, "preceding"),
+    after: adjacentSentence(afterText, "following"),
+    startUtf16: start - trimmedSentenceStart,
+    endUtf16: end - trimmedSentenceStart,
   };
 }
 

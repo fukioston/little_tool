@@ -59,6 +59,144 @@ const LEGACY_SEED_IDS = {
 type SqlValue = string | number | bigint | boolean | null | Uint8Array;
 type Statement = { sql: string; params?: SqlValue[] | Record<string, SqlValue> };
 
+export type VocabWriteInspection =
+  | "exact_saved"
+  | "absent"
+  | "conflict"
+  | "unknown";
+
+export type VocabImportWriteReceipt = Readonly<{
+  version: 1;
+  kind: "article" | "podcast";
+  operationId: string;
+  itemId: string;
+  importId: string;
+  contentIds: readonly string[];
+  createdAt: number;
+  publishedAt: string;
+  projectionSha256: string;
+}>;
+
+export type VocabOccurrenceWriteReceipt = Readonly<{
+  version: 1;
+  kind: "occurrence";
+  operationId: string;
+  occurrenceId: string;
+  activityId: string;
+  lexemeId: string;
+  cardId: string;
+  createdAt: number;
+  day: string;
+  projectionSha256: string;
+}>;
+
+export type VocabWriteReceipt =
+  | VocabImportWriteReceipt
+  | VocabOccurrenceWriteReceipt;
+
+export class VocabWriteConflictError extends Error {
+  readonly code = "VOCAB_WRITE_CONFLICT";
+
+  constructor(
+    message: string,
+    readonly receipt: VocabWriteReceipt,
+  ) {
+    super(message);
+    this.name = "VocabWriteConflictError";
+  }
+}
+
+export class VocabWriteUncertainError extends Error {
+  readonly code = "VOCAB_WRITE_UNCERTAIN";
+  override readonly cause: unknown;
+
+  constructor(
+    message: string,
+    readonly receipt: VocabWriteReceipt,
+    cause?: unknown,
+  ) {
+    super(message);
+    this.name = "VocabWriteUncertainError";
+    this.cause = cause;
+  }
+}
+
+export class VocabWriteNotSavedError extends Error {
+  readonly code = "VOCAB_WRITE_NOT_SAVED";
+  override readonly cause: unknown;
+
+  constructor(
+    message: string,
+    readonly receipt: VocabWriteReceipt,
+    cause?: unknown,
+  ) {
+    super(message);
+    this.name = "VocabWriteNotSavedError";
+    this.cause = cause;
+  }
+}
+
+const RECEIPT_ID_PATTERN = /^[a-z]+_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const RECEIPT_HASH_PATTERN = /^[0-9a-f]{64}$/;
+
+function isReceiptId(value: unknown, prefix: string): value is string {
+  return typeof value === "string" &&
+    value.startsWith(`${prefix}_`) &&
+    RECEIPT_ID_PATTERN.test(value);
+}
+
+function isReceiptTimestamp(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+export function isVocabImportWriteReceipt(
+  value: unknown,
+): value is VocabImportWriteReceipt {
+  if (!value || typeof value !== "object") return false;
+  const receipt = value as Partial<VocabImportWriteReceipt>;
+  const contentPrefix = receipt.kind === "article" ? "block" : "segment";
+  const itemPrefix = receipt.kind === "article" ? "article" : "podcast";
+  return receipt.version === 1 &&
+    (receipt.kind === "article" || receipt.kind === "podcast") &&
+    isReceiptId(receipt.operationId, "operation") &&
+    isReceiptId(receipt.itemId, itemPrefix) &&
+    isReceiptId(receipt.importId, "import") &&
+    Array.isArray(receipt.contentIds) &&
+    receipt.contentIds.length <= 100_000 &&
+    new Set(receipt.contentIds).size === receipt.contentIds.length &&
+    receipt.contentIds.every((id) => isReceiptId(id, contentPrefix)) &&
+    isReceiptTimestamp(receipt.createdAt) &&
+    typeof receipt.publishedAt === "string" &&
+    /^\d{4}-\d{2}-\d{2}$/.test(receipt.publishedAt) &&
+    typeof receipt.projectionSha256 === "string" &&
+    RECEIPT_HASH_PATTERN.test(receipt.projectionSha256);
+}
+
+export function isVocabOccurrenceWriteReceipt(
+  value: unknown,
+): value is VocabOccurrenceWriteReceipt {
+  if (!value || typeof value !== "object") return false;
+  const receipt = value as Partial<VocabOccurrenceWriteReceipt>;
+  return receipt.version === 1 &&
+    receipt.kind === "occurrence" &&
+    isReceiptId(receipt.operationId, "operation") &&
+    isReceiptId(receipt.occurrenceId, "occurrence") &&
+    isReceiptId(receipt.activityId, "activity") &&
+    isReceiptId(receipt.lexemeId, "lexeme") &&
+    isReceiptId(receipt.cardId, "card") &&
+    isReceiptTimestamp(receipt.createdAt) &&
+    typeof receipt.day === "string" &&
+    /^\d{4}-\d{2}-\d{2}$/.test(receipt.day) &&
+    typeof receipt.projectionSha256 === "string" &&
+    RECEIPT_HASH_PATTERN.test(receipt.projectionSha256);
+}
+
+async function projectionSha256(value: unknown): Promise<string> {
+  const bytes = new TextEncoder().encode(JSON.stringify(value));
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+  return Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
 const legacySchemaStatements: readonly Statement[] = [
   { sql: `CREATE TABLE vocab_items (
     id TEXT PRIMARY KEY,
@@ -263,6 +401,7 @@ function newReviewCardStatement(
   status: Lexeme["status"],
   hasExplanation: boolean,
   now: number,
+  cardId = uid("card"),
 ): Statement {
   const suspension = reconcileReviewSuspension({
     state: "new",
@@ -276,7 +415,7 @@ function newReviewCardStatement(
     ) SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?
       WHERE NOT EXISTS (SELECT 1 FROM vocab_review_cards WHERE lexeme_id=?)`,
     params: [
-      uid("card"), lexemeId, suspension.state, now, 0, 2.5, 0, 0, null, 2,
+      cardId, lexemeId, suspension.state, now, 0, 2.5, 0, 0, null, 2,
       suspension.suspended_from_state, suspension.suspended_reason, now, lexemeId,
     ],
   };
@@ -792,120 +931,735 @@ export async function loadVocabSnapshot(): Promise<VocabSnapshot> {
   });
 }
 
+type ImportItemProjection = Pick<
+  LibraryItem,
+  | "id"
+  | "kind"
+  | "title"
+  | "description"
+  | "source"
+  | "source_url"
+  | "author"
+  | "published_at"
+  | "duration_ms"
+  | "audio_url"
+  | "created_at"
+>;
+type ImportRowProjection = Readonly<{
+  id: string;
+  method: string;
+  label: string;
+  status: string;
+  error: string;
+  item_id: string | null;
+  created_at: number;
+}>;
+type BlockProjection = Readonly<{
+  id: string;
+  item_id: string;
+  ordinal: number;
+  kind: string;
+  text: string;
+}>;
+type SegmentProjection = Readonly<{
+  id: string;
+  item_id: string;
+  ordinal: number;
+  start_ms: number;
+  end_ms: number;
+  text: string;
+  speaker: string | null;
+}>;
+
+function importProjection(
+  receipt: VocabImportWriteReceipt,
+  item: ImportItemProjection,
+  content: readonly (BlockProjection | SegmentProjection)[],
+  importRow: ImportRowProjection,
+) {
+  return {
+    version: 1,
+    receipt: {
+      operationId: receipt.operationId,
+      kind: receipt.kind,
+      itemId: receipt.itemId,
+      importId: receipt.importId,
+      contentIds: [...receipt.contentIds],
+      createdAt: receipt.createdAt,
+      publishedAt: receipt.publishedAt,
+    },
+    item,
+    content,
+    import: importRow,
+  };
+}
+
+function expectedArticleProjection(
+  article: ParsedArticle,
+  method: string,
+  receipt: VocabImportWriteReceipt,
+) {
+  const item: ImportItemProjection = {
+    id: receipt.itemId,
+    kind: "article",
+    title: article.title,
+    description: article.description,
+    source: article.source,
+    source_url: article.sourceUrl ?? null,
+    author: article.author,
+    published_at: receipt.publishedAt,
+    duration_ms: 0,
+    audio_url: null,
+    created_at: receipt.createdAt,
+  };
+  const content = article.blocks.map<BlockProjection>((block, ordinal) => ({
+    id: receipt.contentIds[ordinal] ?? "",
+    item_id: receipt.itemId,
+    ordinal,
+    kind: block.kind,
+    text: block.text,
+  }));
+  return importProjection(receipt, item, content, {
+    id: receipt.importId,
+    method,
+    label: article.title,
+    status: "complete",
+    error: "",
+    item_id: receipt.itemId,
+    created_at: receipt.createdAt,
+  });
+}
+
+function expectedPodcastProjection(
+  podcast: ParsedPodcast,
+  method: string,
+  receipt: VocabImportWriteReceipt,
+) {
+  const duration = podcast.durationMs || podcast.segments.at(-1)?.end_ms || 0;
+  const item: ImportItemProjection = {
+    id: receipt.itemId,
+    kind: "podcast",
+    title: podcast.title,
+    description: podcast.description,
+    source: podcast.source,
+    source_url: podcast.sourceUrl ?? null,
+    author: "",
+    published_at: receipt.publishedAt,
+    duration_ms: duration,
+    audio_url: podcast.audioUrl ?? null,
+    created_at: receipt.createdAt,
+  };
+  const content = podcast.segments.map<SegmentProjection>((segment, ordinal) => ({
+    id: receipt.contentIds[ordinal] ?? "",
+    item_id: receipt.itemId,
+    ordinal,
+    start_ms: segment.start_ms,
+    end_ms: segment.end_ms,
+    text: segment.text,
+    speaker: segment.speaker ?? null,
+  }));
+  return importProjection(receipt, item, content, {
+    id: receipt.importId,
+    method,
+    label: podcast.title,
+    status: "complete",
+    error: "",
+    item_id: receipt.itemId,
+    created_at: receipt.createdAt,
+  });
+}
+
+export async function prepareVocabArticleWrite(
+  article: ParsedArticle,
+  method: string,
+): Promise<VocabImportWriteReceipt> {
+  const createdAt = Date.now();
+  const receipt: VocabImportWriteReceipt = {
+    version: 1,
+    kind: "article",
+    operationId: uid("operation"),
+    itemId: uid("article"),
+    importId: uid("import"),
+    contentIds: article.blocks.map(() => uid("block")),
+    createdAt,
+    publishedAt: localDayKey(createdAt),
+    projectionSha256: "",
+  };
+  return {
+    ...receipt,
+    projectionSha256: await projectionSha256(
+      expectedArticleProjection(article, method, receipt),
+    ),
+  };
+}
+
+export async function prepareVocabPodcastWrite(
+  podcast: ParsedPodcast,
+  method: string,
+): Promise<VocabImportWriteReceipt> {
+  const createdAt = Date.now();
+  const receipt: VocabImportWriteReceipt = {
+    version: 1,
+    kind: "podcast",
+    operationId: uid("operation"),
+    itemId: uid("podcast"),
+    importId: uid("import"),
+    contentIds: podcast.segments.map(() => uid("segment")),
+    createdAt,
+    publishedAt: localDayKey(createdAt),
+    projectionSha256: "",
+  };
+  return {
+    ...receipt,
+    projectionSha256: await projectionSha256(
+      expectedPodcastProjection(podcast, method, receipt),
+    ),
+  };
+}
+
+type ImportInspectionResult = Readonly<{ status: VocabWriteInspection }>;
+
+async function inspectImportWriteUnlocked(
+  receipt: VocabImportWriteReceipt,
+): Promise<ImportInspectionResult> {
+  if (!isVocabImportWriteReceipt(receipt)) return { status: "conflict" };
+  try {
+    const contentTable = receipt.kind === "article"
+      ? "vocab_blocks"
+      : "vocab_transcript_segments";
+    const otherContentTable = receipt.kind === "article"
+      ? "vocab_transcript_segments"
+      : "vocab_blocks";
+    const contentColumns = receipt.kind === "article"
+      ? "id,item_id,ordinal,kind,text"
+      : "id,item_id,ordinal,start_ms,end_ms,text,speaker";
+    const [items, imports, content, otherContent, ownedContent] = await Promise.all([
+      rawQuery<ImportItemProjection>(
+        `SELECT id,kind,title,description,source,source_url,author,published_at,
+                duration_ms,audio_url,created_at
+         FROM vocab_items WHERE id=?`,
+        [receipt.itemId],
+      ),
+      rawQuery<ImportRowProjection>(
+        `SELECT id,method,label,status,error,item_id,created_at
+         FROM vocab_imports WHERE id=?`,
+        [receipt.importId],
+      ),
+      rawQuery<BlockProjection | SegmentProjection>(
+        `SELECT ${contentColumns} FROM ${contentTable}
+         WHERE item_id=? ORDER BY ordinal,id`,
+        [receipt.itemId],
+      ),
+      rawQuery<{ id: string }>(
+        `SELECT id FROM ${otherContentTable} WHERE item_id=? LIMIT 1`,
+        [receipt.itemId],
+      ),
+      receipt.contentIds.length === 0
+        ? Promise.resolve([] as Array<{ id: string }>)
+        : rawQuery<{ id: string }>(
+          `SELECT id FROM ${contentTable}
+           WHERE id IN (${placeholders(receipt.contentIds)})`,
+          [...receipt.contentIds],
+        ),
+    ]);
+    if (
+      items.length === 0 &&
+      imports.length === 0 &&
+      content.length === 0 &&
+      otherContent.length === 0 &&
+      ownedContent.length === 0
+    ) return { status: "absent" };
+    if (
+      items.length !== 1 ||
+      imports.length !== 1 ||
+      content.length !== receipt.contentIds.length ||
+      ownedContent.length !== receipt.contentIds.length ||
+      otherContent.length !== 0
+    ) return { status: "conflict" };
+    const digest = await projectionSha256(
+      importProjection(receipt, items[0], content, imports[0]),
+    );
+    return {
+      status: digest === receipt.projectionSha256 ? "exact_saved" : "conflict",
+    };
+  } catch {
+    return { status: "unknown" };
+  }
+}
+
+export async function inspectVocabImportWrite(
+  receipt: VocabImportWriteReceipt,
+): Promise<VocabWriteInspection> {
+  if (!isVocabImportWriteReceipt(receipt)) return "conflict";
+  try {
+    return (await withVocabReadLock(() => inspectImportWriteUnlocked(receipt))).status;
+  } catch {
+    return "unknown";
+  }
+}
+
+async function assertImportReceiptMatches(
+  receipt: VocabImportWriteReceipt,
+  kind: VocabImportWriteReceipt["kind"],
+  expected: unknown,
+): Promise<void> {
+  if (
+    !isVocabImportWriteReceipt(receipt) ||
+    receipt.kind !== kind ||
+    await projectionSha256(expected) !== receipt.projectionSha256
+  ) {
+    throw new VocabWriteConflictError(
+      "写入回执与这份内容不一致，已停止以避免覆盖其他资料。",
+      receipt,
+    );
+  }
+}
+
+export async function matchesVocabArticleWriteReceipt(
+  article: ParsedArticle,
+  method: string,
+  receipt: VocabImportWriteReceipt,
+): Promise<boolean> {
+  return isVocabImportWriteReceipt(receipt) &&
+    receipt.kind === "article" &&
+    await projectionSha256(
+      expectedArticleProjection(article, method, receipt),
+    ) === receipt.projectionSha256;
+}
+
+export async function matchesVocabPodcastWriteReceipt(
+  podcast: ParsedPodcast,
+  method: string,
+  receipt: VocabImportWriteReceipt,
+): Promise<boolean> {
+  return isVocabImportWriteReceipt(receipt) &&
+    receipt.kind === "podcast" &&
+    await projectionSha256(
+      expectedPodcastProjection(podcast, method, receipt),
+    ) === receipt.projectionSha256;
+}
+
+function broadcastConfirmedWrite(reason: string): void {
+  try {
+    broadcastVocabChange(reason);
+  } catch {
+    // A cross-tab hint is not part of the durable commit acknowledgement.
+  }
+}
+
+async function commitImportWrite(
+  receipt: VocabImportWriteReceipt,
+  reason: string,
+  statements: readonly Statement[],
+): Promise<string> {
+  return withVocabWriteLock(async () => {
+    const before = await inspectImportWriteUnlocked(receipt);
+    if (before.status === "exact_saved") return receipt.itemId;
+    if (before.status === "conflict") {
+      throw new VocabWriteConflictError(
+        "这个写入编号已被不同内容占用，未执行任何写入。",
+        receipt,
+      );
+    }
+    if (before.status === "unknown") {
+      throw new VocabWriteUncertainError(
+        "暂时无法核对本地数据库；请先只读核对，不要重复导入。",
+        receipt,
+      );
+    }
+
+    try {
+      await rawBatch(statements);
+    } catch (cause) {
+      const afterFailure = await inspectImportWriteUnlocked(receipt);
+      if (afterFailure.status === "exact_saved") {
+        broadcastConfirmedWrite(reason);
+        return receipt.itemId;
+      }
+      if (afterFailure.status === "absent") {
+        throw new VocabWriteNotSavedError(
+          "已确认内容没有写入本地数据库。",
+          receipt,
+          cause,
+        );
+      }
+      if (afterFailure.status === "conflict") {
+        throw new VocabWriteConflictError(
+          "写入结果与原回执不一致，已停止后续操作。",
+          receipt,
+        );
+      }
+      throw new VocabWriteUncertainError(
+        "数据库没有返回完整回执；请先只读核对，不要重复导入。",
+        receipt,
+        cause,
+      );
+    }
+
+    const after = await inspectImportWriteUnlocked(receipt);
+    if (after.status === "exact_saved") {
+      broadcastConfirmedWrite(reason);
+      return receipt.itemId;
+    }
+    if (after.status === "absent") {
+      throw new VocabWriteNotSavedError(
+        "数据库未能确认刚才的写入。",
+        receipt,
+      );
+    }
+    if (after.status === "conflict") {
+      throw new VocabWriteConflictError(
+        "数据库中的结果与原回执不一致，已停止后续操作。",
+        receipt,
+      );
+    }
+    throw new VocabWriteUncertainError(
+      "写入后暂时无法读取数据库；请先只读核对，不要重复导入。",
+      receipt,
+    );
+  });
+}
+
 export async function saveArticle(
   article: ParsedArticle,
   method: string,
+  suppliedReceipt?: VocabImportWriteReceipt,
 ): Promise<string> {
-  return withWrite("article-saved", async () => {
-    const now = Date.now();
-    const id = uid("article");
-    const statements: Statement[] = [
-      {
-        sql: `INSERT INTO vocab_items(
-          id,kind,title,description,source,source_url,author,published_at,
-          duration_ms,audio_url,status,progress,created_at,updated_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-        params: [
-          id,
-          "article",
-          article.title,
-          article.description,
-          article.source,
-          article.sourceUrl ?? null,
-          article.author,
-          localDayKey(now),
-          0,
-          null,
-          "unread",
-          0,
-          now,
-          now,
-        ],
-      },
-      ...article.blocks.map((block, ordinal) => ({
-        sql: `INSERT INTO vocab_blocks(id,item_id,ordinal,kind,text)
-              VALUES (?,?,?,?,?)`,
-        params: [uid("block"), id, ordinal, block.kind, block.text],
-      })),
-      {
-        sql: `INSERT INTO vocab_imports(
-          id,method,label,status,error,item_id,created_at
-        ) VALUES (?,?,?,?,?,?,?)`,
-        params: [uid("import"), method, article.title, "complete", "", id, now],
-      },
-    ];
-    await rawBatch(statements);
-    return id;
-  });
+  const receipt = suppliedReceipt ?? await prepareVocabArticleWrite(article, method);
+  await assertImportReceiptMatches(
+    receipt,
+    "article",
+    expectedArticleProjection(article, method, receipt),
+  );
+  const statements: Statement[] = [
+    {
+      sql: `INSERT INTO vocab_items(
+        id,kind,title,description,source,source_url,author,published_at,
+        duration_ms,audio_url,status,progress,created_at,updated_at
+      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      params: [
+        receipt.itemId, "article", article.title, article.description,
+        article.source, article.sourceUrl ?? null, article.author,
+        receipt.publishedAt, 0, null, "unread", 0, receipt.createdAt,
+        receipt.createdAt,
+      ],
+    },
+    ...article.blocks.map((block, ordinal) => ({
+      sql: `INSERT INTO vocab_blocks(id,item_id,ordinal,kind,text)
+            VALUES (?,?,?,?,?)`,
+      params: [
+        receipt.contentIds[ordinal], receipt.itemId, ordinal, block.kind,
+        block.text,
+      ],
+    })),
+    {
+      sql: `INSERT INTO vocab_imports(
+        id,method,label,status,error,item_id,created_at
+      ) VALUES (?,?,?,?,?,?,?)`,
+      params: [
+        receipt.importId, method, article.title, "complete", "",
+        receipt.itemId, receipt.createdAt,
+      ],
+    },
+  ];
+  return commitImportWrite(receipt, "article-saved", statements);
 }
 
 export async function savePodcast(
   podcast: ParsedPodcast,
   method: string,
+  suppliedReceipt?: VocabImportWriteReceipt,
 ): Promise<string> {
-  return withWrite("podcast-saved", async () => {
-    const now = Date.now();
-    const id = uid("podcast");
-    const duration = podcast.durationMs || podcast.segments.at(-1)?.end_ms || 0;
-    const statements: Statement[] = [
-      {
-        sql: `INSERT INTO vocab_items(
-          id,kind,title,description,source,source_url,author,published_at,
-          duration_ms,audio_url,status,progress,created_at,updated_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-        params: [
-          id,
-          "podcast",
-          podcast.title,
-          podcast.description,
-          podcast.source,
-          podcast.sourceUrl ?? null,
-          "",
-          localDayKey(now),
-          duration,
-          podcast.audioUrl ?? null,
-          "unread",
-          0,
-          now,
-          now,
-        ],
-      },
-      ...podcast.segments.map((segment, ordinal) => ({
-        sql: `INSERT INTO vocab_transcript_segments(
-          id,item_id,ordinal,start_ms,end_ms,text,speaker
-        ) VALUES (?,?,?,?,?,?,?)`,
-        params: [
-          uid("segment"),
-          id,
-          ordinal,
-          segment.start_ms,
-          segment.end_ms,
-          segment.text,
-          segment.speaker ?? null,
-        ],
-      })),
-      {
-        sql: `INSERT INTO vocab_imports(
-          id,method,label,status,error,item_id,created_at
-        ) VALUES (?,?,?,?,?,?,?)`,
-        params: [uid("import"), method, podcast.title, "complete", "", id, now],
-      },
-    ];
-    await rawBatch(statements);
-    return id;
+  const receipt = suppliedReceipt ?? await prepareVocabPodcastWrite(podcast, method);
+  await assertImportReceiptMatches(
+    receipt,
+    "podcast",
+    expectedPodcastProjection(podcast, method, receipt),
+  );
+  const duration = podcast.durationMs || podcast.segments.at(-1)?.end_ms || 0;
+  const statements: Statement[] = [
+    {
+      sql: `INSERT INTO vocab_items(
+        id,kind,title,description,source,source_url,author,published_at,
+        duration_ms,audio_url,status,progress,created_at,updated_at
+      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      params: [
+        receipt.itemId, "podcast", podcast.title, podcast.description,
+        podcast.source, podcast.sourceUrl ?? null, "", receipt.publishedAt,
+        duration, podcast.audioUrl ?? null, "unread", 0, receipt.createdAt,
+        receipt.createdAt,
+      ],
+    },
+    ...podcast.segments.map((segment, ordinal) => ({
+      sql: `INSERT INTO vocab_transcript_segments(
+        id,item_id,ordinal,start_ms,end_ms,text,speaker
+      ) VALUES (?,?,?,?,?,?,?)`,
+      params: [
+        receipt.contentIds[ordinal], receipt.itemId, ordinal, segment.start_ms,
+        segment.end_ms, segment.text, segment.speaker ?? null,
+      ],
+    })),
+    {
+      sql: `INSERT INTO vocab_imports(
+        id,method,label,status,error,item_id,created_at
+      ) VALUES (?,?,?,?,?,?,?)`,
+      params: [
+        receipt.importId, method, podcast.title, "complete", "",
+        receipt.itemId, receipt.createdAt,
+      ],
+    },
+  ];
+  return commitImportWrite(receipt, "podcast-saved", statements);
+}
+
+function normalizedSelection(target: SelectionTarget): string {
+  return target.surface.normalize("NFC").trim().toLocaleLowerCase("en");
+}
+
+function occurrenceProjection(
+  receipt: VocabOccurrenceWriteReceipt,
+  occurrence: Readonly<{
+    id: string;
+    normalized_key: string | null;
+    item_id: string | null;
+    block_id: string | null;
+    segment_id: string | null;
+    surface: string;
+    context_before: string;
+    context_sentence: string;
+    context_after: string;
+    start_utf16: number;
+    end_utf16: number;
+    start_ms: number | null;
+    note: string;
+    explanation_json: string;
+    created_at: number;
+  }>,
+  activity: Readonly<{
+    id: string;
+    day: string;
+    read_seconds: number;
+    listen_seconds: number;
+    review_count: number;
+    lookups: number;
+    created_at: number;
+  }>,
+) {
+  return {
+    version: 1,
+    receipt: {
+      operationId: receipt.operationId,
+      occurrenceId: receipt.occurrenceId,
+      activityId: receipt.activityId,
+      lexemeId: receipt.lexemeId,
+      cardId: receipt.cardId,
+      createdAt: receipt.createdAt,
+      day: receipt.day,
+    },
+    occurrence,
+    activity,
+  };
+}
+
+function expectedOccurrenceProjection(
+  target: SelectionTarget,
+  explanation: AiExplanation | null,
+  note: string,
+  receipt: VocabOccurrenceWriteReceipt,
+) {
+  return occurrenceProjection(receipt, {
+    id: receipt.occurrenceId,
+    normalized_key: normalizedSelection(target),
+    item_id: target.itemId,
+    block_id: target.blockId ?? null,
+    segment_id: target.segmentId ?? null,
+    surface: target.surface,
+    context_before: target.before,
+    context_sentence: target.sentence,
+    context_after: target.after,
+    start_utf16: target.startUtf16,
+    end_utf16: target.endUtf16,
+    start_ms: target.startMs ?? null,
+    note,
+    explanation_json: explanation ? JSON.stringify(explanation) : "",
+    created_at: receipt.createdAt,
+  }, {
+    id: receipt.activityId,
+    day: receipt.day,
+    read_seconds: 0,
+    listen_seconds: 0,
+    review_count: 0,
+    lookups: 1,
+    created_at: receipt.createdAt,
   });
 }
+
+export async function prepareVocabOccurrenceWrite(
+  target: SelectionTarget,
+  explanation: AiExplanation | null,
+  note = "",
+): Promise<VocabOccurrenceWriteReceipt> {
+  const createdAt = Date.now();
+  const receipt: VocabOccurrenceWriteReceipt = {
+    version: 1,
+    kind: "occurrence",
+    operationId: uid("operation"),
+    occurrenceId: uid("occurrence"),
+    activityId: uid("activity"),
+    lexemeId: uid("lexeme"),
+    cardId: uid("card"),
+    createdAt,
+    day: localDayKey(createdAt),
+    projectionSha256: "",
+  };
+  return {
+    ...receipt,
+    projectionSha256: await projectionSha256(
+      expectedOccurrenceProjection(target, explanation, note, receipt),
+    ),
+  };
+}
+
+type OccurrenceInspectionResult = Readonly<{
+  status: VocabWriteInspection;
+  lexemeId?: string;
+}>;
+
+async function inspectOccurrenceWriteUnlocked(
+  receipt: VocabOccurrenceWriteReceipt,
+): Promise<OccurrenceInspectionResult> {
+  if (!isVocabOccurrenceWriteReceipt(receipt)) return { status: "conflict" };
+  try {
+    const [occurrences, activity] = await Promise.all([
+      rawQuery<{
+        id: string;
+        lexeme_id: string;
+        normalized_key: string | null;
+        item_id: string | null;
+        block_id: string | null;
+        segment_id: string | null;
+        surface: string;
+        context_before: string;
+        context_sentence: string;
+        context_after: string;
+        start_utf16: number;
+        end_utf16: number;
+        start_ms: number | null;
+        note: string;
+        explanation_json: string;
+        created_at: number;
+      }>(
+        `SELECT o.id,o.lexeme_id,l.normalized_key,o.item_id,o.block_id,
+                o.segment_id,o.surface,o.context_before,o.context_sentence,
+                o.context_after,o.start_utf16,o.end_utf16,o.start_ms,o.note,
+                o.explanation_json,o.created_at
+         FROM vocab_occurrences o
+         LEFT JOIN vocab_lexemes l ON l.id=o.lexeme_id
+         WHERE o.id=?`,
+        [receipt.occurrenceId],
+      ),
+      rawQuery<{
+        id: string;
+        day: string;
+        read_seconds: number;
+        listen_seconds: number;
+        review_count: number;
+        lookups: number;
+        created_at: number;
+      }>(
+        `SELECT id,day,read_seconds,listen_seconds,review_count,lookups,created_at
+         FROM vocab_activity WHERE id=?`,
+        [receipt.activityId],
+      ),
+    ]);
+    if (occurrences.length === 0 && activity.length === 0) {
+      return { status: "absent" };
+    }
+    if (occurrences.length !== 1 || activity.length !== 1) {
+      return { status: "conflict" };
+    }
+    const row = occurrences[0];
+    const digest = await projectionSha256(occurrenceProjection(receipt, {
+      id: row.id,
+      normalized_key: row.normalized_key,
+      item_id: row.item_id,
+      block_id: row.block_id,
+      segment_id: row.segment_id,
+      surface: row.surface,
+      context_before: row.context_before,
+      context_sentence: row.context_sentence,
+      context_after: row.context_after,
+      start_utf16: row.start_utf16,
+      end_utf16: row.end_utf16,
+      start_ms: row.start_ms,
+      note: row.note,
+      explanation_json: row.explanation_json,
+      created_at: row.created_at,
+    }, activity[0]));
+    return digest === receipt.projectionSha256
+      ? { status: "exact_saved", lexemeId: row.lexeme_id }
+      : { status: "conflict" };
+  } catch {
+    return { status: "unknown" };
+  }
+}
+
+export async function inspectVocabOccurrenceWrite(
+  receipt: VocabOccurrenceWriteReceipt,
+): Promise<VocabWriteInspection> {
+  if (!isVocabOccurrenceWriteReceipt(receipt)) return "conflict";
+  try {
+    return (await withVocabReadLock(() => inspectOccurrenceWriteUnlocked(receipt))).status;
+  } catch {
+    return "unknown";
+  }
+}
+
+export type SaveOccurrenceOptions = Readonly<{
+  note?: string;
+  receipt?: VocabOccurrenceWriteReceipt;
+}>;
 
 export async function saveOccurrence(
   target: SelectionTarget,
   explanation: AiExplanation | null,
+  options: SaveOccurrenceOptions = {},
 ): Promise<{ lexemeId: string; occurrenceId: string }> {
-  return withWrite("occurrence-saved", async () => {
-    const now = Date.now();
-    const normalized = target.surface
-      .normalize("NFC")
-      .trim()
-      .toLocaleLowerCase("en");
+  const note = options.note ?? "";
+  const receipt = options.receipt ??
+    await prepareVocabOccurrenceWrite(target, explanation, note);
+  if (
+    !isVocabOccurrenceWriteReceipt(receipt) ||
+    await projectionSha256(
+      expectedOccurrenceProjection(target, explanation, note, receipt),
+    ) !== receipt.projectionSha256
+  ) {
+    throw new VocabWriteConflictError(
+      "收词回执与当前语境或笔记不一致，未执行任何写入。",
+      receipt,
+    );
+  }
+
+  return withVocabWriteLock(async () => {
+    const before = await inspectOccurrenceWriteUnlocked(receipt);
+    if (before.status === "exact_saved" && before.lexemeId) {
+      return { lexemeId: before.lexemeId, occurrenceId: receipt.occurrenceId };
+    }
+    if (before.status === "conflict") {
+      throw new VocabWriteConflictError(
+        "这个收词编号已被不同语境占用，未重复计数。",
+        receipt,
+      );
+    }
+    if (before.status === "unknown") {
+      throw new VocabWriteUncertainError(
+        "暂时无法核对这次收词；请先只读核对，不要重复保存。",
+        receipt,
+      );
+    }
+
+    const now = receipt.createdAt;
+    const normalized = normalizedSelection(target);
     const existing = await rawQuery<{
       id: string;
       status: Lexeme["status"];
@@ -927,7 +1681,7 @@ export async function saveOccurrence(
        WHERE l.normalized_key=?`,
       [normalized],
     );
-    const lexemeId = existing[0]?.id ?? uid("lexeme");
+    const lexemeId = existing[0]?.id ?? receipt.lexemeId;
     const canonical = explanation?.target?.canonical?.trim() || target.surface;
     const pronunciation = explanation?.target?.pronunciation ||
       explanation?.target?.ipa ||
@@ -947,7 +1701,6 @@ export async function saveOccurrence(
       existing[0]?.gloss_en ?? "",
       existing[0]?.explanation_en ?? "",
     );
-    const occurrenceId = uid("occurrence");
     const statements: Statement[] = [];
     if (existing[0]) {
       statements.push({
@@ -960,17 +1713,8 @@ export async function saveOccurrence(
               lookup_count=lookup_count+1, updated_at=?
           WHERE id=?`,
         params: [
-          canonical,
-          pronunciation,
-          pronunciation,
-          gloss,
-          gloss,
-          english,
-          english,
-          chinese,
-          chinese,
-          now,
-          lexemeId,
+          canonical, pronunciation, pronunciation, gloss, gloss, english,
+          english, chinese, chinese, now, lexemeId,
         ],
       });
     } else {
@@ -980,19 +1724,8 @@ export async function saveOccurrence(
           explanation_zh,status,starred,notes,lookup_count,created_at,updated_at
         ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
         params: [
-          lexemeId,
-          canonical,
-          normalized,
-          pronunciation,
-          gloss,
-          english,
-          chinese,
-          "saved",
-          0,
-          "",
-          1,
-          now,
-          now,
+          lexemeId, canonical, normalized, pronunciation, gloss, english,
+          chinese, "saved", 0, "", 1, now, now,
         ],
       });
     }
@@ -1012,6 +1745,7 @@ export async function saveOccurrence(
         existingLexeme?.status ?? "saved",
         hasExplanation,
         now,
+        receipt.cardId,
       ));
     }
     statements.push({
@@ -1021,31 +1755,72 @@ export async function saveOccurrence(
         explanation_json,created_at
       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       params: [
-        occurrenceId,
-        lexemeId,
-        target.itemId,
-        target.blockId ?? null,
-        target.segmentId ?? null,
-        target.surface,
-        target.before,
-        target.sentence,
-        target.after,
-        target.startUtf16,
-        target.endUtf16,
-        target.startMs ?? null,
-        "",
-        explanation ? JSON.stringify(explanation) : "",
-        now,
+        receipt.occurrenceId, lexemeId, target.itemId, target.blockId ?? null,
+        target.segmentId ?? null, target.surface, target.before,
+        target.sentence, target.after, target.startUtf16, target.endUtf16,
+        target.startMs ?? null, note,
+        explanation ? JSON.stringify(explanation) : "", now,
       ],
     });
     statements.push({
       sql: `INSERT INTO vocab_activity(
         id,day,read_seconds,listen_seconds,review_count,lookups,created_at
       ) VALUES (?,?,?,?,?,?,?)`,
-      params: [uid("activity"), localDayKey(now), 0, 0, 0, 1, now],
+      params: [receipt.activityId, receipt.day, 0, 0, 0, 1, now],
     });
-    await rawBatch(statements);
-    return { lexemeId, occurrenceId };
+
+    try {
+      await rawBatch(statements);
+    } catch (cause) {
+      const afterFailure = await inspectOccurrenceWriteUnlocked(receipt);
+      if (afterFailure.status === "exact_saved" && afterFailure.lexemeId) {
+        broadcastConfirmedWrite("occurrence-saved");
+        return {
+          lexemeId: afterFailure.lexemeId,
+          occurrenceId: receipt.occurrenceId,
+        };
+      }
+      if (afterFailure.status === "absent") {
+        throw new VocabWriteNotSavedError(
+          "已确认这次收词没有写入，也没有增加查询次数。",
+          receipt,
+          cause,
+        );
+      }
+      if (afterFailure.status === "conflict") {
+        throw new VocabWriteConflictError(
+          "收词结果与原回执不一致，已停止后续操作。",
+          receipt,
+        );
+      }
+      throw new VocabWriteUncertainError(
+        "收词后没有收到完整回执；请先只读核对，不要重复保存。",
+        receipt,
+        cause,
+      );
+    }
+
+    const after = await inspectOccurrenceWriteUnlocked(receipt);
+    if (after.status === "exact_saved" && after.lexemeId) {
+      broadcastConfirmedWrite("occurrence-saved");
+      return { lexemeId: after.lexemeId, occurrenceId: receipt.occurrenceId };
+    }
+    if (after.status === "absent") {
+      throw new VocabWriteNotSavedError(
+        "数据库未能确认这次收词，也没有增加查询次数。",
+        receipt,
+      );
+    }
+    if (after.status === "conflict") {
+      throw new VocabWriteConflictError(
+        "收词结果与原回执不一致，已停止后续操作。",
+        receipt,
+      );
+    }
+    throw new VocabWriteUncertainError(
+      "收词后暂时无法读取数据库；请先只读核对，不要重复保存。",
+      receipt,
+    );
   });
 }
 

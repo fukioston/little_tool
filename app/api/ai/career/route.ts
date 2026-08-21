@@ -16,7 +16,10 @@ export async function POST(request: Request) {
       throw new HttpError(400, "缺少 AI 功能名称。", "ACTION_REQUIRED");
     }
     const safePayload = sanitizeCareerAiRequestPayload(body.action, body.payload ?? {});
-    const result = await runDeepSeekJson(careerPrompt(body.action, safePayload));
+    const result = await runDeepSeekJson(
+      careerPrompt(body.action, safePayload),
+      request.signal,
+    );
     return jsonResponse({ ok: true, ...result });
   } catch (error) {
     if (error instanceof CareerAiActionNotAllowedError) {

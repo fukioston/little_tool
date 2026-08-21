@@ -152,6 +152,8 @@ export interface SelectionTarget {
   segmentId?: string;
   startUtf16: number;
   endUtf16: number;
+  contextStartUtf16?: number;
+  contextEndUtf16?: number;
   startMs?: number;
   rect?: { top: number; left: number; width: number };
 }

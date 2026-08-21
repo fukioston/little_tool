@@ -8,7 +8,7 @@ export async function POST(request: Request) {
   try {
     const { url } = await readJsonBody<{ url?: string }>(request, 32_000);
     if (!url) throw new HttpError(400, "请输入文章链接。", "URL_REQUIRED");
-    const fetched = await safeFetchText(url);
+    const fetched = await safeFetchText(url, { signal: request.signal });
     const content = /html|xhtml/.test(fetched.contentType)
       ? extractReadableHtml(fetched.text, fetched.url)
       : { title: new URL(fetched.url).hostname, author: null, description: null, canonicalUrl: fetched.url, blocks: fetched.text.split(/\n{2,}/).filter(Boolean).map((text, ordinal) => ({ ordinal, kind: "paragraph", text: text.trim() })), text: fetched.text };

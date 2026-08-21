@@ -55,7 +55,10 @@ export async function POST(request: Request) {
       throw new HttpError(400, "不支持这个适练 AI 功能。", "FITNESS_AI_ACTION_UNSUPPORTED");
     }
     const input = validateInput(body.action, body.payload ?? {});
-    const result = await runDeepSeekJson(fitnessPrompt(body.action, input));
+    const result = await runDeepSeekJson(
+      fitnessPrompt(body.action, input),
+      request.signal,
+    );
     const data = validateResult(body.action, result.data, input);
     return jsonResponse({ ok: true, ...result, data });
   } catch (error) {

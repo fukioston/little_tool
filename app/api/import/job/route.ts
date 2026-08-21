@@ -22,7 +22,10 @@ export async function POST(request: Request) {
     let fetchWarning: string | null = null;
     if (body.url) {
       try {
-        const fetched = await safeFetchText(body.url, { maxBytes: 1_500_000 });
+        const fetched = await safeFetchText(body.url, {
+          maxBytes: 1_500_000,
+          signal: request.signal,
+        });
         publicPage = extractJobHtml(fetched.text, fetched.url);
       } catch (error) {
         fetchWarning = error instanceof Error ? error.message : "平台页面无法直接读取。";
@@ -34,7 +37,7 @@ export async function POST(request: Request) {
       shared_or_pasted_text: body.text?.slice(0, 80_000) || null,
       public_page_metadata: publicPage,
       note: fetchWarning,
-    }));
+    }), request.signal);
     return jsonResponse({ ok: true, source, originalUrl: body.url || null, data: result.data, warning: fetchWarning, meta: { model: result.model, promptVersion: result.promptVersion } });
   } catch (error) { return errorResponse(error); }
 }

@@ -23,7 +23,11 @@ export async function POST(request: Request) {
   try {
     const { url } = await readJsonBody<{ url?: string }>(request, 32_000);
     if (!url) throw new HttpError(400, "请输入播客 RSS 地址。", "URL_REQUIRED");
-    const fetched = await safeFetchText(url, { maxBytes: 4_000_000, accept: "application/rss+xml,application/atom+xml,application/xml,text/xml,*/*;q=0.2" });
+    const fetched = await safeFetchText(url, {
+      maxBytes: 4_000_000,
+      accept: "application/rss+xml,application/atom+xml,application/xml,text/xml,*/*;q=0.2",
+      signal: request.signal,
+    });
     const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "@_", textNodeName: "#text", cdataPropName: "__cdata" });
     const parsed = recordOf(parser.parse(fetched.text)) ?? {};
     const channel = recordOf(recordOf(parsed.rss)?.channel) ?? recordOf(parsed.feed);

@@ -1,5 +1,6 @@
 import { HttpError } from "./http";
 import type { PromptBundle } from "./prompts";
+import { composeRequestSignal, isAbortLike } from "./request-signal";
 
 type DeepSeekResult = {
   data: Record<string, unknown>;
@@ -31,10 +32,13 @@ function configuredEndpoint(): { endpoint: string; apiKey: string; model: string
 async function requestCompletion(
   prompt: PromptBundle,
   repair?: { invalid: string; error: string },
+  callerSignal?: AbortSignal,
 ): Promise<{ content: string; model: string; usage: DeepSeekResult["usage"] }> {
+  if (callerSignal?.aborted) {
+    throw new HttpError(499, "AI 请求已停止。", "REQUEST_CANCELLED");
+  }
   const config = configuredEndpoint();
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 60_000);
+  const requestSignal = composeRequestSignal(callerSignal, 60_000);
   const messages = [
     { role: "system", content: prompt.system },
     { role: "user", content: prompt.user },
@@ -65,10 +69,20 @@ async function requestCompletion(
         response_format: { type: "json_object" },
         stream: false,
       }),
-      signal: controller.signal,
+      signal: requestSignal.signal,
     });
 
+    if (requestSignal.cause() === "caller") {
+      await response.body?.cancel().catch(() => undefined);
+      throw new HttpError(499, "AI 请求已停止。", "REQUEST_CANCELLED");
+    }
+    if (requestSignal.cause() === "timeout") {
+      await response.body?.cancel().catch(() => undefined);
+      throw new HttpError(504, "AI 请求超时，请重试。", "AI_TIMEOUT");
+    }
+
     if (!response.ok) {
+      await response.body?.cancel().catch(() => undefined);
       const code = response.status === 401 ? "AI_AUTH_FAILED" : response.status === 429 ? "AI_RATE_LIMITED" : "AI_UPSTREAM_ERROR";
       const message = response.status === 401
         ? "DeepSeek API Key 无效或已失效。"
@@ -83,6 +97,12 @@ async function requestCompletion(
       choices?: Array<{ message?: { content?: string } }>;
       usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
     };
+    if (requestSignal.cause() === "caller") {
+      throw new HttpError(499, "AI 请求已停止。", "REQUEST_CANCELLED");
+    }
+    if (requestSignal.cause() === "timeout") {
+      throw new HttpError(504, "AI 请求超时，请重试。", "AI_TIMEOUT");
+    }
     const content = raw.choices?.[0]?.message?.content;
     if (!content) throw new HttpError(502, "AI 返回了空内容。", "AI_EMPTY_RESPONSE");
     const usage = raw.usage ? {
@@ -93,19 +113,26 @@ async function requestCompletion(
     return { content, model: raw.model || config.model, usage };
   } catch (error) {
     if (error instanceof HttpError) throw error;
-    if (error instanceof DOMException && error.name === "AbortError") {
+    if (requestSignal.cause() === "caller") {
+      throw new HttpError(499, "AI 请求已停止。", "REQUEST_CANCELLED");
+    }
+    if (requestSignal.cause() === "timeout") {
       throw new HttpError(504, "AI 请求超时，请重试。", "AI_TIMEOUT");
     }
+    if (isAbortLike(error)) throw new HttpError(502, "无法连接 AI 服务，请检查网络后重试。", "AI_CONNECTION_FAILED");
     throw new HttpError(502, "无法连接 AI 服务，请检查网络后重试。", "AI_CONNECTION_FAILED");
   } finally {
-    clearTimeout(timeout);
+    requestSignal.dispose();
   }
 }
 
-export async function runDeepSeekJson(prompt: PromptBundle): Promise<DeepSeekResult> {
+export async function runDeepSeekJson(
+  prompt: PromptBundle,
+  callerSignal?: AbortSignal,
+): Promise<DeepSeekResult> {
   let first: Awaited<ReturnType<typeof requestCompletion>>;
   try {
-    first = await requestCompletion(prompt);
+    first = await requestCompletion(prompt, undefined, callerSignal);
   } catch (error) {
     // DeepSeek documents an occasional empty response in JSON mode and
     // recommends modifying the prompt. Retry once with an explicit repair
@@ -114,7 +141,7 @@ export async function runDeepSeekJson(prompt: PromptBundle): Promise<DeepSeekRes
     first = await requestCompletion(prompt, {
       invalid: "",
       error: "the first JSON response was empty",
-    });
+    }, callerSignal);
   }
   let parsed: unknown;
   try {
@@ -123,7 +150,7 @@ export async function runDeepSeekJson(prompt: PromptBundle): Promise<DeepSeekRes
     const repaired = await requestCompletion(prompt, {
       invalid: first.content,
       error: error instanceof Error ? error.message : "invalid JSON",
-    });
+    }, callerSignal);
     try {
       parsed = JSON.parse(stripJsonFence(repaired.content));
       if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("JSON root must be an object");

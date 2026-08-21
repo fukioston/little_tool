@@ -1,4 +1,5 @@
 import { errorResponse, HttpError, jsonResponse, verifySameOrigin } from "@/lib/server/http";
+import { composeRequestSignal, isAbortLike, readAbortableFormData } from "@/lib/server/request-signal";
 
 export async function POST(request: Request) {
   const originError = verifySameOrigin(request);
@@ -15,7 +16,10 @@ export async function POST(request: Request) {
     }
     const length = Number(request.headers.get("content-length") || 0);
     if (length > 100 * 1024 * 1024) throw new HttpError(413, "音频文件不能超过 100 MB。", "AUDIO_TOO_LARGE");
-    const incoming = await request.formData();
+    if (request.signal.aborted) {
+      throw new HttpError(499, "转录已停止。", "REQUEST_CANCELLED");
+    }
+    const incoming = await readAbortableFormData(request);
     const file = incoming.get("file");
     if (!(file instanceof File) || file.size === 0) throw new HttpError(400, "请选择有效的音频文件。", "AUDIO_REQUIRED");
     if (file.size > 100 * 1024 * 1024) throw new HttpError(413, "音频文件不能超过 100 MB。", "AUDIO_TOO_LARGE");
@@ -26,20 +30,59 @@ export async function POST(request: Request) {
     upstream.append("timestamp_granularities[]", "segment");
     const language = incoming.get("language");
     if (typeof language === "string" && /^[a-z]{2,3}$/i.test(language)) upstream.set("language", language);
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 10 * 60_000);
-    let response: Response;
+    if (request.signal.aborted) {
+      throw new HttpError(499, "转录已停止。", "REQUEST_CANCELLED");
+    }
+    const upstreamSignal = composeRequestSignal(request.signal, 10 * 60_000);
     try {
-      response = await fetch(`${baseUrl}/audio/transcriptions`, { method: "POST", headers: { Authorization: `Bearer ${apiKey}` }, body: upstream, signal: controller.signal });
+      const response = await fetch(`${baseUrl}/audio/transcriptions`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${apiKey}` },
+        body: upstream,
+        signal: upstreamSignal.signal,
+      });
+      if (upstreamSignal.cause() === "caller") {
+        await response.body?.cancel().catch(() => undefined);
+        throw new HttpError(499, "转录已停止。", "REQUEST_CANCELLED");
+      }
+      if (upstreamSignal.cause() === "timeout") {
+        await response.body?.cancel().catch(() => undefined);
+        throw new HttpError(504, "转录超时，请尝试较短的音频。", "TRANSCRIPTION_TIMEOUT");
+      }
+      if (!response.ok) {
+        await response.body?.cancel().catch(() => undefined);
+        throw new HttpError(
+          502,
+          `转录服务返回错误（${response.status}）。`,
+          "TRANSCRIPTION_UPSTREAM_ERROR",
+        );
+      }
+      const raw = await response.json() as Record<string, unknown>;
+      if (upstreamSignal.cause() === "caller") {
+        throw new HttpError(499, "转录已停止。", "REQUEST_CANCELLED");
+      }
+      if (upstreamSignal.cause() === "timeout") {
+        throw new HttpError(504, "转录超时，请尝试较短的音频。", "TRANSCRIPTION_TIMEOUT");
+      }
+      const segments = arraySegments(raw.segments || raw.words || []);
+      return jsonResponse({ ok: true, data: { schema_version: "1.0", language: raw.language || null, duration_ms: Math.round(Number(raw.duration || 0) * 1000), text: raw.text || segments.map((segment) => segment.text).join(" "), segments, provider: { label: "Configured transcription endpoint", model } } });
     } catch (error) {
-      if (error instanceof DOMException && error.name === "AbortError") throw new HttpError(504, "转录超时，请尝试较短的音频。", "TRANSCRIPTION_TIMEOUT");
-      throw new HttpError(502, "无法连接转录服务。", "TRANSCRIPTION_CONNECTION_FAILED");
-    } finally { clearTimeout(timeout); }
-    if (!response.ok) throw new HttpError(502, `转录服务返回错误（${response.status}）。`, "TRANSCRIPTION_UPSTREAM_ERROR");
-    const raw = await response.json() as Record<string, unknown>;
-    const segments = arraySegments(raw.segments || raw.words || []);
-    return jsonResponse({ ok: true, data: { schema_version: "1.0", language: raw.language || null, duration_ms: Math.round(Number(raw.duration || 0) * 1000), text: raw.text || segments.map((segment) => segment.text).join(" "), segments, provider: { label: "Configured transcription endpoint", model } } });
-  } catch (error) { return errorResponse(error); }
+      if (error instanceof HttpError) throw error;
+      if (upstreamSignal.cause() === "caller") {
+        throw new HttpError(499, "转录已停止。", "REQUEST_CANCELLED");
+      }
+      if (upstreamSignal.cause() === "timeout") {
+        throw new HttpError(504, "转录超时，请尝试较短的音频。", "TRANSCRIPTION_TIMEOUT");
+      }
+      if (isAbortLike(error)) throw new HttpError(502, "转录服务没有返回可读取结果。", "TRANSCRIPTION_CONNECTION_FAILED");
+      throw new HttpError(502, "转录服务没有返回可读取结果。", "TRANSCRIPTION_CONNECTION_FAILED");
+    } finally { upstreamSignal.dispose(); }
+  } catch (error) {
+    if (request.signal.aborted && !(error instanceof HttpError)) {
+      return errorResponse(new HttpError(499, "转录已停止。", "REQUEST_CANCELLED"));
+    }
+    return errorResponse(error);
+  }
 }
 
 function arraySegments(value: unknown): Array<{ ordinal: number; start_ms: number; end_ms: number; text: string; speaker: string | null; confidence: number | null }> {

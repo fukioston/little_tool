@@ -3,7 +3,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type SyntheticEvent } from "react";
 import { createLocalFileObjectUrl, type LocalStorageEstimate } from "@/lib/local-db/files";
-import { formatDuration, formatShortDate, sentenceContext, wordAt, wordRanges } from "@/lib/vocab/content";
+import { adjacentSentence, formatDuration, formatShortDate, sentenceContext, wordAt, wordRanges } from "@/lib/vocab/content";
 import { getDueCards, recordStudySeconds } from "@/lib/vocab/store";
 import { scheduleReviewV2 } from "@/lib/vocab/srs";
 import type { ContentBlock, Lexeme, LibraryItem, Occurrence, ReviewCard, ReviewRating, SelectionTarget, TranscriptSegment, VocabSettings, VocabSnapshot, VocabView } from "@/lib/vocab/types";
@@ -93,7 +93,7 @@ export function ReaderView({ item, blocks, occurrences, bookmarks, onSelect, onB
   const selectRange = useCallback((block: ContentBlock, range: { text: string; start: number; end: number }) => {
     if (!trackedItemId) return;
     const context = sentenceContext(block.text, range.start, range.end);
-    onSelect({ surface: range.text, sentence: context.sentence, before: context.before, after: context.after, itemId: trackedItemId, blockId: block.id, startUtf16: range.start, endUtf16: range.end });
+    onSelect({ surface: range.text, sentence: context.sentence, before: context.before, after: context.after, itemId: trackedItemId, blockId: block.id, startUtf16: range.start, endUtf16: range.end, contextStartUtf16: context.startUtf16, contextEndUtf16: context.endUtf16 });
   }, [onSelect, trackedItemId]);
 
   useEffect(() => {
@@ -272,7 +272,7 @@ export function PodcastView({ item, segments, occurrences, autoFollow, localLock
   function seek(ms: number) { currentMsRef.current = ms; setCurrentMs(ms); if (audio.current) audio.current.currentTime = ms/1000; }
   const selectRange = (segment: TranscriptSegment, index: number, range: { text: string; start: number; end: number }) => {
     const context = sentenceContext(segment.text,range.start,range.end);
-    onSelect({ surface:range.text,sentence:context.sentence,before:context.before || episodeSegments[index-1]?.text || "",after:context.after || episodeSegments[index+1]?.text || "",itemId:item.id,segmentId:segment.id,startUtf16:range.start,endUtf16:range.end,startMs:alignedTranscript?segment.start_ms:undefined });
+    onSelect({ surface:range.text,sentence:context.sentence,before:context.before || adjacentSentence(episodeSegments[index-1]?.text ?? "", "preceding"),after:context.after || adjacentSentence(episodeSegments[index+1]?.text ?? "", "following"),itemId:item.id,segmentId:segment.id,startUtf16:range.start,endUtf16:range.end,contextStartUtf16:context.startUtf16,contextEndUtf16:context.endUtf16,startMs:alignedTranscript?segment.start_ms:undefined });
   };
   const pick = (segment: TranscriptSegment, index: number, event: ReactMouseEvent<HTMLElement>) => { const value = pickedText(event.currentTarget,event.clientX,event.clientY); if (value && value.text.length <= 80) selectRange(segment,index,value); };
   const transcriptKey = (segment: TranscriptSegment, index: number, event: ReactKeyboardEvent<HTMLButtonElement>) => {
@@ -322,8 +322,9 @@ export function StatsView({ snapshot }: { snapshot: VocabSnapshot }) {
   return <div className="sc-page sc-stats-page"><header className="sc-page-title"><div><span className="sc-eyebrow">A QUIET LOOK BACK</span><h1>最近的记录</h1><p>只呈现最近 7 天真实发生的阅读、收听与回看，不评价完成度。</p></div><div className="sc-date-chip">最近 7 天</div></header><section className="sc-stat-strip"><Metric value={read+listen} suffix="分钟" label="阅读与收听"/><Metric value={snapshot.lexemes.length} label="保存的词"/><Metric value={reviews} label="回到语境"/></section><section className="sc-stats-grid"><article className="sc-chart-card"><header><div><span>有记录的时间</span><strong>{read+listen}<small> 分钟</small></strong></div></header><div className="sc-bar-chart">{days.map((day)=><div key={day.key} aria-label={`${day.key}，${day.minutes} 分钟，回看 ${day.reviews} 次`}><span><i style={{height:`${Math.max(2,day.minutes/maximum*100)}%`}}/></span><small>周{day.label}</small></div>)}</div></article><article className="sc-balance-card"><span>阅读与收听</span><div className="sc-balance-ring" style={{"--read":`${read/Math.max(1,read+listen)*100}%`} as CSSProperties}><strong>{read+listen?Math.round(read/(read+listen)*100):0}%</strong><small>阅读</small></div><footer><span><i/>阅读 <b>{read} 分</b></span><span><i/>收听 <b>{listen} 分</b></span></footer></article></section><section className="sc-memory"><header><div><span>词语状态</span><p>帮助你决定想回到哪里，不是成绩。</p></div></header><div>{([['saved','已保存'],['learning','学习中'],['known','已掌握']] as const).map(([status,label])=>{const count=snapshot.lexemes.filter((word)=>word.status===status).length;return <span key={status}><b>{label}</b><i><em style={{width:`${count/Math.max(1,snapshot.lexemes.length)*100}%`}}/></i><strong>{count}</strong></span>;})}</div></section></div>;
 }
 
-function formatStorageBytes(bytes: number) {
-  if (!Number.isFinite(bytes) || bytes <= 0) return "尚未报告";
+function formatStorageBytes(bytes: number | null | undefined) {
+  if (bytes === null || bytes === undefined || !Number.isFinite(bytes) || bytes < 0) return "尚未报告";
+  if (bytes === 0) return "0 B";
   const units = ["B", "KB", "MB", "GB"];
   let value = bytes;
   let unit = 0;
@@ -337,14 +338,15 @@ function formatStorageBytes(bytes: number) {
 type SettingsViewProps = {
   settings: VocabSettings;
   storage: LocalStorageEstimate | null;
+  persistenceSupported: boolean;
   onChange: (patch: Partial<VocabSettings>) => Promise<void>;
   onExport: () => Promise<string>;
   onImport: (file: File) => Promise<string>;
-  onPersist: () => Promise<boolean>;
+  onPersist: () => Promise<boolean | null>;
   onTestAi: () => Promise<void>;
 };
 
-export function SettingsView({ settings, storage, onChange, onExport, onImport, onPersist, onTestAi }: SettingsViewProps) {
+export function SettingsView({ settings, storage, persistenceSupported, onChange, onExport, onImport, onPersist, onTestAi }: SettingsViewProps) {
   const [message,setMessage]=useState("");
   const [busy,setBusy]=useState(false);
   const restore=useRef<HTMLInputElement>(null);
@@ -357,9 +359,9 @@ export function SettingsView({ settings, storage, onChange, onExport, onImport, 
         <div className="sc-setting-row"><label htmlFor="sc-line-height">行间距<small>让长文更从容</small></label><input id="sc-line-height" type="range" min="1.6" max="2.2" step=".02" value={settings.line_height} onChange={(event)=>void onChange({line_height:Number(event.target.value)})}/><b>{settings.line_height.toFixed(2)}</b></div>
         <Toggle label="字幕自动跟随" copy="播放时让当前句保持在视野中央" value={settings.auto_follow} onChange={(value)=>void onChange({auto_follow:value})}/>
       </section>
-      <section id="ai"><header><h2>AI 与隐私</h2><p>AI 只在你主动请求时收到英文目标和附近语境。</p></header><Toggle label="默认显示简体中文说明" copy="英文释义始终优先" value={settings.chinese_explanation} onChange={(value)=>void onChange({chinese_explanation:value})}/><Toggle label="本地锁" copy="阻止 URL、RSS、AI、转写与远程音频请求" value={settings.local_lock} onChange={(value)=>void onChange({local_lock:value})}/><div className="sc-endpoint"><span><i className={settings.local_lock?"locked":""}/><b>DeepSeek · OpenAI compatible</b><small>{settings.local_lock?"本地锁已开启":"由服务端安全配置"}</small></span><button disabled={busy||settings.local_lock} onClick={()=>void run(onTestAi,"检测到服务端 AI 配置；这次检查没有发送文章或词语内容。")}>检查配置</button></div></section>
+      <section id="ai"><header><h2>AI 与隐私</h2><p>选词后会先显示准确字段说明；只有再点“解释这个词”才会发送。</p></header><Toggle label="默认显示简体中文说明" copy="英文释义始终优先" value={settings.chinese_explanation} onChange={(value)=>void onChange({chinese_explanation:value})}/><Toggle label="本地锁" copy="阻止 URL、RSS、AI、转写与远程音频请求" value={settings.local_lock} onChange={(value)=>void onChange({local_lock:value})}/><div className="sc-endpoint"><span><i className={settings.local_lock?"locked":""}/><b>DeepSeek · OpenAI compatible</b><small>{settings.local_lock?"本地锁已开启":"由服务端安全配置"}</small></span><button disabled={busy||settings.local_lock} onClick={()=>void run(onTestAi,"检测到服务端 AI 配置；这次检查没有发送文章或词语内容。")}>检查配置</button></div></section>
       <section id="review-settings"><header><h2>复习节奏</h2><p>新词依照上限加入每日队列。</p></header><div className="sc-setting-row"><label htmlFor="sc-daily-limit">每日新词<small>到期复习不受影响</small></label><input id="sc-daily-limit" type="range" min="1" max="30" value={settings.daily_new_limit} onChange={(event)=>void onChange({daily_new_limit:Number(event.target.value)})}/><b>{settings.daily_new_limit}</b></div></section>
-      <section id="data"><header><h2>数据与备份</h2><p>完整备份包含 SQLite 数据与实际保存在拾词里的本地音频。</p></header><div className={`sc-storage-fact ${storage?.persisted?"persisted":""}`}><span><i /><b>{storage?.persisted?"浏览器已授予持久化保护":"仍可能被浏览器清理"}</b><small>{storage?`当前占用 ${formatStorageBytes(storage.usage)} · 可用约 ${formatStorageBytes(storage.available)}`:"正在读取当前浏览器的存储状态"}</small></span>{!storage?.persisted&&<button disabled={busy} onClick={()=>void run(async()=>await onPersist()?"已获得浏览器持久化保护。":"浏览器暂未授予持久化保护，请保持定期备份。","")}>请求保护</button>}</div><div className="sc-data-actions"><button disabled={busy} onClick={()=>void run(onExport,"")}><i>↓</i><span><b>导出完整备份</b><small>内容、词语、复习与本地音频</small></span></button><button disabled={busy} onClick={()=>restore.current?.click()}><i>↑</i><span><b>恢复备份</b><small>先校验候选数据，再安全切换</small></span></button><input ref={restore} aria-label="选择拾词完整备份或旧版 SQLite" hidden type="file" accept=".vocab-backup,.sqlite,.sqlite3,.db" onChange={(event)=>{const file=event.target.files?.[0];if(file)void run(()=>onImport(file),"");event.currentTarget.value="";}}/></div><p className="sc-data-note">备份是未加密的私人文件，不含 AI 密钥。请把它保存在受信任的位置；旧版 SQLite 不包含本地音频。</p></section>
+      <section id="data"><header><h2>数据与备份</h2><p>完整备份包含 SQLite 数据与实际保存在拾词里的本地音频。</p></header><div className={`sc-storage-fact ${storage?.persisted===true?"persisted":""}`}><span><i /><b>{storage?.persisted===true?"浏览器已授予持久化保护":!persistenceSupported?"当前浏览器未提供持久化保护接口":storage===null?"正在读取存储状态":storage.persisted===false?"仍可能被浏览器清理":"保护状态暂时未知"}</b><small>{storage?`当前占用 ${formatStorageBytes(storage.usage)} · 可用约 ${formatStorageBytes(storage.available)}`:"正在读取当前浏览器的容量信息"}</small></span>{persistenceSupported&&storage?.persisted!==true&&<button disabled={busy} onClick={()=>void run(async()=>{const result=await onPersist();return result===true?"已获得浏览器持久化保护。":result===false?"浏览器暂未授予持久化保护，请保持定期备份。":"保护请求已完成，但浏览器暂时无法复查状态。";},"")}>请求保护</button>}</div><div className="sc-data-actions"><button disabled={busy} onClick={()=>void run(onExport,"")}><i>↓</i><span><b>导出完整备份</b><small>内容、词语、复习与本地音频</small></span></button><button disabled={busy} onClick={()=>restore.current?.click()}><i>↑</i><span><b>恢复备份</b><small>先校验候选数据，再安全切换</small></span></button><input ref={restore} aria-label="选择拾词完整备份或旧版 SQLite" hidden type="file" accept=".vocab-backup,.sqlite,.sqlite3,.db" onChange={(event)=>{const file=event.target.files?.[0];if(file)void run(()=>onImport(file),"");event.currentTarget.value="";}}/></div><p className="sc-data-note">备份是未加密的私人文件，不含 AI 密钥。请把它保存在受信任的位置；旧版 SQLite 不包含本地音频。</p></section>
       {message&&<div className="sc-settings-message" role="status">{message}</div>}
     </div></div>
   </div>;

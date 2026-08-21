@@ -32,7 +32,11 @@ export async function explainSelection(target: SelectionTarget, includeChinese: 
     action: "explain",
     payload: {
       schema_version: "1.0",
-      target: { surface: target.surface, start_utf16: target.startUtf16, end_utf16: target.endUtf16 },
+      target: {
+        surface: target.surface,
+        start_utf16: target.contextStartUtf16 ?? target.startUtf16,
+        end_utf16: target.contextEndUtf16 ?? target.endUtf16,
+      },
       context: { sentence: target.sentence, preceding_sentence: target.before || null, following_sentence: target.after || null },
       learner: { interface_language: "zh-CN", explanation_language: "en", include_simplified_chinese: includeChinese },
     },
@@ -43,7 +47,16 @@ export async function explainSelection(target: SelectionTarget, includeChinese: 
 export async function explainInChinese(explanation: AiExplanation, target: SelectionTarget, signal?: AbortSignal) {
   const response = await postJson("/api/ai/vocab", {
     action: "explain_chinese",
-    payload: { target: target.surface, context: target.sentence, english_explanation: explanation },
+    payload: {
+      schema_version: "1.0",
+      target: { surface: target.surface },
+      context: { sentence: target.sentence },
+      english_explanation: {
+        glosses_en: explanation.sense?.glosses_en ?? [],
+        meaning_in_context_en: explanation.sense?.meaning_in_context_en ?? null,
+        explanation_en: explanation.sense?.explanation_en ?? null,
+      },
+    },
   }, signal);
   return parseChineseExplanation(dataOf(response));
 }
