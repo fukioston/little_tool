@@ -1335,6 +1335,407 @@ test("week scheduling follows program-day state after rescheduling and preserves
   }
 });
 
+test("cancelling an empty scheduled session restores only its calendar status", async () => {
+  const { database } = await databaseFixture();
+  try {
+    await store.initializeFitnessDatabase();
+    const venueId = await store.saveVenue(venueInput);
+    const equipmentId = await store.saveEquipmentWithLoads(
+      dumbbellInput(venueId, [load(10000), load(12500)]),
+    );
+
+    const historicalSessionId = await store.startFitnessSession({ venueId });
+    const historicalExerciseId = await store.addSessionExercise(
+      historicalSessionId,
+      "dumbbell-rdl",
+      equipmentId,
+    );
+    await store.recordFitnessSet({
+      sessionExerciseId: historicalExerciseId,
+      setIndex: 0,
+      setKind: "work",
+      loadGrams: 10000,
+      reps: 8,
+      rir: 2,
+      clientMutationId: "empty-cancel-history",
+    });
+    await store.finishFitnessSession(historicalSessionId);
+
+    const programId = await store.saveProgramDraft(draftFor(venueId, equipmentId));
+    const firstWeek = new Date(2026, 7, 24, 9, 0, 0, 0);
+    const secondWeek = new Date(2026, 7, 31, 9, 0, 0, 0);
+    const [eventId] = await store.scheduleProgramWeek(programId, firstWeek);
+    const [otherEventId] = await store.scheduleProgramWeek(programId, secondWeek);
+    const sessionId = await store.startFitnessSession({ eventId, venueId });
+    const inProgressEvent = database.selectObjects(
+      "SELECT * FROM fitness_calendar_events WHERE id=?",
+      [eventId],
+    ).map((row) => ({ ...row }))[0];
+    const otherEvent = database.selectObjects(
+      "SELECT * FROM fitness_calendar_events WHERE id=?",
+      [otherEventId],
+    ).map((row) => ({ ...row }))[0];
+    const historicalFacts = {
+      sessions: database.selectObjects(
+        "SELECT * FROM fitness_sessions WHERE id=?",
+        [historicalSessionId],
+      ).map((row) => ({ ...row })),
+      exercises: database.selectObjects(
+        "SELECT * FROM fitness_session_exercises WHERE session_id=?",
+        [historicalSessionId],
+      ).map((row) => ({ ...row })),
+      sets: database.selectObjects(
+        `SELECT recorded_set.*
+         FROM fitness_sets recorded_set
+         JOIN fitness_session_exercises exercise
+           ON exercise.id=recorded_set.session_exercise_id
+         WHERE exercise.session_id=?`,
+        [historicalSessionId],
+      ).map((row) => ({ ...row })),
+      capabilities: database.selectObjects(
+        "SELECT * FROM fitness_capabilities ORDER BY id",
+      ).map((row) => ({ ...row })),
+    };
+    assert.equal(inProgressEvent.status, "in_progress");
+    assert.ok(
+      Number(database.selectValue(
+        "SELECT COUNT(*) FROM fitness_session_exercises WHERE session_id=?",
+        [sessionId],
+      )) > 0,
+      "a scheduled session starts with cloned plan exercises",
+    );
+    const writes = globalThis.__fitnessLockState.writes;
+    const broadcasts = globalThis.__fitnessLockState.broadcasts.length;
+
+    await store.cancelEmptyFitnessSession(sessionId);
+
+    assert.equal(globalThis.__fitnessLockState.writes, writes + 1);
+    assert.equal(globalThis.__fitnessLockState.broadcasts.length, broadcasts + 1);
+    assert.equal(globalThis.__fitnessLockState.broadcasts.at(-1), "session-cancelled");
+    assert.equal(
+      Number(database.selectValue("SELECT COUNT(*) FROM fitness_sessions WHERE id=?", [sessionId])),
+      0,
+    );
+    assert.equal(
+      Number(database.selectValue(
+        "SELECT COUNT(*) FROM fitness_session_exercises WHERE session_id=?",
+        [sessionId],
+      )),
+      0,
+      "session exercises are removed through the declared cascade",
+    );
+    assert.deepEqual(
+      database.selectObjects("SELECT * FROM fitness_calendar_events WHERE id=?", [eventId])
+        .map((row) => ({ ...row }))[0],
+      { ...inProgressEvent, status: "planned" },
+      "undo restores status without changing time, occurrence identity, or authored fields",
+    );
+    assert.deepEqual(
+      database.selectObjects("SELECT * FROM fitness_calendar_events WHERE id=?", [otherEventId])
+        .map((row) => ({ ...row }))[0],
+      otherEvent,
+    );
+    assert.deepEqual({
+      sessions: database.selectObjects(
+        "SELECT * FROM fitness_sessions WHERE id=?",
+        [historicalSessionId],
+      ).map((row) => ({ ...row })),
+      exercises: database.selectObjects(
+        "SELECT * FROM fitness_session_exercises WHERE session_id=?",
+        [historicalSessionId],
+      ).map((row) => ({ ...row })),
+      sets: database.selectObjects(
+        `SELECT recorded_set.*
+         FROM fitness_sets recorded_set
+         JOIN fitness_session_exercises exercise
+           ON exercise.id=recorded_set.session_exercise_id
+         WHERE exercise.session_id=?`,
+        [historicalSessionId],
+      ).map((row) => ({ ...row })),
+      capabilities: database.selectObjects(
+        "SELECT * FROM fitness_capabilities ORDER BY id",
+      ).map((row) => ({ ...row })),
+    }, historicalFacts, "unrelated history and capabilities stay byte-for-byte unchanged");
+    assert.deepEqual(database.selectObjects("PRAGMA foreign_key_check"), []);
+  } finally {
+    database.close();
+  }
+});
+
+test("cancelling an empty temporary program-day session deletes it without touching calendar", async () => {
+  const { database } = await databaseFixture();
+  try {
+    await store.initializeFitnessDatabase();
+    const venueId = await store.saveVenue(venueInput);
+    const equipmentId = await store.saveEquipmentWithLoads(
+      dumbbellInput(venueId, [load(10000)]),
+    );
+    const programId = await store.saveProgramDraft(draftFor(venueId, equipmentId));
+    const [otherEventId] = await store.scheduleProgramWeek(
+      programId,
+      new Date(2026, 7, 24, 9, 0, 0, 0),
+    );
+    const otherEvent = database.selectObjects(
+      "SELECT * FROM fitness_calendar_events WHERE id=?",
+      [otherEventId],
+    ).map((row) => ({ ...row }))[0];
+    const programDayId = database.selectValue(
+      "SELECT id FROM fitness_program_days WHERE program_id=? AND day_index=0",
+      [programId],
+    );
+    const sessionId = await store.startFitnessSession({
+      venueId,
+      programDayId,
+    });
+    assert.equal(
+      database.selectValue("SELECT event_id FROM fitness_sessions WHERE id=?", [sessionId]),
+      null,
+    );
+    assert.ok(
+      Number(database.selectValue(
+        "SELECT COUNT(*) FROM fitness_session_exercises WHERE session_id=?",
+        [sessionId],
+      )) > 0,
+    );
+
+    await store.cancelEmptyFitnessSession(sessionId);
+
+    assert.equal(
+      Number(database.selectValue("SELECT COUNT(*) FROM fitness_sessions WHERE id=?", [sessionId])),
+      0,
+    );
+    assert.equal(
+      Number(database.selectValue(
+        "SELECT COUNT(*) FROM fitness_session_exercises WHERE session_id=?",
+        [sessionId],
+      )),
+      0,
+    );
+    assert.deepEqual(
+      database.selectObjects("SELECT * FROM fitness_calendar_events WHERE id=?", [otherEventId])
+        .map((row) => ({ ...row }))[0],
+      otherEvent,
+      "an event-less session never writes to the calendar",
+    );
+    assert.deepEqual(database.selectObjects("PRAGMA foreign_key_check"), []);
+  } finally {
+    database.close();
+  }
+});
+
+test("empty-session cancellation rejects every measured set or cardio fact without writes", async () => {
+  const cases = [
+    {
+      label: "completed repetition set",
+      async record(database, sessionId, exerciseId) {
+        await store.recordFitnessSet({
+          sessionExerciseId: exerciseId,
+          setIndex: 0,
+          reps: 8,
+          clientMutationId: "cancel-completed-set",
+        });
+      },
+    },
+    {
+      label: "non-completed zero-repetition fact",
+      async record(database, sessionId, exerciseId) {
+        executeRun(
+          database,
+          `INSERT INTO fitness_sets(
+            id,session_exercise_id,set_index,set_kind,load_grams,reps,duration_seconds,
+            rir,rpe,completed,pain_note,completed_at,client_mutation_id,created_at,updated_at
+          ) VALUES('incomplete-measured-set',?,0,'work',NULL,0,NULL,NULL,NULL,0,'',NULL,'cancel-incomplete-set',1,1)`,
+          [exerciseId],
+        );
+      },
+    },
+    {
+      label: "cardio duration fact",
+      async record(database, sessionId) {
+        executeRun(
+          database,
+          "INSERT INTO fitness_cardio_entries(id,session_id,equipment_id,mode,duration_seconds,distance_meters,resistance,average_heart_rate,effort,note,created_at) VALUES('cardio-fact',?,NULL,'walk',60,NULL,'',NULL,'easy','',1)",
+          [sessionId],
+        );
+      },
+    },
+  ];
+
+  for (const entry of cases) {
+    const { database, state } = await databaseFixture();
+    try {
+      await store.initializeFitnessDatabase();
+      const venueId = await store.saveVenue(venueInput);
+      const equipmentId = await store.saveEquipmentWithLoads(
+        dumbbellInput(venueId, [load(10000)]),
+      );
+      const sessionId = await store.startFitnessSession({ venueId });
+      const exerciseId = await store.addSessionExercise(
+        sessionId,
+        "dumbbell-rdl",
+        equipmentId,
+      );
+      await entry.record(database, sessionId, exerciseId);
+      const before = {
+        session: database.selectObjects("SELECT * FROM fitness_sessions WHERE id=?", [sessionId])
+          .map((row) => ({ ...row })),
+        exercises: database.selectObjects(
+          "SELECT * FROM fitness_session_exercises WHERE session_id=?",
+          [sessionId],
+        ).map((row) => ({ ...row })),
+        sets: database.selectObjects(
+          `SELECT recorded_set.*
+           FROM fitness_sets recorded_set
+           JOIN fitness_session_exercises exercise
+             ON exercise.id=recorded_set.session_exercise_id
+           WHERE exercise.session_id=?`,
+          [sessionId],
+        ).map((row) => ({ ...row })),
+        cardio: database.selectObjects(
+          "SELECT * FROM fitness_cardio_entries WHERE session_id=?",
+          [sessionId],
+        ).map((row) => ({ ...row })),
+      };
+      const batches = state.operations.filter(([operation]) => operation === "batch").length;
+      const broadcasts = globalThis.__fitnessLockState.broadcasts.length;
+
+      await assert.rejects(
+        store.cancelEmptyFitnessSession(sessionId),
+        /已有完成组、次数或时长记录/,
+        entry.label,
+      );
+
+      assert.equal(
+        state.operations.filter(([operation]) => operation === "batch").length,
+        batches,
+        `${entry.label} must reject before a SQLite write`,
+      );
+      assert.equal(globalThis.__fitnessLockState.broadcasts.length, broadcasts);
+      assert.deepEqual({
+        session: database.selectObjects("SELECT * FROM fitness_sessions WHERE id=?", [sessionId])
+          .map((row) => ({ ...row })),
+        exercises: database.selectObjects(
+          "SELECT * FROM fitness_session_exercises WHERE session_id=?",
+          [sessionId],
+        ).map((row) => ({ ...row })),
+        sets: database.selectObjects(
+          `SELECT recorded_set.*
+           FROM fitness_sets recorded_set
+           JOIN fitness_session_exercises exercise
+             ON exercise.id=recorded_set.session_exercise_id
+           WHERE exercise.session_id=?`,
+          [sessionId],
+        ).map((row) => ({ ...row })),
+        cardio: database.selectObjects(
+          "SELECT * FROM fitness_cardio_entries WHERE session_id=?",
+          [sessionId],
+        ).map((row) => ({ ...row })),
+      }, before);
+    } finally {
+      database.close();
+    }
+  }
+});
+
+test("empty-session cancellation rejects unknown, finished, and calendar-conflicted sessions", async () => {
+  const { database, state } = await databaseFixture();
+  try {
+    await store.initializeFitnessDatabase();
+    const venueId = await store.saveVenue(venueInput);
+    const equipmentId = await store.saveEquipmentWithLoads(
+      dumbbellInput(venueId, [load(10000)]),
+    );
+    let batches = state.operations.filter(([operation]) => operation === "batch").length;
+    let broadcasts = globalThis.__fitnessLockState.broadcasts.length;
+    let writes = globalThis.__fitnessLockState.writes;
+
+    await assert.rejects(
+      store.cancelEmptyFitnessSession("session-does-not-exist"),
+      /训练不存在/,
+    );
+    assert.equal(globalThis.__fitnessLockState.writes, writes + 1);
+    assert.equal(state.operations.filter(([operation]) => operation === "batch").length, batches);
+    assert.equal(globalThis.__fitnessLockState.broadcasts.length, broadcasts);
+
+    const finishedId = await store.startFitnessSession({ venueId });
+    await store.finishFitnessSession(finishedId);
+    batches = state.operations.filter(([operation]) => operation === "batch").length;
+    broadcasts = globalThis.__fitnessLockState.broadcasts.length;
+    writes = globalThis.__fitnessLockState.writes;
+    const finishedBefore = database.selectObjects(
+      "SELECT * FROM fitness_sessions WHERE id=?",
+      [finishedId],
+    ).map((row) => ({ ...row }));
+    await assert.rejects(
+      store.cancelEmptyFitnessSession(finishedId),
+      /只能撤销正在进行的空训练/,
+    );
+    assert.equal(globalThis.__fitnessLockState.writes, writes + 1);
+    assert.equal(state.operations.filter(([operation]) => operation === "batch").length, batches);
+    assert.equal(globalThis.__fitnessLockState.broadcasts.length, broadcasts);
+    assert.deepEqual(
+      database.selectObjects("SELECT * FROM fitness_sessions WHERE id=?", [finishedId])
+        .map((row) => ({ ...row })),
+      finishedBefore,
+    );
+
+    const programId = await store.saveProgramDraft(draftFor(venueId, equipmentId));
+    const [eventId] = await store.scheduleProgramWeek(
+      programId,
+      new Date(2026, 7, 24, 9, 0, 0, 0),
+    );
+    const conflictedSessionId = await store.startFitnessSession({ eventId, venueId });
+    executeRun(
+      database,
+      "UPDATE fitness_calendar_events SET status='cancelled' WHERE id=?",
+      [eventId],
+    );
+    const sessionBefore = database.selectObjects(
+      "SELECT * FROM fitness_sessions WHERE id=?",
+      [conflictedSessionId],
+    ).map((row) => ({ ...row }));
+    const exercisesBefore = database.selectObjects(
+      "SELECT * FROM fitness_session_exercises WHERE session_id=? ORDER BY id",
+      [conflictedSessionId],
+    ).map((row) => ({ ...row }));
+    const eventBefore = database.selectObjects(
+      "SELECT * FROM fitness_calendar_events WHERE id=?",
+      [eventId],
+    ).map((row) => ({ ...row }))[0];
+    batches = state.operations.filter(([operation]) => operation === "batch").length;
+    broadcasts = globalThis.__fitnessLockState.broadcasts.length;
+    writes = globalThis.__fitnessLockState.writes;
+
+    await assert.rejects(
+      store.cancelEmptyFitnessSession(conflictedSessionId),
+      /日历安排已不在进行中/,
+    );
+
+    assert.equal(globalThis.__fitnessLockState.writes, writes + 1);
+    assert.equal(state.operations.filter(([operation]) => operation === "batch").length, batches);
+    assert.equal(globalThis.__fitnessLockState.broadcasts.length, broadcasts);
+    assert.deepEqual(
+      database.selectObjects("SELECT * FROM fitness_sessions WHERE id=?", [conflictedSessionId])
+        .map((row) => ({ ...row })),
+      sessionBefore,
+    );
+    assert.deepEqual(
+      database.selectObjects(
+        "SELECT * FROM fitness_session_exercises WHERE session_id=? ORDER BY id",
+        [conflictedSessionId],
+      ).map((row) => ({ ...row })),
+      exercisesBefore,
+    );
+    assert.deepEqual(
+      database.selectObjects("SELECT * FROM fitness_calendar_events WHERE id=?", [eventId])
+        .map((row) => ({ ...row }))[0],
+      eventBefore,
+    );
+  } finally {
+    database.close();
+  }
+});
+
 test("manual sessions support added exercises, idempotent sets, undo, and truthful early finish", async () => {
   const { database } = await databaseFixture();
   try {
@@ -1669,6 +2070,7 @@ test("store operations take product locks and broadcast only successful writes",
       "rescheduleCalendarEvent",
       "markCalendarEventNotPerformed",
       "startFitnessSession",
+      "cancelEmptyFitnessSession",
       "addSessionExercise",
       "recordFitnessSet",
       "undoFitnessSet",

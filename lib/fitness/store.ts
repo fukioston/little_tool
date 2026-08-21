@@ -1273,6 +1273,118 @@ export async function startFitnessSession(input: {
   });
 }
 
+export async function cancelEmptyFitnessSession(sessionId: string): Promise<void> {
+  return write("session-cancelled", async () => {
+    const id = requireNonEmpty(sessionId, "训练标识");
+    const session = (await rawQuery<{
+      event_id: string | null;
+      status: FitnessSession["status"];
+    }>(
+      "SELECT event_id,status FROM fitness_sessions WHERE id=?",
+      [id],
+    ))[0];
+    if (!session) throw new Error("这场训练不存在");
+    if (session.status !== "active") throw new Error("只能撤销正在进行的空训练");
+
+    const facts = (await rawQuery<{
+      has_set_fact: number;
+      has_cardio_fact: number;
+    }>(
+      `SELECT
+        EXISTS(
+          SELECT 1
+          FROM fitness_sets recorded_set
+          JOIN fitness_session_exercises exercise
+            ON exercise.id=recorded_set.session_exercise_id
+          WHERE exercise.session_id=?
+            AND (
+              recorded_set.completed=1
+              OR recorded_set.reps IS NOT NULL
+              OR recorded_set.duration_seconds IS NOT NULL
+            )
+        ) has_set_fact,
+        EXISTS(
+          SELECT 1 FROM fitness_cardio_entries cardio
+          WHERE cardio.session_id=? AND cardio.duration_seconds IS NOT NULL
+        ) has_cardio_fact`,
+      [id, id],
+    ))[0];
+    if (Number(facts?.has_set_fact) === 1 || Number(facts?.has_cardio_fact) === 1) {
+      throw new Error("这场训练已有完成组、次数或时长记录，不能作为空训练撤销");
+    }
+
+    if (session.event_id) {
+      const event = (await rawQuery<{ status: FitnessCalendarEvent["status"] }>(
+        "SELECT status FROM fitness_calendar_events WHERE id=?",
+        [session.event_id],
+      ))[0];
+      if (!event) throw new Error("关联的日历安排不存在，未撤销训练");
+      if (event.status !== "in_progress") {
+        throw new Error("关联的日历安排已不在进行中，未撤销训练");
+      }
+    }
+
+    const statements: SqlStatement[] = [{
+      sql: `CREATE TEMP TABLE __fitness_cancel_empty_session_guard(
+        value INTEGER NOT NULL CHECK(value=1)
+      )`,
+    }, {
+      sql: `INSERT INTO temp.__fitness_cancel_empty_session_guard(value)
+        SELECT CASE WHEN
+          EXISTS(
+            SELECT 1 FROM fitness_sessions
+            WHERE id=? AND status='active'
+          )
+          AND NOT EXISTS(
+            SELECT 1
+            FROM fitness_sets recorded_set
+            JOIN fitness_session_exercises exercise
+              ON exercise.id=recorded_set.session_exercise_id
+            WHERE exercise.session_id=?
+              AND (
+                recorded_set.completed=1
+                OR recorded_set.reps IS NOT NULL
+                OR recorded_set.duration_seconds IS NOT NULL
+              )
+          )
+          AND NOT EXISTS(
+            SELECT 1 FROM fitness_cardio_entries cardio
+            WHERE cardio.session_id=? AND cardio.duration_seconds IS NOT NULL
+          )
+          AND (
+            (SELECT event_id FROM fitness_sessions WHERE id=?) IS NULL
+            OR EXISTS(
+              SELECT 1
+              FROM fitness_sessions active_session
+              JOIN fitness_calendar_events event
+                ON event.id=active_session.event_id
+              WHERE active_session.id=?
+                AND active_session.status='active'
+                AND event.status='in_progress'
+            )
+          )
+        THEN 1 ELSE 0 END`,
+      params: [id, id, id, id, id],
+    }];
+    if (session.event_id) {
+      statements.push({
+        // This is an undo: preserve the immutable occurrence, appointment,
+        // and every authored field exactly as they are now.
+        sql: "UPDATE fitness_calendar_events SET status='planned' WHERE id=? AND status='in_progress'",
+        params: [session.event_id],
+      });
+    }
+    statements.push(
+      // ON DELETE CASCADE removes the session's exercises, their empty sets,
+      // and session cardio rows. The guards above prevent measured facts from
+      // ever reaching this delete.
+      { sql: "DELETE FROM fitness_sessions WHERE id=? AND status='active'", params: [id] },
+      { sql: "DROP TABLE temp.__fitness_cancel_empty_session_guard" },
+    );
+    await rawBatch(statements);
+  });
+}
+
 export async function addSessionExercise(
   sessionId: string,
   exerciseId: string,
