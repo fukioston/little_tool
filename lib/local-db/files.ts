@@ -17,6 +17,8 @@ export type LocalFileMetadata = Readonly<{
   sha256: string;
   createdAt: string;
   updatedAt: string;
+  /** Internal write ownership used to make crash cleanup fail closed. */
+  stagingOwner?: string;
 }>;
 
 export type SaveLocalFileOptions = Readonly<{
@@ -151,6 +153,86 @@ function metadataFilename(key: string): string {
   return `${key}.json`;
 }
 
+function isNotFoundError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === "NotFoundError";
+}
+
+function isTypeMismatchError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === "TypeMismatchError";
+}
+
+async function fileEntryExists(
+  directory: FileSystemDirectoryHandle,
+  name: string,
+): Promise<boolean> {
+  try {
+    await directory.getFileHandle(name);
+    return true;
+  } catch (error) {
+    if (isNotFoundError(error)) return false;
+    // A directory or another incompatible entry at the exact name is still a
+    // collision. It must never be replaced by a file write.
+    if (isTypeMismatchError(error)) return true;
+    throw error;
+  }
+}
+
+async function directoryIfPresent(
+  directory: FileSystemDirectoryHandle,
+  name: string,
+): Promise<FileSystemDirectoryHandle | null> {
+  try {
+    return await directory.getDirectoryHandle(name);
+  } catch (error) {
+    if (isNotFoundError(error)) return null;
+    throw error;
+  }
+}
+
+async function assertKeyAvailableWithoutCreatingDirectories(
+  namespace: LocalFileNamespace,
+  key: string,
+): Promise<void> {
+  const storageRoot = await requireBrowserStorage().getDirectory();
+  const root = await directoryIfPresent(storageRoot, ROOT_DIRECTORY);
+  if (!root) return;
+  const version = await directoryIfPresent(root, `v${FORMAT_VERSION}`);
+  if (!version) return;
+  const namespaceDirectory = await directoryIfPresent(version, namespace);
+  if (!namespaceDirectory) return;
+  const [objects, metadata] = await Promise.all([
+    directoryIfPresent(namespaceDirectory, "objects"),
+    directoryIfPresent(namespaceDirectory, "metadata"),
+  ]);
+  const [objectExists, metadataExists] = await Promise.all([
+    objects ? fileEntryExists(objects, objectFilename(key)) : false,
+    metadata ? fileEntryExists(metadata, metadataFilename(key)) : false,
+  ]);
+  if (objectExists || metadataExists) {
+    throw new LocalFileError(
+      "The local file key is already in use.",
+      "FILE_KEY_COLLISION",
+    );
+  }
+}
+
+async function assertKeyAvailableInDirectories(
+  objects: FileSystemDirectoryHandle,
+  metadata: FileSystemDirectoryHandle,
+  key: string,
+): Promise<void> {
+  const [objectExists, metadataExists] = await Promise.all([
+    fileEntryExists(objects, objectFilename(key)),
+    fileEntryExists(metadata, metadataFilename(key)),
+  ]);
+  if (objectExists || metadataExists) {
+    throw new LocalFileError(
+      "The local file key is already in use.",
+      "FILE_KEY_COLLISION",
+    );
+  }
+}
+
 async function removeEntryIfPresent(
   directory: FileSystemDirectoryHandle,
   name: string,
@@ -162,6 +244,53 @@ async function removeEntryIfPresent(
     if (error instanceof DOMException && error.name === "NotFoundError") return false;
     throw error;
   }
+}
+
+type LocalFileWriteClaim = Readonly<{
+  version: 1;
+  namespace: LocalFileNamespace;
+  key: string;
+  stagingOwner: string;
+}>;
+
+function assertStagingOwner(stagingOwner: string): void {
+  if (!/^[0-9a-f]{64}$/.test(stagingOwner)) {
+    throw new LocalFileError(
+      "The local file staging owner is invalid.",
+      "INVALID_FILE_OWNER",
+    );
+  }
+}
+
+async function writeJson(
+  directory: FileSystemDirectoryHandle,
+  name: string,
+  value: unknown,
+): Promise<void> {
+  const handle = await directory.getFileHandle(name, { create: true });
+  const writable = await handle.createWritable({ keepExistingData: false });
+  try {
+    await writable.write(new TextEncoder().encode(`${JSON.stringify(value)}\n`));
+    await writable.close();
+  } catch (error) {
+    await writable.abort(error).catch(() => undefined);
+    throw error;
+  }
+}
+
+async function writeOwnershipClaim(
+  directory: FileSystemDirectoryHandle,
+  namespace: LocalFileNamespace,
+  key: string,
+  stagingOwner: string,
+): Promise<void> {
+  const claim: LocalFileWriteClaim = {
+    version: FORMAT_VERSION,
+    namespace,
+    key,
+    stagingOwner,
+  };
+  await writeJson(directory, metadataFilename(key), claim);
 }
 
 async function writeBlobAndHash(
@@ -214,19 +343,7 @@ async function writeMetadata(
   directory: FileSystemDirectoryHandle,
   metadata: LocalFileMetadata,
 ): Promise<void> {
-  const handle = await directory.getFileHandle(metadataFilename(metadata.key), {
-    create: true,
-  });
-  const writable = await handle.createWritable({ keepExistingData: false });
-  try {
-    await writable.write(
-      new TextEncoder().encode(`${JSON.stringify(metadata)}\n`),
-    );
-    await writable.close();
-  } catch (error) {
-    await writable.abort(error).catch(() => undefined);
-    throw error;
-  }
+  await writeJson(directory, metadataFilename(metadata.key), metadata);
 }
 
 function isLocalFileMetadata(
@@ -249,8 +366,50 @@ function isLocalFileMetadata(
     typeof metadata.sha256 === "string" &&
     /^[0-9a-f]{64}$/i.test(metadata.sha256) &&
     typeof metadata.createdAt === "string" &&
-    typeof metadata.updatedAt === "string"
+    typeof metadata.updatedAt === "string" &&
+    (metadata.stagingOwner === undefined ||
+      (typeof metadata.stagingOwner === "string" &&
+        /^[0-9a-f]{64}$/.test(metadata.stagingOwner)))
   );
+}
+
+function isOwnedMetadataOrClaim(
+  value: unknown,
+  namespace: LocalFileNamespace,
+  key: string,
+  stagingOwner: string,
+): boolean {
+  if (!value || typeof value !== "object") return false;
+  const record = value as Partial<LocalFileMetadata & LocalFileWriteClaim>;
+  if (
+    record.version !== FORMAT_VERSION ||
+    record.namespace !== namespace ||
+    record.key !== key ||
+    record.stagingOwner !== stagingOwner
+  ) {
+    return false;
+  }
+  const keys = Object.keys(record);
+  return (
+    keys.length === 4 &&
+    keys.every((name) =>
+      name === "version" || name === "namespace" || name === "key" ||
+      name === "stagingOwner")
+  ) || isLocalFileMetadata(record, namespace, key);
+}
+
+async function readRawMetadataIfPresent(
+  directory: FileSystemDirectoryHandle,
+  key: string,
+): Promise<unknown | undefined> {
+  try {
+    const handle = await directory.getFileHandle(metadataFilename(key));
+    const file = await handle.getFile();
+    return JSON.parse(await file.text()) as unknown;
+  } catch (error) {
+    if (isNotFoundError(error)) return undefined;
+    throw error;
+  }
 }
 
 async function readMetadata(
@@ -297,13 +456,75 @@ export async function saveLocalFile(
     throw new LocalFileError("saveLocalFile expects a Blob or File.", "INVALID_BLOB");
   }
 
+  return saveLocalFileWithExactKey(
+    namespace,
+    crypto.randomUUID().toLowerCase(),
+    blob,
+    options,
+  );
+}
+
+/**
+ * Prove that neither side of an exact-key file record currently exists.
+ * Callers that persist a crash-recovery receipt before writing can preflight
+ * every key, then rely on saveLocalFileAtKey to repeat the same proof.
+ */
+export async function assertLocalFileKeyAvailable(
+  namespace: LocalFileNamespace,
+  key: string,
+): Promise<void> {
+  assertSafeKey(key);
+  await assertKeyAvailableWithoutCreatingDirectories(namespace, key);
+}
+
+/**
+ * Save to an exact UUID after refusing any object or metadata collision.
+ * A small ownership claim is written first, so a crash after the first write
+ * can later be cleaned only by the operation that created it.
+ */
+export async function saveLocalFileAtKey(
+  namespace: LocalFileNamespace,
+  key: string,
+  blob: Blob,
+  options: SaveLocalFileOptions,
+  stagingOwner: string,
+): Promise<LocalFileMetadata> {
+  assertStagingOwner(stagingOwner);
+  return saveLocalFileWithExactKey(
+    namespace,
+    key,
+    blob,
+    options,
+    stagingOwner,
+  );
+}
+
+async function saveLocalFileWithExactKey(
+  namespace: LocalFileNamespace,
+  key: string,
+  blob: Blob,
+  options: SaveLocalFileOptions,
+  stagingOwner?: string,
+): Promise<LocalFileMetadata> {
+  assertSafeKey(key);
+  if (!(blob instanceof Blob)) {
+    throw new LocalFileError(
+      "saveLocalFileAtKey expects a Blob or File.",
+      "INVALID_BLOB",
+    );
+  }
   const { objects, metadata: metadataDirectory } =
     await getNamespaceDirectories(namespace);
-  const key = crypto.randomUUID();
+  await assertKeyAvailableInDirectories(objects, metadataDirectory, key);
   const objectName = objectFilename(key);
-  const objectHandle = await objects.getFileHandle(objectName, { create: true });
+  let ownershipClaimStarted = false;
 
   try {
+    if (stagingOwner !== undefined) {
+      ownershipClaimStarted = true;
+      await writeOwnershipClaim(metadataDirectory, namespace, key, stagingOwner);
+    }
+    const objectHandle = await objects.getFileHandle(objectName, { create: true });
     const digest = await writeBlobAndHash(objectHandle, blob);
     const now = new Date().toISOString();
     const createdAt = safeTimestamp(options.createdAt, now);
@@ -324,14 +545,19 @@ export async function saveLocalFile(
       sha256: digest.sha256,
       createdAt,
       updatedAt,
+      ...(stagingOwner === undefined ? {} : { stagingOwner }),
     };
     await writeMetadata(metadataDirectory, metadata);
     return metadata;
   } catch (error) {
-    await Promise.allSettled([
-      removeEntryIfPresent(objects, objectName),
-      removeEntryIfPresent(metadataDirectory, metadataFilename(key)),
-    ]);
+    if (stagingOwner === undefined) {
+      await Promise.allSettled([
+        removeEntryIfPresent(objects, objectName),
+        removeEntryIfPresent(metadataDirectory, metadataFilename(key)),
+      ]);
+    } else if (ownershipClaimStarted) {
+      await deleteOwnedLocalFile(namespace, key, stagingOwner).catch(() => undefined);
+    }
     throw error;
   }
 }
@@ -377,6 +603,43 @@ export async function deleteLocalFile(
 ): Promise<boolean> {
   assertSafeKey(key);
   const { objects, metadata } = await getNamespaceDirectories(namespace);
+  const [objectDeleted, metadataDeleted] = await Promise.all([
+    removeEntryIfPresent(objects, objectFilename(key)),
+    removeEntryIfPresent(metadata, metadataFilename(key)),
+  ]);
+  return objectDeleted || metadataDeleted;
+}
+
+/**
+ * Delete an exact-key record only when its metadata or in-progress claim is
+ * bound to the expected operation. Missing records are an idempotent success;
+ * partial or foreign records fail closed and are retained.
+ */
+export async function deleteOwnedLocalFile(
+  namespace: LocalFileNamespace,
+  key: string,
+  stagingOwner: string,
+): Promise<boolean> {
+  assertSafeKey(key);
+  assertStagingOwner(stagingOwner);
+  const { objects, metadata } = await getNamespaceDirectories(namespace);
+  const [objectExists, rawMetadata] = await Promise.all([
+    fileEntryExists(objects, objectFilename(key)),
+    readRawMetadataIfPresent(metadata, key),
+  ]);
+  if (rawMetadata === undefined) {
+    if (!objectExists) return false;
+    throw new LocalFileError(
+      "The local file ownership cannot be verified.",
+      "FILE_OWNERSHIP_UNVERIFIED",
+    );
+  }
+  if (!isOwnedMetadataOrClaim(rawMetadata, namespace, key, stagingOwner)) {
+    throw new LocalFileError(
+      "The local file belongs to a different write operation.",
+      "FILE_OWNERSHIP_MISMATCH",
+    );
+  }
   const [objectDeleted, metadataDeleted] = await Promise.all([
     removeEntryIfPresent(objects, objectFilename(key)),
     removeEntryIfPresent(metadata, metadataFilename(key)),

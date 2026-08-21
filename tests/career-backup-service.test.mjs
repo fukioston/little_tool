@@ -12,10 +12,21 @@ const OTHER_GENERATION_ID = "40000000-0000-4000-8000-000000000001";
 const ACTIVATION_TOKEN = "a".repeat(64);
 const RECOVERY_TOKEN = "b".repeat(64);
 const SOURCE_KEY = "10000000-0000-4000-8000-000000000001";
+const SOURCE_KEY_2 = "10000000-0000-4000-8000-000000000002";
+const SOURCE_KEY_3 = "10000000-0000-4000-8000-000000000003";
 const STAGED_KEY = "20000000-0000-4000-8000-000000000001";
+const STAGED_KEY_2 = "20000000-0000-4000-8000-000000000002";
+const STAGED_KEY_3 = "20000000-0000-4000-8000-000000000003";
+const FIXTURE_UUIDS = [
+  GENERATION_ID,
+  STAGED_KEY,
+  STAGED_KEY_2,
+  STAGED_KEY_3,
+];
 
-// Stable caller operation id keeps the fixture assertions deterministic.
-globalThis.crypto.randomUUID = () => GENERATION_ID;
+// Stable caller ids keep operation and exact attachment keys deterministic.
+globalThis.crypto.randomUUID = () =>
+  globalThis.__careerBackupServiceTestRuntime?.nextUuid?.() ?? GENERATION_ID;
 
 function moduleUrl(source) {
   return `data:text/javascript;base64,${Buffer.from(source).toString("base64")}`;
@@ -99,11 +110,20 @@ const filesUrl = moduleUrl(`
   export function deleteLocalFile(database,key){
     return runtime().deleteLocalFile(database,key);
   }
+  export function deleteOwnedLocalFile(database,key,stagingOwner){
+    return runtime().deleteOwnedLocalFile(database,key,stagingOwner);
+  }
   export function getLocalFile(database,key){
     return runtime().getLocalFile(database,key);
   }
+  export function assertLocalFileKeyAvailable(database,key){
+    return runtime().assertLocalFileKeyAvailable(database,key);
+  }
   export function saveLocalFile(database,blob,options){
     return runtime().saveLocalFile(database,blob,options);
+  }
+  export function saveLocalFileAtKey(database,key,blob,options,stagingOwner){
+    return runtime().saveLocalFileAtKey(database,key,blob,options,stagingOwner);
   }
   export async function sha256Blob(blob){
     const digest=await crypto.subtle.digest("SHA-256",await blob.arrayBuffer());
@@ -209,6 +229,35 @@ async function completeContainer(userVersion = 3) {
   }, hashBlob);
 }
 
+async function completeContainerWithThreeAttachments() {
+  const inputs = [
+    [SOURCE_KEY, "resume.pdf", "primary resume"],
+    [SOURCE_KEY_2, "portfolio.pdf", "selected portfolio"],
+    [SOURCE_KEY_3, "cover-letter.pdf", "cover letter"],
+  ];
+  const attachments = await Promise.all(inputs.map(async ([key, name, content], index) => {
+    const file = new File([content], name, { type: "application/pdf" });
+    return {
+      metadata: {
+        key,
+        originalName: file.name,
+        mimeType: file.type,
+        category: `career-material:restore-${index + 1}`,
+        byteSize: file.size,
+        sha256: await hashBlob(file),
+        createdAt: `2026-08-20T06:07:0${index + 1}.000Z`,
+        updatedAt: `2026-08-20T07:08:0${index + 1}.000Z`,
+      },
+      blob: file,
+    };
+  }));
+  return format.createCareerBackupBlob({
+    database: sqliteBytes(3),
+    attachments,
+    exportedAt: "2026-08-20T08:09:10.000Z",
+  }, hashBlob);
+}
+
 async function runtimeFixture(overrides = {}) {
   const oldGeneration = {
     database: "zhiji",
@@ -234,6 +283,9 @@ async function runtimeFixture(overrides = {}) {
   };
   const state = {
     lockCalls: 0,
+    uuidCalls: 0,
+    availabilityChecks: [],
+    fileRecords: new Map(),
     saved: [],
     deleted: [],
     staged: [],
@@ -251,15 +303,30 @@ async function runtimeFixture(overrides = {}) {
     broadcasts: [],
   };
   const runtime = {
+    nextUuid() {
+      const value = FIXTURE_UUIDS[state.uuidCalls];
+      state.uuidCalls += 1;
+      if (!value) throw new Error("fixture UUID sequence exhausted");
+      return value;
+    },
     async withCareerBackupLock(task) {
       state.lockCalls += 1;
       return task({ token: Symbol("career-backup-test"), mode: "exclusive" });
     },
-    async saveLocalFile(database, blob, options) {
+    async assertLocalFileKeyAvailable(database, key) {
+      state.availabilityChecks.push({ database, key });
+      if (state.fileRecords.has(key)) {
+        const error = new Error("exact key collision");
+        error.code = "FILE_KEY_COLLISION";
+        throw error;
+      }
+    },
+    async saveLocalFileAtKey(database, key, blob, options, stagingOwner) {
+      await runtime.assertLocalFileKeyAvailable(database, key);
       const metadata = {
         version: 1,
         namespace: database,
-        key: STAGED_KEY,
+        key,
         originalName: options.originalName,
         mimeType: options.mimeType,
         category: options.category ?? null,
@@ -267,12 +334,41 @@ async function runtimeFixture(overrides = {}) {
         sha256: await hashBlob(blob),
         createdAt: options.createdAt,
         updatedAt: options.updatedAt,
+        stagingOwner,
       };
-      state.saved.push({ database, blob, options, metadata });
+      state.fileRecords.set(key, {
+        database,
+        blob,
+        metadata: structuredClone(metadata),
+        stagingOwner,
+      });
+      state.saved.push({ database, key, blob, options, stagingOwner, metadata });
       return metadata;
+    },
+    async saveLocalFile(database, blob, options) {
+      return runtime.saveLocalFileAtKey(
+        database,
+        STAGED_KEY,
+        blob,
+        options,
+        undefined,
+      );
     },
     async deleteLocalFile(database, key) {
       state.deleted.push({ database, key });
+      return state.fileRecords.delete(key);
+    },
+    async deleteOwnedLocalFile(database, key, stagingOwner) {
+      state.deleted.push({ database, key });
+      const record = state.fileRecords.get(key);
+      if (!record) return false;
+      if (record.stagingOwner !== stagingOwner) {
+        const error = new Error("file ownership mismatch");
+        error.code = "FILE_OWNERSHIP_MISMATCH";
+        throw error;
+      }
+      state.fileRecords.delete(key);
+      return true;
     },
     async getLocalFile() {
       throw new Error("export is outside this test boundary");
@@ -486,7 +582,10 @@ test("an awaited recovery checkpoint precedes database staging with attachments"
   );
 
   await hookEntered;
-  assert.equal(fixture.state.saved.length, 1);
+  assert.equal(fixture.state.saved.length, 0, "checkpoint must precede the first OPFS write");
+  assert.deepEqual(fixture.state.availabilityChecks, [
+    { database: "career", key: STAGED_KEY },
+  ]);
   assert.equal(fixture.state.staged.length, 0);
   assert.equal(checkpoint.operationId, GENERATION_ID);
   assert.equal(checkpoint.generationId, GENERATION_ID);
@@ -495,6 +594,8 @@ test("an awaited recovery checkpoint precedes database staging with attachments"
 
   releaseHook();
   const prepared = await operation;
+  assert.equal(fixture.state.saved.length, 1);
+  assert.equal(fixture.state.availabilityChecks.length, 2, "exact save rechecks the key");
   assert.equal(fixture.state.staged.length, 1);
   assert.equal(prepared.generationId, checkpoint.generationId);
   assert.equal(prepared.projectionSha256, checkpoint.projectionSha256);
@@ -524,7 +625,7 @@ test("a legacy restore without attachments also checkpoints before database stag
   assert.equal(fixture.state.staged.length, 1);
 });
 
-test("a rejected recovery checkpoint prevents database staging and rolls back attachments", async () => {
+test("a rejected recovery checkpoint prevents every OPFS and database staging write", async () => {
   const fixture = await runtimeFixture();
 
   await assert.rejects(
@@ -537,31 +638,57 @@ test("a rejected recovery checkpoint prevents database staging and rolls back at
       error?.message.includes("没有开始建立候选"),
   );
 
-  assert.equal(fixture.state.saved.length, 1);
+  assert.equal(fixture.state.saved.length, 0);
   assert.equal(fixture.state.staged.length, 0);
-  assert.deepEqual(fixture.state.deleted, [
-    { database: "career", key: STAGED_KEY },
-  ]);
+  assert.deepEqual(fixture.state.deleted, []);
   assert.equal(fixture.state.prepareReceipt, null);
 });
 
-test("a rejected checkpoint plus unknown rollback exposes durable bound cleanup", async () => {
+test("a preflight key collision prevents both checkpoint and overwrite", async () => {
   const fixture = await runtimeFixture();
-  const originalRegister = fixture.runtime.registerPrepareCleanup;
-  fixture.runtime.deleteLocalFile = async (database, key) => {
-    fixture.state.deleted.push({ database, key });
-    throw new Error("temporary OPFS delete failure");
+  const foreignRecord = {
+    database: "career",
+    blob: new Blob(["existing private file"]),
+    metadata: { key: STAGED_KEY, originalName: "existing.txt" },
+    stagingOwner: "f".repeat(64),
   };
-  fixture.runtime.registerPrepareCleanup = async (...args) => {
-    await originalRegister(...args);
-    throw new Error("cleanup binding response lost");
+  fixture.state.fileRecords.set(STAGED_KEY, foreignRecord);
+  let hookCalled = false;
+
+  await assert.rejects(
+    backupService.prepareCareerBackupRestore(await completeContainer(), {
+      onRecoveryPrepared() {
+        hookCalled = true;
+      },
+    }),
+    (error) => error?.code === "PREPARE_FAILED",
+  );
+
+  assert.equal(hookCalled, false);
+  assert.equal(fixture.state.saved.length, 0);
+  assert.equal(fixture.state.staged.length, 0);
+  assert.deepEqual(fixture.state.deleted, []);
+  assert.equal(fixture.state.fileRecords.get(STAGED_KEY), foreignRecord);
+  assert.equal(fixture.state.prepareReceipt, null);
+});
+
+test("a post-checkpoint exact-key collision is retained through bound cleanup", async () => {
+  const fixture = await runtimeFixture();
+  const foreignBlob = new Blob(["pre-existing private file"]);
+  const foreignRecord = {
+    database: "career",
+    blob: foreignBlob,
+    metadata: { key: STAGED_KEY, originalName: "do-not-delete.txt" },
+    stagingOwner: "f".repeat(64),
   };
+  let checkpoint;
   let cleanupError;
 
   try {
     await backupService.prepareCareerBackupRestore(await completeContainer(), {
-      onRecoveryPrepared() {
-        throw new Error("persistent recovery write rejected");
+      onRecoveryPrepared(value) {
+        checkpoint = JSON.parse(JSON.stringify(value));
+        fixture.state.fileRecords.set(STAGED_KEY, foreignRecord);
       },
     });
   } catch (error) {
@@ -573,20 +700,107 @@ test("a rejected checkpoint plus unknown rollback exposes durable bound cleanup"
     JSON.parse(JSON.stringify(cleanupError.receipt)),
     cleanupError.receipt,
   );
+  assert.equal(fixture.state.saved.length, 0, "the exact save must refuse the collision");
   assert.equal(fixture.state.staged.length, 0);
   assert.deepEqual(fixture.state.prepareReceipt, cleanupError.receipt);
+  assert.equal(fixture.state.fileRecords.get(STAGED_KEY), foreignRecord);
+  assert.equal(fixture.state.fileRecords.get(STAGED_KEY).blob, foreignBlob);
 
-  fixture.runtime.deleteLocalFile = async (database, key) => {
-    fixture.state.deleted.push({ database, key });
-  };
-  fixture.runtime.registerPrepareCleanup = originalRegister;
-  assert.deepEqual(
-    await backupService.retryCareerPrepareCleanup(
-      JSON.parse(JSON.stringify(cleanupError.receipt)),
-    ),
-    { cleaned: true },
+  const recovered = await backupService.recoverCareerBackupPrepare(
+    JSON.parse(JSON.stringify(checkpoint)),
   );
-  assert.equal(fixture.state.prepareStatus, "cleanup-complete");
+  assert.equal(recovered.status, "cleanup-pending");
+  await assert.rejects(
+    backupService.retryCareerPrepareCleanup(
+      JSON.parse(JSON.stringify(recovered.cleanupReceipt)),
+    ),
+    (error) => error?.code === "PREPARE_CLEANUP_INCOMPLETE",
+  );
+  assert.equal(fixture.state.fileRecords.get(STAGED_KEY), foreignRecord);
+  assert.equal(fixture.state.fileRecords.get(STAGED_KEY).blob, foreignBlob);
+});
+
+test("serialized prepare recovery cleans owned metadata, objects, and unstaged keys after crashes", async () => {
+  for (const crashPoint of ["first-claim", "first-object", "between-attachments"]) {
+    const fixture = await runtimeFixture();
+    const originalSave = fixture.runtime.saveLocalFileAtKey;
+    const originalDelete = fixture.runtime.deleteOwnedLocalFile;
+    const foreignKey = OTHER_GENERATION_ID;
+    const foreignRecord = {
+      database: "career",
+      blob: new Blob(["unrelated local file"]),
+      metadata: { key: foreignKey, originalName: "keep-me.txt" },
+      stagingOwner: "f".repeat(64),
+    };
+    fixture.state.fileRecords.set(foreignKey, foreignRecord);
+    let saveCalls = 0;
+    fixture.runtime.saveLocalFileAtKey = async (
+      database,
+      key,
+      blob,
+      options,
+      stagingOwner,
+    ) => {
+      saveCalls += 1;
+      if (crashPoint === "between-attachments" && saveCalls === 1) {
+        return originalSave(database, key, blob, options, stagingOwner);
+      }
+      await fixture.runtime.assertLocalFileKeyAvailable(database, key);
+      fixture.state.fileRecords.set(key, {
+        database,
+        blob: crashPoint === "first-claim" ? null : blob.slice(0, 3),
+        metadata: { version: 1, namespace: database, key, stagingOwner },
+        stagingOwner,
+        partial: true,
+      });
+      throw new Error(`simulated page termination at ${crashPoint}`);
+    };
+    fixture.runtime.deleteOwnedLocalFile = async (database, key) => {
+      fixture.state.deleted.push({ database, key });
+      throw new Error("the terminated page cannot finish cleanup");
+    };
+
+    let checkpoint;
+    let interrupted;
+    try {
+      await backupService.prepareCareerBackupRestore(
+        await completeContainerWithThreeAttachments(),
+        {
+          onRecoveryPrepared(value) {
+            checkpoint = JSON.parse(JSON.stringify(value));
+          },
+        },
+      );
+    } catch (error) {
+      interrupted = error;
+    }
+
+    assert.equal(interrupted?.code, "PREPARE_CLEANUP_INCOMPLETE", crashPoint);
+    assert.deepEqual(checkpoint.stagedAttachmentKeys, [
+      STAGED_KEY,
+      STAGED_KEY_2,
+      STAGED_KEY_3,
+    ]);
+    assert.equal(fixture.state.staged.length, 0, crashPoint);
+    assert.equal(fixture.state.fileRecords.get(foreignKey), foreignRecord, crashPoint);
+
+    fixture.runtime.deleteOwnedLocalFile = originalDelete;
+    const recovered = await backupService.recoverCareerBackupPrepare(
+      JSON.parse(JSON.stringify(checkpoint)),
+    );
+    assert.equal(recovered.status, "cleanup-pending", crashPoint);
+    assert.deepEqual(
+      await backupService.retryCareerPrepareCleanup(
+        JSON.parse(JSON.stringify(recovered.cleanupReceipt)),
+      ),
+      { cleaned: true },
+      crashPoint,
+    );
+    for (const key of [STAGED_KEY, STAGED_KEY_2, STAGED_KEY_3]) {
+      assert.equal(fixture.state.fileRecords.has(key), false, `${crashPoint}: ${key}`);
+    }
+    assert.equal(fixture.state.fileRecords.get(foreignKey), foreignRecord, crashPoint);
+  }
 });
 
 test("activate performs one guarded activation and treats broadcast failure as best-effort", async () => {
@@ -1004,14 +1218,14 @@ test("tampered prepare capability fails closed before recovery or attachment del
 test("failed pre-stage attachment rollback is explicit and exposes a capability-bound retry", async () => {
   const fixture = await runtimeFixture();
   const controller = new AbortController();
-  const originalSave = fixture.runtime.saveLocalFile;
-  fixture.runtime.saveLocalFile = async (...args) => {
+  const originalSave = fixture.runtime.saveLocalFileAtKey;
+  fixture.runtime.saveLocalFileAtKey = async (...args) => {
     const metadata = await originalSave(...args);
     controller.abort();
     return metadata;
   };
   let deleteAttempts = 0;
-  fixture.runtime.deleteLocalFile = async (database, key) => {
+  fixture.runtime.deleteOwnedLocalFile = async (database, key) => {
     fixture.state.deleted.push({ database, key });
     deleteAttempts += 1;
     if (deleteAttempts === 1) throw new Error("temporary cleanup failure");
@@ -1048,14 +1262,14 @@ test("failed pre-stage attachment rollback is explicit and exposes a capability-
 test("lost cleanup completion is recovered idempotently without widening keys", async () => {
   const fixture = await runtimeFixture();
   const controller = new AbortController();
-  const originalSave = fixture.runtime.saveLocalFile;
-  fixture.runtime.saveLocalFile = async (...args) => {
+  const originalSave = fixture.runtime.saveLocalFileAtKey;
+  fixture.runtime.saveLocalFileAtKey = async (...args) => {
     const metadata = await originalSave(...args);
     controller.abort();
     return metadata;
   };
   let deleteAttempts = 0;
-  fixture.runtime.deleteLocalFile = async (database, key) => {
+  fixture.runtime.deleteOwnedLocalFile = async (database, key) => {
     fixture.state.deleted.push({ database, key });
     deleteAttempts += 1;
     if (deleteAttempts === 1) throw new Error("first cleanup failed");
@@ -1100,13 +1314,13 @@ test("lost cleanup completion is recovered idempotently without widening keys", 
 test("a re-signed cleanup key list is rejected by the worker-owned binding", async () => {
   const fixture = await runtimeFixture();
   const controller = new AbortController();
-  const originalSave = fixture.runtime.saveLocalFile;
-  fixture.runtime.saveLocalFile = async (...args) => {
+  const originalSave = fixture.runtime.saveLocalFileAtKey;
+  fixture.runtime.saveLocalFileAtKey = async (...args) => {
     const metadata = await originalSave(...args);
     controller.abort();
     return metadata;
   };
-  fixture.runtime.deleteLocalFile = async (database, key) => {
+  fixture.runtime.deleteOwnedLocalFile = async (database, key) => {
     fixture.state.deleted.push({ database, key });
     throw new Error("cleanup unavailable");
   };
@@ -1301,7 +1515,7 @@ test("an incomplete attachment cleanup can retry the idempotent bound discard", 
     await completeContainer(),
   );
   let attempts = 0;
-  fixture.runtime.deleteLocalFile = async (database, key) => {
+  fixture.runtime.deleteOwnedLocalFile = async (database, key) => {
     fixture.state.deleted.push({ database, key });
     attempts += 1;
     if (attempts === 1) throw new Error("temporary OPFS delete failure");

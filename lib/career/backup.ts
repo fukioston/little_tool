@@ -1,8 +1,9 @@
 import { localDb } from "@/lib/local-db/client";
 import {
-  deleteLocalFile,
+  assertLocalFileKeyAvailable,
+  deleteOwnedLocalFile,
   getLocalFile,
-  saveLocalFile,
+  saveLocalFileAtKey,
   sha256Blob,
   type LocalFileMetadata,
 } from "@/lib/local-db/files";
@@ -149,9 +150,9 @@ export type CareerPrepareRecovery =
 export type CareerBackupRestoreOptions = Readonly<{
   signal?: AbortSignal;
   /**
-   * Persist this JSON-safe receipt before the worker may create a READY
-   * database generation. Rejecting the hook prevents stageImport from
-   * starting; any attachments already staged by this attempt are rolled back.
+   * Persist this JSON-safe receipt before the first attachment or database
+   * staging write. Rejecting the hook leaves OPFS and the active database
+   * untouched.
    */
   onRecoveryPrepared?(
     prepared: CareerPrepareRecoveryReceipt,
@@ -434,6 +435,7 @@ function assertMaterialMetadata(material: Material, metadata: LocalFileMetadata)
 function assertStagedAttachment(
   original: CareerBackupAttachmentMetadata,
   staged: LocalFileMetadata,
+  stagingOwner: string,
 ): void {
   if (
     staged.version !== 1 ||
@@ -445,7 +447,8 @@ function assertStagedAttachment(
     staged.byteSize !== original.byteSize ||
     staged.sha256 !== original.sha256 ||
     staged.createdAt !== original.createdAt ||
-    staged.updatedAt !== original.updatedAt
+    staged.updatedAt !== original.updatedAt ||
+    staged.stagingOwner !== stagingOwner
   ) {
     throw new CareerRestoreError(
       `暂存附件「${original.originalName}」时校验失败，当前资料没有改变。`,
@@ -454,31 +457,70 @@ function assertStagedAttachment(
   }
 }
 
-async function deleteAttachmentKeys(keys: readonly string[]): Promise<string[]> {
-  const results = await Promise.allSettled(keys.map((key) => deleteLocalFile(DB, key)));
+async function deleteAttachmentKeys(
+  keys: readonly string[],
+  stagingOwner: string,
+): Promise<string[]> {
+  const results = await Promise.allSettled(
+    keys.map((key) => deleteOwnedLocalFile(DB, key, stagingOwner)),
+  );
   return results.flatMap((result, index) => result.status === "rejected" ? [keys[index]] : []);
 }
 
-async function deleteStagedAttachments(staged: readonly StagedAttachment[]): Promise<string[]> {
-  return deleteAttachmentKeys(staged.map(({ staged: metadata }) => metadata.key));
+function newStagedAttachmentKeys(count: number): readonly string[] {
+  const keys: string[] = [];
+  const seen = new Set<string>();
+  for (let index = 0; index < count; index += 1) {
+    const key = crypto.randomUUID().toLowerCase();
+    if (!UUID_V4_PATTERN.test(key) || seen.has(key)) {
+      throw new CareerRestoreError(
+        "浏览器无法为暂存附件建立唯一凭据。当前资料没有改变。",
+        "PREPARE_FAILED",
+      );
+    }
+    seen.add(key);
+    keys.push(key);
+  }
+  return keys;
+}
+
+async function assertAttachmentKeysAvailable(
+  keys: readonly string[],
+): Promise<void> {
+  await Promise.all(keys.map((key) => assertLocalFileKeyAvailable(DB, key)));
 }
 
 async function stageAttachments(
   parsed: ParsedCareerBackup,
+  keys: readonly string[],
+  stagingOwner: string,
   staged: StagedAttachment[],
   signal?: AbortSignal,
 ): Promise<void> {
-  for (const attachment of parsed.attachments) {
+  if (parsed.attachments.length !== keys.length) {
+    throw new CareerRestoreError(
+      "暂存附件数量与恢复凭据不一致。当前资料没有改变。",
+      "PREPARE_FAILED",
+    );
+  }
+  for (let index = 0; index < parsed.attachments.length; index += 1) {
+    const attachment = parsed.attachments[index];
     throwIfAborted(signal);
-    const metadata = await saveLocalFile(DB, attachment.blob, {
-      originalName: attachment.metadata.originalName,
-      mimeType: attachment.metadata.mimeType,
-      category: attachment.metadata.category ?? undefined,
-      createdAt: attachment.metadata.createdAt,
-      updatedAt: attachment.metadata.updatedAt,
-    });
+    const metadata = await saveLocalFileAtKey(
+      DB,
+      keys[index],
+      attachment.blob,
+      {
+        originalName: attachment.metadata.originalName,
+        mimeType: attachment.metadata.mimeType,
+        category: attachment.metadata.category ?? undefined,
+        createdAt: attachment.metadata.createdAt,
+        updatedAt: attachment.metadata.updatedAt,
+      },
+      stagingOwner,
+    );
     staged.push({ original: attachment.metadata, staged: metadata });
-    assertStagedAttachment(attachment.metadata, metadata);
+    assertStagedAttachment(attachment.metadata, metadata, stagingOwner);
     throwIfAborted(signal);
   }
 }
@@ -551,19 +593,6 @@ async function restoreProjectionSha256(
   ], { type: "application/json" }));
 }
 
-async function cleanupProjectionSha256(
-  operationId: string,
-  stagedAttachmentKeys: readonly string[],
-): Promise<string> {
-  return sha256Blob(new Blob([JSON.stringify({
-    version: 1,
-    database: CANONICAL_DB,
-    operationId,
-    generationId: operationId,
-    stagedAttachmentKeys,
-  })], { type: "application/json" }));
-}
-
 async function attachmentKeysSha256(
   stagedAttachmentKeys: readonly string[],
 ): Promise<string> {
@@ -603,25 +632,6 @@ function databasePrepareReceiptFor(
     projectionSha256: receipt.projectionSha256,
     attachmentKeysSha256: receipt.attachmentKeysSha256,
     stagedAttachmentKeys: [...receipt.stagedAttachmentKeys],
-  };
-}
-
-async function cleanupReceiptFor(
-  keys: readonly string[],
-): Promise<CareerPrepareCleanupReceipt> {
-  const capability = newPrepareOperationCapability();
-  return {
-    version: 1,
-    database: CANONICAL_DB,
-    operationId: capability.operationId,
-    generationId: capability.operationId,
-    operationToken: capability.operationToken,
-    projectionSha256: await cleanupProjectionSha256(
-      capability.operationId,
-      keys,
-    ),
-    attachmentKeysSha256: await attachmentKeysSha256(keys),
-    stagedAttachmentKeys: [...keys],
   };
 }
 
@@ -1157,7 +1167,10 @@ async function discardPreparedInContext(
   assertExclusiveContext(context);
   const receipt = await verifyRestoreReceipt(rawReceipt);
   await discardStagedCandidate(receipt);
-  const failedAttachmentKeys = await deleteAttachmentKeys(receipt.stagedAttachmentKeys);
+  const failedAttachmentKeys = await deleteAttachmentKeys(
+    receipt.stagedAttachmentKeys,
+    receipt.projectionSha256,
+  );
   return {
     discarded: true,
     attachmentCleanup: failedAttachmentKeys.length === 0 ? "complete" : "incomplete",
@@ -1178,21 +1191,20 @@ async function stageSourceInContext(
   let stagedDatabase: StagedDatabaseImportResult | null = null;
   let preparedReceipt: CareerRestoreReceipt | null = null;
   let prepareRecoveryReceipt: CareerPrepareRecoveryReceipt | null = null;
+  let attachmentStageStarted = false;
   let atomicStageStarted = false;
   try {
-    if (source.kind === "complete-backup") {
-      await stageAttachments(source.parsed, stagedAttachments, signal);
-    }
-    throwIfAborted(signal);
-    const statements: readonly SqlStatement[] = source.kind === "complete-backup"
-      ? createCompleteCareerRestoreStatements(stagedAttachments, source.sourceUserVersion)
-      : createLegacyCareerRestoreStatements(source.sourceUserVersion);
+    const capability = newPrepareOperationCapability();
+    const stagedAttachmentKeys = newStagedAttachmentKeys(
+      source.kind === "complete-backup" ? source.parsed.attachments.length : 0,
+    );
+    await assertAttachmentKeysAvailable(stagedAttachmentKeys);
     throwIfAborted(signal);
 
     const projection = restoreProjection(
       new Date().toISOString(),
       summaryFor(source),
-      stagedAttachments.map(({ staged: metadata }) => metadata.key),
+      stagedAttachmentKeys,
     );
     const projectionSha256 = await restoreProjectionSha256(projection);
     const attachmentDigest = await attachmentKeysSha256(
@@ -1202,7 +1214,7 @@ async function stageSourceInContext(
       projection,
       projectionSha256,
       attachmentDigest,
-      newPrepareOperationCapability(),
+      capability,
     );
     throwIfAborted(signal);
 
@@ -1217,6 +1229,22 @@ async function stageSourceInContext(
         );
       }
     }
+    throwIfAborted(signal);
+
+    if (source.kind === "complete-backup" && stagedAttachmentKeys.length > 0) {
+      attachmentStageStarted = true;
+      await stageAttachments(
+        source.parsed,
+        stagedAttachmentKeys,
+        projectionSha256,
+        stagedAttachments,
+        signal,
+      );
+    }
+    throwIfAborted(signal);
+    const statements: readonly SqlStatement[] = source.kind === "complete-backup"
+      ? createCompleteCareerRestoreStatements(stagedAttachments, source.sourceUserVersion)
+      : createLegacyCareerRestoreStatements(source.sourceUserVersion);
     throwIfAborted(signal);
 
     // Once atomic worker staging starts, a late AbortSignal is ignored. A
@@ -1283,9 +1311,14 @@ async function stageSourceInContext(
     if (atomicStageStarted && !preparedReceipt && prepareRecoveryReceipt) {
       throw new CareerPrepareUncertainError(prepareRecoveryReceipt, error);
     }
-    const failed = await deleteStagedAttachments(stagedAttachments);
+    const failed = attachmentStageStarted && prepareRecoveryReceipt
+      ? await deleteAttachmentKeys(
+        prepareRecoveryReceipt.stagedAttachmentKeys,
+        prepareRecoveryReceipt.projectionSha256,
+      )
+      : [];
     if (failed.length > 0) {
-      const cleanupReceipt = await cleanupReceiptFor(failed);
+      const cleanupReceipt = cleanupReceiptFromPrepare(prepareRecoveryReceipt!);
       try {
         const bound = await localDb.registerPrepareCleanup(
           DB,
@@ -1298,9 +1331,10 @@ async function stageSourceInContext(
           (bound.status !== "cleanup-pending" &&
             bound.status !== "cleanup-complete") ||
           !Array.isArray(bound.stagedAttachmentKeys) ||
-          bound.stagedAttachmentKeys.length !== failed.length ||
+          bound.stagedAttachmentKeys.length !==
+            cleanupReceipt.stagedAttachmentKeys.length ||
           bound.stagedAttachmentKeys.some(
-            (key, index) => key !== failed[index],
+            (key, index) => key !== cleanupReceipt.stagedAttachmentKeys[index],
           )
         ) {
           throw new Error("Invalid prepare cleanup binding response.");
@@ -1742,7 +1776,10 @@ export async function retryCareerPrepareCleanup(
     const state = assertPrepareCleanupResult(rawState, receipt);
     if (state.status === "cleanup-complete") return { cleaned: true };
 
-    const failed = await deleteAttachmentKeys(state.stagedAttachmentKeys);
+    const failed = await deleteAttachmentKeys(
+      state.stagedAttachmentKeys,
+      receipt.projectionSha256,
+    );
     if (failed.length > 0) {
       throw new CareerPrepareCleanupIncompleteError(receipt, { failed });
     }
