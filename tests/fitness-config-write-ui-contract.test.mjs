@@ -431,22 +431,39 @@ test("dirty close keeps the form mounted and restores deferred focus", () => {
   assert.match(keep, /target\?\.isConnected/);
   assert.match(keep, /\.sl-dialog \.sl-form :is\(input, select, textarea, button\)/);
   assert.match(appSource, /document\.addEventListener\("focusin", rememberFocus, true\)/);
+  assert.match(appSource, /fitnessDirtyConfigDialogBlocksRouteChange\([\s\S]*?dialogDirtyRef\.current[\s\S]*?snapshotRef\.current\.sessions[\s\S]*?next\.sessions/);
+  assert.match(appSource, /configDialogSnapshotPending && <ConfigDialogSnapshotNotice/);
+  assert.match(appSource, /另一页已开始或结束训练[\s\S]*?当前表单和输入仍完整保留/);
+  assert.match(appSource, /const discardDirtyDialog =[\s\S]*?if \(configDialogSnapshotPending\) applyPendingConfigDialogSnapshot\(\)/);
 });
 
 test("pending or unreadable journals visibly lock config writes without discarding open drafts", () => {
   assert.match(flowSource, /const writeLocked = !journal\.loaded \|\| journal\.unavailable \|\|\s*journal\.entries\.length > 0 \|\| journal\.unreadable\.length > 0 \|\| busy/);
-  assert.equal((appSource.match(/writeBlocked=\{configWrites\.writeLocked \|\| snapshotReadStatus !== "ready"\}/g) ?? []).length, 4);
+  assert.equal((appSource.match(/writeBlocked=\{configDialogSnapshotPending \|\| configWrites\.writeLocked \|\| snapshotReadStatus !== "ready"\}/g) ?? []).length, 4);
   assert.equal((formsSource.match(/现有草稿会保留，但资料核对线索处理完成前不能保存/g) ?? []).length, 4);
   assert.match(appSource, /busy=\{busy \|\| configWrites\.writeLocked\}/);
 });
 
+test("only the config form bound to the durable receipt is consumed before refresh", () => {
+  const start = flowSource.slice(flowSource.indexOf("const start = useCallback"), flowSource.indexOf("const open = useCallback"));
+  assert.ok(start.indexOf("persistFitnessConfigWrite(createFitnessConfigWriteTicket(receipt))") < start.indexOf("onDurablePrepared?.(receipt)"));
+  const finish = flowSource.slice(flowSource.indexOf("const finishCommitted"), flowSource.indexOf("const commitEntry"));
+  assert.ok(finish.indexOf("onDurableCommitted?.(entry.ticket.receipt)") < finish.indexOf("await refresh()"));
+  assert.match(appSource, /submittedConfigDialogRef\.current = \{ operationId: receipt\.operationId, dialog: current \}/);
+  assert.match(appSource, /submitted\.operationId !== receipt\.operationId \|\| activeDialog\.current !== submitted\.dialog\) return/);
+  assert.match(appSource, /onDurablePrepared: rememberPreparedConfigDialog/);
+  assert.match(appSource, /onDurableCommitted: consumeCommittedConfigDialog/);
+  assert.match(flowSource, /const refreshOutcome = await refresh\(\);[\s\S]*?if \(!fitnessFactsRefreshApplied\(refreshOutcome\)\)[\s\S]*?phase: "refresh-only"/);
+  assert.ok(flowSource.indexOf("fitnessFactsRefreshApplied(refreshOutcome)") < flowSource.indexOf("const removal = await removeCurrent(entry)"));
+});
+
 test("read failure preserves the rendered baseline and config recovery fits narrow screens", () => {
   const refresh = appSource.slice(
-    appSource.indexOf("const refresh = useCallback"),
+    appSource.indexOf("const readFitnessFacts = useCallback"),
     appSource.indexOf("const openConfigRecovery = useCallback"),
   );
-  assert.match(refresh, /const next = await loadFitnessSnapshot\(\);\s*setSnapshot\(next\)/);
-  assert.doesNotMatch(refresh.slice(refresh.indexOf("catch")), /\bsetSnapshot\(/);
+  assert.match(refresh, /const next = await loadFitnessSnapshot\(\);[\s\S]*?applyFitnessSnapshot\(next\)/);
+  assert.doesNotMatch(refresh.slice(refresh.indexOf("catch (reason)"), refresh.indexOf("const refresh = useCallback")), /\bsetSnapshot\(/);
   assert.match(appSource, /loads=\{editingEquipmentExpected\?\.loads \?\? \[\]\}/);
   assert.match(appSource, /profile=\{editingProfile\}/);
   assert.match(appSource, /当前显示的是上次成功读取的资料/);

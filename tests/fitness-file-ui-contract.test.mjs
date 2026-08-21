@@ -105,7 +105,7 @@ test("missing Web Locks disables mutations instead of silently weakening CAS", (
 
 test("the equipment form remains mounted while its photo subpanel is open", () => {
   assert.doesNotMatch(app, /"equipment-photos"/);
-  assert.match(app, /<div hidden=\{equipmentPanel !== "details"\}><EquipmentForm/);
+  assert.match(app, /<div hidden=\{equipmentPanel !== "details"\}>[\s\S]*?<EquipmentForm/);
   assert.match(app, /equipmentPanel === "photos" && equipmentPhotoTarget && <EquipmentPhotos/);
   assert.match(app, /busy=\{dialogMutationBusy \|\| equipmentPhotoBusy\}/);
   assert.match(app, /requestEquipmentDialogClose/);

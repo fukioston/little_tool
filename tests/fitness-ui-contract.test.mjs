@@ -89,25 +89,27 @@ test("scheduled starts distinguish planned and current venues before writing", (
   assert.match(source, />切换到计划场地并开始<\/button>/);
   assert.match(source, />按当前场地开始临时训练<\/button>/);
   assert.match(source, /原来的日历安排仍会保留/);
-  assert.match(source, /if \(scheduledStartMutationRef\.current\) return;/);
+  assert.match(source, /if \(liveWrites\.operationInProgress\(\)\) return;/);
+  assert.match(source, /const expected = fitnessLiveStartExpectationFromSnapshot\(snapshot, input\)/);
+  assert.match(source, /liveWrites\.start\(\(\) => prepareFitnessLiveSessionStart\(input, expected\)\)/);
+  assert.doesNotMatch(source, /scheduledStartMutationRef|startFitnessSession/);
   assert.match(source, /scheduledStartChoiceRef\.current\?\.requestId === expectedChoiceId/);
   assert.match(source, /activeDialog\.current === "venue-start-choice"/);
 });
 
-test("the one-shot pain note clears only after persistence succeeds", () => {
+test("the one-shot pain note is controlled and clears only after its durable receipt is confirmed", () => {
   assert.equal(resolveFitnessPainDraftAfterRecord("左膝不适", false), "左膝不适");
   assert.equal(resolveFitnessPainDraftAfterRecord("左膝不适", true), "");
-  assert.match(source, /name="pain" value=\{currentPainDraft\}/);
-  assert.match(source, /painNote: currentPainDraft/);
+  assert.match(source, /name="pain" value=\{setDraft\?\.pain \?\? ""\}/);
+  assert.match(source, /painNote: setDraft\.pain/);
 
   const recordStart = source.indexOf("const record = async");
-  const finishStart = source.indexOf("const finish = async", recordStart);
-  assert.ok(recordStart >= 0 && finishStart > recordStart);
-  const recordSource = source.slice(recordStart, finishStart);
-  const persistedAt = recordSource.indexOf("await runFitnessPersistThenRefresh");
-  const writeAt = recordSource.indexOf("recordFitnessSet", persistedAt);
-  const clearedAt = recordSource.indexOf("setPainDraft", persistedAt);
-  assert.ok(persistedAt >= 0 && writeAt > persistedAt && clearedAt > writeAt);
+  const confirmStart = source.indexOf("const requestLiveConfirm", recordStart);
+  assert.ok(recordStart >= 0 && confirmStart > recordStart);
+  const recordSource = source.slice(recordStart, confirmStart);
+  assert.match(recordSource, /await liveWrites\.start\(\(\) => prepareFitnessSetRecord/);
+  assert.match(recordSource, /result === "fresh"[\s\S]*?pain: ""/);
+  assert.doesNotMatch(recordSource, /recordFitnessSet|runFitnessPersistThenRefresh/);
 });
 
 test("a committed write with a failed refresh becomes recovery, never a write retry", async () => {
@@ -144,35 +146,22 @@ test("a committed write with a failed refresh becomes recovery, never a write re
   const liveStart = source.indexOf("function LiveSession");
   const pickerStart = source.indexOf("function ExercisePicker", liveStart);
   const liveSource = source.slice(liveStart, pickerStart);
-  assert.equal(
-    (liveSource.match(/await runFitnessPersistThenRefresh\(/g) ?? []).length,
-    4,
-    "mutate, record, finish and cancel must share the commit boundary",
-  );
-  assert.equal(
-    (liveSource.match(/await onRefresh\(\)/g) ?? []).length,
-    1,
-    "only the explicit recovery path may refresh outside the shared commit helper",
-  );
-  assert.match(liveSource, /interactionLocked = mutationBusy \|\| postCommitRecovery !== null/);
-  assert.match(liveSource, /mutationGuardRef\.current \|\| recoveryRef\.current/);
-  assert.match(liveSource, /recoveryRequestRef\.current !== null/);
-  assert.match(liveSource, /recoveryRef\.current\?\.token !== pending\.token \|\| recoveryTokenRef\.current !== pending\.token/);
-  assert.match(liveSource, /已保存在本地/);
-  assert.match(liveSource, /请重新读取/);
-  assert.match(liveSource, /不要重复提交/);
-  assert.match(liveSource, /onClick=\{\(\) => void retryPostCommitRefresh\(\)\}/);
-  assert.match(liveSource, /: "重新读取"/);
-  assert.match(liveSource, /onToast\(pending\.success\)/);
-  assert.match(liveSource, /if \(pending\.nextView\) onExit\(pending\.nextView\)/);
+  assert.equal((liveSource.match(/await runFitnessPersistThenRefresh\(/g) ?? []).length, 0);
+  assert.equal((liveSource.match(/await onRefresh\(\)/g) ?? []).length, 0);
+  for (const safePrepare of [
+    "prepareFitnessLiveExerciseAdd",
+    "prepareFitnessLiveExerciseComplete",
+    "prepareFitnessLiveExerciseSubstitute",
+  ]) assert.match(liveSource, new RegExp(`${safePrepare}\\(`));
+  assert.doesNotMatch(liveSource, /addSessionExercise|completeSessionExercise|substituteSessionExercise/);
+  assert.match(liveSource, /interactionLocked = liveWrites\.writeLocked \|\| draftStale/);
 });
 
 test("empty live sessions offer cancellation separately from an explicit empty save", () => {
-  assert.match(source, /cancelEmptyFitnessSession,/);
-  assert.match(source, /\(\) => cancelEmptyFitnessSession\(session\.id\)/);
-  assert.match(source, /nextView: returningToCalendar \? "calendar" : "today"/);
-  assert.match(source, /onExit=\{navigateToFitnessView\}/);
-  assert.doesNotMatch(source, /onExit=\{[^}]*refresh/);
+  assert.match(source, /prepareFitnessEmptySessionCancel,/);
+  assert.match(source, /prepareFitnessEmptySessionCancel\(\s*session\.id,/);
+  assert.match(source, /fitnessLiveSessionExpectationFromSnapshot\(snapshot, session\.id\)/);
+  assert.doesNotMatch(source, /onExit=\{navigateToFitnessView\}/);
   const liveActionsStart = source.indexOf('<footer className="sl-live-actions">');
   const liveActionsEnd = source.indexOf("</footer>", liveActionsStart);
   assert.ok(liveActionsStart >= 0 && liveActionsEnd > liveActionsStart);
@@ -181,7 +170,9 @@ test("empty live sessions offer cancellation separately from an explicit empty s
   assert.match(liveActions, />完成这个动作<\/button>/);
   assert.match(source, />取消误开的训练<\/button>/);
   assert.match(source, /hasActualFacts \? "结束并保存" : "保存空时段"/);
-  assert.match(source, /原来的日历安排会回到待进行/);
+  assert.match(source, /原安排会回到待进行/);
+  assert.match(source, /initialFocus="\[data-live-confirm-keep\]"/);
+  assert.doesNotMatch(source, /window\.confirm\([^)]*训练/);
 });
 
 test("the More sheet backdrop is inert to keyboard and accessibility traversal", () => {

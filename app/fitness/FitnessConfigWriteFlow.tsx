@@ -20,6 +20,7 @@ import {
   type FitnessConfigWriteJournal,
   type FitnessConfigWriteToken,
 } from "./config-write-journal";
+import { fitnessFactsRefreshApplied, type FitnessFactsRefreshOutcome } from "./live-refresh-gate";
 
 type JournalView = FitnessConfigWriteJournal & Readonly<{ loaded: boolean }>;
 
@@ -69,10 +70,14 @@ export function useFitnessConfigWriteFlow({
   refresh,
   onToast,
   onAttention,
+  onDurablePrepared,
+  onDurableCommitted,
 }: {
-  refresh: () => Promise<void>;
+  refresh: () => Promise<FitnessFactsRefreshOutcome>;
   onToast: (message: string) => void;
   onAttention: () => void;
+  onDurablePrepared?: (receipt: FitnessConfigWriteReceipt) => void;
+  onDurableCommitted?: (receipt: FitnessConfigWriteReceipt) => void;
 }) {
   const [journal, setJournal] = useState<JournalView>(EMPTY_JOURNAL);
   const [flow, setFlow] = useState<FitnessConfigFlow>({ phase: "idle" });
@@ -188,8 +193,20 @@ export function useFitnessConfigWriteFlow({
     setFlow({ phase: "working", action: "refresh" });
     setStatus(committedCopy(entry.ticket.receipt));
     setError("");
+    onDurableCommitted?.(entry.ticket.receipt);
     try {
-      await refresh();
+      const refreshOutcome = await refresh();
+      if (!fitnessFactsRefreshApplied(refreshOutcome)) {
+        showAttention({
+          phase: "refresh-only",
+          entry,
+          message: refreshOutcome === "deferred"
+            ? `${committedCopy(entry.ticket.receipt)} 当前未提交表单仍保留；明确处理后再重新读取，收据不会提前清除。`
+            : `${committedCopy(entry.ticket.receipt)} 这次读取已被更新请求取代；收据仍保留。`,
+        });
+        release(token);
+        return "attention";
+      }
     } catch {
       showAttention({
         phase: "refresh-only",
@@ -227,7 +244,7 @@ export function useFitnessConfigWriteFlow({
     } finally {
       release(token);
     }
-  }, [onToast, refresh, release, removeCurrent, reopenLatestAfterStale, showAttention]);
+  }, [onDurableCommitted, onToast, refresh, release, removeCurrent, reopenLatestAfterStale, showAttention]);
 
   const commitEntry = useCallback(async (
     entry: FitnessConfigWriteEntry,
@@ -326,6 +343,7 @@ export function useFitnessConfigWriteFlow({
       }
       const receipt = await prepare();
       entry = await persistFitnessConfigWrite(createFitnessConfigWriteTicket(receipt));
+      onDurablePrepared?.(receipt);
       reloadJournal();
       return await commitEntry(entry, success, token);
     } catch (reason) {
@@ -343,7 +361,7 @@ export function useFitnessConfigWriteFlow({
       release(token);
       throw reason;
     }
-  }, [claim, commitEntry, reloadJournal, release, showAttention]);
+  }, [claim, commitEntry, onDurablePrepared, reloadJournal, release, showAttention]);
 
   const open = useCallback((entry?: FitnessConfigWriteEntry) => {
     const next = entry ?? reloadJournal().entries[0] ?? null;
@@ -490,7 +508,17 @@ export function useFitnessConfigWriteFlow({
     const token = claim("refresh");
     if (!token) return;
     try {
-      await refresh();
+      const refreshOutcome = await refresh();
+      if (!fitnessFactsRefreshApplied(refreshOutcome)) {
+        showAttention({
+          phase: "changed",
+          entry,
+          message: refreshOutcome === "deferred"
+            ? "当前未提交表单仍保留；明确处理前不会清除旧收据。"
+            : "这次读取已被更新请求取代；旧收据仍保留。",
+        });
+        return;
+      }
       const removal = await removeCurrent(entry);
       if (removal === "blocked") {
         showAttention({ phase: "changed", entry, message: "当前资料已经变化；页面已重新读取，但出现了无法完整验证的跨页面提醒，所以旧收据仍保留。" });
