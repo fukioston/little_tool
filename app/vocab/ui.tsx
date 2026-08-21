@@ -38,6 +38,6 @@ export function AnnotatedText({ text, ranges, activeRange }: { text: string; ran
   return <>{nodes}</>;
 }
 
-export function Toggle({ label, copy, value, onChange }: { label: string; copy: string; value: boolean; onChange: (value: boolean) => void }) {
-  return <div className="sc-toggle-row"><label>{label}<small>{copy}</small></label><button type="button" role="switch" aria-label={label} aria-checked={value} className={value ? "on" : ""} onClick={() => onChange(!value)}><i /></button></div>;
+export function Toggle({ label, copy, value, disabled = false, describedBy, onChange }: { label: string; copy: string; value: boolean; disabled?: boolean; describedBy?: string; onChange: (value: boolean, trigger: HTMLButtonElement) => void }) {
+  return <div className="sc-toggle-row"><label>{label}<small>{copy}</small></label><button type="button" role="switch" aria-label={label} aria-checked={value} aria-describedby={describedBy} disabled={disabled} className={value ? "on" : ""} onClick={(event) => onChange(!value, event.currentTarget)}><i /></button></div>;
 }

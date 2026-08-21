@@ -17,18 +17,22 @@ import {
   isVocabOccurrenceWriteReceipt,
   loadVocabSnapshot,
   inspectVocabOccurrenceWrite,
+  loadVocabSettingsExpectedState,
   prepareVocabOccurrenceWrite,
+  prepareVocabSettingsSave,
   saveLexemeNote,
   saveOccurrence,
-  saveSettings,
   toggleLexemeStar,
   updateItemProgress,
   updateItemStatus,
   updateLexemeStatus,
+  VocabSettingsMutationError,
   VocabWriteConflictError,
   VocabWriteNotSavedError,
   VocabWriteUncertainError,
   type VocabOccurrenceWriteReceipt,
+  type VocabSettingsWriteReceipt,
+  type VocabSettingsWriteSnapshot,
 } from "@/lib/vocab/store";
 import type { AiExplanation, LibraryItem, SelectionTarget, VocabSettings, VocabSnapshot, VocabView } from "@/lib/vocab/types";
 import { subscribeVocabChanges } from "@/lib/vocab/lock";
@@ -37,6 +41,12 @@ import { LibraryView, PodcastView, ReaderView, ReviewView, SettingsView, StatsVi
 import { Loader, Logo } from "./ui";
 import { useOverlayDialog } from "./useOverlayDialog";
 import { SearchPalette } from "./SearchPalette";
+import {
+  VocabSettingsWriteBanner,
+  VocabSettingsWriteRecovery,
+  useVocabSettingsWriteFlow,
+  type VocabSettingsRefreshOutcome,
+} from "./VocabSettingsWriteFlow";
 
 const navigation: Array<{ id: VocabView; label: string; glyph: string }> = [
   { id: "today", label: "今日", glyph: "今" },
@@ -50,6 +60,80 @@ const empty: VocabSnapshot = {
   items: [], blocks: [], segments: [], lexemes: [], occurrences: [], reviewCards: [], bookmarks: [], activity: [],
   settings: { chinese_explanation: false, font_scale: 1, line_height: 1.92, local_lock: false, auto_follow: true, daily_new_limit: 8 },
 };
+
+type VocabSnapshotReadStatus = "loading" | "ready" | "stale";
+type VocabFactsReadBundle = Readonly<{
+  snapshot: VocabSnapshot;
+  expected: VocabSettingsWriteSnapshot;
+}>;
+type VocabSettingsDraft = Readonly<{
+  settings: VocabSettings;
+  expected: VocabSettingsWriteSnapshot;
+  revision: number;
+}>;
+
+function claimVocabSettingsDraftFlush(
+  flushedRevision: { current: number | null },
+  draft: Pick<VocabSettingsDraft, "revision">,
+) {
+  if (flushedRevision.current === draft.revision) return false;
+  flushedRevision.current = draft.revision;
+  return true;
+}
+
+function vocabSettingsOutboundBlocked(
+  confirmedLocalLock: boolean,
+  journalLoaded: boolean,
+  busy: boolean,
+  storageUnavailable: boolean,
+  unreadableCount: number,
+  entryCount: number,
+  operationInProgress = false,
+) {
+  return confirmedLocalLock || !journalLoaded || busy || storageUnavailable ||
+    unreadableCount > 0 || entryCount > 0 || operationInProgress;
+}
+
+function sameVocabSettings(left: VocabSettings, right: VocabSettings) {
+  return left.chinese_explanation === right.chinese_explanation &&
+    left.font_scale === right.font_scale &&
+    left.line_height === right.line_height &&
+    left.local_lock === right.local_lock &&
+    left.auto_follow === right.auto_follow &&
+    left.daily_new_limit === right.daily_new_limit;
+}
+
+function sameVocabSettingsExpectedState(
+  left: VocabSettingsWriteSnapshot,
+  right: VocabSettingsWriteSnapshot,
+) {
+  return left.generationId === right.generationId &&
+    left.generationSequence === right.generationSequence &&
+    sameVocabSettings(left.settings, right.settings) &&
+    left.rows.length === right.rows.length &&
+    left.rows.every((row, index) => {
+      const other = right.rows[index];
+      return row === null || other === null
+        ? row === other
+        : row.key === other.key && row.value === other.value && row.updated_at === other.updated_at;
+    });
+}
+
+async function loadVocabFactsWithSettingsExpected(): Promise<VocabFactsReadBundle> {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const expectedBefore = await loadVocabSettingsExpectedState();
+    const facts = await loadVocabSnapshot();
+    const expectedAfter = await loadVocabSettingsExpectedState();
+    if (sameVocabSettingsExpectedState(expectedBefore, expectedAfter) &&
+        sameVocabSettings(facts.settings, expectedAfter.settings)) {
+      return {
+        snapshot: { ...facts, settings: expectedAfter.settings },
+        expected: expectedAfter,
+      };
+    }
+  }
+  throw new Error("设置在读取期间持续变化；这次没有拼接新旧词库资料，请重新尝试。");
+}
 
 class VocabSnapshotSupersededError extends Error {
   constructor() {
@@ -145,6 +229,12 @@ type PendingOccurrenceWrite = Readonly<{
 export default function VocabApp() {
   const { mobile, sideOpen, setSideOpen } = useVocabMobileLayout();
   const [snapshot, setSnapshot] = useState<VocabSnapshot>(empty);
+  const [settingsExpected, setSettingsExpected] = useState<VocabSettingsWriteSnapshot | null>(null);
+  const [snapshotReadStatus, setSnapshotReadStatus] = useState<VocabSnapshotReadStatus>("loading");
+  const [settingsDraft, setSettingsDraft] = useState<VocabSettingsDraft | null>(null);
+  const [settingsExternalPending, setSettingsExternalPending] = useState(false);
+  const [settingsWriteNotice, setSettingsWriteNotice] = useState("");
+  const [settingsRecoveryOpen, setSettingsRecoveryOpen] = useState(false);
   const [ready, setReady] = useState(false);
   const [fatal, setFatal] = useState("");
   const [view, setView] = useState<VocabView>("today");
@@ -175,6 +265,23 @@ export default function VocabApp() {
   const committedOccurrenceRef = useRef<{ surface: string } | null>(null);
   const wordAbandonOpenerRef = useRef<HTMLElement | null>(null);
   const snapshotReadRequestRef = useRef(0);
+  const snapshotRef = useRef(snapshot);
+  const settingsExpectedRef = useRef<VocabSettingsWriteSnapshot | null>(null);
+  const settingsDraftRef = useRef<VocabSettingsDraft | null>(null);
+  const flushedSettingsDraftRevisionRef = useRef<number | null>(null);
+  const pendingSettingsBundleRef = useRef<Readonly<{ requestId: number; bundle: VocabFactsReadBundle }> | null>(null);
+  const settingsPrepareBindingRef = useRef<Readonly<{
+    trigger: HTMLElement;
+    revision: number | null;
+    expected: VocabSettingsWriteSnapshot;
+  }> | null>(null);
+  const submittedSettingsRef = useRef<Readonly<{
+    operationId: string;
+    trigger: HTMLElement;
+    revision: number | null;
+    expected: VocabSettingsWriteSnapshot;
+  }> | null>(null);
+  const settingsFocusFrame = useRef<number | null>(null);
   const sidebarOpener = useRef<HTMLButtonElement>(null);
   const sidebarFocusFrame = useRef<number | null>(null);
   const focusSidebarOpenerAfterClose = useCallback(() => {
@@ -211,19 +318,243 @@ export default function VocabApp() {
     }
   }, []);
 
-  const readAndApplySnapshot = useCallback(async () => {
-    const request = ++snapshotReadRequestRef.current;
-    const data = await loadVocabSnapshot();
-    if (request !== snapshotReadRequestRef.current) {
-      throw new VocabSnapshotSupersededError();
-    }
-    setSnapshot(data);
-    return data;
+  const applyVocabFactsBundle = useCallback((bundle: VocabFactsReadBundle) => {
+    snapshotRef.current = bundle.snapshot;
+    settingsExpectedRef.current = bundle.expected;
+    setSnapshot(bundle.snapshot);
+    setSettingsExpected(bundle.expected);
+    setSnapshotReadStatus("ready");
+    setReady(true);
   }, []);
+
+  const readVocabFacts = useCallback(async (): Promise<Readonly<{
+    outcome: VocabSettingsRefreshOutcome;
+    snapshot: VocabSnapshot;
+  }>> => {
+    const requestId = ++snapshotReadRequestRef.current;
+    try {
+      const bundle = await loadVocabFactsWithSettingsExpected();
+      if (requestId !== snapshotReadRequestRef.current) {
+        return { outcome: "superseded", snapshot: snapshotRef.current };
+      }
+      const draft = settingsDraftRef.current;
+      if (draft) {
+        const settingsChanged = !sameVocabSettingsExpectedState(draft.expected, bundle.expected);
+        if (settingsChanged) {
+          pendingSettingsBundleRef.current = { requestId, bundle };
+          setSettingsExternalPending(true);
+          return { outcome: "deferred", snapshot: snapshotRef.current };
+        }
+        const nextSnapshot = { ...bundle.snapshot, settings: draft.expected.settings };
+        snapshotRef.current = nextSnapshot;
+        setSnapshot(nextSnapshot);
+        setSnapshotReadStatus("ready");
+        setReady(true);
+        pendingSettingsBundleRef.current = null;
+        setSettingsExternalPending(false);
+        return { outcome: "applied", snapshot: nextSnapshot };
+      }
+      pendingSettingsBundleRef.current = null;
+      setSettingsExternalPending(false);
+      applyVocabFactsBundle(bundle);
+      return { outcome: "applied", snapshot: bundle.snapshot };
+    } catch (reason) {
+      if (requestId === snapshotReadRequestRef.current) setSnapshotReadStatus("stale");
+      throw reason;
+    }
+  }, [applyVocabFactsBundle]);
+
+  const readAndApplySnapshot = useCallback(async () => {
+    const result = await readVocabFacts();
+    if (result.outcome === "superseded") throw new VocabSnapshotSupersededError();
+    return result.snapshot;
+  }, [readVocabFacts]);
 
   const refresh = useCallback(async () => {
     await readAndApplySnapshot();
   }, [readAndApplySnapshot]);
+
+  const refreshSettingsFacts = useCallback(async (): Promise<VocabSettingsRefreshOutcome> => {
+    return (await readVocabFacts()).outcome;
+  }, [readVocabFacts]);
+
+  const clearSettingsDraft = useCallback(() => {
+    settingsDraftRef.current = null;
+    flushedSettingsDraftRevisionRef.current = null;
+    setSettingsDraft(null);
+  }, []);
+
+  const rememberPreparedSettings = useCallback((receipt: VocabSettingsWriteReceipt) => {
+    const binding = settingsPrepareBindingRef.current;
+    settingsPrepareBindingRef.current = null;
+    if (!binding || !sameVocabSettingsExpectedState(binding.expected, receipt.before)) return;
+    submittedSettingsRef.current = {
+      operationId: receipt.operationId,
+      trigger: binding.trigger,
+      revision: binding.revision,
+      expected: binding.expected,
+    };
+  }, []);
+
+  const consumeCommittedSettingsDraft = useCallback((receipt: VocabSettingsWriteReceipt) => {
+    const submitted = submittedSettingsRef.current;
+    const draft = settingsDraftRef.current;
+    if (!submitted || submitted.operationId !== receipt.operationId || submitted.revision === null ||
+        !draft || draft.revision !== submitted.revision || draft.expected !== submitted.expected ||
+        !sameVocabSettingsExpectedState(draft.expected, receipt.before) ||
+        !sameVocabSettings(draft.settings, receipt.after.settings)) return;
+    clearSettingsDraft();
+    pendingSettingsBundleRef.current = null;
+    setSettingsExternalPending(false);
+  }, [clearSettingsDraft]);
+
+  const settleSettingsWrite = useCallback((receipt: VocabSettingsWriteReceipt) => {
+    const submitted = submittedSettingsRef.current;
+    if (!submitted || submitted.operationId !== receipt.operationId) return;
+    submittedSettingsRef.current = null;
+    settingsPrepareBindingRef.current = null;
+    setSettingsRecoveryOpen(false);
+    setSettingsWriteNotice("");
+    if (settingsFocusFrame.current !== null) window.cancelAnimationFrame(settingsFocusFrame.current);
+    settingsFocusFrame.current = window.requestAnimationFrame(() => {
+      settingsFocusFrame.current = window.requestAnimationFrame(() => {
+        settingsFocusFrame.current = null;
+        const trigger = submitted.trigger;
+        const target = trigger.isConnected && trigger.getClientRects().length > 0
+          ? trigger
+          : document.querySelector<HTMLElement>(".sc-settings-page .sc-page-title h1, .sc-podcast-head h1, .sc-page .sc-page-title h1");
+        if (!target?.isConnected || target.getClientRects().length === 0) return;
+        if (target.matches("h1")) target.tabIndex = -1;
+        target.focus({ preventScroll: true });
+      });
+    });
+  }, []);
+
+  const settingsWrites = useVocabSettingsWriteFlow({
+    refresh: refreshSettingsFacts,
+    onToast: setToast,
+    onAttention: () => setSettingsRecoveryOpen(true),
+    onDurablePrepared: rememberPreparedSettings,
+    onDurableCommitted: consumeCommittedSettingsDraft,
+    onDurableSettled: settleSettingsWrite,
+  });
+  const effectiveLocalLock = vocabSettingsOutboundBlocked(
+    snapshot.settings.local_lock,
+    settingsWrites.journal.loaded,
+    settingsWrites.busy,
+    settingsWrites.journal.storageUnavailable,
+    settingsWrites.journal.unreadable.length,
+    settingsWrites.journal.entries.length,
+  );
+  const settingsOutboundBlocked = useCallback(() => vocabSettingsOutboundBlocked(
+    snapshotRef.current.settings.local_lock,
+    settingsWrites.journal.loaded,
+    settingsWrites.busy,
+    settingsWrites.journal.storageUnavailable,
+    settingsWrites.journal.unreadable.length,
+    settingsWrites.journal.entries.length,
+    settingsWrites.operationInProgress(),
+  ), [settingsWrites]);
+
+  const updateSettingsDraft = useCallback((patch: Partial<VocabSettings>) => {
+    if (snapshotReadStatus !== "ready" || settingsWrites.writeLocked || settingsWrites.operationInProgress()) return;
+    const current = settingsDraftRef.current;
+    const expected = current?.expected ?? settingsExpectedRef.current;
+    if (!expected || (!current && snapshotRef.current.settings !== expected.settings)) {
+      setSnapshotReadStatus("stale");
+      setSettingsWriteNotice("设置与安全读取凭据没有成对就绪；没有改动草稿，请先只重新读取。");
+      return;
+    }
+    const next: VocabSettingsDraft = {
+      settings: { ...(current?.settings ?? expected.settings), ...patch },
+      expected,
+      revision: (current?.revision ?? 0) + 1,
+    };
+    settingsDraftRef.current = next;
+    setSettingsDraft(next);
+    setSettingsWriteNotice("");
+  }, [settingsWrites, snapshotReadStatus]);
+
+  const requestSettingsSave = useCallback(async (
+    next: VocabSettings,
+    expected: VocabSettingsWriteSnapshot,
+    trigger: HTMLElement,
+    revision: number | null,
+  ) => {
+    if (snapshotReadStatus !== "ready" || settingsWrites.writeLocked || settingsWrites.operationInProgress() ||
+        settingsExpectedRef.current !== expected || snapshotRef.current.settings !== expected.settings) {
+      setSnapshotReadStatus("stale");
+      setSettingsWriteNotice("当前设置与安全读取凭据不再属于同一次读取；仍显示上次确认内容，请先只重新读取。");
+      return;
+    }
+    setSettingsWriteNotice("");
+    const binding = { trigger, revision, expected } as const;
+    settingsPrepareBindingRef.current = binding;
+    try {
+      await settingsWrites.start(
+        () => prepareVocabSettingsSave(next, expected),
+        "设置已保存在当前浏览器的本地词库",
+      );
+    } catch (reason) {
+      setSnapshotReadStatus("stale");
+      setSettingsWriteNotice(reason instanceof VocabSettingsMutationError && reason.code === "changed"
+        ? "另一页已经更新了设置；这次没有写入，当前草稿仍保留。请明确放弃草稿后只重新读取。"
+        : `${errorMessage(reason)} 没有确认安全收据是否完整保留；当前显示不会冒充已保存。`);
+    } finally {
+      if (settingsPrepareBindingRef.current === binding) settingsPrepareBindingRef.current = null;
+    }
+  }, [settingsWrites, snapshotReadStatus]);
+
+  const submitSettingsDraft = useCallback((trigger: HTMLElement) => {
+    const draft = settingsDraftRef.current;
+    if (!draft || !claimVocabSettingsDraftFlush(flushedSettingsDraftRevisionRef, draft)) return;
+    void requestSettingsSave(draft.settings, draft.expected, trigger, draft.revision);
+  }, [requestSettingsSave]);
+
+  const requestSettingsChange = useCallback((
+    patch: Partial<VocabSettings>,
+    trigger: HTMLElement,
+  ) => {
+    if (settingsDraftRef.current) {
+      if (!settingsWrites.operationInProgress()) {
+        setSettingsWriteNotice("先松开或离开正在调整的滑块；这次开关没有另起一笔写入。");
+      }
+      return;
+    }
+    const expected = settingsExpectedRef.current;
+    if (!expected) {
+      setSnapshotReadStatus("stale");
+      setSettingsWriteNotice("设置读取凭据尚未就绪；开关没有改动。");
+      return;
+    }
+    void requestSettingsSave({ ...expected.settings, ...patch }, expected, trigger, null);
+  }, [requestSettingsSave, settingsWrites]);
+
+  const discardSettingsDraftAndRead = useCallback(() => {
+    clearSettingsDraft();
+    const pending = pendingSettingsBundleRef.current;
+    pendingSettingsBundleRef.current = null;
+    setSettingsExternalPending(false);
+    setSettingsWriteNotice("");
+    if (pending && pending.requestId === snapshotReadRequestRef.current) {
+      applyVocabFactsBundle(pending.bundle);
+      return;
+    }
+    void readVocabFacts().catch((reason) => {
+      setSettingsWriteNotice(`${errorMessage(reason)} 仍显示上次成功读取的设置。`);
+    });
+  }, [applyVocabFactsBundle, clearSettingsDraft, readVocabFacts]);
+
+  const rereadSettingsTruth = useCallback(() => {
+    if (settingsDraftRef.current) {
+      discardSettingsDraftAndRead();
+      return;
+    }
+    setSettingsWriteNotice("");
+    void readVocabFacts().catch((reason) => {
+      setSettingsWriteNotice(`${errorMessage(reason)} 仍显示上次成功读取的设置。`);
+    });
+  }, [discardSettingsDraftAndRead, readVocabFacts]);
 
   const refreshStorageStatus = useCallback(async () => {
     const next = await estimateLocalStorage();
@@ -251,21 +582,20 @@ export default function VocabApp() {
     void (async () => {
       try {
         await initializeVocabDatabase();
-        const request = ++snapshotReadRequestRef.current;
-        const data = await loadVocabSnapshot();
-        if (request !== snapshotReadRequestRef.current) return;
+        const data = await readAndApplySnapshot();
         if (!live) return;
-        setSnapshot(data);
         setShowChinese(data.settings.chinese_explanation);
         setActiveItemId(data.items.find((item) => item.status === "in_progress")?.id ?? data.items[0]?.id ?? null);
-        setReady(true);
         void refreshStorageStatus().catch(() => undefined);
       } catch (error) {
         if (live) setFatal(errorMessage(error));
       }
     })();
-    return () => { live = false; };
-  }, [refreshStorageStatus]);
+    return () => {
+      live = false;
+      snapshotReadRequestRef.current += 1;
+    };
+  }, [readAndApplySnapshot, refreshStorageStatus]);
 
   useEffect(() => {
     let live = true;
@@ -289,6 +619,29 @@ export default function VocabApp() {
   }, [ready, refresh]);
 
   useEffect(() => {
+    if (!ready) return;
+    const refreshVisibleFacts = () => { void refresh().catch(() => undefined); };
+    const onVisibility = () => { if (document.visibilityState === "visible") refreshVisibleFacts(); };
+    window.addEventListener("focus", refreshVisibleFacts);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      window.removeEventListener("focus", refreshVisibleFacts);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [ready, refresh]);
+
+  useEffect(() => {
+    if (!settingsDraft) return;
+    const protectDraft = (event: BeforeUnloadEvent) => event.preventDefault();
+    window.addEventListener("beforeunload", protectDraft);
+    return () => window.removeEventListener("beforeunload", protectDraft);
+  }, [settingsDraft]);
+
+  useEffect(() => () => {
+    if (settingsFocusFrame.current !== null) window.cancelAnimationFrame(settingsFocusFrame.current);
+  }, []);
+
+  useEffect(() => {
     if (!toast) return;
     const timeout = window.setTimeout(() => setToast(""), 3200);
     return () => window.clearTimeout(timeout);
@@ -302,6 +655,10 @@ export default function VocabApp() {
     aiRequest.current = null;
     setAiBusy(false);
   }, []);
+
+  useEffect(() => {
+    if (effectiveLocalLock) aiRequest.current?.controller.abort();
+  }, [effectiveLocalLock]);
 
   const clearSelection = useCallback(() => {
     if (wordSaveBusyRef.current) return;
@@ -366,7 +723,7 @@ export default function VocabApp() {
 
   const askAiFor = useCallback(async (target: SelectionTarget, includeChinese: boolean) => {
     const key = selectionIdentity(target);
-    if (snapshot.settings.local_lock) {
+    if (settingsOutboundBlocked()) {
       setAiError("本地锁已开启。这个语境仍可保存在本地，但不会发送给 AI。");
       return;
     }
@@ -389,7 +746,7 @@ export default function VocabApp() {
         setAiBusy(false);
       }
     }
-  }, [snapshot.settings.local_lock]);
+  }, [settingsOutboundBlocked]);
 
   const selectText = useCallback((target: SelectionTarget) => {
     if (
@@ -424,7 +781,7 @@ export default function VocabApp() {
   const addChinese = useCallback(async () => {
     const target = selectionRef.current;
     if (!target || !explanation) return;
-    if (snapshot.settings.local_lock) { setAiError("本地锁已开启。"); return; }
+    if (settingsOutboundBlocked()) { setAiError("本地锁已开启或正在安全确认；没有发送内容。"); return; }
     const key = selectionIdentity(target);
     if (explanationKey.current !== key) return;
     aiRequest.current?.controller.abort();
@@ -444,7 +801,7 @@ export default function VocabApp() {
         setAiBusy(false);
       }
     }
-  }, [explanation, snapshot.settings.local_lock]);
+  }, [explanation, settingsOutboundBlocked]);
 
   const finishWordBusy = useCallback(() => {
     wordSaveBusyRef.current = false;
@@ -666,12 +1023,6 @@ export default function VocabApp() {
     return savePickedWord(note);
   }, [inspectPendingWord, refreshCommittedWord, requestAbandonConflictedWord, savePickedWord, wordSavePhase]);
 
-  const changeSettings = useCallback(async (patch: Partial<VocabSettings>) => {
-    const next = { ...snapshot.settings, ...patch };
-    setSnapshot((current) => ({ ...current, settings: next }));
-    await saveSettings(next);
-  }, [snapshot.settings]);
-
   const recordReaderProgress = useCallback(async (item: LibraryItem, progress: number) => {
     await updateItemProgress(item.id, Math.max(0, Math.min(.99, progress)));
   }, []);
@@ -716,13 +1067,33 @@ export default function VocabApp() {
     return () => window.removeEventListener("keydown", shortcuts);
   }, [askAi, selection, wordPrimaryAction]);
 
-  if (fatal) return <main className="shici sc-fatal"><Logo /><section><span>数据库未能打开</span><h1>你的内容没有被改动。</h1><p>{fatal}</p><button onClick={() => window.location.reload()}>重新尝试</button></section></main>;
+  if (fatal) return <main className="shici sc-fatal"><Logo /><section><span>词库暂时没有完整打开</span><h1>你的内容没有被改动。</h1><p>{fatal}</p><button onClick={() => window.location.reload()}>重新尝试</button></section></main>;
   if (!ready) return <Loader />;
 
   const pageLabel = navigation.find((entry) => entry.id === view)?.label ?? (view === "reader" ? "阅读" : view === "podcast" ? "收听" : "设置");
   const persistenceSupported = supportsPersistentLocalStorage();
   const sidebarHidden = mobile && !sideOpen;
-  return <main className="shici" style={{ "--reader-scale": snapshot.settings.font_scale, "--reader-leading": snapshot.settings.line_height } as CSSProperties}>
+  const displayedSettings = settingsDraft?.settings ?? snapshot.settings;
+  const settingsPairBound = settingsExpected !== null && snapshot.settings === settingsExpected.settings &&
+    (!settingsDraft || settingsDraft.expected === settingsExpected);
+  const settingsControlsLocked = snapshotReadStatus !== "ready" || !settingsPairBound || settingsWrites.writeLocked;
+  const settingsControlStatus = settingsWrites.busy
+    ? "正在安全确认设置；结果明确前不会开始另一笔写入。"
+    : snapshotReadStatus !== "ready"
+      ? "当前显示上次成功读取的设置；明确重新读取前，设置控件保持停用。"
+      : !settingsPairBound
+        ? "设置与安全读取凭据没有成对就绪；没有据此写入。"
+        : settingsWrites.writeLocked
+          ? "先处理页面上方的设置核对提醒；当前确认内容仍完整显示。"
+          : settingsExternalPending
+            ? "另一页的设置已经变化；当前滑块草稿仍按开始调整时的完整设置保留，不会自动重签。"
+            : settingsDraft
+              ? "这只是尚未确认的本地预览；松开滑块或离开控件时才会准备一张安全收据。"
+              : "";
+  const globalSettingsNotice = settingsWriteNotice || (settingsExternalPending
+    ? "另一页有更新的设置；当前草稿与原读取凭据仍成对保留。"
+    : "");
+  return <main className="shici" style={{ "--reader-scale": displayedSettings.font_scale, "--reader-leading": displayedSettings.line_height } as CSSProperties}>
     <aside ref={sidebarDialog} id="sc-navigation" className={`sc-sidebar ${sideOpen ? "open" : ""}`} role={mobile && sideOpen ? "dialog" : undefined} aria-modal={mobile && sideOpen ? true : undefined} aria-label="拾词导航" aria-hidden={sidebarHidden || undefined} inert={sidebarHidden || undefined} tabIndex={sidebarHidden ? -1 : mobile && sideOpen ? -1 : undefined}>
       <button data-sidebar-close className="sc-sidebar-close" tabIndex={sidebarHidden ? -1 : undefined} onClick={closeMobileSidebar} aria-label="关闭导航">×</button>
       <Link href="/" className="sc-brand" aria-label="返回私人工作台" tabIndex={sidebarHidden ? -1 : undefined}><Logo /></Link>
@@ -731,21 +1102,24 @@ export default function VocabApp() {
     </aside>
     <section className="sc-main">
       <header className="sc-topbar"><button ref={sidebarOpener} className="sc-menu" onClick={() => setSideOpen((value) => !value)} aria-expanded={sideOpen} aria-controls="sc-navigation" aria-label={sideOpen ? "关闭导航" : "打开导航"}>拾</button><div className="sc-crumb"><span>拾词</span><b>/</b><strong>{pageLabel}</strong></div><div className="sc-top-actions"><button className="sc-search-jump" aria-label="搜索资料、词和语境" onClick={() => setSearchOpen(true)}>⌕ <span>搜索</span><kbd>⌘ K</kbd></button><button className="sc-import" aria-label="导入内容" onClick={() => setImportOpen(true)}>＋ <span>导入内容</span></button></div></header>
+      <VocabSettingsWriteBanner controller={settingsWrites} />
+      {settingsRecoveryOpen && <VocabSettingsWriteRecovery controller={settingsWrites} />}
+      {globalSettingsNotice && <section className="sc-settings-truth-notice" role="status"><span>{globalSettingsNotice}</span><button type="button" disabled={settingsWrites.busy} onClick={rereadSettingsTruth}>{settingsDraft ? "放弃草稿并读取最新设置" : "只重新读取"}</button></section>}
       <div className="sc-view">
         {view === "today" && <TodayView snapshot={snapshot} due={dueCards.length} onOpen={openItem} onGo={go} onImport={() => setImportOpen(true)} onWord={setWordId} />}
         {view === "library" && <LibraryView items={snapshot.items} onOpen={openItem} onImport={() => setImportOpen(true)} onArchive={async (item) => { await updateItemStatus(item.id, item.status === "archived" ? "unread" : "archived"); await refresh(); }} />}
         {view === "reader" && <ReaderView item={activeItem?.kind === "article" ? activeItem : snapshot.items.find((item) => item.kind === "article") ?? null} blocks={snapshot.blocks} occurrences={snapshot.occurrences} bookmarks={snapshot.bookmarks} onSelect={selectText} onBack={() => go("library")} onProgress={recordReaderProgress} onFinish={async (item) => { await updateItemProgress(item.id, 1, true); await refresh(); setToast("已标记为读完，随时可以改回阅读中"); }} onBookmark={async (item, block) => { await createBookmark(item.id, block?.id ?? "top", block?.text.slice(0, 30) ?? item.title); await refresh(); setToast("已收藏当前位置"); }} />}
-        {view === "podcast" && <PodcastView key={(activeItem?.kind === "podcast" ? activeItem : snapshot.items.find((item) => item.kind === "podcast"))?.id ?? "empty-podcast"} item={activeItem?.kind === "podcast" ? activeItem : snapshot.items.find((item) => item.kind === "podcast") ?? null} segments={snapshot.segments} occurrences={snapshot.occurrences} autoFollow={snapshot.settings.auto_follow} localLock={snapshot.settings.local_lock} onAutoFollow={(value) => void changeSettings({ auto_follow: value })} onSelect={selectText} onProgress={recordPodcastProgress} onBookmark={async (item, ms, label) => { await createBookmark(item.id, `t:${ms}`, label); await refresh(); setToast("已收藏此刻"); }} />}
+        {view === "podcast" && <PodcastView key={(activeItem?.kind === "podcast" ? activeItem : snapshot.items.find((item) => item.kind === "podcast"))?.id ?? "empty-podcast"} item={activeItem?.kind === "podcast" ? activeItem : snapshot.items.find((item) => item.kind === "podcast") ?? null} segments={snapshot.segments} occurrences={snapshot.occurrences} autoFollow={snapshot.settings.auto_follow} autoFollowWriteLocked={settingsControlsLocked} autoFollowWriteBusy={settingsWrites.busy} autoFollowStatus={settingsControlStatus} localLock={effectiveLocalLock} onAutoFollow={(value, trigger) => requestSettingsChange({ auto_follow: value }, trigger)} onSelect={selectText} onProgress={recordPodcastProgress} onBookmark={async (item, ms, label) => { await createBookmark(item.id, `t:${ms}`, label); await refresh(); setToast("已收藏此刻"); }} />}
         {view === "words" && <WordsView lexemes={snapshot.lexemes} occurrences={snapshot.occurrences} onOpen={setWordId} onStar={async (word) => { await toggleLexemeStar(word.id, !word.starred); await refresh(); }} />}
         {view === "review" && <ReviewView cards={snapshot.reviewCards} onRefresh={refresh} onGo={go} />}
         {view === "stats" && <StatsView snapshot={snapshot} />}
-        {view === "settings" && <SettingsView settings={snapshot.settings} storage={storageStatus} persistenceSupported={persistenceSupported} onChange={changeSettings} onExport={exportBackup} onRestoreRefresh={refreshAfterBackupActivation} onPersist={async () => { const granted = await requestPersistentLocalStorage(); const checked = await refreshStorageStatus(); return checked.persisted ?? granted; }} onTestAi={async () => { if (snapshot.settings.local_lock) throw new Error("请先关闭本地锁"); const response = await fetch("/api/health", { headers: { Accept: "application/json" } }); const health = await response.json() as { ai?: { configured?: boolean } }; if (!response.ok) throw new Error("无法检查 AI 服务状态"); if (!health.ai?.configured) throw new Error("DeepSeek API Key 尚未配置"); }} />}
+        {view === "settings" && <SettingsView settings={displayedSettings} settingsDraftDirty={Boolean(settingsDraft)} settingsWriteLocked={settingsControlsLocked} settingsWriteBusy={settingsWrites.busy} settingsWriteStatus={settingsControlStatus} storage={storageStatus} persistenceSupported={persistenceSupported} onDraftChange={updateSettingsDraft} onDraftCommit={submitSettingsDraft} onToggle={(patch, trigger) => requestSettingsChange(patch, trigger)} onDiscardDraft={discardSettingsDraftAndRead} onExport={exportBackup} onRestoreRefresh={refreshAfterBackupActivation} onPersist={async () => { const granted = await requestPersistentLocalStorage(); const checked = await refreshStorageStatus(); return checked.persisted ?? granted; }} onTestAi={async () => { if (settingsOutboundBlocked()) throw new Error("本地锁已开启或正在安全确认；没有发出检查请求"); const response = await fetch("/api/health", { headers: { Accept: "application/json" } }); const health = await response.json() as { ai?: { configured?: boolean } }; if (!response.ok) throw new Error("无法检查 AI 服务状态"); if (!health.ai?.configured) throw new Error("DeepSeek API Key 尚未配置"); }} />}
       </div>
     </section>
     <nav className="sc-mobile-tabs" aria-label="拾词页面">{navigation.slice(0, 4).map((item) => <button key={item.id} aria-current={view === item.id ? "page" : undefined} className={view === item.id ? "active" : ""} onClick={() => go(item.id)}><i>{item.glyph}</i><span>{item.label}</span></button>)}</nav>
     {selection && <ContextPanel target={selection} explanation={explanation} loading={aiBusy} error={aiError} showChinese={showChinese} saveBusy={wordSaveBusy} saveLabel={wordSavePhase === "uncertain" ? "只读核对" : wordSavePhase === "conflict" ? "移除这条提醒" : wordSavePhase === "refresh_failed" ? "只刷新词库" : "＋ 收入词库"} saveMessage={wordSaveMessage} confirmReminderRemoval={wordAbandonConfirm} onChinese={async (value) => { setShowChinese(value); if (value && explanation && !explanation.sense?.explanation_zh) await addChinese(); }} onExplain={() => void askAi()} onSave={wordPrimaryAction} onCancelReminderRemoval={cancelWordAbandon} onConfirmReminderRemoval={abandonConflictedWord} onClose={requestCloseSelection} />}
     {wordId && <WordDetail key={wordId} word={snapshot.lexemes.find((word) => word.id === wordId) ?? null} occurrences={snapshot.occurrences.filter((item) => item.lexeme_id === wordId)} onClose={() => setWordId(null)} onNote={async (id, note) => { await saveLexemeNote(id, note); await refresh(); setToast("笔记已保存"); }} onStatus={async (id, status) => { await updateLexemeStatus(id, status); await refresh(); }} />}
-    {importOpen && <ImportWizard localLock={snapshot.settings.local_lock} onClose={() => setImportOpen(false)} onImported={async (id) => { const data = await readAndApplySnapshot(); setImportOpen(false); const item = data.items.find((entry) => entry.id === id); if (item) openItem(item); setToast("内容已存入本地资料库"); }} />}
+    {importOpen && <ImportWizard localLock={effectiveLocalLock} onClose={() => setImportOpen(false)} onImported={async (id) => { const data = await readAndApplySnapshot(); setImportOpen(false); const item = data.items.find((entry) => entry.id === id); if (item) openItem(item); setToast("内容已存入本地资料库"); }} />}
     {searchOpen && <SearchPalette snapshot={snapshot} onClose={() => setSearchOpen(false)} onOpenItem={openItem} onOpenWord={(id) => { setWordId(id); }} />}
     {!selection && !toast && (occurrenceRecovery || (wordSavePhase === "refresh_failed" && committedOccurrence)) && (wordAbandonConfirm ? <div className="sc-toast sc-toast-confirm" role="group" aria-label="是否只移除这条恢复提醒"><span>词库内容会原样保留</span><div><button data-word-reminder-keep onClick={cancelWordAbandon}>继续保留提醒</button><button className="danger" onClick={() => void abandonConflictedWord()}>只移除提醒</button></div></div> : <button data-word-recovery-primary className="sc-toast" disabled={wordSaveBusy} aria-label={wordSavePhase === "refresh_failed" ? "上次收词已保存，只刷新词库" : wordSavePhase === "conflict" ? "移除这条冲突提醒" : "只读核对上次收词结果"} onClick={() => void wordPrimaryAction()}><span>{wordSaveBusy ? "正在确认…" : wordSavePhase === "refresh_failed" ? "上次收词已保存" : wordSavePhase === "conflict" ? "发现冲突，不会改库" : "上次收词待核对"}</span>{wordSavePhase === "refresh_failed" ? "只刷新词库" : wordSavePhase === "conflict" ? "移除提醒" : "只读核对"}</button>)}
     {toast && <div className="sc-toast" role="status"><span>✓</span>{toast}</div>}

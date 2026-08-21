@@ -138,6 +138,30 @@ export function WordDetail({ word, occurrences, onClose, onNote, onStatus }: { w
 
 type ImportPhase = "idle" | "preparing" | "committing" | "refreshing" | "uncertain" | "conflict" | "recovery_absent" | "refresh_failed";
 
+class VocabLocalLockImportError extends Error {
+  constructor(message = "本地锁已开启；远程读取已经停止，没有继续发送内容。") {
+    super(message);
+    this.name = "VocabLocalLockImportError";
+  }
+}
+
+function assertVocabExternalImportAllowed(
+  localLock: boolean,
+  signal: AbortSignal,
+  message: string,
+) {
+  throwIfVocabImportAborted(signal);
+  if (localLock) throw new VocabLocalLockImportError(message);
+}
+
+function throwIfVocabImportAborted(signal: AbortSignal) {
+  if (signal.aborted) throw signal.reason;
+}
+
+function isVocabLocalLockImportError(reason: unknown): reason is VocabLocalLockImportError {
+  return reason instanceof VocabLocalLockImportError;
+}
+
 export function ImportWizard({ localLock, onClose, onImported }: { localLock: boolean; onClose: () => void; onImported: (id: string) => void | Promise<void> }) {
   const [kind, setKind] = useState<"article" | "rss" | "audio">("article");
   const [articleMode, setArticleMode] = useState<"url" | "paste" | "file">("url");
@@ -158,6 +182,7 @@ export function ImportWizard({ localLock, onClose, onImported }: { localLock: bo
   const [confirmAbandon, setConfirmAbandon] = useState(false);
   const [transcriptionConfigured, setTranscriptionConfigured] = useState<boolean | null>(null);
   const operation = useRef<AbortController | null>(null);
+  const healthOperation = useRef<AbortController | null>(null);
   const busyRef = useRef(false);
   const closed = useRef(false);
   const activeRecovery = useRef<ImportRecovery | null>(null);
@@ -190,25 +215,43 @@ export function ImportWizard({ localLock, onClose, onImported }: { localLock: bo
       setPhase("uncertain");
       setError("上次导入没有留下完整回执。先只读核对，不会重复写入或删除文件。");
     });
+    return () => {
+      live = false;
+      closed.current = true;
+      healthOperation.current?.abort();
+      operation.current?.abort();
+    };
+  }, []);
+
+  useEffect(() => {
+    healthOperation.current?.abort();
+    healthOperation.current = null;
+    if (localLock) {
+      const active = operation.current;
+      if (active && !active.signal.aborted) active.abort(new VocabLocalLockImportError());
+      return;
+    }
     const controller = new AbortController();
+    healthOperation.current = controller;
+    assertVocabExternalImportAllowed(localLock, controller.signal, "本地锁已开启；没有检查外部服务状态。");
     void fetch("/api/health", {
       headers: { Accept: "application/json" },
       signal: controller.signal,
     }).then(async (response) => {
       const payload = await response.json() as { transcription?: { configured?: boolean } };
-      if (!closed.current) {
+      if (!closed.current && healthOperation.current === controller) {
         setTranscriptionConfigured(Boolean(response.ok && payload.transcription?.configured));
       }
     }).catch(() => {
-      if (!closed.current && !controller.signal.aborted) setTranscriptionConfigured(false);
+      if (!closed.current && !controller.signal.aborted && healthOperation.current === controller) {
+        setTranscriptionConfigured(false);
+      }
     });
     return () => {
-      live = false;
-      closed.current = true;
       controller.abort();
-      operation.current?.abort();
+      if (healthOperation.current === controller) healthOperation.current = null;
     };
-  }, []);
+  }, [localLock]);
 
   useEffect(() => {
     if (!confirmAbandon) return;
@@ -305,12 +348,13 @@ export function ImportWizard({ localLock, onClose, onImported }: { localLock: bo
       if (kind === "article") {
         let article;
         if (articleMode === "url") {
-          if (localLock) throw new Error("本地锁已开启。可以改用粘贴或文件导入。");
+          assertVocabExternalImportAllowed(localLock, controller.signal, "本地锁已开启。可以改用粘贴或文件导入；没有读取这个网址。");
           if (!/^https?:\/\//i.test(url)) throw new Error("请输入完整的 http 或 https 地址");
           setStage(1);
           article = normalizeArticleApi(
             await postJson("/api/import/article", { url }, controller.signal),
           );
+          assertVocabExternalImportAllowed(localLock, controller.signal, "本地锁已开启；网页读取已经停止，没有继续处理远程内容。");
           article.sourceUrl ||= url;
         } else if (articleMode === "paste") {
           if (!paste.trim()) throw new Error("请先粘贴英文文章内容");
@@ -323,7 +367,7 @@ export function ImportWizard({ localLock, onClose, onImported }: { localLock: bo
           );
         }
         if (title.trim()) article.title = title.trim();
-        if (controller.signal.aborted) return;
+        throwIfVocabImportAborted(controller.signal);
         const receipt = await prepareVocabArticleWrite(article, articleMode);
         checkpoint({ version: 1, type: "database", receipt });
         checkpointed = true;
@@ -331,18 +375,17 @@ export function ImportWizard({ localLock, onClose, onImported }: { localLock: bo
         setStage(2);
         await finishCommitted(await saveArticle(article, articleMode, receipt));
       } else if (kind === "rss") {
-        if (localLock) throw new Error("本地锁已开启，无法访问 RSS。");
+        assertVocabExternalImportAllowed(localLock, controller.signal, "本地锁已开启，没有访问 RSS。");
         if (!/^https?:\/\//i.test(url)) throw new Error("请输入完整的 RSS 地址");
         setStage(1);
         const found = normalizePodcastApi(
           await postJson("/api/import/rss", { url }, controller.signal),
         );
+        assertVocabExternalImportAllowed(localLock, controller.signal, "本地锁已开启；RSS 读取已经停止，没有继续处理节目。");
         if (!found.length) throw new Error("订阅中没有找到可导入的单集");
-        if (!controller.signal.aborted) {
-          setEpisodes(found);
-          setPhase("idle");
-          setStage(0);
-        }
+        setEpisodes(found);
+        setPhase("idle");
+        setStage(0);
       } else {
         if (!audioFile && !transcriptFile) throw new Error("请添加音频或字幕文件");
         let segments: ParsedPodcast["segments"] = transcriptFile
@@ -350,7 +393,7 @@ export function ImportWizard({ localLock, onClose, onImported }: { localLock: bo
           : [];
         let durationMs = segments.at(-1)?.end_ms ?? 0;
         if (transcribe && audioFile && segments.length === 0) {
-          if (localLock) throw new Error("本地锁已开启，无法发送音频转写。");
+          assertVocabExternalImportAllowed(localLock, controller.signal, "本地锁已开启，没有发送音频转写。");
           if (!transcriptionConfigured) {
             throw new Error("尚未配置语音转写服务。可以直接导入 VTT、SRT、LRC 或纯文本字幕。");
           }
@@ -364,6 +407,7 @@ export function ImportWizard({ localLock, onClose, onImported }: { localLock: bo
             signal: controller.signal,
           });
           const payload = await response.json().catch(() => ({}));
+          assertVocabExternalImportAllowed(localLock, controller.signal, "本地锁已开启；音频转写已经停止，没有继续处理远程结果。");
           if (!response.ok) {
             throw new Error(String((payload as Record<string, unknown>).error ?? "转写失败"));
           }
@@ -382,7 +426,7 @@ export function ImportWizard({ localLock, onClose, onImported }: { localLock: bo
           }
           durationMs = Number(data.duration_ms ?? segments.at(-1)?.end_ms ?? 0);
         }
-        if (controller.signal.aborted) return;
+        throwIfVocabImportAborted(controller.signal);
         const podcast: ParsedPodcast = {
           title: title.trim() ||
             audioFile?.name.replace(/\.[^.]+$/, "") ||
@@ -424,7 +468,15 @@ export function ImportWizard({ localLock, onClose, onImported }: { localLock: bo
         }
       }
     } catch (caught) {
-      if (!controller.signal.aborted) handleFailure(caught, checkpointed);
+      const localLockError = isVocabLocalLockImportError(caught)
+        ? caught
+        : isVocabLocalLockImportError(controller.signal.reason) ? controller.signal.reason : null;
+      if (localLockError && !checkpointed) {
+        setPhase("idle");
+        setError(localLockError.message);
+      } else if (!controller.signal.aborted || checkpointed) {
+        handleFailure(caught, checkpointed);
+      }
     } finally {
       finish(controller);
     }
@@ -442,12 +494,14 @@ export function ImportWizard({ localLock, onClose, onImported }: { localLock: bo
       let ready = episode;
       if (!episode.segments.length && episode.transcriptUrl) {
         try {
+          assertVocabExternalImportAllowed(localLock, controller.signal, "本地锁已开启，没有读取这一集的远程字幕。");
           setStage(1);
           const transcript = normalizeArticleApi(await postJson(
             "/api/import/article",
             { url: episode.transcriptUrl },
             controller.signal,
           ));
+          assertVocabExternalImportAllowed(localLock, controller.signal, "本地锁已开启；远程字幕读取已经停止，没有继续处理。");
           ready = {
             ...episode,
             segments: parseTranscript(
@@ -456,11 +510,11 @@ export function ImportWizard({ localLock, onClose, onImported }: { localLock: bo
             ),
           };
         } catch (caught) {
-          if (controller.signal.aborted) throw caught;
+          if (controller.signal.aborted || isVocabLocalLockImportError(caught)) throw caught;
           // The episode remains importable when its publisher blocks transcripts.
         }
       }
-      if (controller.signal.aborted) return;
+      throwIfVocabImportAborted(controller.signal);
       const receipt = await prepareVocabPodcastWrite(ready, "rss");
       checkpoint({ version: 1, type: "database", receipt });
       checkpointed = true;
@@ -468,7 +522,15 @@ export function ImportWizard({ localLock, onClose, onImported }: { localLock: bo
       setStage(2);
       await finishCommitted(await savePodcast(ready, "rss", receipt));
     } catch (caught) {
-      if (!controller.signal.aborted) handleFailure(caught, checkpointed);
+      const localLockError = isVocabLocalLockImportError(caught)
+        ? caught
+        : isVocabLocalLockImportError(controller.signal.reason) ? controller.signal.reason : null;
+      if (localLockError && !checkpointed) {
+        setPhase("idle");
+        setError(localLockError.message);
+      } else if (!controller.signal.aborted || checkpointed) {
+        handleFailure(caught, checkpointed);
+      }
     } finally {
       finish(controller);
     }

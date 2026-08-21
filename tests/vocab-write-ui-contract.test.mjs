@@ -181,14 +181,18 @@ test("snapshot refreshes apply only the newest completed read", async () => {
   const app = await source("app/vocab/VocabApp.tsx");
   const sequencedRead = between(
     app,
+    "const readVocabFacts = useCallback",
+    "const readAndApplySnapshot = useCallback(async () =>",
+  );
+  assert.match(sequencedRead, /const requestId = \+\+snapshotReadRequestRef\.current/);
+  assert.ok(sequencedRead.indexOf("await loadVocabFactsWithSettingsExpected()") < sequencedRead.indexOf("requestId !== snapshotReadRequestRef.current"));
+  assert.ok(sequencedRead.indexOf("requestId !== snapshotReadRequestRef.current") < sequencedRead.indexOf("applyVocabFactsBundle(bundle)"));
+  const publicRead = between(
+    app,
     "const readAndApplySnapshot = useCallback(async () =>",
     "const refresh = useCallback(async () =>",
   );
-  assert.match(sequencedRead, /const request = \+\+snapshotReadRequestRef\.current/);
-  assert.match(
-    sequencedRead,
-    /if \(request !== snapshotReadRequestRef\.current\) \{\s*throw new VocabSnapshotSupersededError\(\);\s*\}\s*setSnapshot\(data\)/,
-  );
+  assert.match(publicRead, /result\.outcome === "superseded"[\s\S]*?throw new VocabSnapshotSupersededError\(\)/);
   assert.match(app, /if \(!ready\) return;\s*return subscribeVocabChanges/);
   assert.match(
     app,

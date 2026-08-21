@@ -418,3 +418,82 @@
   .sc-reminder-confirm,.sc-toast-confirm>div{display:grid;grid-template-columns:1fr;width:100%}
   .sc-reminder-confirm button,.sc-toast-confirm button{width:100%}
 }
+
+/* Settings writes stay reviewable across reloads without turning preferences
+   into an alarming task or hiding the rest of the local library. */
+.sc-settings-write-banner,.sc-settings-truth-notice{
+  width:min(1080px,calc(100% - 48px));
+  margin:18px auto 0;
+  border:1px solid #d5d2c5;
+  border-radius:16px;
+  background:#f3f2e7;
+  padding:14px 16px;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:18px;
+  min-width:0;
+  overflow-wrap:anywhere;
+}
+.sc-settings-write-banner>div,.sc-settings-truth-notice>span{min-width:0}
+.sc-settings-write-banner b{display:block;font-size:var(--sc-text-footnote)}
+.sc-settings-write-banner p{margin:4px 0 0;color:#62645b;font-size:var(--sc-text-caption);line-height:1.55}
+.sc-settings-write-banner button,.sc-settings-truth-notice button{
+  flex:none;
+  min-height:44px;
+  border:1px solid #c8c5b9;
+  border-radius:23px;
+  background:#fffefa;
+  padding:0 16px;
+  font-size:var(--sc-text-footnote);
+}
+.sc-settings-write-recovery{
+  width:min(760px,calc(100% - 48px));
+  margin:16px auto 0;
+  border:1px solid #d2cfc2;
+  border-radius:19px;
+  background:#fffefa;
+  box-shadow:0 18px 50px #22251f14;
+  padding:20px;
+  min-width:0;
+  overflow-wrap:anywhere;
+}
+.sc-settings-write-recovery>header h2{margin:0;font:500 22px/1.3 Georgia,"Songti SC",serif;outline:none}
+.sc-settings-write-recovery>header p{margin:7px 0 0;color:#5f6159;font-size:var(--sc-text-footnote);line-height:1.6}
+.sc-settings-write-error,.sc-settings-write-status,.sc-settings-safe-status,.sc-settings-message,.sc-settings-backup-lock,.sc-podcast-follow-status{
+  overflow-wrap:anywhere;
+  line-height:1.55;
+}
+.sc-settings-write-error{border-left:3px solid #b77966;background:#f7ece7;padding:11px 13px;color:#744a40}
+.sc-settings-write-status{border-left:3px solid #a8ad5d;background:#f3f3df;padding:11px 13px;color:#515448}
+.sc-settings-receipt{margin-top:15px;border:1px solid #ddd9cc;border-radius:14px;background:#f8f6ef;padding:12px 14px;min-width:0}
+.sc-settings-receipt summary{cursor:pointer;min-height:44px;display:flex;align-items:center;font-size:var(--sc-text-footnote);font-weight:650}
+.sc-settings-receipt p{margin:5px 0 10px;color:#686961;font-size:var(--sc-text-caption);line-height:1.55}
+.sc-settings-receipt pre{margin:0;max-width:100%;white-space:pre-wrap;overflow-wrap:anywhere;font:500 var(--sc-text-footnote)/1.7 -apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC",sans-serif}
+.sc-settings-write-recovery>footer{margin-top:17px;display:flex;justify-content:flex-end;flex-wrap:wrap;gap:9px}
+.sc-settings-write-recovery>footer button,.sc-settings-safe-status button{
+  min-height:44px;
+  border:1px solid #c8c5b9;
+  border-radius:23px;
+  background:#fffefa;
+  padding:0 16px;
+  font-size:var(--sc-text-footnote);
+}
+.sc-settings-write-recovery>footer button.primary{border-color:#252820;background:#252820;color:#fff}
+.sc-settings-truth-notice{font-size:var(--sc-text-footnote);line-height:1.55}
+.sc-settings-safe-status{margin-top:14px;border:1px solid #d7d3c5;border-radius:14px;background:#f5f3e9;padding:12px 14px;display:flex;align-items:center;justify-content:space-between;gap:12px;font-size:var(--sc-text-caption)}
+.sc-settings-safe-status span{min-width:0}
+.sc-settings-backup-lock,.sc-podcast-follow-status{display:block;margin:10px 0 0;color:#66685f;font-size:var(--sc-text-caption)}
+.sc-toggle-row>button:disabled{cursor:not-allowed;opacity:.55}
+
+@media(max-width:760px){
+  .sc-settings-write-banner,.sc-settings-truth-notice,.sc-settings-write-recovery{width:calc(100% - 28px)}
+  .sc-settings-write-banner,.sc-settings-truth-notice,.sc-settings-safe-status{align-items:stretch;flex-direction:column}
+  .sc-settings-write-banner button,.sc-settings-truth-notice button,.sc-settings-safe-status button{width:100%;white-space:normal}
+}
+
+@media(max-width:370px){
+  .sc-settings-write-recovery{padding:17px 14px}
+  .sc-settings-write-recovery>footer{display:grid;grid-template-columns:minmax(0,1fr)}
+  .sc-settings-write-recovery>footer button{width:100%;white-space:normal}
+}
