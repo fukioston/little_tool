@@ -980,7 +980,7 @@ function JobDrawer({ job, data, now, onClose, onMove, onArchive, onRefresh, onAi
 }
 
 type InterviewEditorSnapshot = {
-  status: string;
+  status: Interview["status"];
   summary: string;
   rawNotes: string;
   questions: InterviewQuestion[];
@@ -1017,8 +1017,9 @@ function readInterviewLocalDraft(interview: Interview): InterviewLocalDraft | nu
     const snapshot = parsed?.snapshot;
     const questionsAreValid = Array.isArray(snapshot?.questions) && snapshot.questions.every((question) =>
       question && typeof question.question === "string" && typeof question.answer === "string" && typeof question.note === "string");
+    const statusIsValid = snapshot && ["scheduled", "completed", "canceled"].includes(snapshot.status);
     if (parsed?.version !== 1 || parsed.interviewId !== interview.id || typeof parsed.savedAt !== "string" ||
-      typeof parsed.sourceUpdatedAt !== "string" || !snapshot || typeof snapshot.status !== "string" ||
+      typeof parsed.sourceUpdatedAt !== "string" || !snapshot || !statusIsValid ||
       typeof snapshot.summary !== "string" || typeof snapshot.rawNotes !== "string" ||
       typeof snapshot.reflection !== "string" || !questionsAreValid) return null;
     return parsed as InterviewLocalDraft;

@@ -139,6 +139,7 @@ test("every dirty interview close path offers an explicit local-only choice", ()
   assert.match(drawerSource, /不进入 SQLite 或导出备份/);
   assert.match(drawerSource, /setBaseline\(currentSnapshot\)/);
   assert.match(drawerSource, /localStorage\.removeItem\(interviewDraftKey\(interview\.id\)\)/);
+  assert.match(source, /\["scheduled", "completed", "canceled"\]\.includes\(snapshot\.status\)/);
   assert.match(drawerSource, /if \(draft\.summary !== null\) setSummary/);
   assert.match(css, /\.career-draft-choice\s*\{/);
   assert.match(css, /\.career-local-draft-note/);
