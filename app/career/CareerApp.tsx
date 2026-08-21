@@ -32,7 +32,6 @@ import {
 import {
   archiveCareerContact,
   createCareerContact,
-  createCareerContactTask,
   loadCareerContactDetail,
   loadCareerContacts,
   recordCareerContactInteraction,
@@ -58,6 +57,11 @@ import {
   type CareerLifecycleSnapshot,
   type CareerPreparedLifecycleChange,
 } from "@/lib/career/lifecycle";
+import {
+  CareerTaskError,
+  careerTaskActions,
+  type CareerTaskDetail,
+} from "@/lib/career/tasks";
 import { subscribeToCareerGenerationChanges, withCareerWriteLock } from "@/lib/career/lock";
 import { createLocalFileObjectUrl, deleteLocalFile, saveLocalFile } from "@/lib/local-db/files";
 import type {
@@ -84,6 +88,19 @@ type CareerJobScope = Exclude<CareerLifecycleScope, "all">;
 type CareerLifecycleDialogState =
   | { phase: "decision"; prepared: CareerPreparedLifecycleChange; choice: CareerLifecycleChoice | null; changed: boolean; error: string; rememberUndo: boolean }
   | { phase: "refresh-recovery"; prepared: CareerPreparedLifecycleChange; error: string; rememberUndo: boolean };
+
+type CareerTaskSheetRequest = Readonly<{
+  taskId: string;
+  nonce: string;
+  initialState?: "stale" | "refresh-only";
+}>;
+
+export async function runCareerTaskUiOnce<T>(pending: Set<string>, taskId: string, action: () => Promise<T>): Promise<T | undefined> {
+  if (pending.has(taskId)) return undefined;
+  pending.add(taskId);
+  try { return await action(); }
+  finally { pending.delete(taskId); }
+}
 
 const sourceClass: Record<string, string> = { LinkedIn: "linkedin", BOSS直聘: "boss", 官网: "website", 内推: "referral" };
 function useCareerClock() {
@@ -134,12 +151,52 @@ function formatAbsoluteDate(value: string | null) {
 }
 
 function relativeDate(value: string | null, clock: number) {
-  if (!value) return "未安排";
-  const days = Math.ceil((new Date(value).getTime() - clock) / 86_400_000);
-  if (days < 0) return `逾期 ${Math.abs(days)} 天`;
-  if (days === 0) return "今天";
-  if (days === 1) return "明天";
-  return `${days} 天后`;
+  return formatCareerTaskDate(value, clock);
+}
+
+function localDayBounds(clock: number) {
+  const start = new Date(clock);
+  start.setHours(0, 0, 0, 0);
+  const end = new Date(start);
+  end.setDate(end.getDate() + 1);
+  return { start: start.getTime(), end: end.getTime() };
+}
+
+function localDayKey(value: string | number | Date) {
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return "invalid";
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+}
+
+export function resolveCareerTaskDateGroup(value: string | null, clock: number) {
+  if (!value) return "unscheduled" as const;
+  const timestamp = new Date(value).getTime();
+  if (!Number.isFinite(timestamp)) return "unscheduled" as const;
+  const { start, end } = localDayBounds(clock);
+  if (timestamp < start) return "past" as const;
+  if (timestamp < end) return "today" as const;
+  return "future" as const;
+}
+
+export function formatCareerTaskDate(value: string | null, clock: number) {
+  if (!value) return "以后再说";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "时间待确认";
+  const group = resolveCareerTaskDateGroup(value, clock);
+  const time = new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false }).format(date);
+  if (group === "past") return `原计划 ${new Intl.DateTimeFormat("zh-CN", { month: "long", day: "numeric" }).format(date)} ${time}`;
+  if (group === "today") return `今天 ${time}`;
+  const tomorrow = new Date(clock);
+  tomorrow.setHours(0, 0, 0, 0);
+  tomorrow.setDate(tomorrow.getDate() + 1);
+  if (localDayKey(date) === localDayKey(tomorrow)) return `明天 ${time}`;
+  const sixDaysLater = new Date(clock);
+  sixDaysLater.setHours(0, 0, 0, 0);
+  sixDaysLater.setDate(sixDaysLater.getDate() + 6);
+  if (date.getTime() <= sixDaysLater.getTime() + 86_400_000) {
+    return `${new Intl.DateTimeFormat("zh-CN", { weekday: "short" }).format(date)} ${time}`;
+  }
+  return `${new Intl.DateTimeFormat("zh-CN", { month: "long", day: "numeric" }).format(date)} ${time}`;
 }
 
 function neutralActivityDetail(detail: string) {
@@ -190,20 +247,23 @@ export function resolveCareerTodayFocus(data: CareerData, now: number) {
   const terminalStages = new Set(data.stages.filter((stage) => stage.is_terminal === 1).map((stage) => stage.id));
   const eligibleJobs = data.jobs.filter((job) => job.archived !== 1 && !terminalStages.has(job.stage_id));
   const eligibleJobsById = new Map(eligibleJobs.map((job) => [job.id, job]));
-  const startOfToday = new Date(now);
-  startOfToday.setHours(0, 0, 0, 0);
+  const { start: startOfToday, end: endOfToday } = localDayBounds(now);
 
   const interview = data.interviews
     .filter((item) => {
       const scheduledAt = item.scheduled_at ? new Date(item.scheduled_at).getTime() : Number.NaN;
       return item.status === "scheduled" && eligibleJobsById.has(item.job_id) &&
-        Number.isFinite(scheduledAt) && scheduledAt >= startOfToday.getTime();
+        Number.isFinite(scheduledAt) && scheduledAt >= now && scheduledAt < endOfToday;
     })
     .sort((left, right) => new Date(left.scheduled_at!).getTime() - new Date(right.scheduled_at!).getTime())[0];
   if (interview) return { kind: "interview" as const, interviewId: interview.id, jobId: interview.job_id };
 
   const task = data.tasks
-    .filter((item) => item.status === "todo" && (!item.job_id || eligibleJobsById.has(item.job_id)))
+    .filter((item) => {
+      if (item.status !== "todo" || (item.job_id && !eligibleJobsById.has(item.job_id)) || !item.due_at) return false;
+      const scheduledAt = new Date(item.due_at).getTime();
+      return Number.isFinite(scheduledAt) && scheduledAt >= startOfToday && scheduledAt < endOfToday;
+    })
     .sort((left, right) => {
       const leftTime = left.due_at ? new Date(left.due_at).getTime() : Number.POSITIVE_INFINITY;
       const rightTime = right.due_at ? new Date(right.due_at).getTime() : Number.POSITIVE_INFINITY;
@@ -372,7 +432,7 @@ function useDialogA11y(onClose: () => void, inertToasts = false) {
     const previousOverflow = document.body.style.overflow;
     document.body.style.overflow = "hidden";
     const focusFrame = window.requestAnimationFrame(() => {
-      const initial = dialog.querySelector<HTMLElement>("[data-dialog-initial]")
+      const initial = dialog.querySelector<HTMLElement>("[data-dialog-initial]:not([disabled])")
         ?? dialog.querySelector<HTMLElement>("input:not([disabled]):not([type='hidden']), textarea:not([disabled]), select:not([disabled])")
         ?? dialog.querySelector<HTMLElement>("button:not([disabled]), a[href]");
       (initial ?? dialog).focus();
@@ -395,6 +455,11 @@ function useDialogA11y(onClose: () => void, inertToasts = false) {
       if (items.length === 0) { event.preventDefault(); dialog?.focus(); return; }
       const first = items[0];
       const last = items[items.length - 1];
+      if (!(document.activeElement instanceof HTMLElement) || !items.includes(document.activeElement)) {
+        event.preventDefault();
+        (event.shiftKey ? last : first).focus();
+        return;
+      }
       if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
       else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
     }
@@ -437,13 +502,13 @@ export default function CareerApp() {
   const [selectedInterviewId, setSelectedInterviewId] = useState<string | null>(null);
   const [selectedContactId, setSelectedContactId] = useState<string | null>(null);
   const [contactEditorId, setContactEditorId] = useState<string | null | undefined>(undefined);
-  const [contactAction, setContactAction] = useState<{ kind: "interaction" | "task"; contactId: string; taskId?: string } | null>(null);
+  const [contactAction, setContactAction] = useState<{ kind: "interaction" | "task"; contactId: string } | null>(null);
   const [contactRevision, setContactRevision] = useState(0);
   const [contactUndo, setContactUndo] = useState<{ id: string; name: string } | null>(null);
   const [activeDragId, setActiveDragId] = useState<string | null>(null);
   const [notices, setNotices] = useState<Notice[]>([]);
   const [undo, setUndo] = useState<{ jobId: string; from: string; to: string } | null>(null);
-  const [taskUndo, setTaskUndo] = useState<{ taskId: string; from: Task["status"]; title: string; token: string } | null>(null);
+  const [taskSheet, setTaskSheet] = useState<CareerTaskSheetRequest | null>(null);
   const [lifecycleDialog, setLifecycleDialog] = useState<CareerLifecycleDialogState | null>(null);
   const [lifecycleBusy, setLifecycleBusy] = useState(false);
   const [lifecyclePendingJobId, setLifecyclePendingJobId] = useState<string | null>(null);
@@ -452,6 +517,7 @@ export default function CareerApp() {
   const jobScopeRef = useRef<CareerJobScope>("active");
   const lifecycleTriggerRef = useRef<HTMLElement | null>(null);
   const lifecycleWriteRef = useRef(false);
+  const taskCompletionRef = useRef(new Set<string>());
   const lifecycleRefreshOnlyRef = useRef(false);
   const scopeRequestRef = useRef(0);
   const uiReadRequestRef = useRef(0);
@@ -467,6 +533,10 @@ export default function CareerApp() {
     if (jobScopeRef.current === requestedScope) setScopedLifecycle(next.scoped);
   }, []);
   const refreshContacts = useCallback(async () => {
+    await refresh();
+    setContactRevision((current) => current + 1);
+  }, [refresh]);
+  const refreshTasks = useCallback(async () => {
     await refresh();
     setContactRevision((current) => current + 1);
   }, [refresh]);
@@ -802,42 +872,36 @@ export default function CareerApp() {
     if (restored) { setUndo(null); notify("已恢复到原阶段", "info"); }
   }
 
-  async function toggleTask(task: Task) {
-    const status = task.status === "done" ? "todo" : "done";
-    setData((current) => ({ ...current, tasks: current.tasks.map((item) => item.id === task.id ? { ...item, status } : item) }));
-    setAllLifecycle((current) => ({ ...current, tasks: current.tasks.map((item) => item.id === task.id ? { ...item, status } : item) }));
-    setScopedLifecycle((current) => ({ ...current, tasks: current.tasks.map((item) => item.id === task.id ? { ...item, status } : item) }));
-    try {
-      await runCareerSql("UPDATE career_tasks SET status = ? WHERE id = ?", [status, task.id]);
-      const change = { taskId: task.id, from: task.status, title: task.title, token: crypto.randomUUID() };
-      setTaskUndo(change);
-      window.setTimeout(() => setTaskUndo((current) => current?.token === change.token ? null : current), 6500);
-    }
-    catch {
-      setData((current) => ({ ...current, tasks: current.tasks.map((item) => item.id === task.id ? task : item) }));
-      setAllLifecycle((current) => ({ ...current, tasks: current.tasks.map((item) => item.id === task.id ? task : item) }));
-      setScopedLifecycle((current) => ({ ...current, tasks: current.tasks.map((item) => item.id === task.id ? task : item) }));
-      notify("待办更新失败", "error");
-    }
+  function openTask(taskId: string, initialState?: CareerTaskSheetRequest["initialState"]) {
+    setTaskSheet({ taskId, initialState, nonce: crypto.randomUUID() });
   }
 
-  async function handleTaskUndo() {
-    if (!taskUndo) return;
-    const change = taskUndo;
-    setTaskUndo(null);
-    setData((current) => ({ ...current, tasks: current.tasks.map((item) => item.id === change.taskId ? { ...item, status: change.from } : item) }));
-    setAllLifecycle((current) => ({ ...current, tasks: current.tasks.map((item) => item.id === change.taskId ? { ...item, status: change.from } : item) }));
-    setScopedLifecycle((current) => ({ ...current, tasks: current.tasks.map((item) => item.id === change.taskId ? { ...item, status: change.from } : item) }));
-    try {
-      await runCareerSql("UPDATE career_tasks SET status = ? WHERE id = ?", [change.from, change.taskId]);
-      notify("已撤销待办状态", "info");
-    } catch {
-      const changedStatus = change.from === "todo" ? "done" : "todo";
-      setData((current) => ({ ...current, tasks: current.tasks.map((item) => item.id === change.taskId ? { ...item, status: changedStatus } : item) }));
-      setAllLifecycle((current) => ({ ...current, tasks: current.tasks.map((item) => item.id === change.taskId ? { ...item, status: changedStatus } : item) }));
-      setScopedLifecycle((current) => ({ ...current, tasks: current.tasks.map((item) => item.id === change.taskId ? { ...item, status: changedStatus } : item) }));
-      notify("撤销失败，原状态已保留", "error");
-    }
+  async function completeTask(task: Task) {
+    if (task.status !== "todo") { openTask(task.id); return; }
+    const expectedUpdatedAt = task.updated_at;
+    if (!expectedUpdatedAt) { openTask(task.id, "stale"); return; }
+    await runCareerTaskUiOnce(taskCompletionRef.current, task.id, async () => {
+      let committed = false;
+      try {
+        await careerTaskActions.complete(task.id, {
+          expectedUpdatedAt,
+          operationId: `task_complete_${crypto.randomUUID()}`,
+        });
+        committed = true;
+        await refreshTasks();
+        notify(`已完成「${task.title}」`, "info");
+      } catch (error) {
+        if (committed) {
+          openTask(task.id, "refresh-only");
+          return;
+        }
+        if (error instanceof CareerTaskError && error.code === "changed") {
+          openTask(task.id, "stale");
+          return;
+        }
+        notify(error instanceof Error ? error.message : "这次更改没有保存，原记录仍保持不变。", "error");
+      }
+    });
   }
 
   async function changeJobScope(nextScope: CareerJobScope) {
@@ -895,10 +959,10 @@ export default function CareerApp() {
       <Topbar title={navItems.find((item) => item.id === view)?.label ?? "职迹"} query={query} menuOpen={sidebarOpen} onQuery={setQuery} onSearch={() => setSearchOpen(true)} onMenu={() => setSidebarOpen(true)} onAdd={() => setModal("job")} onSettings={() => navigate("settings")} />
       <div className="career-content">
         {legacyReviewNeeded && <div className="career-legacy-review-note" role="status"><ShieldCheck size={19} /><div><b>旧版资料需要你看一眼</b><p>旧版可能含示例内容，未自动删除以保护你的编辑。我们不会替你判断哪些记录属于你，也不会自行清理。</p></div></div>}
-        {view === "today" && <TodayView data={allData} now={careerClock} onNavigate={navigate} onSelectJob={setSelectedJobId} onSelectInterview={setSelectedInterviewId} onToggleTask={toggleTask} onAddJob={() => setModal("job")} onAi={runAi} />}
+        {view === "today" && <TodayView data={allData} now={careerClock} onNavigate={navigate} onSelectJob={setSelectedJobId} onSelectInterview={setSelectedInterviewId} onOpenTask={openTask} onCompleteTask={completeTask} onAddJob={() => setModal("job")} onAi={runAi} />}
         {view === "board" && <BoardView data={boardData} jobs={boardJobs} now={careerClock} query={query} sourceFilter={sourceFilter} priorityOnly={priorityOnly} onSourceFilter={setSourceFilter} onPriorityOnly={setPriorityOnly} onClear={() => { setQuery(""); setSourceFilter("all"); setPriorityOnly(false); }} onSelectJob={setSelectedJobId} onAddJob={() => setModal("job")} onMove={async (jobId, stageId) => { await requestLifecycleChange({ kind: "stage", jobId, nextStageId: stageId }); }} lifecycleLocked={lifecycleLocked} sensors={sensors} activeJob={activeJob} onDragStart={(event) => { if (!lifecycleWriteRef.current && !lifecycleRefreshOnlyRef.current) setActiveDragId(String(event.active.id)); }} onDragEnd={async (event) => { setActiveDragId(null); if (!event.over || lifecycleWriteRef.current || lifecycleRefreshOnlyRef.current) return; const stageId = String(event.over.id).replace(/^stage:/, ""); if (data.stages.some((stage) => stage.id === stageId)) await requestLifecycleChange({ kind: "stage", jobId: String(event.active.id), nextStageId: stageId }); }} />}
         {view === "jobs" && <JobsView data={scopedData} jobs={scopedJobs} now={careerClock} scope={jobScope} scopeLoading={scopeLoading} scopeError={scopeError} stageFilter={stageFilter} sourceFilter={sourceFilter} priorityOnly={priorityOnly} onScope={(scope) => { void changeJobScope(scope); }} onStageFilter={setStageFilter} onSourceFilter={setSourceFilter} onPriorityOnly={setPriorityOnly} onSelectJob={setSelectedJobId} onImport={() => setModal("import")} />}
-        {view === "calendar" && <CalendarView data={allData} now={careerClock} onToggleTask={toggleTask} onAddTask={() => setModal("task")} onAddInterview={() => setModal("interview")} onSelectJob={setSelectedJobId} />}
+        {view === "calendar" && <CalendarView data={allData} now={careerClock} onOpenTask={openTask} onCompleteTask={completeTask} onAddTask={() => setModal("task")} onAddInterview={() => setModal("interview")} onSelectInterview={setSelectedInterviewId} />}
         {view === "interviews" && <InterviewsView data={data} now={careerClock} onAdd={() => setModal("interview")} onSelect={setSelectedInterviewId} onAi={runAi} />}
         {view === "contacts" && <ContactsView data={data} now={careerClock} revision={contactRevision} onAdd={() => setContactEditorId(null)} onSelect={setSelectedContactId} />}
         {view === "materials" && <MaterialsView data={data} onAdd={() => setModal("material")} onRemove={async (material) => {
@@ -952,7 +1016,7 @@ export default function CareerApp() {
       </div>
     </section>
     <MobileNav view={view} onNavigate={navigate} onMore={() => setSidebarOpen(true)} />
-    {selectedJob && <JobDrawer key={`${selectedJob.id}:${selectedJob.archived}`} job={selectedJob} data={allData} now={careerClock} lifecyclePending={lifecycleLocked} onClose={() => setSelectedJobId(null)} onLifecycle={(intent) => requestLifecycleChange(intent)} onRefresh={refresh} onAi={runAi} onSelectContact={(contactId) => { setSelectedJobId(null); setSelectedContactId(contactId); }} notify={notify} />}
+    {selectedJob && <JobDrawer key={`${selectedJob.id}:${selectedJob.archived}`} job={selectedJob} data={allData} now={careerClock} lifecyclePending={lifecycleLocked} onClose={() => setSelectedJobId(null)} onLifecycle={(intent) => requestLifecycleChange(intent)} onRefresh={refresh} onOpenTask={openTask} onCompleteTask={completeTask} onAi={runAi} onSelectContact={(contactId) => { setSelectedJobId(null); setSelectedContactId(contactId); }} notify={notify} />}
     {selectedInterview && <InterviewDrawer interview={selectedInterview} data={allData} onClose={() => setSelectedInterviewId(null)} onRefresh={refresh} onAi={runAi} notify={notify} />}
     {lifecycleDialog && <CareerLifecycleModal
       state={lifecycleDialog}
@@ -974,8 +1038,9 @@ export default function CareerApp() {
       onClose={() => setSelectedContactId(null)}
       onEdit={() => setContactEditorId(selectedContactId)}
       onRecord={() => setContactAction({ kind: "interaction", contactId: selectedContactId })}
-      onTask={(taskId) => setContactAction({ kind: "task", contactId: selectedContactId, taskId })}
-      onToggleTask={async (task) => { await toggleTask(task); setContactRevision((current) => current + 1); }}
+      onAddTask={() => setContactAction({ kind: "task", contactId: selectedContactId })}
+      onOpenTask={openTask}
+      onCompleteTask={completeTask}
       onArchive={async (contact) => {
         await archiveCareerContact(contact.id);
         setSelectedContactId(null);
@@ -992,7 +1057,7 @@ export default function CareerApp() {
       notify={notify}
     />}
     {modal === "job" && <JobModal data={data} onClose={() => setModal(null)} onSaved={async (id) => { setModal(null); await refresh(); setSelectedJobId(id); notify("职位已加入职迹"); }} />}
-    {modal === "task" && <TaskModal data={data} initialJobId={selectedJobId} onClose={() => { setModal(null); setSelectedJobId(null); }} onSaved={async () => { setModal(null); setSelectedJobId(null); await refresh(); notify("待办已创建"); }} />}
+    {modal === "task" && <TaskModal data={data} initialJobId={selectedJobId} onClose={() => { setModal(null); setSelectedJobId(null); }} onSaved={async () => { await refreshTasks(); setModal(null); setSelectedJobId(null); notify("待办已创建"); }} />}
     {modal === "interview" && <InterviewModal data={data} onClose={() => setModal(null)} onSaved={async () => { setModal(null); await refresh(); notify("面试轮次已安排"); }} />}
     {modal === "material" && <MaterialModal data={data} onClose={() => setModal(null)} onSaved={async () => { setModal(null); await refresh(); notify("材料已保存"); }} />}
     {modal === "import" && <SmartImportModal data={data} initialInput={importInitial} onClose={() => { setModal(null); setImportInitial(""); }} onSaved={async () => { setModal(null); setImportInitial(""); await refresh(); notify("职位已导入"); }} notify={notify} />}
@@ -1020,14 +1085,21 @@ export default function CareerApp() {
     />}
     {contactAction?.kind === "task" && <ContactTaskModal
       contactId={contactAction.contactId}
-      taskId={contactAction.taskId}
       data={data}
       onClose={() => setContactAction(null)}
       onSaved={async () => {
+        await refreshTasks();
         setContactAction(null);
-        await refreshContacts();
         notify("下一步已安排");
       }}
+    />}
+    {taskSheet && <TaskDetailSheet
+      key={taskSheet.nonce}
+      request={taskSheet}
+      now={careerClock}
+      onClose={() => setTaskSheet(null)}
+      onRefresh={refreshTasks}
+      notify={notify}
     />}
     {aiState && <AiPreview
       state={aiState}
@@ -1045,7 +1117,7 @@ export default function CareerApp() {
       } : undefined}
       applyLabel={aiState.applyLabel}
     />}
-    <div className="career-toast-stack" aria-live="polite">{contactUndo && <button className="career-toast undo" onClick={async () => { await restoreCareerContact(contactUndo.id); setContactUndo(null); await refreshContacts(); notify(`已恢复「${contactUndo.name}」`, "info"); }} aria-label={`撤销归档「${contactUndo.name}」`}><RotateCcw size={16} />联系人已归档 <b>撤销</b></button>}{taskUndo && <button className="career-toast undo" onClick={() => void handleTaskUndo()} aria-label={`撤销「${taskUndo.title}」的状态变化`}><RotateCcw size={16} />{taskUndo.from === "todo" ? "待办已完成" : "待办已恢复"} <b>撤销</b></button>}{undo && <button className="career-toast undo" onClick={handleUndo}><RotateCcw size={16} />阶段已更新 <b>撤销</b></button>}{notices.map((notice) => <div className={`career-toast ${notice.tone}`} key={notice.id}>{notice.tone === "success" ? <Check size={16} /> : notice.tone === "error" ? <X size={16} /> : <Bell size={16} />}{notice.text}</div>)}</div>
+    <div className="career-toast-stack" aria-live="polite">{contactUndo && <button className="career-toast undo" onClick={async () => { await restoreCareerContact(contactUndo.id); setContactUndo(null); await refreshContacts(); notify(`已恢复「${contactUndo.name}」`, "info"); }} aria-label={`撤销归档「${contactUndo.name}」`}><RotateCcw size={16} />联系人已归档 <b>撤销</b></button>}{undo && <button className="career-toast undo" onClick={handleUndo}><RotateCcw size={16} />阶段已更新 <b>撤销</b></button>}{notices.map((notice) => <div className={`career-toast ${notice.tone}`} key={notice.id}>{notice.tone === "success" ? <Check size={16} /> : notice.tone === "error" ? <X size={16} /> : <Bell size={16} />}{notice.text}</div>)}</div>
   </main>;
 }
 
@@ -1057,7 +1129,7 @@ function Sidebar({ sidebarRef, view, open, data, now, onNavigate, onClose }: { s
   const recentNotes = data.activities.filter((item) => now - new Date(item.created_at).getTime() < 7 * 86_400_000).length;
   return <><button className={`career-scrim ${open ? "show" : ""}`} tabIndex={-1} aria-label="关闭导航" onClick={onClose} /><aside ref={sidebarRef} id="career-sidebar" className={`career-sidebar ${open ? "open" : ""}`} role={open ? "dialog" : undefined} aria-modal={open ? "true" : undefined} aria-label={open ? "职迹导航" : undefined} tabIndex={open ? -1 : undefined}>
     <Link href="/" className="career-brand" aria-label="返回私人工作台"><span>职</span><div><b>职迹</b><small>每一步，都算数</small></div></Link><button data-sidebar-close className="career-icon-button mobile-only" style={{ position: "absolute", insetBlockStart: 29, insetInlineEnd: 24 }} onClick={onClose} aria-label="关闭导航"><X size={18} /></button>
-    <nav className="career-nav" aria-label="职迹主导航">{navItems.map((item) => <button key={item.id} aria-label={item.label} className={view === item.id ? "active" : ""} onClick={() => onNavigate(item.id)}><item.icon size={18} strokeWidth={1.8} /><span>{item.label}</span>{item.id === "calendar" && data.tasks.filter((task) => task.status === "todo").length > 0 && <em>{data.tasks.filter((task) => task.status === "todo").length}</em>}</button>)}</nav>
+    <nav className="career-nav" aria-label="职迹主导航">{navItems.map((item) => <button key={item.id} aria-label={item.label} className={view === item.id ? "active" : ""} onClick={() => onNavigate(item.id)}><item.icon size={18} strokeWidth={1.8} /><span>{item.label}</span></button>)}</nav>
     <div className="career-sidebar-spacer" /><div className="career-goal-card calm"><div><span>近 7 天记录</span><b>{recentNotes}<small> 次变化</small></b></div><div className="career-no-score"><ShieldCheck size={14} /><span>不设目标，也不给你打分</span></div><p>{active} 个机会在工作台里，按自己的节奏来。</p></div><div className="career-privacy"><ShieldCheck size={15} /><span>资料保存在本地 SQLite</span><i /></div>
   </aside></>;
 }
@@ -1083,23 +1155,68 @@ function CompanyMark({ company, small = false }: { company: string; small?: bool
 
 function SourceBadge({ source }: { source: string }) { return <span className={`career-source ${sourceClass[source] ?? "other"}`}>{source === "LinkedIn" ? "in" : source === "BOSS直聘" ? "BOSS" : source}</span>; }
 
-function TodayView({ data, now, onNavigate, onSelectJob, onSelectInterview, onToggleTask, onAddJob, onAi }: { data: CareerData; now: number; onNavigate: (view: CareerView) => void; onSelectJob: (id: string) => void; onSelectInterview: (id: string) => void; onToggleTask: (task: Task) => void; onAddJob: () => void; onAi: (action: AiAction, title: string, payload: unknown) => void }) {
+function careerTaskStatusCopy(task: Task) {
+  if (task.status === "done") return "已完成";
+  if (task.status === "canceled") return isCareerLifecyclePaused(task) ? "随职位暂停" : "已放下";
+  return "待办";
+}
+
+function CareerTaskRow({ task, data, now, onOpen, onComplete, compact = false }: {
+  task: Task;
+  data: CareerData;
+  now: number;
+  onOpen: (taskId: string) => void;
+  onComplete: (task: Task) => void | Promise<void>;
+  compact?: boolean;
+}) {
+  const [pending, setPending] = useState(false);
+  const pendingRef = useRef(false);
+  const job = data.jobs.find((item) => item.id === task.job_id);
+  const context = careerJobContext(job, data.stages);
+  async function handleComplete() {
+    if (pendingRef.current) return;
+    pendingRef.current = true;
+    setPending(true);
+    try { await onComplete(task); }
+    finally { pendingRef.current = false; setPending(false); }
+  }
+  return <article className={`career-task-row ${compact ? "compact" : ""}`} data-task-status={task.status}>
+    {task.status === "todo" ? <button type="button" className="career-task-complete" disabled={pending} aria-busy={pending || undefined} onClick={() => void handleComplete()} aria-label={`完成「${task.title}」`}>{pending ? <LoaderCircle className="spin" size={15} /> : <Check size={15} />}</button> : <span className={`career-task-state ${task.status}`} aria-hidden="true">{task.status === "done" ? <Check size={15} /> : <Circle size={13} />}</span>}
+    <button type="button" className="career-task-open" onClick={() => onOpen(task.id)} aria-label={`打开待办「${task.title}」`}><b>{task.title}</b><small>{job ? `${job.company} · ${job.role}` : task.contact_id ? "联系人待办" : "个人待办"}<i>{formatCareerTaskDate(task.due_at, now)}</i>{context && <i className="career-action-context">{context}</i>}</small></button>
+    <span className="career-task-kind"><em>{careerTaskStatusCopy(task)}</em><small>{task.kind}</small></span>
+  </article>;
+}
+
+function TodayView({ data, now, onNavigate, onSelectJob, onSelectInterview, onOpenTask, onCompleteTask, onAddJob, onAi }: { data: CareerData; now: number; onNavigate: (view: CareerView) => void; onSelectJob: (id: string) => void; onSelectInterview: (id: string) => void; onOpenTask: (id: string) => void; onCompleteTask: (task: Task) => void | Promise<void>; onAddJob: () => void; onAi: (action: AiAction, title: string, payload: unknown) => void }) {
   const today = new Date(now);
   const date = new Intl.DateTimeFormat("zh-CN", { month: "long", day: "numeric", weekday: "long" }).format(today);
   const greeting = today.getHours() < 11 ? "早上好" : today.getHours() < 14 ? "中午好" : today.getHours() < 18 ? "下午好" : "晚上好";
   const terminalStages = new Set(data.stages.filter((stage) => stage.is_terminal === 1).map((stage) => stage.id));
   const activeJobs = data.jobs.filter((job) => job.archived !== 1 && !terminalStages.has(job.stage_id));
   const activeJobIds = new Set(activeJobs.map((job) => job.id));
-  const activeOpenTasks = data.tasks
-    .filter((task) => task.status === "todo" && (!task.job_id || activeJobIds.has(task.job_id)))
-    .sort((a, b) => (a.due_at ?? "9999").localeCompare(b.due_at ?? "9999"));
+  const { start: todayStart, end: todayEnd } = localDayBounds(now);
+  const agendaEnd = new Date(todayEnd);
+  agendaEnd.setDate(agendaEnd.getDate() + 6);
+  const activeOpenTasks = data.tasks.filter((task) => {
+    if (task.status !== "todo" || (task.job_id && !activeJobIds.has(task.job_id)) || !task.due_at) return false;
+    const timestamp = new Date(task.due_at).getTime();
+    return Number.isFinite(timestamp) && timestamp >= todayStart && timestamp < todayEnd;
+  }).sort((a, b) => (a.due_at ?? "").localeCompare(b.due_at ?? ""));
   const agendaTasks = data.tasks
-    .filter((task) => task.status === "todo")
+    .filter((task) => {
+      if (task.status !== "todo" || !task.due_at) return false;
+      const timestamp = new Date(task.due_at).getTime();
+      return Number.isFinite(timestamp) && timestamp >= todayStart && timestamp < agendaEnd.getTime();
+    })
     .sort((a, b) => (a.due_at ?? "9999").localeCompare(b.due_at ?? "9999"));
   const agendaItems = [
     ...agendaTasks.map((task) => ({ kind: "task" as const, at: task.due_at ?? "9999", task })),
     ...data.interviews
       .filter((interview) => interview.status === "scheduled" && Boolean(interview.scheduled_at))
+      .filter((interview) => {
+        const timestamp = new Date(interview.scheduled_at ?? "").getTime();
+        return Number.isFinite(timestamp) && timestamp >= now && timestamp < agendaEnd.getTime();
+      })
       .map((interview) => ({ kind: "interview" as const, at: interview.scheduled_at ?? "9999", interview })),
   ].sort((left, right) => left.at.localeCompare(right.at));
   const upcoming = data.interviews
@@ -1114,11 +1231,11 @@ function TodayView({ data, now, onNavigate, onSelectJob, onSelectInterview, onTo
 
   return <div className="career-view career-today"><section className="career-welcome"><div><span>{date}</span><h2>{greeting}，按自己的节奏来。</h2><p>这里只放你真实安排过的事项；没有必须处理的事，也是一种正常状态。</p></div><div className="career-welcome-actions"><button className="career-button secondary" onClick={() => onNavigate("calendar")}><CalendarDays size={16} />查看日程</button><button className="career-button primary" onClick={onAddJob}><Plus size={16} />记录职位</button></div></section>
     <section className="career-today-grid"><div className="career-panel career-focus-panel"><SectionHeading eyebrow="TODAY" title="今天的落点" />
-      {focus?.kind === "interview" && focusJob && focusInterview ? <div className="career-focus-card"><CompanyMark company={focusJob.company} /><div className="career-focus-copy"><span>{focusJob.company}</span><h3>{focusInterview.round_name} · {focusJob.role}</h3><p>{formatDate(focusInterview.scheduled_at, true)} · {focusInterview.interviewer || "面试官待确认"}</p></div><div className="career-focus-actions">{interviewStillAhead && <button className="career-button primary" onClick={() => onAi("interview_prep", "AI 面试准备", { job: focusJob, interview: focusInterview })}><WandSparkles size={16} />AI 准备</button>}<button className="career-button secondary" onClick={() => onSelectInterview(focusInterview.id)}><MessageSquareText size={16} />打开面经</button></div></div> : focus?.kind === "task" && focusTask ? <div className="career-focus-card"><span className="career-focus-symbol"><ListTodo size={20} /></span><div className="career-focus-copy"><span>{focusJob?.company ?? "已记录待办"}</span><h3>{focusTask.title}</h3><p>{focusTask.due_at ? `${formatDate(focusTask.due_at, true)} · ${relativeDate(focusTask.due_at, now)}` : "没有设定时间，可在合适的时候处理"}</p></div><div className="career-focus-actions"><button className="career-button primary" onClick={() => onNavigate("calendar")}><CalendarDays size={16} />查看日程</button>{focusJob && <button className="career-icon-button" onClick={() => onSelectJob(focusJob.id)} aria-label="打开关联职位"><ArrowUpRight size={18} /></button>}</div></div> : focus?.kind === "offer" && focusJob ? <div className="career-focus-card"><CompanyMark company={focusJob.company} /><div className="career-focus-copy"><span>{focusJob.company}</span><h3>{focusJob.role} · Offer 待决定</h3><p>这是需要你亲自权衡的选择，不必为了尽快清空状态而仓促决定。</p></div><div className="career-focus-actions"><button className="career-button primary" onClick={() => onSelectJob(focusJob.id)}>查看记录 <ArrowRight size={14} /></button></div></div> : <div className="career-focus-rest"><span><ShieldCheck size={21} /></span><div><h3>今天没有必须处理的事</h3><p>你可以休息，也可以只在想记录时打开这里。职迹不会替你制造任务。</p></div></div>}
+      {focus?.kind === "interview" && focusJob && focusInterview ? <div className="career-focus-card"><CompanyMark company={focusJob.company} /><div className="career-focus-copy"><span>{focusJob.company}</span><h3>{focusInterview.round_name} · {focusJob.role}</h3><p>{formatDate(focusInterview.scheduled_at, true)} · {focusInterview.interviewer || "面试官待确认"}</p></div><div className="career-focus-actions">{interviewStillAhead && <button className="career-button primary" onClick={() => onAi("interview_prep", "AI 面试准备", { job: focusJob, interview: focusInterview })}><WandSparkles size={16} />AI 准备</button>}<button className="career-button secondary" onClick={() => onSelectInterview(focusInterview.id)}><MessageSquareText size={16} />打开面经</button></div></div> : focus?.kind === "task" && focusTask ? <div className="career-focus-card"><span className="career-focus-symbol"><ListTodo size={20} /></span><div className="career-focus-copy"><span>{focusJob?.company ?? "个人待办"}</span><h3>{focusTask.title}</h3><p>{formatCareerTaskDate(focusTask.due_at, now)}</p></div><div className="career-focus-actions"><button className="career-button primary" onClick={() => onOpenTask(focusTask.id)}><ListTodo size={16} />打开待办</button>{focusJob && <button className="career-icon-button" onClick={() => onSelectJob(focusJob.id)} aria-label="打开关联职位"><ArrowUpRight size={18} /></button>}</div></div> : focus?.kind === "offer" && focusJob ? <div className="career-focus-card"><CompanyMark company={focusJob.company} /><div className="career-focus-copy"><span>{focusJob.company}</span><h3>{focusJob.role} · Offer 待决定</h3><p>这是需要你亲自权衡的选择，不必为了尽快清空状态而仓促决定。</p></div><div className="career-focus-actions"><button className="career-button primary" onClick={() => onSelectJob(focusJob.id)}>查看记录 <ArrowRight size={14} /></button></div></div> : <div className="career-focus-rest"><span><ShieldCheck size={21} /></span><div><h3>今天没有安排待办</h3><p>原来的安排仍在日历里，需要时再处理。今天不必为了清空列表做决定。</p></div></div>}
       {focus?.kind === "interview" && interviewStillAhead && <div className="career-focus-tips"><span><i />准备到让自己安心就好，不需要把每一种问题都预测完。</span></div>}
     </div>
-      <div className="career-panel career-agenda-panel"><SectionHeading title="今天与接下来" action={<button className="career-text-button" onClick={() => onNavigate("calendar")}>全部日程 <ChevronRight size={14} /></button>} /><div className="career-agenda-list">{agendaItems.slice(0, 5).map((item) => { if (item.kind === "task") { const task = item.task; const job = data.jobs.find((entry) => entry.id === task.job_id); const context = careerJobContext(job, data.stages); return <button className="career-agenda-item" key={`task:${task.id}`} onClick={() => onToggleTask(task)}><span className={`career-check ${task.status}`}><Check size={13} /></span><span><b>{task.title}</b><small>{job ? `${job.company} · ` : ""}{relativeDate(task.due_at, now)}{context && <i className="career-action-context">{context}</i>}</small></span><em className={task.priority >= 3 ? "urgent" : ""}>{task.kind}</em></button>; } const interview = item.interview; const job = data.jobs.find((entry) => entry.id === interview.job_id); const context = careerJobContext(job, data.stages); return <button className="career-agenda-item" key={`interview:${interview.id}`} onClick={() => onSelectInterview(interview.id)}><span className="career-agenda-symbol"><CalendarDays size={14} /></span><span><b>{interview.round_name}</b><small>{job ? `${job.company} · ` : ""}{formatDate(interview.scheduled_at, true)}{context && <i className="career-action-context">{context}</i>}</small></span><em>面试</em></button>; })}{agendaItems.length === 0 && <p className="career-agenda-calm">没有安排。需要时再记录下一步，不必为了填满列表而安排。</p>}</div></div>
-    </section><section className="career-metric-grid career-today-metrics"><Metric label="活跃机会" value={String(activeJobs.length)} note={`${activeJobs.filter((job) => job.stage_id === "stage_interview").length} 个正在面试`} icon={<BriefcaseBusiness size={18} />} /><Metric label="待办事项" value={String(activeOpenTasks.length)} note={`${activeOpenTasks.filter((task) => task.due_at && new Date(task.due_at).getTime() < now).length} 项可以重新安排`} icon={<ListTodo size={18} />} tone="amber" /><Metric label="近期待面" value={String(upcoming.length)} note={upcoming[0] ? `${formatDate(upcoming[0].scheduled_at, true)} · ${upcoming[0].round_name}` : "暂未安排"} icon={<CalendarDays size={18} />} tone="plum" /><Metric label="等待回应" value={String(waiting.length)} note="等待也是流程的一部分" icon={<Clock3 size={18} />} tone="green" /></section><section className="career-panel career-recent"><SectionHeading title="最近动态" description="只记录发生过的变化，不评价进度快慢" action={<button className="career-text-button" onClick={() => onNavigate("jobs")}>查看全部</button>} /><div className="career-activity-row">{data.activities.slice(0, 4).map((item) => { const job = data.jobs.find((entry) => entry.id === item.job_id); return <button key={item.id} onClick={() => job && onSelectJob(job.id)}><span className={`career-activity-icon ${item.type}`}><Zap size={15} /></span><span><b>{neutralActivityDetail(item.detail)}</b><small>{job ? `${job.company} · ${job.role}` : "职迹"}</small></span><time>{formatDate(item.created_at)}</time></button>; })}</div></section>
+      <div className="career-panel career-agenda-panel"><SectionHeading title="今天与接下来" action={<button className="career-text-button" onClick={() => onNavigate("calendar")}>全部日程 <ChevronRight size={14} /></button>} /><div className="career-agenda-list">{agendaItems.slice(0, 5).map((item) => { if (item.kind === "task") return <CareerTaskRow compact key={`task:${item.task.id}`} task={item.task} data={data} now={now} onOpen={onOpenTask} onComplete={onCompleteTask} />; const interview = item.interview; const job = data.jobs.find((entry) => entry.id === interview.job_id); const context = careerJobContext(job, data.stages); return <button className="career-agenda-item" key={`interview:${interview.id}`} onClick={() => onSelectInterview(interview.id)}><span className="career-agenda-symbol"><CalendarDays size={14} /></span><span><b>{interview.round_name}</b><small>{job ? `${job.company} · ` : ""}{formatDate(interview.scheduled_at, true)}{context && <i className="career-action-context">{context}</i>}</small></span><em>面试</em></button>; })}{agendaItems.length === 0 && <p className="career-agenda-calm">今天和最近几天没有安排。更早或未定时间的记录仍安静地留在日历里。</p>}</div></div>
+    </section><section className="career-metric-grid career-today-metrics"><Metric label="活跃机会" value={String(activeJobs.length)} note={`${activeJobs.filter((job) => job.stage_id === "stage_interview").length} 个正在面试`} icon={<BriefcaseBusiness size={18} />} /><Metric label="待办节奏" value="自在" note="旧安排仍在日历里" icon={<ListTodo size={18} />} tone="amber" /><Metric label="近期待面" value={String(upcoming.length)} note={upcoming[0] ? `${formatDate(upcoming[0].scheduled_at, true)} · ${upcoming[0].round_name}` : "暂未安排"} icon={<CalendarDays size={18} />} tone="plum" /><Metric label="等待回应" value={String(waiting.length)} note="等待也是流程的一部分" icon={<Clock3 size={18} />} tone="green" /></section><section className="career-panel career-recent"><SectionHeading title="最近动态" description="只记录发生过的变化，不评价进度快慢" action={<button className="career-text-button" onClick={() => onNavigate("jobs")}>查看全部</button>} /><div className="career-activity-row">{data.activities.slice(0, 4).map((item) => { const job = data.jobs.find((entry) => entry.id === item.job_id); return <button key={item.id} onClick={() => job && onSelectJob(job.id)}><span className={`career-activity-icon ${item.type}`}><Zap size={15} /></span><span><b>{neutralActivityDetail(item.detail)}</b><small>{job ? `${job.company} · ${job.role}` : "职迹"}</small></span><time>{formatDate(item.created_at)}</time></button>; })}</div></section>
   </div>;
 }
 
@@ -1164,15 +1281,27 @@ function JobsView({ data, jobs, now, scope, scopeLoading, scopeError, stageFilte
   </div>;
 }
 
-function CalendarView({ data: sourceData, now, onToggleTask, onAddTask, onAddInterview, onSelectJob }: { data: CareerData; now: number; onToggleTask: (task: Task) => void; onAddTask: () => void; onAddInterview: () => void; onSelectJob: (id: string) => void }) {
+function CalendarView({ data: sourceData, now, onOpenTask, onCompleteTask, onAddTask, onAddInterview, onSelectInterview }: { data: CareerData; now: number; onOpenTask: (id: string) => void; onCompleteTask: (task: Task) => void | Promise<void>; onAddTask: () => void; onAddInterview: () => void; onSelectInterview: (id: string) => void }) {
   const data = { ...sourceData, interviews: sourceData.interviews.filter((item) => item.status === "scheduled") };
   const [mode, setMode] = useState<"agenda" | "week">("agenda");
   const [showCompleted, setShowCompleted] = useState(false);
+  const [showPaused, setShowPaused] = useState(false);
+  const [selectedDay, setSelectedDay] = useState(() => localDayKey(now));
   const open = data.tasks.filter((task) => task.status === "todo").sort((a, b) => (a.due_at ?? "9999").localeCompare(b.due_at ?? "9999"));
   const completed = data.tasks.filter((task) => task.status === "done").sort((a, b) => (b.due_at ?? b.created_at).localeCompare(a.due_at ?? a.created_at));
+  const paused = data.tasks.filter((task) => task.status === "canceled").sort((a, b) => (b.updated_at ?? b.created_at).localeCompare(a.updated_at ?? a.created_at));
+  const grouped = {
+    today: open.filter((task) => resolveCareerTaskDateGroup(task.due_at, now) === "today"),
+    past: open.filter((task) => resolveCareerTaskDateGroup(task.due_at, now) === "past"),
+    future: open.filter((task) => resolveCareerTaskDateGroup(task.due_at, now) === "future"),
+    unscheduled: open.filter((task) => resolveCareerTaskDateGroup(task.due_at, now) === "unscheduled"),
+  };
   const days = Array.from({ length: 7 }, (_, index) => { const date = new Date(now); date.setDate(date.getDate() + index); date.setHours(0, 0, 0, 0); return date; });
-  return <div className="career-view"><SectionHeading eyebrow="PLAN" title="待办与日历" description="把投递、面试和跟进放在同一条时间线上" action={<div className="career-view-actions"><button className="career-button secondary" onClick={onAddInterview}><CalendarDays size={16} />安排面试</button><button className="career-button primary" onClick={onAddTask}><Plus size={16} />新建待办</button></div>} /><div className="career-segmented"><button className={mode === "agenda" ? "active" : ""} onClick={() => setMode("agenda")}>议程</button><button className={mode === "week" ? "active" : ""} onClick={() => setMode("week")}>未来 7 天</button></div>
-    {mode === "agenda" ? <div className="career-plan-grid"><section className="career-panel career-task-list"><header><h3>待办清单</h3><span>{open.length} 项未完成</span></header>{open.map((task) => { const job = data.jobs.find((item) => item.id === task.job_id); const context = careerJobContext(job, data.stages); return <article key={task.id}><button className="career-check" onClick={() => onToggleTask(task)} aria-label={`完成「${task.title}」`}><Check size={13} /></button><div><b>{task.title}</b><button onClick={() => job && onSelectJob(job.id)}>{job ? `${job.company} · ${job.role}` : "通用任务"}</button>{context && <small className="career-action-context">{context}</small>}</div><span className={task.due_at && new Date(task.due_at).getTime() < now ? "late" : ""}><Clock3 size={13} />{relativeDate(task.due_at, now)}</span><em>{task.kind}</em></article>; })}{open.length === 0 && <p className="career-task-calm-empty">目前没有待办。需要时再记录下一步就好。</p>}{completed.length > 0 && <div className="career-completed-block"><button className="career-completed-toggle" onClick={() => setShowCompleted((current) => !current)} aria-expanded={showCompleted}><span><CheckCircle2 size={15} />已完成</span><em>{completed.length}</em><small>{showCompleted ? "收起" : "查看与恢复"}</small><ChevronRight size={15} /></button>{showCompleted && <div className="career-completed-list">{completed.map((task) => { const job = data.jobs.find((item) => item.id === task.job_id); return <article key={task.id}><span><Check size={13} /></span><div><b>{task.title}</b><small>{job ? `${job.company} · ${job.role}` : "通用任务"}</small></div><button onClick={() => onToggleTask(task)} aria-label={`恢复「${task.title}」`}>恢复</button></article>; })}</div>}</div>}</section><section className="career-panel career-upcoming"><header><h3>面试日程</h3><span>按时间排序</span></header>{data.interviews.map((item) => { const job = data.jobs.find((entry) => entry.id === item.job_id); const context = careerJobContext(job, data.stages); return <button key={item.id} onClick={() => job && onSelectJob(job.id)}><time><b>{new Date(item.scheduled_at ?? "").getDate() || "—"}</b><small>{formatDate(item.scheduled_at)}</small></time><span><b>{job?.company} · {item.round_name}</b><small>{formatDate(item.scheduled_at, true)} · {item.duration} 分钟{context && <i className="career-action-context">{context}</i>}</small></span><ChevronRight size={16} /></button>; })}</section></div> : <div className="career-week-grid">{days.map((day) => { const key = day.toDateString(); const tasks = open.filter((task) => task.due_at && new Date(task.due_at).toDateString() === key); const interviews = data.interviews.filter((item) => item.scheduled_at && new Date(item.scheduled_at).toDateString() === key); return <section key={key} className={key === new Date(now).toDateString() ? "today" : ""}><header><span>{new Intl.DateTimeFormat("zh-CN", { weekday: "short" }).format(day)}</span><b>{day.getDate()}</b></header><div>{interviews.map((item) => { const job = data.jobs.find((job) => job.id === item.job_id); const context = careerJobContext(job, data.stages); return <article className="event" key={item.id}><CalendarDays size={13} /><b>{job?.company}</b><small>{item.round_name}</small>{context && <small className="career-action-context">{context}</small>}</article>; })}{tasks.map((task) => { const context = careerJobContext(data.jobs.find((job) => job.id === task.job_id), data.stages); return <article key={task.id}><Circle size={12} /><b>{task.title}</b><small>{dateInputValue(task.due_at).slice(11)}</small>{context && <small className="career-action-context">{context}</small>}</article>; })}</div></section>; })}</div>}
+  const taskGroup = (key: keyof typeof grouped, title: string, description?: string) => grouped[key].length > 0 && <section className={`career-task-group ${key}`}><header><h3>{title}</h3>{description && <p>{description}</p>}</header><div>{grouped[key].map((task) => <CareerTaskRow key={task.id} task={task} data={data} now={now} onOpen={onOpenTask} onComplete={onCompleteTask} />)}</div></section>;
+  const selectedTasks = open.filter((task) => task.due_at && localDayKey(task.due_at) === selectedDay);
+  const selectedInterviews = data.interviews.filter((item) => item.scheduled_at && localDayKey(item.scheduled_at) === selectedDay);
+  return <div className="career-view"><SectionHeading eyebrow="PLAN" title="待办与日历" description="安排可以放下，也可以重新拾起。时间经过不会被写成你的欠账。" action={<div className="career-view-actions"><button className="career-button secondary" onClick={onAddInterview}><CalendarDays size={16} />安排面试</button><button className="career-button primary" onClick={onAddTask}><Plus size={16} />新建待办</button></div>} /><div className="career-segmented"><button className={mode === "agenda" ? "active" : ""} onClick={() => setMode("agenda")}>议程</button><button className={mode === "week" ? "active" : ""} onClick={() => setMode("week")}>未来 7 天</button></div>
+    {mode === "agenda" ? <div className="career-plan-grid"><section className="career-panel career-task-list"><header><h3>待办清单</h3><span>按你安排过的时间整理</span></header>{taskGroup("today", "今天")}{taskGroup("past", "原计划更早", "这些安排的时间已经过去。可以重新安排，也可以放下；它们不代表你做得不够好。")}{taskGroup("future", "接下来")}{taskGroup("unscheduled", "以后再说")}{open.length === 0 && <p className="career-task-calm-empty">目前没有待办。需要时再记录下一步就好。</p>}{completed.length > 0 && <div className="career-completed-block"><button className="career-completed-toggle" onClick={() => setShowCompleted((current) => !current)} aria-expanded={showCompleted}><span><CheckCircle2 size={15} />已完成</span><small>{showCompleted ? "收起" : "查看"}</small><ChevronRight size={15} /></button>{showCompleted && <div className="career-completed-list">{completed.map((task) => <CareerTaskRow key={task.id} task={task} data={data} now={now} onOpen={onOpenTask} onComplete={onCompleteTask} />)}</div>}</div>}{paused.length > 0 && <div className="career-completed-block"><button className="career-completed-toggle" onClick={() => setShowPaused((current) => !current)} aria-expanded={showPaused}><span><Circle size={15} />已放下与暂停</span><small>{showPaused ? "收起" : "查看"}</small><ChevronRight size={15} /></button>{showPaused && <div className="career-completed-list">{paused.map((task) => <CareerTaskRow key={task.id} task={task} data={data} now={now} onOpen={onOpenTask} onComplete={onCompleteTask} />)}</div>}</div>}</section><section className="career-panel career-upcoming"><header><h3>面试日程</h3><span>按时间排序</span></header>{data.interviews.map((item) => { const job = data.jobs.find((entry) => entry.id === item.job_id); const context = careerJobContext(job, data.stages); return <button key={item.id} onClick={() => onSelectInterview(item.id)}><time><b>{new Date(item.scheduled_at ?? "").getDate() || "—"}</b><small>{formatDate(item.scheduled_at)}</small></time><span><b>{job?.company} · {item.round_name}</b><small>{formatDate(item.scheduled_at, true)} · {item.duration} 分钟{context && <i className="career-action-context">{context}</i>}</small></span><ChevronRight size={16} /></button>; })}{data.interviews.length === 0 && <p className="career-task-calm-empty">还没有安排面试，需要时再记录。</p>}</section></div> : <><div className="career-week-grid">{days.map((day) => { const key = localDayKey(day); const tasks = open.filter((task) => task.due_at && localDayKey(task.due_at) === key); const interviews = data.interviews.filter((item) => item.scheduled_at && localDayKey(item.scheduled_at) === key); return <section key={key} className={key === localDayKey(now) ? "today" : ""}><header><span>{new Intl.DateTimeFormat("zh-CN", { weekday: "short" }).format(day)}</span><b>{day.getDate()}</b></header><div>{interviews.map((item) => { const job = data.jobs.find((job) => job.id === item.job_id); const context = careerJobContext(job, data.stages); return <button className="career-week-entry event" key={item.id} onClick={() => onSelectInterview(item.id)}><CalendarDays size={13} /><b>{job?.company}</b><small>{item.round_name}</small>{context && <small className="career-action-context">{context}</small>}</button>; })}{tasks.map((task) => <button className="career-week-entry" key={task.id} onClick={() => onOpenTask(task.id)}><Circle size={12} /><b>{task.title}</b><small>{dateInputValue(task.due_at).slice(11)}</small></button>)}</div></section>; })}</div><div className="career-week-mobile"><div className="career-week-day-picker" aria-label="选择日期">{days.map((day) => { const key = localDayKey(day); return <button key={key} className={selectedDay === key ? "active" : ""} aria-pressed={selectedDay === key} onClick={() => setSelectedDay(key)}><span>{new Intl.DateTimeFormat("zh-CN", { weekday: "short" }).format(day)}</span><b>{day.getDate()}</b></button>; })}</div><section className="career-week-selected" aria-live="polite">{selectedInterviews.map((item) => { const job = data.jobs.find((entry) => entry.id === item.job_id); return <button key={item.id} onClick={() => onSelectInterview(item.id)}><CalendarDays size={16} /><span><b>{job?.company} · {item.round_name}</b><small>{formatDate(item.scheduled_at, true)}</small></span><ChevronRight size={16} /></button>; })}{selectedTasks.map((task) => <CareerTaskRow key={task.id} task={task} data={data} now={now} onOpen={onOpenTask} onComplete={onCompleteTask} compact />)}{selectedInterviews.length === 0 && selectedTasks.length === 0 && <p>这一天没有安排。</p>}</section><button className="career-text-button career-unscheduled-link" onClick={() => setMode("agenda")}>查看“以后再说”</button></div></>}
   </div>;
 }
 
@@ -1186,30 +1315,35 @@ function ContactsView({ data, now, revision, onAdd, onSelect }: { data: CareerDa
   const [scope, setScope] = useState<"active" | "archived">("active");
   const [archived, setArchived] = useState<Contact[]>([]);
   const [details, setDetails] = useState<Record<string, CareerContactDetail>>({});
+  const [detailErrors, setDetailErrors] = useState<Record<string, true>>({});
   const [loading, setLoading] = useState(true);
+  const [readError, setReadError] = useState("");
+  const [readRevision, setReadRevision] = useState(0);
   const contacts = scope === "active" ? data.contacts : archived;
 
   useEffect(() => {
     let live = true;
     void (async () => {
+      setReadError("");
       const list = scope === "active" ? data.contacts : await loadCareerContacts("archived");
-      const loaded = await Promise.all(list.map((contact) => loadCareerContactDetail(contact.id)));
+      const loaded = await Promise.allSettled(list.map((contact) => loadCareerContactDetail(contact.id)));
       if (!live) return;
       if (scope === "archived") setArchived(list);
-      setDetails(Object.fromEntries(loaded.filter((item): item is CareerContactDetail => Boolean(item)).map((item) => [item.contact.id, item])));
+      setDetails((current) => ({ ...current, ...Object.fromEntries(loaded.flatMap((item) => item.status === "fulfilled" && item.value ? [[item.value.contact.id, item.value]] : [])) }));
+      setDetailErrors(Object.fromEntries(loaded.flatMap((item, index) => item.status === "rejected" ? [[list[index].id, true]] : [])));
       setLoading(false);
-    })().catch(() => { if (live) setLoading(false); });
+    })().catch(() => { if (live) { setReadError("联系人列表暂时没有打开。已有资料不会因此变成空记录。"); setLoading(false); } });
     return () => { live = false; };
-  }, [data.contacts, revision, scope]);
+  }, [data.contacts, readRevision, revision, scope]);
 
-  return <div className="career-view"><SectionHeading eyebrow="RELATIONSHIPS" title="联系人" description="只记录真实发生的沟通，以及你愿意安排的下一步" action={<button className="career-button primary" onClick={onAdd}><Plus size={16} />添加联系人</button>} /><div className="career-segmented" aria-label="联系人范围"><button className={scope === "active" ? "active" : ""} aria-pressed={scope === "active"} onClick={() => { if (scope !== "active") { setLoading(true); setScope("active"); } }}>联系人</button><button className={scope === "archived" ? "active" : ""} aria-pressed={scope === "archived"} onClick={() => { if (scope !== "archived") { setLoading(true); setScope("archived"); } }}>已归档</button></div>{loading && contacts.length === 0 ? <div className="career-contact-loading"><LoaderCircle className="spin" size={18} />正在打开联系人…</div> : <div className="career-contact-grid">{contacts.map((contact) => {
+  return <div className="career-view"><SectionHeading eyebrow="RELATIONSHIPS" title="联系人" description="只记录真实发生的沟通，以及你愿意安排的下一步" action={<button className="career-button primary" onClick={onAdd}><Plus size={16} />添加联系人</button>} /><div className="career-segmented" aria-label="联系人范围"><button className={scope === "active" ? "active" : ""} aria-pressed={scope === "active"} onClick={() => { if (scope !== "active") { setLoading(true); setScope("active"); } }}>联系人</button><button className={scope === "archived" ? "active" : ""} aria-pressed={scope === "archived"} onClick={() => { if (scope !== "archived") { setLoading(true); setScope("archived"); } }}>已归档</button></div>{readError && <div className="career-scope-error" role="alert"><ShieldCheck size={17} /><span>{readError}</span><button onClick={() => { setLoading(true); setReadRevision((current) => current + 1); }}>重新读取</button></div>}{loading && contacts.length === 0 ? <div className="career-contact-loading"><LoaderCircle className="spin" size={18} />正在打开联系人…</div> : <div className="career-contact-grid">{contacts.map((contact) => {
     const detail = details[contact.id];
     const latest = detail?.interactions[0];
     const next = detail?.tasks.filter((task) => task.status === "todo").sort((left, right) => (left.due_at ?? "9999").localeCompare(right.due_at ?? "9999"))[0];
-    const overdue = next?.due_at && new Date(next.due_at).getTime() < now;
     const jobs = detail?.jobs.slice(0, 2) ?? [];
+    const detailFailed = detailErrors[contact.id];
     const identity = [contact.role, contact.company].filter(Boolean).join(" · ");
-    return <article className="career-contact-card" key={contact.id}><button className="career-contact-open" onClick={() => onSelect(contact.id)} aria-label={`打开联系人 ${contact.name}`}><header><span className="career-contact-avatar">{initials(contact.name)}</span><div><h3>{contact.name}</h3>{identity && <p>{identity}</p>}</div><ChevronRight size={18} /></header>{jobs.length > 0 && <div className="career-contact-jobs">{jobs.map((job) => <span key={job.id}>{job.company} · {job.role}</span>)}</div>}<div className="career-contact-truth"><span><ContactRound size={14} />{latest ? `${formatDate(latest.occurred_at)} · ${latest.channel || "已记录沟通"}` : "等一次真实沟通"}</span><span><CalendarDays size={14} />{next ? overdue ? `原计划 ${formatDate(next.due_at)}，可重新安排` : `${relativeDate(next.due_at, now)} · ${next.title}` : "没有安排下一步"}</span></div></button></article>;
+    return <article className="career-contact-card" key={contact.id}><button className="career-contact-open" onClick={() => onSelect(contact.id)} aria-label={`打开联系人 ${contact.name}`}><header><span className="career-contact-avatar">{initials(contact.name)}</span><div><h3>{contact.name}</h3>{identity && <p>{identity}</p>}</div><ChevronRight size={18} /></header>{jobs.length > 0 && <div className="career-contact-jobs">{jobs.map((job) => <span key={job.id}>{job.company} · {job.role}</span>)}</div>}<div className="career-contact-truth">{detailFailed ? <><span><ContactRound size={14} />相关记录暂时没有读到</span><span><CalendarDays size={14} />没有把它当成“没有安排”</span></> : <><span><ContactRound size={14} />{latest ? `${formatDate(latest.occurred_at)} · ${latest.channel || "已记录沟通"}` : "等一次真实沟通"}</span><span><CalendarDays size={14} />{next ? `${formatCareerTaskDate(next.due_at, now)} · ${next.title}` : "没有安排下一步"}</span></>}</div></button></article>;
   })}</div>}{!loading && contacts.length === 0 && <EmptyState icon={<UsersRound />} title={scope === "archived" ? "归档里很安静" : "还没有联系人"} text={scope === "archived" ? "移入归档的联系人会保留全部历史，也可以随时恢复。" : "不需要为了数量而添加。下一次真实认识某个人时，再把关系记下来。"} action={scope === "active" ? <button className="career-button primary" onClick={onAdd}>添加第一位联系人</button> : undefined} />}</div>;
 }
 
@@ -1278,6 +1412,206 @@ function Modal({ title, description, children, onClose, wide = false, dismissibl
   const titleId = useId();
   const descriptionId = useId();
   return <div className="career-layer">{dismissible ? <button className="career-modal-scrim" onClick={onClose} aria-label={`关闭${title}`} /> : <div className="career-modal-scrim" aria-hidden="true" />}<section ref={dialogRef} tabIndex={-1} className={`career-modal ${wide ? "wide" : ""}`} role="dialog" aria-modal="true" aria-labelledby={titleId} aria-describedby={description ? descriptionId : undefined}><header><div><h2 id={titleId}>{title}</h2>{description && <p id={descriptionId}>{description}</p>}</div>{dismissible && <button className="career-icon-button" onClick={onClose} aria-label={`关闭${title}`}><X size={19} /></button>}</header>{children}</section></div>;
+}
+
+type CareerTaskSheetPhase = "idle" | "loading" | "ready" | "writing" | "refreshing" | "stale" | "refresh-only";
+type CareerTaskSheetMode = "summary" | "schedule" | "restore" | "cancel-confirm";
+type CareerTaskDueChoice = "later" | "new" | "original" | null;
+
+function TaskDetailSheet({ request, now, onClose, onRefresh, notify }: {
+  request: CareerTaskSheetRequest;
+  now: number;
+  onClose: () => void;
+  onRefresh: () => Promise<void>;
+  notify: (text: string, tone?: Notice["tone"]) => void;
+}) {
+  const [phase, setPhase] = useState<CareerTaskSheetPhase>(() => request.initialState ?? "idle");
+  const [detail, setDetail] = useState<CareerTaskDetail | null>(null);
+  const [mode, setMode] = useState<CareerTaskSheetMode>("summary");
+  const [dueChoice, setDueChoice] = useState<CareerTaskDueChoice>(null);
+  const [newDueAt, setNewDueAt] = useState("");
+  const [message, setMessage] = useState(request.initialState === "stale" ? "这条待办刚在另一个页面发生了变化。这里没有继续保存。" : "");
+  const [notFound, setNotFound] = useState(false);
+  const requestRef = useRef(0);
+  const writeRef = useRef(false);
+  const titleId = useId();
+  const descriptionId = useId();
+  const busy = phase === "writing" || phase === "refreshing" || phase === "refresh-only" || phase === "loading";
+  function requestClose() {
+    if (busy || (mode !== "summary" && phase !== "stale")) return;
+    onClose();
+  }
+  const dialogRef = useDialogA11y(requestClose, true);
+
+  async function readLatest() {
+    const token = ++requestRef.current;
+    setPhase("loading");
+    setMessage("");
+    setNotFound(false);
+    try {
+      const next = await careerTaskActions.load(request.taskId);
+      if (requestRef.current !== token) return;
+      if (!next) {
+        setDetail(null);
+        setNotFound(true);
+      } else {
+        setDetail(next);
+        setMode("summary");
+        setDueChoice(null);
+        setNewDueAt("");
+      }
+      setPhase("ready");
+    } catch {
+      if (requestRef.current !== token) return;
+      setPhase("ready");
+      setMessage("待办资料暂时没有打开。没有把它当成一条空记录。");
+    }
+  }
+
+  useEffect(() => {
+    if (request.initialState) return;
+    const frame = window.requestAnimationFrame(() => { void readLatest(); });
+    return () => { window.cancelAnimationFrame(frame); requestRef.current += 1; };
+    // The request nonce remounts the sheet; task ID is stable for this instance.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [request.taskId]);
+
+  useEffect(() => {
+    if (mode !== "cancel-confirm") return;
+    const frame = window.requestAnimationFrame(() => dialogRef.current?.querySelector<HTMLElement>("[data-task-safe-focus]")?.focus());
+    return () => window.cancelAnimationFrame(frame);
+  }, [dialogRef, mode]);
+
+  useEffect(() => {
+    if (phase !== "ready" && phase !== "stale") return;
+    const dialog = dialogRef.current;
+    if (!dialog || dialog.contains(document.activeElement)) return;
+    const frame = window.requestAnimationFrame(() => {
+      (dialog.querySelector<HTMLElement>("[data-dialog-initial]:not([disabled])") ?? dialog).focus();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [dialogRef, phase]);
+
+  async function finishMutation(action: () => Promise<unknown>, successMessage: string) {
+    if (!detail || writeRef.current) return;
+    writeRef.current = true;
+    setPhase("writing");
+    setMessage("");
+    try {
+      await action();
+    } catch (error) {
+      writeRef.current = false;
+      if (error instanceof CareerTaskError && error.code === "changed") {
+        setPhase("stale");
+        setMessage("这条待办刚在另一个页面发生了变化。这里没有继续保存。");
+        return;
+      }
+      setPhase("ready");
+      setMessage(error instanceof Error ? error.message : "这次更改没有保存，原记录仍保持不变。");
+      return;
+    }
+    setPhase("refreshing");
+    try {
+      await onRefresh();
+      const latest = await careerTaskActions.load(request.taskId);
+      if (!latest) {
+        setDetail(null);
+        setNotFound(true);
+      } else setDetail(latest);
+      setMode("summary");
+      setDueChoice(null);
+      setNewDueAt("");
+      setPhase("ready");
+      notify(successMessage, "info");
+    } catch {
+      setPhase("refresh-only");
+      setMessage("更改已保存在本机，画面还没有重新读取。请只重新读取，不要重复提交。");
+    } finally { writeRef.current = false; }
+  }
+
+  async function retryRefreshOnly() {
+    if (phase !== "refresh-only") return;
+    setMessage("");
+    try {
+      await onRefresh();
+      const latest = await careerTaskActions.load(request.taskId);
+      setDetail(latest);
+      setNotFound(!latest);
+      setMode("summary");
+      setDueChoice(null);
+      setNewDueAt("");
+      setPhase("ready");
+    } catch {
+      setMessage("更改仍已保存在本机。这里只会重新读取，不会再次提交。");
+    }
+  }
+
+  function chosenDueAt() {
+    if (dueChoice === "later") return null;
+    if (dueChoice === "original") return detail?.task.due_at ?? null;
+    if (dueChoice === "new") return fromDateInput(newDueAt);
+    return undefined;
+  }
+
+  function submitDueChoice() {
+    if (!detail || !detail.task.updated_at) return;
+    const dueAt = chosenDueAt();
+    if (dueAt === undefined) return;
+    const options = { expectedUpdatedAt: detail.task.updated_at, dueAt, operationId: `task_due_${crypto.randomUUID()}` };
+    if (mode === "schedule") {
+      void finishMutation(() => careerTaskActions.reschedule(detail.task.id, options), dueAt ? "安排已调整" : "已放到“以后再说”");
+      return;
+    }
+    if (detail.task.status === "done") {
+      void finishMutation(() => careerTaskActions.reopenCompleted(detail.task.id, options), "待办已重新放回");
+      return;
+    }
+    void finishMutation(() => careerTaskActions.restore(detail.task.id, options), "待办已重新放回");
+  }
+
+  const task = detail?.task ?? null;
+  const taskVersion = task?.updated_at ?? "";
+  const originalFuture = Boolean(task?.due_at && new Date(task.due_at).getTime() > now);
+  const canSubmitDue = dueChoice === "later" || dueChoice === "original" || (dueChoice === "new" && Boolean(newDueAt));
+  const lifecyclePaused = Boolean(task && isCareerLifecyclePaused(task));
+  const statusCopy = task ? careerTaskStatusCopy(task) : "待办";
+  const contextCopy = detail?.job?.archived ? "关联职位已归档" : detail?.job?.stage?.isTerminal ? "关联职位已结束" : "";
+  const restoreBlockedCopy = task?.status === "done" && detail?.job?.archived
+    ? "关联职位已归档，因此先不重新安排。取回职位后，可以再决定。"
+    : task?.status === "done" && detail?.job?.stage?.isTerminal
+      ? "关联职位已结束，因此先不重新安排。职位重新开始后，可以再决定。"
+      : detail?.hardRestoreBlockedReason === "job_archived"
+    ? "关联职位已归档，因此先不重新安排。取回职位后，可以再决定。"
+    : detail?.hardRestoreBlockedReason === "job_ended"
+      ? "关联职位已结束，因此先不重新安排。职位重新开始后，可以再决定。"
+      : detail?.hardRestoreBlockedReason && detail.hardRestoreBlockedReason !== "not_canceled"
+        ? "关联记录已经变化，这里没有继续操作。"
+        : "";
+
+  if (phase === "refresh-only") return <div className="career-layer"><div className="career-modal-scrim" aria-hidden="true" /><aside ref={dialogRef} tabIndex={-1} className="career-task-sheet recovery" role="dialog" aria-modal="true" aria-labelledby={titleId} aria-describedby={descriptionId}><div className="career-task-recovery"><ShieldCheck size={24} /><span><h2 id={titleId}>更改已保存在本机</h2><p id={descriptionId}>{message || "画面还没有重新读取。请只重新读取，不要重复提交。"}</p></span><button className="career-button primary" data-dialog-initial onClick={() => void retryRefreshOnly()}><RotateCcw size={16} />重新读取</button></div></aside></div>;
+
+  return <div className="career-layer"><button className="career-modal-scrim" disabled={busy || (mode !== "summary" && phase !== "stale")} onClick={requestClose} aria-label="关闭待办详情" /><aside ref={dialogRef} tabIndex={-1} className={`career-task-sheet ${phase}`} role="dialog" aria-modal="true" aria-labelledby={titleId} aria-describedby={descriptionId} aria-busy={busy || undefined}>
+    <header><div><span>{statusCopy}</span><h2 id={titleId}>{task?.title ?? (notFound ? "待办记录已经变化" : "正在打开待办")}</h2><p id={descriptionId}>{task ? formatCareerTaskDate(task.due_at, now) : "只呈现成功读取到的本地记录。"}</p></div><button className="career-icon-button" data-dialog-initial disabled={busy || (mode !== "summary" && phase !== "stale")} onClick={requestClose} aria-label="关闭待办详情"><X size={19} /></button></header>
+    <div className="career-task-sheet-body" aria-live="polite">
+      {phase === "loading" && <div className="career-modal-loading" role="status"><LoaderCircle className="spin" size={20} />正在打开待办…</div>}
+      {phase === "stale" && <div className="career-task-alert" role="alert"><ShieldCheck size={18} /><div><b>这里没有继续保存</b><p>{message}</p></div><button className="career-button secondary" onClick={() => void readLatest()}><RotateCcw size={16} />查看最新状态</button></div>}
+      {message && phase === "ready" && <div className="career-task-alert" role="alert"><ShieldCheck size={18} /><div><b>记录保持原样</b><p>{message}</p></div>{!detail && <button className="career-button secondary" onClick={() => void readLatest()}>重新读取</button>}</div>}
+      {notFound && <div className="career-task-empty"><ShieldCheck size={22} /><h3>这条待办已不在当前记录中</h3><p>这里没有进行任何更改。</p></div>}
+      {task && phase !== "loading" && <>
+        <section className="career-task-facts"><div><span>状态</span><b>{statusCopy}</b></div><div><span>计划时间</span><b>{formatCareerTaskDate(task.due_at, now)}</b></div><div><span>类型</span><b>{task.kind}</b></div><div><span>关联</span><b>{detail?.job ? `${detail.job.company} · ${detail.job.role}` : detail?.contact ? detail.contact.name : "个人待办"}</b></div></section>
+        {contextCopy && <div className="career-task-context"><ShieldCheck size={16} /><span><b>{contextCopy}</b><small>保留的安排仍由你决定是否完成、调整或放下。</small></span></div>}
+        {lifecyclePaused && <div className="career-task-context"><Archive size={16} /><span><b>随职位暂停</b><small>{task.cancellation_reason === "job_archived" ? "这条安排随职位归档而暂停，记录仍完整保留。" : "这条安排随职位结束而暂停，记录仍完整保留。"}</small></span></div>}
+        {mode === "summary" && phase !== "stale" && <div className="career-task-actions">
+          {!taskVersion && <p className="career-task-blocked">这条记录缺少可确认的版本，请先查看最新状态。</p>}
+          {task.status === "todo" && taskVersion && <><button className="career-button primary" disabled={busy} onClick={() => void finishMutation(() => careerTaskActions.complete(task.id, { expectedUpdatedAt: taskVersion, operationId: `task_complete_${crypto.randomUUID()}` }), "待办已完成")}><Check size={16} />标记为已完成</button><button className="career-button secondary" disabled={busy} onClick={() => { setDueChoice(null); setNewDueAt(""); setMode("schedule"); }}><CalendarDays size={16} />调整安排</button>{task.due_at && <button className="career-button ghost" disabled={busy} onClick={() => void finishMutation(() => careerTaskActions.reschedule(task.id, { expectedUpdatedAt: taskVersion, dueAt: null, operationId: `task_later_${crypto.randomUUID()}` }), "已放到“以后再说”")}>以后再说</button>}<button className="career-button ghost" disabled={busy} onClick={() => setMode("cancel-confirm")}>放下这条待办</button></>}
+          {(task.status === "done" || task.status === "canceled") && taskVersion && !restoreBlockedCopy && (task.status === "done" || detail?.canRestoreWithNewDueAt) && <button className="career-button primary" disabled={busy} onClick={() => { setDueChoice(null); setNewDueAt(""); setMode("restore"); }}><RotateCcw size={16} />重新放回待办</button>}
+          {restoreBlockedCopy && <p className="career-task-blocked">{restoreBlockedCopy}</p>}
+        </div>}
+        {(mode === "schedule" || mode === "restore") && <section className="career-task-due-choice"><header><h3>{mode === "restore" ? "重新放回待办" : "调整安排"}</h3><p>{mode === "restore" && task.due_at && !originalFuture ? "原计划时间已经过去。请选择新的时间，或选“以后再说”。" : "先明确选择；这里不会替你沿用旧时间。"}</p></header><fieldset><legend className="sr-only">选择新的计划时间</legend><label aria-label="以后再说"><input type="radio" name="task-due-choice" checked={dueChoice === "later"} onChange={() => setDueChoice("later")} /><span><b>以后再说</b><small>不设时间，记录仍会保留</small></span></label><label aria-label="选择新的时间"><input type="radio" name="task-due-choice" checked={dueChoice === "new"} onChange={() => setDueChoice("new")} /><span><b>选择新的时间</b><small>只接受现在之后的时间</small></span></label>{dueChoice === "new" && <input aria-label="新的计划时间" type="datetime-local" value={newDueAt} onChange={(event) => setNewDueAt(event.target.value)} />}{mode === "restore" && originalFuture && <label aria-label="沿用原计划"><input type="radio" name="task-due-choice" checked={dueChoice === "original"} onChange={() => setDueChoice("original")} /><span><b>沿用原计划</b><small>{formatCareerTaskDate(task.due_at, now)}</small></span></label>}</fieldset><footer><button className="career-button ghost" onClick={() => { setDueChoice(null); setNewDueAt(""); setMode("summary"); }}>先不调整</button><button className="career-button primary" disabled={!canSubmitDue || busy} onClick={submitDueChoice}>{busy ? <LoaderCircle className="spin" size={16} /> : <Check size={16} />}{busy ? "正在保存…" : "确认安排"}</button></footer></section>}
+        {mode === "cancel-confirm" && <section className="career-task-cancel-confirm"><ShieldCheck size={22} /><h3>放下这条待办？</h3><p>它会留在记录里，不会被删除，也不会被当作失败。</p><footer><button className="career-button primary" data-task-safe-focus onClick={() => setMode("summary")}>继续保留</button><button className="career-button secondary" disabled={busy || !taskVersion} onClick={() => void finishMutation(() => careerTaskActions.cancel(task.id, { expectedUpdatedAt: taskVersion, reason: "changed_plan", operationId: `task_cancel_${crypto.randomUUID()}` }), "待办已放下")}>确认放下</button></footer></section>}
+      </>}
+    </div>
+  </aside></div>;
 }
 
 function lifecycleChoiceCopy(choice: CareerLifecycleChoice) {
@@ -1352,7 +1686,7 @@ function CareerLifecycleModal({ state, busy, onChoice, onClose, onConfirm, onRet
 function Field({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) { return <label className="career-field"><span>{label}{hint && <small>{hint}</small>}</span>{children}</label>; }
 function EmptyState({ icon, title, text, action }: { icon: ReactNode; title: string; text: string; action?: ReactNode }) { return <div className="career-empty"><span>{icon}</span><h3>{title}</h3><p>{text}</p>{action}</div>; }
 
-function JobDrawer({ job, data, now, lifecyclePending, onClose, onLifecycle, onRefresh, onAi, onSelectContact, notify }: { job: Job; data: CareerData; now: number; lifecyclePending: boolean; onClose: () => void; onLifecycle: (intent: CareerLifecycleIntent) => Promise<boolean>; onRefresh: () => Promise<void>; onAi: (action: AiAction, title: string, payload: unknown) => void; onSelectContact: (contactId: string) => void; notify: (text: string, tone?: Notice["tone"]) => void }) {
+function JobDrawer({ job, data, now, lifecyclePending, onClose, onLifecycle, onRefresh, onOpenTask, onCompleteTask, onAi, onSelectContact, notify }: { job: Job; data: CareerData; now: number; lifecyclePending: boolean; onClose: () => void; onLifecycle: (intent: CareerLifecycleIntent) => Promise<boolean>; onRefresh: () => Promise<void>; onOpenTask: (taskId: string) => void; onCompleteTask: (task: Task) => void | Promise<void>; onAi: (action: AiAction, title: string, payload: unknown) => void; onSelectContact: (contactId: string) => void; notify: (text: string, tone?: Notice["tone"]) => void }) {
   const [tab, setTab] = useState<"overview" | "tasks" | "interviews" | "materials">("overview");
   const [editing, setEditing] = useState(false);
   const [linkedContacts, setLinkedContacts] = useState<Contact[]>([]);
@@ -1374,7 +1708,7 @@ function JobDrawer({ job, data, now, lifecyclePending, onClose, onLifecycle, onR
   }, [job.id]);
   async function save(event: FormEvent<HTMLFormElement>) { event.preventDefault(); if (archived) return; const form = new FormData(event.currentTarget); const result = await runCareerSql("UPDATE career_jobs SET company=?,role=?,location=?,salary=?,work_mode=?,description=?,note=?,tags=?,deadline=?,updated_at=? WHERE id=? AND archived=0", [form.get("company"), form.get("role"), form.get("location"), form.get("salary"), form.get("work_mode"), form.get("description"), form.get("note"), form.get("tags"), fromDateInput(String(form.get("deadline") || "")), new Date().toISOString(), job.id]); await onRefresh(); setEditing(false); if (result.changes === 0) { notify("职位状态刚有变化，这次编辑没有保存。请重新打开后确认。", "info"); return; } notify("职位信息已保存"); }
   return <Drawer label={`${job.company} · ${job.role}`} onClose={onClose} wide><div className="career-job-drawer-head"><CompanyMark company={job.company} /><div><SourceBadge source={job.source} /><h2>{job.role}</h2><p>{job.company} · {job.location || "地点待确认"}</p></div><button className="career-icon-button" onClick={onClose} aria-label="关闭职位详情"><X size={19} /></button></div><div className="career-job-status-row">{archived ? <span className="career-archived-state"><Archive size={14} />已归档 · {currentStage?.name ?? "原阶段"}</span> : <select value={job.stage_id} disabled={lifecyclePending} onChange={(event) => void onLifecycle({ kind: "stage", jobId: job.id, nextStageId: event.target.value })} aria-label="职位阶段">{data.stages.map((stage) => <option key={stage.id} value={stage.id}>{stage.name}</option>)}</select>}{ended && !archived && <span className="career-ended-state">已结束 · 只记录结果</span>}<span><Target size={14} />优先级 {job.priority}</span>{safeLink(job.source_url) && <a href={job.source_url} target="_blank" rel="noreferrer">查看原职位 <ExternalLink size={14} /></a>}</div><div className="career-drawer-tabs">{[["overview", "职位概览"], ["tasks", `待办 ${tasks.length}`], ["interviews", `面试 ${interviews.length}`], ["materials", `材料 ${materials.length}`]].map(([id, label]) => <button className={tab === id ? "active" : ""} aria-pressed={tab === id} key={id} onClick={() => setTab(id as typeof tab)}>{label}</button>)}</div><div className="career-drawer-body">{tab === "overview" && (editing ? <form className="career-form" onSubmit={save}><Field label="公司"><input name="company" defaultValue={job.company} required /></Field><Field label="职位"><input name="role" defaultValue={job.role} required /></Field><div className="career-form-row"><Field label="地点"><input name="location" defaultValue={job.location} /></Field><Field label="工作方式"><input name="work_mode" defaultValue={job.work_mode} /></Field></div><div className="career-form-row"><Field label="薪资"><input name="salary" defaultValue={job.salary} /></Field><Field label="截止时间"><input name="deadline" type="datetime-local" defaultValue={dateInputValue(job.deadline)} /></Field></div><Field label="标签"><input name="tags" defaultValue={job.tags} /></Field><Field label="职位描述"><textarea name="description" rows={7} defaultValue={job.description} /></Field><Field label="个人备注"><textarea name="note" rows={4} defaultValue={job.note} /></Field><div className="career-form-actions"><button type="button" className="career-button ghost" onClick={() => setEditing(false)}>取消</button><button className="career-button primary">保存修改</button></div></form> : <>{!archived && <div className="career-detail-actions"><button className="career-button secondary" onClick={() => onAi("fit_analysis", "AI 职位要求拆解", { job })}><Sparkles size={15} />拆解职位要求</button><button className="career-button ghost" onClick={() => setEditing(true)}><Pencil size={15} />编辑</button></div>}<dl className="career-detail-grid"><div><dt>薪资范围</dt><dd>{job.salary || "未记录"}</dd></div><div><dt>工作方式</dt><dd>{job.work_mode || "未记录"}</dd></div><div><dt>申请来源</dt><dd>{job.source}</dd></div><div><dt>投递时间</dt><dd>{job.applied_at ? formatDate(job.applied_at) : "尚未投递"}</dd></div><div><dt>旧版联系人备注</dt><dd>{job.contact_name || "没有旧版备注"}</dd></div><div><dt>截止时间</dt><dd>{job.deadline ? formatDate(job.deadline, true) : "未记录"}</dd></div></dl><section className="career-detail-section"><h3>已关联联系人</h3>{linkedContacts.length > 0 ? <div className="career-job-contact-links">{linkedContacts.map((contact) => <button key={contact.id} onClick={() => onSelectContact(contact.id)}><span className="career-contact-avatar">{initials(contact.name)}</span><span><b>{contact.name}</b><small>{[contact.role, contact.company, contact.archived === 1 ? "已归档" : ""].filter(Boolean).join(" · ")}</small></span><ChevronRight size={16} /></button>)}</div> : <p className="career-contact-calm-copy">{job.contact_name ? `旧版备注写着“${job.contact_name}”，尚未确认成联系人关系。请从联系人页面明确关联。` : "还没有明确关联的联系人。可在联系人详情中管理职位关系。"}</p>}</section><section className="career-detail-section"><h3>职位描述</h3><p className="career-long-copy">{job.description || "还没有保存职位描述。"}</p></section><section className="career-detail-section"><h3>我的备注</h3><p className="career-long-copy">{job.note || "还没有添加备注。"}</p></section><div className="career-card-tags">{job.tags.split(",").filter(Boolean).map((tag) => <i key={tag}>{tag}</i>)}</div></>)}
-    {tab === "tasks" && <div className="career-drawer-list">{tasks.map((task) => <article key={task.id}><span className={`career-check ${task.status}`}><Check size={13} /></span><div><b>{task.title}</b><small>{relativeDate(task.due_at, now)} · {task.kind}{isCareerLifecyclePaused(task) ? " · 随职位暂停" : task.status === "canceled" ? " · 已取消" : ""}</small></div></article>)}{tasks.length === 0 && <EmptyState icon={<ListTodo />} title="还没有待办" text="为这个职位安排一个具体的下一步。" />}</div>}{tab === "interviews" && <div className="career-drawer-list">{interviews.map((item) => <article key={item.id}><span className="career-list-icon"><MessageSquareText size={16} /></span><div><b>{item.round_name}</b><small>{formatDate(item.scheduled_at, true)} · {item.interviewer || "面试官待确认"}{isCareerLifecyclePaused(item) ? " · 随职位暂停" : item.status === "canceled" ? " · 已取消" : ""}</small><p>{item.summary}</p></div></article>)}{interviews.length === 0 && <EmptyState icon={<MessageSquareText />} title="还没有面试轮次" text="推进到面试后，在这里完整记录每一轮。" />}</div>}{tab === "materials" && <div className="career-drawer-list">{materials.map((item) => <article key={item.id}><span className="career-list-icon"><FileText size={16} /></span><div><b>{item.name}</b><small>{item.kind} · {item.version}</small><p>{item.notes}</p></div></article>)}{materials.length === 0 && <EmptyState icon={<FileText />} title="还没有关联材料" text="关联确切版本，之后随时知道发出的是哪一份。" />}</div>}</div><footer className="career-drawer-footer">{archived ? <button className="career-button secondary" disabled={lifecyclePending} onClick={() => void onLifecycle({ kind: "restore", jobId: job.id })}><RotateCcw size={15} />从归档取回</button> : <button className="career-button ghost" disabled={lifecyclePending} onClick={() => void onLifecycle({ kind: "archive", jobId: job.id })}><Archive size={15} />收进归档</button>}<span>{archived ? "取回不会自动恢复过期或后来修改过的安排。" : "归档只是整理，不会删除职位或相关记录。"}</span></footer></Drawer>;
+    {tab === "tasks" && <div className="career-drawer-list career-drawer-task-list">{tasks.map((task) => <CareerTaskRow key={task.id} task={task} data={data} now={now} onOpen={onOpenTask} onComplete={onCompleteTask} />)}{tasks.length === 0 && <EmptyState icon={<ListTodo />} title="还没有待办" text="为这个职位安排一个具体的下一步。" />}</div>}{tab === "interviews" && <div className="career-drawer-list">{interviews.map((item) => <article key={item.id}><span className="career-list-icon"><MessageSquareText size={16} /></span><div><b>{item.round_name}</b><small>{formatDate(item.scheduled_at, true)} · {item.interviewer || "面试官待确认"}{isCareerLifecyclePaused(item) ? " · 随职位暂停" : item.status === "canceled" ? " · 已取消" : ""}</small><p>{item.summary}</p></div></article>)}{interviews.length === 0 && <EmptyState icon={<MessageSquareText />} title="还没有面试轮次" text="推进到面试后，在这里完整记录每一轮。" />}</div>}{tab === "materials" && <div className="career-drawer-list">{materials.map((item) => <article key={item.id}><span className="career-list-icon"><FileText size={16} /></span><div><b>{item.name}</b><small>{item.kind} · {item.version}</small><p>{item.notes}</p></div></article>)}{materials.length === 0 && <EmptyState icon={<FileText />} title="还没有关联材料" text="关联确切版本，之后随时知道发出的是哪一份。" />}</div>}</div><footer className="career-drawer-footer">{archived ? <button className="career-button secondary" disabled={lifecyclePending} onClick={() => void onLifecycle({ kind: "restore", jobId: job.id })}><RotateCcw size={15} />从归档取回</button> : <button className="career-button ghost" disabled={lifecyclePending} onClick={() => void onLifecycle({ kind: "archive", jobId: job.id })}><Archive size={15} />收进归档</button>}<span>{archived ? "取回不会自动恢复已经过去或后来修改过的安排。" : "归档只是整理，不会删除职位或相关记录。"}</span></footer></Drawer>;
 }
 
 type InterviewEditorSnapshot = {
@@ -1660,31 +1994,36 @@ function InterviewDrawer({ interview, data, onClose, onRefresh, onAi, notify }: 
   </Drawer>{closePrompt && <Modal title="保留这次编辑吗？" description="这些修改还没有写入职迹的 SQLite 数据库。" onClose={() => setClosePrompt(false)}><div className="career-draft-choice"><p>你可以继续编辑、暂存在此浏览器，或明确放弃这次修改。</p><div><button type="button" className="career-button primary" data-dialog-initial onClick={() => setClosePrompt(false)}>继续编辑</button><button type="button" className="career-button secondary" onClick={saveLocalDraftAndClose}><FileArchive size={16} />保存本机草稿并关闭</button><button type="button" className="career-button danger" onClick={discardAndClose}><Trash2 size={16} />放弃修改</button></div><small><ShieldCheck size={14} />本机草稿只在当前设备与此浏览器的站点存储中，不进入 SQLite 或导出备份；清除站点数据会同时清除它。</small></div></Modal>}</>;
 }
 
-function ContactDrawer({ contactId, revision, now, onClose, onEdit, onRecord, onTask, onToggleTask, onArchive, onRestore, notify }: {
+function ContactDrawer({ contactId, revision, now, onClose, onEdit, onRecord, onAddTask, onOpenTask, onCompleteTask, onArchive, onRestore, notify }: {
   contactId: string;
   revision: number;
   now: number;
   onClose: () => void;
   onEdit: () => void;
   onRecord: () => void;
-  onTask: (taskId?: string) => void;
-  onToggleTask: (task: Task) => Promise<void>;
+  onAddTask: () => void;
+  onOpenTask: (taskId: string) => void;
+  onCompleteTask: (task: Task) => void | Promise<void>;
   onArchive: (contact: Contact) => Promise<void>;
   onRestore: (contact: Contact) => Promise<void>;
   notify: (text: string, tone?: Notice["tone"]) => void;
 }) {
   const [detail, setDetail] = useState<CareerContactDetail | null>(null);
   const [loading, setLoading] = useState(true);
+  const [readError, setReadError] = useState("");
+  const [readRevision, setReadRevision] = useState(0);
   const [busy, setBusy] = useState(false);
   useEffect(() => {
     let live = true;
-    void loadCareerContactDetail(contactId).then((next) => { if (live) setDetail(next); }).catch((error) => {
-      if (live) notify(error instanceof Error ? error.message : "联系人暂时无法打开", "error");
+    void loadCareerContactDetail(contactId).then((next) => { if (live) { setReadError(""); setDetail(next); } }).catch(() => {
+      if (live) setReadError("联系人资料暂时没有打开。没有把它当成空记录。");
     }).finally(() => { if (live) setLoading(false); });
     return () => { live = false; };
-  }, [contactId, notify, revision]);
+  }, [contactId, revision, readRevision]);
 
-  if (loading || !detail) return <Drawer label="联系人详情" onClose={onClose} wide><div className="career-drawer-loading"><LoaderCircle className="spin" size={20} /><p>{loading ? "正在打开联系人…" : "没有找到这位联系人"}</p></div></Drawer>;
+  if (loading && !detail) return <Drawer label="联系人详情" onClose={onClose} wide><div className="career-drawer-loading"><LoaderCircle className="spin" size={20} /><p>正在打开联系人…</p></div></Drawer>;
+  if (readError && !detail) return <Drawer label="联系人详情" onClose={onClose} wide><div className="career-drawer-read-error" role="alert"><ShieldCheck size={22} /><h2>联系人资料暂时没有打开</h2><p>{readError}</p><div><button className="career-button primary" data-dialog-initial onClick={() => setReadRevision((current) => current + 1)}><RotateCcw size={16} />重新读取</button><button className="career-button ghost" onClick={onClose}>关闭</button></div></div></Drawer>;
+  if (!detail) return <Drawer label="联系人详情" onClose={onClose} wide><div className="career-drawer-read-error"><ShieldCheck size={22} /><h2>没有找到这位联系人</h2><p>联系人记录可能已经变化，这里没有把它显示成一份空资料。</p><button className="career-button primary" onClick={onClose}>关闭</button></div></Drawer>;
   const { contact } = detail;
   const openTasks = detail.tasks.filter((task) => task.status === "todo").sort((left, right) => (left.due_at ?? "9999").localeCompare(right.due_at ?? "9999"));
   const nextTask = openTasks[0];
@@ -1696,7 +2035,7 @@ function ContactDrawer({ contactId, revision, now, onClose, onEdit, onRecord, on
     try { if (archived) await onRestore(detail.contact); else await onArchive(detail.contact); }
     catch (error) { notify(error instanceof Error ? error.message : "联系人状态更新失败", "error"); setBusy(false); }
   }
-  return <Drawer label={`${contact.name} · 联系人详情`} onClose={onClose} wide><div className="career-contact-drawer-head"><span className="career-contact-avatar large">{initials(contact.name)}</span><div><span>{archived ? "已归档联系人" : "联系人"}</span><h2>{contact.name}</h2>{identity && <p>{identity}</p>}</div><button className="career-icon-button" onClick={onClose} aria-label="关闭联系人详情"><X size={19} /></button></div><div className="career-contact-drawer-actions">{!archived && <button className="career-button primary" onClick={onRecord}><MessageSquareText size={16} />记录联系</button>}<button className="career-button secondary" onClick={onEdit}><Pencil size={15} />编辑</button></div><div className="career-drawer-body career-contact-detail"><section><header><div><span>NEXT STEP</span><h3>下一步</h3></div>{!archived && <button className="career-text-button" onClick={() => onTask(nextTask?.id)}>{nextTask ? "重新安排" : "安排下一步"}<ChevronRight size={14} /></button>}</header>{nextTask ? <article className="career-contact-next-card"><span><CalendarDays size={17} /></span><div><b>{nextTask.title}</b><p>{nextTask.due_at && new Date(nextTask.due_at).getTime() < now ? `原计划 ${formatDate(nextTask.due_at, true)}，可以按现在的节奏重新安排` : `${formatDate(nextTask.due_at, true)} · ${nextTask.kind}`}</p></div><button onClick={() => void onToggleTask(nextTask)} aria-label={`完成「${nextTask.title}」`}><Check size={16} />完成</button></article> : <p className="career-contact-calm-copy">没有安排下一步。需要时再决定，不必为了填满而创建提醒。</p>}{contact.next_follow_up && openTasks.length === 0 && <p className="career-contact-legacy">旧版曾记录 {formatDate(contact.next_follow_up, true)} 的提醒，但没有自动转成待办。</p>}</section><section><header><div><span>CONTEXT</span><h3>关联职位</h3></div><button className="career-text-button" onClick={onEdit}>管理关联 <ChevronRight size={14} /></button></header>{detail.jobs.length > 0 ? <div className="career-contact-related-jobs">{detail.jobs.map((job) => <span key={job.id}><CompanyMark company={job.company} small /><b>{job.role}</b><small>{job.company}</small></span>)}</div> : <p className="career-contact-calm-copy">还没有关联职位。只有你明确选择后，这里才会建立关系。</p>}</section><section><header><div><span>HISTORY</span><h3>联系记录</h3></div>{!archived && <button className="career-text-button" onClick={onRecord}>记录一次 <Plus size={14} /></button>}</header>{detail.interactions.length > 0 ? <div className="career-contact-timeline">{detail.interactions.map((interaction) => <article key={interaction.id}><i /><div><header><b>{interaction.summary}</b><time>{formatDate(interaction.occurred_at, true)}</time></header><p>{interaction.channel || "未注明渠道"} · {interaction.direction === "outbound" ? "我发出" : interaction.direction === "inbound" ? "对方发来" : "双方交流"}{interaction.job_id ? ` · ${detail.jobs.find((job) => job.id === interaction.job_id)?.role ?? "关联职位"}` : ""}</p>{interaction.notes && <small>{interaction.notes}</small>}</div></article>)}</div> : <><p className="career-contact-calm-copy">还没有联系记录。不需要为了填满而补写；下次真实交流后再记。</p>{contact.last_contact_at && <p className="career-contact-legacy">旧版只保存了 {formatDate(contact.last_contact_at, true)} 这个时间，没有沟通内容，因此没有把它冒充成联系记录。</p>}</>}</section><section><header><div><span>CONTACT</span><h3>联系方式</h3></div></header><div className="career-contact-channels">{contact.email && <a href={`mailto:${contact.email}`}><ContactRound size={16} /><span><b>邮箱</b><small>{contact.email}</small></span><ExternalLink size={14} /></a>}{contact.phone && <a href={`tel:${contact.phone.replace(/[^+\d*#,;]/g, "")}`}><Phone size={16} /><span><b>电话</b><small>{contact.phone}</small></span><ExternalLink size={14} /></a>}{!contact.email && !contact.phone && <p className="career-contact-calm-copy">还没有保存邮箱或电话。</p>}</div>{contact.notes && <p className="career-contact-notes">{contact.notes}</p>}</section></div><footer className="career-drawer-footer"><button className={archived ? "career-button secondary" : "career-button ghost"} disabled={busy} onClick={() => void changeArchive()}>{archived ? <RotateCcw size={15} /> : <Archive size={15} />}{busy ? "正在保存…" : archived ? "恢复联系人" : "移入归档"}</button></footer></Drawer>;
+  return <Drawer label={`${contact.name} · 联系人详情`} onClose={onClose} wide><div className="career-contact-drawer-head"><span className="career-contact-avatar large">{initials(contact.name)}</span><div><span>{archived ? "已归档联系人" : "联系人"}</span><h2>{contact.name}</h2>{identity && <p>{identity}</p>}</div><button className="career-icon-button" onClick={onClose} aria-label="关闭联系人详情"><X size={19} /></button></div><div className="career-contact-drawer-actions">{!archived && <button className="career-button primary" onClick={onRecord}><MessageSquareText size={16} />记录联系</button>}<button className="career-button secondary" onClick={onEdit}><Pencil size={15} />编辑</button></div>{readError && <div className="career-contact-read-warning" role="alert"><ShieldCheck size={16} /><span>相关记录暂时没有重新读到，画面保留上一次成功读取的内容。</span><button onClick={() => setReadRevision((current) => current + 1)}>重新读取</button></div>}<div className="career-drawer-body career-contact-detail"><section><header><div><span>NEXT STEP</span><h3>下一步</h3></div>{!archived && <button className="career-text-button" onClick={onAddTask}>{nextTask ? "再安排一步" : "安排下一步"}<ChevronRight size={14} /></button>}</header>{nextTask ? <CareerTaskRow compact task={nextTask} data={{ ...emptyData, jobs: detail.jobs, stages: [] }} now={now} onOpen={onOpenTask} onComplete={onCompleteTask} /> : <p className="career-contact-calm-copy">没有安排下一步。需要时再决定，不必为了填满而创建提醒。</p>}{contact.next_follow_up && openTasks.length === 0 && <p className="career-contact-legacy">旧版曾记录 {formatDate(contact.next_follow_up, true)} 的提醒，但没有自动转成待办。</p>}</section><section><header><div><span>CONTEXT</span><h3>关联职位</h3></div><button className="career-text-button" onClick={onEdit}>管理关联 <ChevronRight size={14} /></button></header>{detail.jobs.length > 0 ? <div className="career-contact-related-jobs">{detail.jobs.map((job) => <span key={job.id}><CompanyMark company={job.company} small /><b>{job.role}</b><small>{job.company}</small></span>)}</div> : <p className="career-contact-calm-copy">还没有关联职位。只有你明确选择后，这里才会建立关系。</p>}</section><section><header><div><span>HISTORY</span><h3>联系记录</h3></div>{!archived && <button className="career-text-button" onClick={onRecord}>记录一次 <Plus size={14} /></button>}</header>{detail.interactions.length > 0 ? <div className="career-contact-timeline">{detail.interactions.map((interaction) => <article key={interaction.id}><i /><div><header><b>{interaction.summary}</b><time>{formatDate(interaction.occurred_at, true)}</time></header><p>{interaction.channel || "未注明渠道"} · {interaction.direction === "outbound" ? "我发出" : interaction.direction === "inbound" ? "对方发来" : "双方交流"}{interaction.job_id ? ` · ${detail.jobs.find((job) => job.id === interaction.job_id)?.role ?? "关联职位"}` : ""}</p>{interaction.notes && <small>{interaction.notes}</small>}</div></article>)}</div> : <><p className="career-contact-calm-copy">还没有联系记录。不需要为了填满而补写；下次真实交流后再记。</p>{contact.last_contact_at && <p className="career-contact-legacy">旧版只保存了 {formatDate(contact.last_contact_at, true)} 这个时间，没有沟通内容，因此没有把它冒充成联系记录。</p>}</>}</section><section><header><div><span>CONTACT</span><h3>联系方式</h3></div></header><div className="career-contact-channels">{contact.email && <a href={`mailto:${contact.email}`}><ContactRound size={16} /><span><b>邮箱</b><small>{contact.email}</small></span><ExternalLink size={14} /></a>}{contact.phone && <a href={`tel:${contact.phone.replace(/[^+\d*#,;]/g, "")}`}><Phone size={16} /><span><b>电话</b><small>{contact.phone}</small></span><ExternalLink size={14} /></a>}{!contact.email && !contact.phone && <p className="career-contact-calm-copy">还没有保存邮箱或电话。</p>}</div>{contact.notes && <p className="career-contact-notes">{contact.notes}</p>}</section></div><footer className="career-drawer-footer"><button className={archived ? "career-button secondary" : "career-button ghost"} disabled={busy} onClick={() => void changeArchive()}>{archived ? <RotateCcw size={15} /> : <Archive size={15} />}{busy ? "正在保存…" : archived ? "恢复联系人" : "移入归档"}</button></footer></Drawer>;
 }
 
 function JobModal({ data, onClose, onSaved }: { data: CareerData; onClose: () => void; onSaved: (id: string) => Promise<void> }) {
@@ -1706,27 +2045,49 @@ function JobModal({ data, onClose, onSaved }: { data: CareerData; onClose: () =>
 }
 
 function TaskModal({ data, initialJobId, onClose, onSaved }: { data: CareerData; initialJobId: string | null; onClose: () => void; onSaved: () => Promise<void> }) {
-  const [saving, setSaving] = useState(false);
+  const [phase, setPhase] = useState<"idle" | "writing" | "refresh-only">("idle");
   const [error, setError] = useState("");
   const savingRef = useRef(false);
+  const stableIdRef = useRef(newId("task"));
+  const activeStageIds = new Set(data.stages.filter((stage) => stage.is_terminal !== 1).map((stage) => stage.id));
+  const availableJobs = data.jobs.filter((job) => job.archived !== 1 && activeStageIds.has(job.stage_id));
+  async function finishRefresh() {
+    try { await onSaved(); }
+    catch { setPhase("refresh-only"); setError("待办已保存在本机，但画面还没有重新读取。请只重新读取，不要重复提交。"); }
+  }
+  async function retryRefresh() {
+    if (phase !== "refresh-only") return;
+    setError("");
+    try { await onSaved(); }
+    catch { setError("待办仍已保存在本机。这里只会重新读取，不会再次创建。"); }
+  }
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (savingRef.current) return;
     savingRef.current = true;
-    setSaving(true);
+    setPhase("writing");
     setError("");
     const form = new FormData(event.currentTarget);
     try {
-      await runCareerSql("INSERT INTO career_tasks (id,job_id,title,due_at,kind,priority,status,created_at) VALUES (?,?,?,?,?,?,?,?)", [newId("task"), form.get("job_id") || null, form.get("title"), fromDateInput(String(form.get("due_at") || "")), form.get("kind"), Number(form.get("priority")), "todo", new Date().toISOString()]);
-      await onSaved();
+      await careerTaskActions.create({
+        id: stableIdRef.current,
+        title: String(form.get("title") ?? ""),
+        jobId: String(form.get("job_id") ?? "") || null,
+        dueAt: fromDateInput(String(form.get("due_at") || "")),
+        kind: String(form.get("kind") ?? "跟进"),
+        priority: Number(form.get("priority") ?? 1),
+      });
+      setPhase("refresh-only");
+      await finishRefresh();
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "待办暂时没有保存，请再试一次");
+      setPhase("idle");
     } finally {
       savingRef.current = false;
-      setSaving(false);
     }
   }
-  return <Modal title="新建待办" description="让下一步具体到时间与动作。" onClose={saving ? () => undefined : onClose}><form className="career-form" onSubmit={submit}><Field label="要完成什么"><input name="title" required placeholder="例如：发送面试感谢邮件" /></Field><Field label="关联职位"><select name="job_id" defaultValue={initialJobId ?? ""}><option value="">不关联职位</option>{data.jobs.map((job) => <option key={job.id} value={job.id}>{job.company} · {job.role}</option>)}</select></Field><div className="career-form-row"><Field label="截止时间"><input name="due_at" type="datetime-local" /></Field><Field label="类型"><select name="kind"><option>跟进</option><option>面试准备</option><option>材料</option><option>截止事项</option><option>其他</option></select></Field></div><Field label="优先级"><select name="priority" defaultValue="2"><option value="1">普通</option><option value="2">重点</option><option value="3">时间敏感</option></select></Field>{error && <div className="career-inline-error" role="alert"><X size={15} />{error}</div>}<div className="career-form-actions"><button type="button" className="career-button ghost" disabled={saving} onClick={onClose}>取消</button><button className="career-button primary" disabled={saving}>{saving ? <LoaderCircle className="spin" size={16} /> : <ListTodo size={16} />}{saving ? "正在创建…" : "创建待办"}</button></div></form></Modal>;
+  if (phase === "refresh-only") return <Modal title="待办已保存在本机" description="画面还没有重新读取。请只重新读取，不要重复提交。" onClose={() => undefined} dismissible={false} inertToasts><div className="career-task-refresh-only" role="status"><ShieldCheck size={22} /><p>{error || "这条待办已经写入本地 SQLite；重新读取不会再创建一条。"}</p><button className="career-button primary" data-dialog-initial onClick={() => void retryRefresh()}><RotateCcw size={16} />重新读取</button></div></Modal>;
+  return <Modal title="新建待办" description="记录你主动决定的下一步；计划时间可以留空。" onClose={phase === "writing" ? () => undefined : onClose}><form className="career-form" onSubmit={submit}><Field label="要做什么"><input name="title" required placeholder="例如：发送面试感谢邮件" /></Field><Field label="关联职位" hint="可选"><select name="job_id" defaultValue={initialJobId ?? ""}><option value="">个人待办</option>{availableJobs.map((job) => <option key={job.id} value={job.id}>{job.company} · {job.role}</option>)}</select></Field><div className="career-form-row"><Field label="计划时间（可选）" hint="不设时间会放在“以后再说”"><input name="due_at" type="datetime-local" /></Field><Field label="类型"><select name="kind"><option>跟进</option><option>面试准备</option><option>材料</option><option>截止事项</option><option>其他</option></select></Field></div><Field label="优先级"><select name="priority" defaultValue="1"><option value="1">普通</option><option value="2">重点</option><option value="3">时间敏感</option></select></Field>{error && <div className="career-inline-error" role="alert"><X size={15} />{error}</div>}<div className="career-form-actions"><button type="button" className="career-button ghost" disabled={phase === "writing"} onClick={onClose}>取消</button><button className="career-button primary" disabled={phase === "writing"}>{phase === "writing" ? <LoaderCircle className="spin" size={16} /> : <ListTodo size={16} />}{phase === "writing" ? "正在创建…" : "创建待办"}</button></div></form></Modal>;
 }
 
 function InterviewModal({ data, onClose, onSaved }: { data: CareerData; onClose: () => void; onSaved: () => Promise<void> }) {
@@ -1833,7 +2194,7 @@ function ContactInteractionModal({ contactId, data, onClose, onSaved }: { contac
           title: String(form.get("follow_up_title") ?? ""),
           dueAt: followUpDueAt!,
           kind: "跟进",
-          priority: 2,
+          priority: 1,
           jobId,
         } : undefined,
       });
@@ -1848,43 +2209,44 @@ function ContactInteractionModal({ contactId, data, onClose, onSaved }: { contac
   return <Modal title="记录一次真实联系" description={contact ? `记录与 ${contact.name} 已经发生的沟通；不会自动发送消息。` : "只记录已经发生的沟通。"} onClose={onClose} wide><form className="career-form" onSubmit={submit}><div className="career-form-row thirds"><Field label="发生时间"><input name="occurred_at" type="datetime-local" required defaultValue={dateInputValue(new Date().toISOString())} /></Field><Field label="方向"><select name="direction" defaultValue="mutual"><option value="outbound">我发出</option><option value="inbound">对方发来</option><option value="mutual">双方交流</option></select></Field><Field label="渠道"><select name="channel" defaultValue={contact?.channel ?? ""}><option value="">未注明</option><option>LinkedIn</option><option>BOSS直聘</option><option>邮件</option><option>微信</option><option>电话</option><option>当面</option><option>其他</option></select></Field></div><Field label="沟通摘要" hint="必填，写事实而不是评价"><input name="summary" required placeholder="例如：确认了作品集评审时间" /></Field><Field label="关联职位" hint="可选；选择即明确建立关系"><select name="job_id" defaultValue=""><option value="">不关联职位</option>{data.jobs.map((job) => <option key={job.id} value={job.id}>{job.company} · {job.role}</option>)}</select></Field><Field label="补充备注" hint="可选"><textarea name="notes" rows={4} placeholder="关键信息、对方提到的事项…" /></Field><label className="career-contact-follow-toggle"><input type="checkbox" checked={scheduleNext} onChange={(event) => setScheduleNext(event.target.checked)} /><span><b>顺手安排下一步</b><small>只有你选择后才创建待办</small></span></label>{scheduleNext && <div className="career-contact-follow-fields"><Field label="下一步动作"><input name="follow_up_title" required placeholder="例如：发送更新后的案例页" /></Field><Field label="时间"><input name="follow_up_due_at" type="datetime-local" required /></Field></div>}{error && <div className="career-inline-error"><X size={15} />{error}</div>}<div className="career-form-actions"><button type="button" className="career-button ghost" onClick={onClose}>取消</button><button className="career-button primary" disabled={saving}>{saving ? <LoaderCircle className="spin" size={16} /> : <MessageSquareText size={16} />}{saving ? "正在保存…" : "保存联系记录"}</button></div></form></Modal>;
 }
 
-function ContactTaskModal({ contactId, taskId, data, onClose, onSaved }: { contactId: string; taskId?: string; data: CareerData; onClose: () => void; onSaved: () => Promise<void> }) {
-  const [detail, setDetail] = useState<CareerContactDetail | null>(null);
-  const [loading, setLoading] = useState(Boolean(taskId));
-  const [saving, setSaving] = useState(false);
+function ContactTaskModal({ contactId, data, onClose, onSaved }: { contactId: string; data: CareerData; onClose: () => void; onSaved: () => Promise<void> }) {
+  const [phase, setPhase] = useState<"idle" | "writing" | "refresh-only">("idle");
   const [error, setError] = useState("");
-  useEffect(() => {
-    let live = true;
-    void loadCareerContactDetail(contactId).then((next) => { if (live) setDetail(next); }).catch((caught) => {
-      if (live) setError(caught instanceof Error ? caught.message : "下一步暂时无法打开");
-    }).finally(() => { if (live) setLoading(false); });
-    return () => { live = false; };
-  }, [contactId]);
-  const task = detail?.tasks.find((item) => item.id === taskId);
-  if (loading) return <Modal title="重新安排下一步" description="正在读取原来的安排。" onClose={onClose}><div className="career-modal-loading"><LoaderCircle className="spin" size={20} />正在打开下一步…</div></Modal>;
-  if (taskId && !task) return <Modal title="下一步没有打开" description="原安排可能已经被完成或移除。" onClose={onClose}><div className="career-form"><div className="career-inline-error"><X size={15} />{error || "没有找到这条安排"}</div><div className="career-form-actions"><button type="button" className="career-button primary" onClick={onClose}>返回联系人</button></div></div></Modal>;
-  async function submit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault(); setSaving(true); setError("");
-    const form = new FormData(event.currentTarget);
-    const jobId = String(form.get("job_id") ?? "") || null;
-    const title = String(form.get("title") ?? "");
-    const dueAt = fromDateInput(String(form.get("due_at") ?? ""));
-    const kind = String(form.get("kind") ?? "跟进");
-    const priority = Number(form.get("priority") ?? 2);
-    try {
-      if (taskId) {
-        await withCareerWriteLock(async (context) => runCareerBatch([
-          { sql: "UPDATE career_tasks SET title = ?, due_at = ?, kind = ?, priority = ?, job_id = ? WHERE id = ? AND contact_id = ?", params: [title, dueAt, kind, priority, jobId, taskId, contactId] },
-          ...(jobId ? [{ sql: "INSERT OR IGNORE INTO career_contact_jobs (contact_id, job_id, created_at) VALUES (?, ?, ?)", params: [contactId, jobId, new Date().toISOString()] }] : []),
-        ], context));
-      } else {
-        await createCareerContactTask({ contactId, title, dueAt, kind, priority, jobId });
-      }
-      await onSaved();
-    } catch (caught) { setError(caught instanceof Error ? caught.message : "下一步保存失败"); }
-    finally { setSaving(false); }
+  const savingRef = useRef(false);
+  const stableIdRef = useRef(newId("task"));
+  const activeStageIds = new Set(data.stages.filter((stage) => stage.is_terminal !== 1).map((stage) => stage.id));
+  const availableJobs = data.jobs.filter((job) => job.archived !== 1 && activeStageIds.has(job.stage_id));
+  async function refreshOnly() {
+    setError("");
+    try { await onSaved(); }
+    catch { setPhase("refresh-only"); setError("下一步仍已保存在本机。这里只会重新读取，不会再次创建。"); }
   }
-  return <Modal title={taskId ? "重新安排下一步" : "安排下一步"} description="这是你主动选择的提醒，可以随时调整或完成。" onClose={onClose}><form className="career-form" onSubmit={submit}><Field label="要做什么"><input name="title" required defaultValue={task?.title ?? ""} placeholder="例如：确认下一轮时间" /></Field><Field label="关联职位" hint="可选；不会按公司自动猜"><select name="job_id" defaultValue={task?.job_id ?? ""}><option value="">不关联职位</option>{data.jobs.map((job) => <option key={job.id} value={job.id}>{job.company} · {job.role}</option>)}</select></Field><div className="career-form-row"><Field label="时间"><input name="due_at" type="datetime-local" defaultValue={dateInputValue(task?.due_at)} /></Field><Field label="类型"><select name="kind" defaultValue={task?.kind ?? "跟进"}><option>跟进</option><option>材料</option><option>面试准备</option><option>其他</option></select></Field></div><Field label="优先级"><select name="priority" defaultValue={String(task?.priority ?? 2)}><option value="1">普通</option><option value="2">重点</option><option value="3">时间敏感</option></select></Field>{error && <div className="career-inline-error"><X size={15} />{error}</div>}<div className="career-form-actions"><button type="button" className="career-button ghost" onClick={onClose}>取消</button><button className="career-button primary" disabled={saving}>{saving ? <LoaderCircle className="spin" size={16} /> : <CalendarDays size={16} />}{saving ? "正在保存…" : taskId ? "保存安排" : "创建待办"}</button></div></form></Modal>;
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (savingRef.current) return;
+    savingRef.current = true;
+    setPhase("writing");
+    setError("");
+    const form = new FormData(event.currentTarget);
+    try {
+      await careerTaskActions.create({
+        id: stableIdRef.current,
+        contactId,
+        title: String(form.get("title") ?? ""),
+        jobId: String(form.get("job_id") ?? "") || null,
+        dueAt: fromDateInput(String(form.get("due_at") ?? "")),
+        kind: String(form.get("kind") ?? "跟进"),
+        priority: Number(form.get("priority") ?? 1),
+      });
+      setPhase("refresh-only");
+      await refreshOnly();
+    } catch (caught) {
+      setPhase("idle");
+      setError(caught instanceof Error ? caught.message : "这次没有保存，原记录仍保持不变。");
+    } finally { savingRef.current = false; }
+  }
+  if (phase === "refresh-only") return <Modal title="下一步已保存在本机" description="画面还没有重新读取。请只重新读取，不要重复提交。" onClose={() => undefined} dismissible={false} inertToasts><div className="career-task-refresh-only" role="status"><ShieldCheck size={22} /><p>{error || "重新读取只会刷新画面，不会再创建一条待办。"}</p><button className="career-button primary" data-dialog-initial onClick={() => void refreshOnly()}><RotateCcw size={16} />重新读取</button></div></Modal>;
+  return <Modal title="安排下一步" description="这是你主动选择的提醒；计划时间可以留空。" onClose={phase === "writing" ? () => undefined : onClose}><form className="career-form" onSubmit={submit}><Field label="要做什么"><input name="title" required placeholder="例如：确认下一轮时间" /></Field><Field label="关联职位" hint="可选；不会按公司自动猜"><select name="job_id" defaultValue=""><option value="">不关联职位</option>{availableJobs.map((job) => <option key={job.id} value={job.id}>{job.company} · {job.role}</option>)}</select></Field><div className="career-form-row"><Field label="计划时间（可选）" hint="不设时间会放在“以后再说”"><input name="due_at" type="datetime-local" /></Field><Field label="类型"><select name="kind" defaultValue="跟进"><option>跟进</option><option>材料</option><option>面试准备</option><option>其他</option></select></Field></div><Field label="优先级"><select name="priority" defaultValue="1"><option value="1">普通</option><option value="2">重点</option><option value="3">时间敏感</option></select></Field>{error && <div className="career-inline-error" role="alert"><X size={15} />{error}</div>}<div className="career-form-actions"><button type="button" className="career-button ghost" disabled={phase === "writing"} onClick={onClose}>取消</button><button className="career-button primary" disabled={phase === "writing"}>{phase === "writing" ? <LoaderCircle className="spin" size={16} /> : <CalendarDays size={16} />}{phase === "writing" ? "正在保存…" : "创建待办"}</button></div></form></Modal>;
 }
 
 function MaterialModal({ data, onClose, onSaved }: { data: CareerData; onClose: () => void; onSaved: () => Promise<void> }) {

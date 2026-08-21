@@ -17,7 +17,7 @@ async function loadPureCareerUiHelpers() {
     true,
     ts.ScriptKind.TSX,
   );
-  const wanted = new Set(["isCareerLifecyclePaused", "projectCareerLifecycleScope", "resolveCareerTodayFocus", "resolveInterviewDraftRestoreMode"]);
+  const wanted = new Set(["isCareerLifecyclePaused", "localDayBounds", "projectCareerLifecycleScope", "resolveCareerTodayFocus", "resolveInterviewDraftRestoreMode"]);
   const declarations = sourceFile.statements.filter(
     (statement) => ts.isFunctionDeclaration(statement) && statement.name && wanted.has(statement.name.text),
   );
@@ -53,14 +53,14 @@ function data(overrides = {}) {
 
 test("Today stays quiet when there is no authored action", () => {
   assert.equal(resolveCareerTodayFocus(data(), now), null);
-  assert.match(source, /今天没有必须处理的事/);
-  assert.match(source, /职迹不会替你制造任务/);
+  assert.match(source, /今天没有安排待办/);
+  assert.match(source, /今天不必为了清空列表做决定/);
   assert.doesNotMatch(source, /interview:\s*[^,}\n]*\?\?\s*null/);
 });
 
 test("Today focus is driven only by an eligible interview, task, or offer decision", () => {
   const interview = { id: "real-interview", job_id: "active", status: "scheduled", scheduled_at: new Date(now + 3_600_000).toISOString() };
-  const task = { id: "real-task", job_id: "active", status: "todo", due_at: null, priority: 2, created_at: "2026-08-20" };
+  const task = { id: "real-task", job_id: "active", status: "todo", due_at: new Date(now + 2 * 3_600_000).toISOString(), priority: 2, created_at: "2026-08-20" };
   const offer = { ...activeJob, id: "offer", stage_id: "stage_offer", updated_at: "2026-08-21" };
   assert.deepEqual(
     resolveCareerTodayFocus(data({ jobs: [activeJob, offer], tasks: [task], interviews: [interview] }), now),
@@ -70,6 +70,9 @@ test("Today focus is driven only by an eligible interview, task, or offer decisi
     resolveCareerTodayFocus(data({ tasks: [task] }), now),
     { kind: "task", taskId: "real-task", jobId: "active" },
   );
+  for (const due_at of [null, new Date(now - 86_400_000).toISOString(), new Date(now + 86_400_000).toISOString()]) {
+    assert.equal(resolveCareerTodayFocus(data({ tasks: [{ ...task, due_at }] }), now), null);
+  }
   assert.deepEqual(
     resolveCareerTodayFocus(data({ jobs: [offer] }), now),
     { kind: "offer", jobId: "offer" },
@@ -78,9 +81,9 @@ test("Today focus is driven only by an eligible interview, task, or offer decisi
 
 test("archived, terminal, stale, and completed records never become Today focus", () => {
   const ignoredTasks = [
-    { id: "terminal-task", job_id: "terminal", status: "todo", due_at: null, priority: 2, created_at: "2026-08-20" },
-    { id: "archived-task", job_id: "archived", status: "todo", due_at: null, priority: 2, created_at: "2026-08-20" },
-    { id: "done-task", job_id: "active", status: "done", due_at: null, priority: 2, created_at: "2026-08-20" },
+    { id: "terminal-task", job_id: "terminal", status: "todo", due_at: new Date(now + 3_600_000).toISOString(), priority: 2, created_at: "2026-08-20" },
+    { id: "archived-task", job_id: "archived", status: "todo", due_at: new Date(now + 3_600_000).toISOString(), priority: 2, created_at: "2026-08-20" },
+    { id: "done-task", job_id: "active", status: "done", due_at: new Date(now + 3_600_000).toISOString(), priority: 2, created_at: "2026-08-20" },
   ];
   const ignoredInterviews = [
     { id: "terminal-interview", job_id: "terminal", status: "scheduled", scheduled_at: new Date(now + 3_600_000).toISOString() },
@@ -102,7 +105,7 @@ test("the visible career clock refreshes each minute and when the tab returns", 
 
 test("stage undo stays lifecycle-safe and never announces a failed restore", () => {
   const undoStart = source.indexOf("async function handleUndo");
-  const taskStart = source.indexOf("async function toggleTask", undoStart);
+  const taskStart = source.indexOf("function openTask", undoStart);
   const undoSource = source.slice(undoStart, taskStart);
   assert.match(undoSource, /const restored = await requestLifecycleChange/);
   assert.match(undoSource, /rememberUndo: false, choice: "keep"/);
@@ -284,7 +287,7 @@ test("task and interview creation use a synchronous duplicate-submit guard", () 
     assert.match(modalSource, /const savingRef = useRef\(false\)/);
     assert.match(modalSource, /if \(savingRef\.current\) return/);
     assert.match(modalSource, /savingRef\.current = true/);
-    assert.match(modalSource, /disabled=\{saving\}/);
+    assert.match(modalSource, startName.includes("Task") ? /disabled=\{phase === "writing"\}/ : /disabled=\{saving\}/);
   }
 });
 
