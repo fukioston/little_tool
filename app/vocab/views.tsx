@@ -5,11 +5,44 @@ import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, 
 import { createLocalFileObjectUrl, type LocalStorageEstimate } from "@/lib/local-db/files";
 import { adjacentSentence, formatDuration, formatShortDate, sentenceContext, wordAt, wordRanges } from "@/lib/vocab/content";
 import { resolveReviewRound, restoreUndoneCardToRound, startReviewRound } from "@/lib/vocab/review-round";
-import { getDueCards, recordStudySeconds } from "@/lib/vocab/store";
+import {
+  commitVocabReviewRating,
+  commitVocabReviewUndo,
+  getDueCards,
+  inspectVocabReviewRating,
+  inspectVocabReviewUndo,
+  prepareVocabReviewRating,
+  prepareVocabReviewUndo,
+  recordStudySeconds,
+  VocabReviewChangedError,
+  VocabReviewConflictError,
+  VocabReviewNotSavedError,
+  VocabReviewUncertainError,
+} from "@/lib/vocab/store";
 import { scheduleReviewV2 } from "@/lib/vocab/srs";
 import type { ContentBlock, Lexeme, LibraryItem, Occurrence, ReviewCard, ReviewRating, SelectionTarget, TranscriptSegment, VocabSettings, VocabSnapshot, VocabView } from "@/lib/vocab/types";
 import { AnnotatedText, EmptyState, Metric, Toggle } from "./ui";
 import { VocabBackupFlow } from "./VocabBackupFlow";
+import {
+  VOCAB_REVIEW_RECOVERY_PREFIX,
+  VOCAB_REVIEW_RECENT_UNDO_KEY,
+  createVocabReviewRecoveryTicket,
+  readBrowserVocabReviewRecentUndo,
+  readBrowserVocabReviewRecovery,
+  probeVocabReviewJournalLock,
+  removeUnreadableVocabReviewRecentUndo,
+  removeUnreadableVocabReviewEntry,
+  runNewVocabReviewRecoveryTransaction,
+  runVocabReviewRecentUndoEntryTransaction,
+  runVocabReviewRecoveryEntryTransaction,
+  transitionVocabReviewRecoveryTicket,
+  type VocabReviewJournalTransactionResult,
+  type VocabReviewLockedEntry,
+  type VocabReviewRecentUndoEntry,
+  type VocabReviewRecentUndoReadResult,
+  type VocabReviewRecoveryReadResult,
+  type VocabReviewRecoveryTicket,
+} from "./review-recovery";
 
 function caretOffset(element: HTMLElement, clientX: number, clientY: number) {
   const doc = document as Document & {
@@ -52,6 +85,12 @@ function localDayKey(date = new Date()) {
   return `${values.year}-${values.month}-${values.day}`;
 }
 
+export function formatKnownVocabDuration(durationMs: number): string {
+  if (!Number.isFinite(durationMs) || durationMs <= 0) return "时长未记录";
+  if (durationMs < 60_000) return "少于 1 分钟";
+  return `${Math.round(durationMs / 60_000)} 分钟`;
+}
+
 function isInteractiveTarget(target: EventTarget | null) {
   return target instanceof HTMLElement && Boolean(target.closest("button,a,input,textarea,select,[contenteditable='true']"));
 }
@@ -77,8 +116,8 @@ export function LibraryView({ items, onOpen, onImport, onArchive }: { items: Lib
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<"all" | "article" | "podcast" | "archived">("all");
   const visible = items.filter((item) => (filter === "all" ? item.status !== "archived" : filter === "archived" ? item.status === "archived" : item.kind === filter && item.status !== "archived") && `${item.title}${item.source}${item.author}`.toLowerCase().includes(query.toLowerCase()));
-  return <div className="sc-page sc-library"><header className="sc-page-title"><div><span className="sc-eyebrow">YOUR LOCAL LIBRARY</span><h1>资料库</h1><p>{items.filter((item) => item.status !== "archived").length} 项英文内容，只属于这台设备。</p></div><button className="sc-primary" onClick={onImport}>＋ 导入内容</button></header><div className="sc-toolbar"><label className="sc-search">⌕<input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索标题、作者或来源"/></label><div className="sc-segmented">{([['all','全部'],['article','文章'],['podcast','播客'],['archived','归档']] as const).map(([id,label]) => <button aria-pressed={filter===id} key={id} className={filter === id ? "active" : ""} onClick={() => setFilter(id)}>{label}</button>)}</div></div>
-    {visible.length ? <div className="sc-library-grid">{visible.map((item,index) => <article className="sc-library-card" key={item.id}><button className="sc-card-main" onClick={() => onOpen(item)}><div className={`sc-cover cover-${index % 4 + 1}`}><span>{item.kind === "article" ? "ARTICLE" : "PODCAST"}</span><strong>{item.title.slice(0,1)}</strong><i>{Math.round(item.progress * 100)}%</i></div><div className="sc-card-copy"><span>{item.source}</span><h2>{item.title}</h2><p>{item.description}</p><footer><small>{item.author || formatShortDate(item.published_at)}</small><b>{item.kind === "article" ? "阅读" : `${Math.max(1, Math.round(item.duration_ms / 60000))} 分钟`} · {Math.round(item.progress * 100)}%</b></footer></div></button><button className="sc-card-menu" onClick={() => onArchive(item)} aria-label={item.status === "archived" ? "恢复到资料库" : "移入归档"}>{item.status === "archived" ? "恢复" : "归档"}</button></article>)}</div> : <EmptyState title="没有找到内容" copy="换一个搜索词，或带回新的英文文章与播客。" action={<button onClick={onImport}>导入内容</button>} />}</div>;
+  return <div className="sc-page sc-library"><header className="sc-page-title"><div><span className="sc-eyebrow">YOUR LOCAL LIBRARY</span><h1>资料库</h1><p>{items.filter((item) => item.status !== "archived").length} 项英文内容，保存在当前完整网址与浏览器资料中。</p></div><button className="sc-primary" onClick={onImport}>＋ 导入内容</button></header><div className="sc-toolbar"><label className="sc-search">⌕<input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索标题、作者或来源"/></label><div className="sc-segmented">{([['all','全部'],['article','文章'],['podcast','播客'],['archived','归档']] as const).map(([id,label]) => <button aria-pressed={filter===id} key={id} className={filter === id ? "active" : ""} onClick={() => setFilter(id)}>{label}</button>)}</div></div>
+    {visible.length ? <div className="sc-library-grid">{visible.map((item,index) => <article className="sc-library-card" key={item.id}><button className="sc-card-main" onClick={() => onOpen(item)}><div className={`sc-cover cover-${index % 4 + 1}`}><span>{item.kind === "article" ? "ARTICLE" : "PODCAST"}</span><strong>{item.title.slice(0,1)}</strong><i>{Math.round(item.progress * 100)}%</i></div><div className="sc-card-copy"><span>{item.source}</span><h2>{item.title}</h2><p>{item.description}</p><footer><small>{item.author || formatShortDate(item.published_at)}</small><b>{item.kind === "article" ? "阅读" : formatKnownVocabDuration(item.duration_ms)} · {Math.round(item.progress * 100)}%</b></footer></div></button><button className="sc-card-menu" onClick={() => onArchive(item)} aria-label={item.status === "archived" ? "恢复到资料库" : "移入归档"}>{item.status === "archived" ? "恢复" : "归档"}</button></article>)}</div> : <EmptyState title="没有找到内容" copy="换一个搜索词，或带回新的英文文章与播客。" action={<button onClick={onImport}>导入内容</button>} />}</div>;
 }
 
 export function ReaderView({ item, blocks, occurrences, bookmarks, onSelect, onBack, onProgress, onFinish, onBookmark }: { item: LibraryItem | null; blocks: ContentBlock[]; occurrences: Occurrence[]; bookmarks: VocabSnapshot["bookmarks"]; onSelect: (target: SelectionTarget) => void; onBack: () => void; onProgress: (item: LibraryItem, progress: number) => Promise<unknown>; onFinish: (item: LibraryItem) => void; onBookmark: (item: LibraryItem, block?: ContentBlock) => void }) {
@@ -217,8 +256,10 @@ export function PodcastView({ item, segments, occurrences, autoFollow, localLock
   const [keyboardWord, setKeyboardWord] = useState<{ segmentId: string; index: number } | null>(null);
   const episodeSegments = useMemo(() => segments.filter((entry) => entry.item_id === item?.id), [item?.id, segments]);
   const alignedTranscript = episodeSegments.some((entry) => entry.end_ms > entry.start_ms);
-  const fallbackDuration = item?.duration_ms || (alignedTranscript ? episodeSegments.at(-1)?.end_ms : 0) || 1;
-  const duration = durationMs || fallbackDuration;
+  const knownDuration = durationMs || item?.duration_ms ||
+    (alignedTranscript ? episodeSegments.at(-1)?.end_ms : 0) || 0;
+  const fallbackDuration = knownDuration || 1;
+  const duration = knownDuration || fallbackDuration;
   const timedIndex = episodeSegments.findIndex((entry) => currentMs >= entry.start_ms && currentMs < entry.end_ms);
   const activeIndex = alignedTranscript ? Math.max(0, timedIndex) : 0;
   const active = episodeSegments[activeIndex] ?? episodeSegments[0];
@@ -300,7 +341,7 @@ export function PodcastView({ item, segments, occurrences, autoFollow, localLock
       void onProgress(item, next / Math.max(1, duration));
     }
   };
-  return <div className="sc-podcast-page">{src && <audio ref={audio} src={src} preload="metadata" onLoadedMetadata={(event) => { const nextDuration=Number.isFinite(event.currentTarget.duration)?event.currentTarget.duration*1000:fallbackDuration;durationRef.current=nextDuration;setDurationMs(nextDuration);const restored=Math.min(nextDuration,Math.max(0,item.progress*nextDuration));currentMsRef.current=restored;event.currentTarget.currentTime=restored/1000;setCurrentMs(restored); }} onTimeUpdate={updateTime} onPlay={() => { setPlaying(true); startListen(); }} onPause={() => { setPlaying(false); commitListen(); void onProgress(item,currentMsRef.current/Math.max(1,durationRef.current||fallbackDuration)); }} onEnded={() => { setPlaying(false); commitListen(); void onProgress(item,1); }} onError={() => setMediaError("音频无法播放，来源可能已失效或格式不受支持。")}/>}<header className="sc-podcast-head"><div><span className="sc-eyebrow">LISTEN IN CONTEXT</span><h1>{item.title}</h1><p>{item.description}</p><div><b>{item.source}</b><span>{item.author}</span><span>{Math.max(1,Math.round(duration/60000))} 分钟</span></div></div><div className="sc-podcast-art"><i/><i/><i/><strong>声</strong></div></header><section className="sc-player" aria-label="音频播放器"><button className="sc-play" aria-label={playing?"暂停":"播放"} disabled={!src} onClick={() => { if (audio.current?.paused) void audio.current.play(); else audio.current?.pause(); }}>{playing ? "Ⅱ" : "▶"}</button><span>{formatDuration(currentMs)}</span><input type="range" aria-label="播放进度" aria-valuetext={`${formatDuration(currentMs)} / ${formatDuration(duration)}`} min={0} max={Math.max(1,duration)} value={Math.min(currentMs,duration)} onChange={(event) => seek(Number(event.target.value))}/><span>{formatDuration(duration)}</span><button className="sc-speed" aria-label={`播放速度 ${speed} 倍，点击切换`} onClick={() => { const next = speed >= 2 ? .75 : speed + .25; setSpeed(next); if (audio.current) audio.current.playbackRate = next; }}>{speed}×</button><button aria-label="收藏当前播放位置" onClick={() => onBookmark(item,currentMs,active?.text.slice(0,24) ?? item.title)}>◇</button></section>{mediaError && <div className="sc-inline-error" role="alert">{mediaError}</div>}{remoteBlocked ? <div className="sc-notice">本地锁阻止了远程音频请求。你仍可阅读字幕；关闭本地锁后才会连接音频来源。</div> : !src && <div className="sc-notice">当前单集没有可播放音频。英文字幕仍可阅读和选词。</div>}{!alignedTranscript && episodeSegments.length > 0 && <div className="sc-notice">这份纯文本字幕没有时间轴，因此不会伪装成同步字幕；你仍可逐段阅读和选词。</div>}<section className="sc-transcript-shell"><aside><span>本期字幕</span><strong>{episodeSegments.length}</strong><p>{alignedTranscript?"段":"段 · 未对齐"}</p><button className={follow ? "active" : ""} disabled={!alignedTranscript} onClick={() => { const next=!follow;setFollow(next);onAutoFollow(next); }}>◎ {follow ? "正在跟随" : "继续跟随"}</button></aside><div className="sc-transcript" onWheel={() => setFollow(false)}>{episodeSegments.length ? episodeSegments.map((segment,index) => { const words=wordRanges(segment.text);const activeRange=keyboardWord?.segmentId===segment.id?words[keyboardWord.index]:null;return <button ref={alignedTranscript&&index === activeIndex ? activeRow : undefined} key={segment.id} className={alignedTranscript&&index === activeIndex ? "active" : ""} aria-current={alignedTranscript&&index===activeIndex?"true":undefined} title="左右方向键选择单词，Enter 或 E 查看解释；Space 跳到此处" onFocus={()=>{if(words.length&&keyboardWord?.segmentId!==segment.id)setKeyboardWord({segmentId:segment.id,index:0});}} onKeyDown={(event)=>transcriptKey(segment,index,event)} onClick={() => { if (alignedTranscript) seek(segment.start_ms); }} onMouseUp={(event) => pick(segment,index,event)}><time>{alignedTranscript?formatDuration(segment.start_ms):"—"}</time><p><AnnotatedText text={segment.text} ranges={occurrences.filter((entry) => entry.segment_id === segment.id)} activeRange={activeRange}/></p>{segment.speaker && <small>{segment.speaker}</small>}</button>;}) : <EmptyState title="没有字幕" copy="导入 VTT、SRT、LRC 或纯文本后，字幕会显示在这里。"/>}</div></section></div>;
+  return <div className="sc-podcast-page">{src && <audio ref={audio} src={src} preload="metadata" onLoadedMetadata={(event) => { const nextDuration=Number.isFinite(event.currentTarget.duration)?event.currentTarget.duration*1000:fallbackDuration;durationRef.current=nextDuration;setDurationMs(nextDuration);const restored=Math.min(nextDuration,Math.max(0,item.progress*nextDuration));currentMsRef.current=restored;event.currentTarget.currentTime=restored/1000;setCurrentMs(restored); }} onTimeUpdate={updateTime} onPlay={() => { setPlaying(true); startListen(); }} onPause={() => { setPlaying(false); commitListen(); void onProgress(item,currentMsRef.current/Math.max(1,durationRef.current||fallbackDuration)); }} onEnded={() => { setPlaying(false); commitListen(); void onProgress(item,1); }} onError={() => setMediaError("音频无法播放，来源可能已失效或格式不受支持。")}/>}<header className="sc-podcast-head"><div><span className="sc-eyebrow">LISTEN IN CONTEXT</span><h1>{item.title}</h1><p>{item.description}</p><div><b>{item.source}</b><span>{item.author}</span><span>{formatKnownVocabDuration(knownDuration)}</span></div></div><div className="sc-podcast-art"><i/><i/><i/><strong>声</strong></div></header><section className="sc-player" aria-label="音频播放器"><button className="sc-play" aria-label={playing?"暂停":"播放"} disabled={!src} onClick={() => { if (audio.current?.paused) void audio.current.play(); else audio.current?.pause(); }}>{playing ? "Ⅱ" : "▶"}</button><span>{formatDuration(currentMs)}</span><input type="range" aria-label="播放进度" aria-valuetext={`${formatDuration(currentMs)} / ${formatDuration(duration)}`} min={0} max={Math.max(1,duration)} value={Math.min(currentMs,duration)} onChange={(event) => seek(Number(event.target.value))}/><span>{formatDuration(duration)}</span><button className="sc-speed" aria-label={`播放速度 ${speed} 倍，点击切换`} onClick={() => { const next = speed >= 2 ? .75 : speed + .25; setSpeed(next); if (audio.current) audio.current.playbackRate = next; }}>{speed}×</button><button aria-label="收藏当前播放位置" onClick={() => onBookmark(item,currentMs,active?.text.slice(0,24) ?? item.title)}>◇</button></section>{mediaError && <div className="sc-inline-error" role="alert">{mediaError}</div>}{remoteBlocked ? <div className="sc-notice">本地锁阻止了远程音频请求。你仍可阅读字幕；关闭本地锁后才会连接音频来源。</div> : !src && <div className="sc-notice">当前单集没有可播放音频。英文字幕仍可阅读和选词。</div>}{!alignedTranscript && episodeSegments.length > 0 && <div className="sc-notice">这份纯文本字幕没有时间轴，因此不会伪装成同步字幕；你仍可逐段阅读和选词。</div>}<section className="sc-transcript-shell"><aside><span>本期字幕</span><strong>{episodeSegments.length}</strong><p>{alignedTranscript?"段":"段 · 未对齐"}</p><button className={follow ? "active" : ""} disabled={!alignedTranscript} onClick={() => { const next=!follow;setFollow(next);onAutoFollow(next); }}>◎ {follow ? "正在跟随" : "继续跟随"}</button></aside><div className="sc-transcript" onWheel={() => setFollow(false)}>{episodeSegments.length ? episodeSegments.map((segment,index) => { const words=wordRanges(segment.text);const activeRange=keyboardWord?.segmentId===segment.id?words[keyboardWord.index]:null;return <button ref={alignedTranscript&&index === activeIndex ? activeRow : undefined} key={segment.id} className={alignedTranscript&&index === activeIndex ? "active" : ""} aria-current={alignedTranscript&&index===activeIndex?"true":undefined} title="左右方向键选择单词，Enter 或 E 查看解释；Space 跳到此处" onFocus={()=>{if(words.length&&keyboardWord?.segmentId!==segment.id)setKeyboardWord({segmentId:segment.id,index:0});}} onKeyDown={(event)=>transcriptKey(segment,index,event)} onClick={() => { if (alignedTranscript) seek(segment.start_ms); }} onMouseUp={(event) => pick(segment,index,event)}><time>{alignedTranscript?formatDuration(segment.start_ms):"—"}</time><p><AnnotatedText text={segment.text} ranges={occurrences.filter((entry) => entry.segment_id === segment.id)} activeRange={activeRange}/></p>{segment.speaker && <small>{segment.speaker}</small>}</button>;}) : <EmptyState title="没有字幕" copy="导入 VTT、SRT、LRC 或纯文本后，字幕会显示在这里。"/>}</div></section></div>;
 }
 
 export function WordsView({ lexemes, occurrences, onOpen, onStar }: { lexemes: Lexeme[]; occurrences: Occurrence[]; onOpen: (id: string) => void; onStar: (word: Lexeme) => void }) {
@@ -311,12 +352,37 @@ export function WordsView({ lexemes, occurrences, onOpen, onStar }: { lexemes: L
 
 type ReviewViewProps = {
   cards: ReviewCard[];
-  onRate: (card: ReviewCard, rating: ReviewRating) => Promise<string>;
-  onUndo: (id: string) => Promise<void>;
+  onRefresh: () => Promise<void>;
   onGo: (view: VocabView) => void;
 };
 
-export function ReviewView({ cards, onRate, onUndo, onGo }: ReviewViewProps) {
+type ReviewJournalState = VocabReviewRecoveryReadResult & Readonly<{
+  loaded: boolean;
+}>;
+
+const EMPTY_REVIEW_JOURNAL: ReviewJournalState = {
+  loaded: false,
+  entries: [],
+  unreadableEntries: [],
+  storageUnavailable: false,
+};
+
+type ReviewRecentUndoState = VocabReviewRecentUndoReadResult & Readonly<{
+  loaded: boolean;
+}>;
+
+const EMPTY_RECENT_UNDO: ReviewRecentUndoState = {
+  loaded: false,
+  entry: null,
+  unreadable: null,
+  storageUnavailable: false,
+};
+
+function reviewActionLabel(ticket: VocabReviewRecoveryTicket): string {
+  return ticket.action === "rating" ? "这次选择" : "这次撤销";
+}
+
+export function ReviewView({ cards, onRefresh, onGo }: ReviewViewProps) {
   const [reviewClock, setReviewClock] = useState(() => Date.now());
   const due = getDueCards(cards, reviewClock);
   const [roundIds, setRoundIds] = useState(() => startReviewRound(due));
@@ -324,15 +390,26 @@ export function ReviewView({ cards, onRate, onUndo, onGo }: ReviewViewProps) {
   const [busy, setBusy] = useState(false);
   const [reviewed, setReviewed] = useState(0);
   const [lastEvent, setLastEvent] = useState<string | null>(null);
-  const [lastRatedCard, setLastRatedCard] = useState<ReviewCard | null>(null);
   const [locallyRatedVersions, setLocallyRatedVersions] = useState<Record<string, number>>({});
   const [locallyRestoredCard, setLocallyRestoredCard] = useState<ReviewCard | null>(null);
   const [error, setError] = useState("");
   const [announcement, setAnnouncement] = useState("");
+  const [journal, setJournal] = useState<ReviewJournalState>(EMPTY_REVIEW_JOURNAL);
+  const [recentUndo, setRecentUndo] = useState<ReviewRecentUndoState>(EMPTY_RECENT_UNDO);
+  const [journalLockUnavailable, setJournalLockUnavailable] = useState(false);
+  const [recoveryNotice, setRecoveryNotice] = useState("");
+  const [undoNotice, setUndoNotice] = useState("");
   const revealButton = useRef<HTMLButtonElement>(null);
   const completeHeading = useRef<HTMLHeadingElement>(null);
+  const recoveryHeading = useRef<HTMLHeadingElement>(null);
+  const recentUndoHeading = useRef<HTMLHeadingElement>(null);
   const handOffFocus = useRef(false);
   const focusAnnouncement = useRef("");
+  const focusRecoveryAfterAction = useRef(false);
+  const recoveryFocusTarget = useRef<"operation" | "recent-undo">("operation");
+  const operationClaim = useRef(false);
+  const locallySettledOperations = useRef(new Set<string>());
+  const seenRecentEvent = useRef<string | null>(null);
   const availableDue = due.filter((dueCard) => {
     const beforeVersion = locallyRatedVersions[dueCard.id];
     return beforeVersion === undefined || dueCard.updated_at !== beforeVersion;
@@ -342,58 +419,532 @@ export function ReviewView({ cards, onRate, onUndo, onGo }: ReviewViewProps) {
     : availableDue;
   const round = resolveReviewRound(roundSource, roundIds);
   const card = round[0] ?? null;
+  const activeRecovery = journal.entries[0] ?? null;
+  const recoveryBlocksWrites = !journal.loaded || journal.storageUnavailable ||
+    journalLockUnavailable || journal.unreadableEntries.length > 0 ||
+    journal.entries.length > 0;
+
+  const reloadReviewJournal = useCallback(() => {
+    const next = readBrowserVocabReviewRecovery();
+    const latest = readBrowserVocabReviewRecentUndo();
+    setJournal({ ...next, loaded: true });
+    setRecentUndo({ ...latest, loaded: true });
+    if (!navigator.locks) setJournalLockUnavailable(true);
+    if (!latest.storageUnavailable) {
+      const eventId = latest.entry?.ticket.receipt.eventId ?? null;
+      if (eventId) {
+        seenRecentEvent.current = eventId;
+        setLastEvent(eventId);
+      } else {
+        const previous = seenRecentEvent.current;
+        if (previous) {
+          setLastEvent((current) => current === previous ? null : current);
+          seenRecentEvent.current = null;
+        }
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    let live = true;
+    queueMicrotask(() => {
+      if (live) reloadReviewJournal();
+    });
+    return () => { live = false; };
+  }, [reloadReviewJournal]);
+
+  useEffect(() => {
+    const onStorage = (event: StorageEvent) => {
+      if (
+        event.storageArea === window.localStorage &&
+        (
+          event.key === null ||
+          event.key.startsWith(VOCAB_REVIEW_RECOVERY_PREFIX) ||
+          event.key === VOCAB_REVIEW_RECENT_UNDO_KEY
+        )
+      ) reloadReviewJournal();
+    };
+    const onFocus = () => reloadReviewJournal();
+    window.addEventListener("storage", onStorage);
+    window.addEventListener("focus", onFocus);
+    return () => {
+      window.removeEventListener("storage", onStorage);
+      window.removeEventListener("focus", onFocus);
+    };
+  }, [reloadReviewJournal]);
+
+  const claim = useCallback(() => {
+    if (operationClaim.current) return false;
+    operationClaim.current = true;
+    setBusy(true);
+    return true;
+  }, []);
+
+  const release = useCallback(() => {
+    operationClaim.current = false;
+    setBusy(false);
+  }, []);
+
+  const focusRecovery = useCallback((target: "operation" | "recent-undo" = "operation") => {
+    recoveryFocusTarget.current = target;
+    focusRecoveryAfterAction.current = true;
+  }, []);
+
+  useEffect(() => {
+    if (!focusRecoveryAfterAction.current) return;
+    const frame = window.requestAnimationFrame(() => {
+      const target = recoveryFocusTarget.current === "recent-undo"
+        ? recentUndoHeading.current ?? recoveryHeading.current
+        : recoveryHeading.current;
+      focusRecoveryAfterAction.current = false;
+      if (!target) return;
+      target.focus({ preventScroll: true });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [activeRecovery?.raw, journal.storageUnavailable, journal.unreadableEntries.length, recoveryNotice]);
+
+  const applySettledTicket = useCallback((ticket: VocabReviewRecoveryTicket) => {
+    if (locallySettledOperations.current.has(ticket.operationId)) return;
+    locallySettledOperations.current.add(ticket.operationId);
+    const receipt = ticket.receipt;
+    const snapshotCard = cards.find(({ id }) => id === receipt.cardId) ?? null;
+    const beforeCard = snapshotCard
+      ? { ...snapshotCard, ...receipt.before }
+      : null;
+    setError("");
+    setRevealed(false);
+    setReviewClock(Date.now());
+    if (ticket.action === "rating") {
+      setLastEvent(receipt.eventId);
+      setLocallyRatedVersions((current) => ({
+        ...current,
+        [receipt.cardId]: receipt.before.updated_at,
+      }));
+      setLocallyRestoredCard((current) =>
+        current?.id === receipt.cardId ? null : current);
+      setRoundIds((current) => current.filter((id) => id !== receipt.cardId));
+      setReviewed((count) => count + 1);
+      focusAnnouncement.current = "已记录这次选择，下一张可以开始。";
+    } else {
+      setRoundIds((current) => restoreUndoneCardToRound(current, receipt.cardId));
+      setLocallyRatedVersions((current) => {
+        const next = { ...current };
+        delete next[receipt.cardId];
+        return next;
+      });
+      setLocallyRestoredCard(beforeCard);
+      setLastEvent(null);
+      setReviewed((count) => Math.max(0, count - 1));
+      focusAnnouncement.current = "已撤销上一次选择。";
+    }
+    handOffFocus.current = true;
+  }, [cards]);
+
+  const noteTransactionGate = useCallback((
+    result: VocabReviewJournalTransactionResult<unknown>,
+  ) => {
+    reloadReviewJournal();
+    if (result.outcome === "stale") {
+      setRecoveryNotice("另一页已经更新这条线索。这里已重新读取，没有覆盖旧结果。");
+    } else if (result.outcome === "unavailable") {
+      setJournalLockUnavailable(true);
+      setRecoveryNotice("暂时无法取得跨页面恢复锁。没有核对、提交或清除任何结果。");
+    } else {
+      setJournalLockUnavailable(false);
+    }
+  }, [reloadReviewJournal]);
+
+  const replaceLockedMode = useCallback((
+    locked: VocabReviewLockedEntry,
+    mode: VocabReviewRecoveryTicket["mode"],
+  ) => locked.replace(transitionVocabReviewRecoveryTicket(
+    locked.current().ticket,
+    mode,
+  )), []);
+
+  const rememberCommitOutcome = useCallback((
+    locked: VocabReviewLockedEntry,
+    caught: unknown,
+  ) => {
+    const entry = locked.current();
+    let mode: VocabReviewRecoveryTicket["mode"] = "inspect-only";
+    let message = `${reviewActionLabel(entry.ticket)}的结果待核对；没有重复记录。`;
+    if (caught instanceof VocabReviewNotSavedError) {
+      mode = "retry-commit";
+      message = `${reviewActionLabel(entry.ticket)}已确认没有写入。想保留时，可以用同一条凭据再试一次。`;
+    } else if (
+      caught instanceof VocabReviewConflictError ||
+      caught instanceof VocabReviewChangedError
+    ) {
+      mode = "discard-only";
+      message = "数据库里已有别的变化。这里不会覆盖它，也不会重复记录。";
+    } else if (caught instanceof VocabReviewUncertainError) {
+      message = `${reviewActionLabel(entry.ticket)}的结果待核对。下一步只会读取，不会再写一次。`;
+    }
+    focusRecovery();
+    const moved = replaceLockedMode(locked, mode);
+    setRecoveryNotice(moved.outcome === "written"
+      ? message
+      : "本机线索在处理时发生变化。没有覆盖它，也没有再次提交。");
+  }, [focusRecovery, replaceLockedMode]);
+
+  const finishCommittedTicket = useCallback(async (
+    locked: VocabReviewLockedEntry,
+  ) => {
+    const entry = locked.current();
+    const recentResult = entry.ticket.receipt.kind === "review-rating"
+      ? locked.rememberRecentRating(entry.ticket.receipt)
+      : locked.clearRecentRating(entry.ticket.receipt.eventId);
+    applySettledTicket(entry.ticket);
+    setAnnouncement(entry.ticket.action === "rating"
+      ? "这次选择已记录。"
+      : "上一次选择已撤销。");
+    setRecoveryNotice(entry.ticket.action === "rating"
+      ? recentResult.outcome === "written"
+        ? "这次选择已记录，刷新页面后仍可撤销；正在重新读取页面。"
+        : "这次选择已记录，正在重新读取页面；最近一次撤销入口暂时无法持久保留。"
+      : "这次撤销已记录，正在重新读取页面。");
+    const moved = replaceLockedMode(locked, "refresh-only");
+    if (moved.outcome !== "written") {
+      setRecoveryNotice("记录已经完成，但本机线索暂时无法转为只刷新状态。没有再次提交。");
+      return;
+    }
+    try {
+      await onRefresh();
+    } catch {
+      setRecoveryNotice(
+        `${reviewActionLabel(entry.ticket)}已经保存在本机，只是页面暂时没有重新读到。只需稍后重新读取，不会再次提交。`,
+      );
+      return;
+    }
+    const removed = locked.remove();
+    if (removed.outcome === "removed") {
+      setRecoveryNotice(entry.ticket.action === "rating"
+        ? "这次选择已记录，页面也已重新读取。"
+        : "这次撤销已完成，页面也已重新读取。");
+    } else {
+      setRecoveryNotice(removed.outcome === "stale"
+        ? "另一页已经接手这条线索；这里没有清除它的新状态。"
+        : "页面已经重新读取，但本机提醒暂时无法清除。没有再次提交。");
+    }
+  }, [applySettledTicket, onRefresh, replaceLockedMode]);
+
+  const commitRecoveryEntry = useCallback(async (
+    locked: VocabReviewLockedEntry,
+  ) => {
+    const receipt = locked.current().ticket.receipt;
+    try {
+      if (receipt.kind === "review-rating") {
+        await commitVocabReviewRating(receipt);
+      } else {
+        await commitVocabReviewUndo(receipt);
+      }
+      await finishCommittedTicket(locked);
+    } catch (caught) {
+      rememberCommitOutcome(locked, caught);
+    }
+  }, [finishCommittedTicket, rememberCommitOutcome]);
 
   const submit = useCallback(async (rating: ReviewRating) => {
-    if (!card || busy) return;
-    setBusy(true);
+    if (!card || recoveryBlocksWrites || !claim()) return;
     setError("");
+    setUndoNotice("");
     try {
-      const eventId = await onRate(card, rating);
-      setLastEvent(eventId);
-      setLastRatedCard(card);
-      setLocallyRatedVersions((current) => ({ ...current, [card.id]: card.updated_at }));
-      setLocallyRestoredCard((current) => current?.id === card.id ? null : current);
-      setRoundIds((current) => current.filter((id) => id !== card.id));
-      setReviewed((count) => count + 1);
-      setRevealed(false);
-      setReviewClock(Date.now());
-      focusAnnouncement.current = "";
-      handOffFocus.current = true;
+      const receipt = await prepareVocabReviewRating(card, rating);
+      const ticket = createVocabReviewRecoveryTicket(receipt, "inspect-only");
+      const result = await runNewVocabReviewRecoveryTransaction(
+        ticket,
+        commitRecoveryEntry,
+      );
+      noteTransactionGate(result);
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "这次评分还没有保存，请保持当前选择后重试。");
+      setError(caught instanceof Error
+        ? caught.message
+        : "这次选择还没有提交；当前卡片会留在这里。");
     } finally {
-      setBusy(false);
+      release();
     }
-  }, [busy, card, onRate]);
+  }, [card, claim, commitRecoveryEntry, noteTransactionGate, recoveryBlocksWrites, release]);
+
+  const settleUnavailableRecentUndo = useCallback(async (
+    source: VocabReviewRecentUndoEntry,
+    alreadyDefinite: boolean,
+  ): Promise<"handled" | "exact" | "unknown"> => {
+    const result = await runVocabReviewRecentUndoEntryTransaction(
+      source,
+      async (locked) => {
+        const status = alreadyDefinite
+          ? "definite" as const
+          : await inspectVocabReviewRating(locked.current().ticket.receipt);
+        const removed = status === "definite" || status === "absent" ||
+            status === "changed" || status === "conflict"
+          ? locked.remove()
+          : null;
+        return { status, removed };
+      },
+    );
+    noteTransactionGate(result);
+    if (result.outcome === "stale") {
+      setUndoNotice("另一页已经更新最近一次评分；这里没有清除新的撤销入口，也没有改动记录。");
+      return "handled";
+    }
+    if (result.outcome === "unavailable") {
+      setUndoNotice("暂时无法安全核对撤销入口；它仍保留，复习记录没有改动。");
+      return "unknown";
+    }
+    if (result.value.status === "exact") return "exact";
+    if (result.value.status === "still_unknown") {
+      setUndoNotice("这次评分与当前词库的关系仍待核对；撤销入口会保留，复习记录没有改动。");
+      return "unknown";
+    }
+    const removed = result.value.removed;
+    if (removed?.outcome === "removed") {
+      setUndoNotice("当前词库没有这次评分，未改动记录；旧的撤销入口已清除。");
+      setAnnouncement("当前词库没有这次评分，未改动记录。");
+      focusAnnouncement.current = "当前词库没有这次评分，未改动记录。";
+      handOffFocus.current = true;
+    } else if (removed?.outcome === "stale") {
+      setUndoNotice("另一页已经更新最近一次评分；这里没有清除新的撤销入口，也没有改动记录。");
+    } else {
+      setUndoNotice("当前词库没有这次评分，记录未改动；旧的撤销入口暂时无法安全清除。");
+    }
+    return "handled";
+  }, [noteTransactionGate]);
 
   const undoLast = useCallback(async () => {
-    if (!lastEvent || busy) return;
-    setBusy(true);
+    if (!lastEvent || recoveryBlocksWrites || !claim()) return;
+    const source = recentUndo.entry?.ticket.receipt.eventId === lastEvent
+      ? recentUndo.entry
+      : null;
     setError("");
+    setUndoNotice("");
     try {
-      await onUndo(lastEvent);
-      if (lastRatedCard) {
-        setRoundIds((current) => restoreUndoneCardToRound(current, lastRatedCard.id));
-        setLocallyRatedVersions((current) => {
-          const next = { ...current };
-          delete next[lastRatedCard.id];
-          return next;
-        });
-        setLocallyRestoredCard(lastRatedCard);
-      }
-      setLastEvent(null);
-      setLastRatedCard(null);
-      setReviewed((count) => Math.max(0, count - 1));
-      setRevealed(false);
-      setReviewClock(Date.now());
-      focusAnnouncement.current = "已撤销上一次评分。";
-      handOffFocus.current = true;
+      const receipt = await prepareVocabReviewUndo(lastEvent);
+      const ticket = createVocabReviewRecoveryTicket(receipt, "inspect-only");
+      const result = await runNewVocabReviewRecoveryTransaction(
+        ticket,
+        commitRecoveryEntry,
+      );
+      noteTransactionGate(result);
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "暂时无法撤销，上一次评分没有被改动。");
+      if (source && caught instanceof VocabReviewUncertainError) {
+        setUndoNotice("这次评分与当前词库的关系仍待核对；撤销入口会保留，复习记录没有改动。");
+        return;
+      }
+      if (source) {
+        const definitelyUnavailable = caught instanceof VocabReviewNotSavedError ||
+          caught instanceof VocabReviewConflictError ||
+          caught instanceof VocabReviewChangedError;
+        const disposition = await settleUnavailableRecentUndo(
+          source,
+          definitelyUnavailable,
+        );
+        if (disposition !== "exact") return;
+      }
+      setError(caught instanceof Error
+        ? caught.message
+        : "这次撤销还没有提交；上一次选择没有被改动。");
     } finally {
-      setBusy(false);
+      release();
     }
-  }, [busy, lastEvent, lastRatedCard, onUndo]);
+  }, [claim, commitRecoveryEntry, lastEvent, noteTransactionGate, recentUndo.entry, recoveryBlocksWrites, release, settleUnavailableRecentUndo]);
+
+  const inspectActiveRecovery = useCallback(async () => {
+    if (!activeRecovery || activeRecovery.ticket.mode !== "inspect-only" || !claim()) return;
+    setError("");
+    focusRecovery();
+    try {
+      const result = await runVocabReviewRecoveryEntryTransaction(
+        activeRecovery,
+        async (locked) => {
+          const receipt = locked.current().ticket.receipt;
+          const status = receipt.kind === "review-rating"
+            ? await inspectVocabReviewRating(receipt)
+            : await inspectVocabReviewUndo(receipt);
+          if (status === "exact") {
+            const moved = replaceLockedMode(locked, "refresh-only");
+            if (moved.outcome === "written") setRecoveryNotice(
+              `${reviewActionLabel(activeRecovery.ticket)}已经存在，没有重复记录。下一步只重新读取页面。`,
+            );
+          } else if (status === "absent") {
+            const moved = replaceLockedMode(locked, "retry-commit");
+            if (moved.outcome === "written") setRecoveryNotice(
+              `${reviewActionLabel(activeRecovery.ticket)}已确认没有写入。想保留时，可以用同一条凭据再试一次。`,
+            );
+          } else if (status === "conflict" || status === "changed") {
+            const moved = replaceLockedMode(locked, "discard-only");
+            if (moved.outcome === "written") setRecoveryNotice(
+              "数据库里已有别的变化。这里不会覆盖它；可以重新读取或只清除提醒。",
+            );
+          } else {
+            setRecoveryNotice("结果暂时仍无法核对。没有写入，也没有重复记录；稍后可以再次只读核对。");
+          }
+        },
+      );
+      noteTransactionGate(result);
+    } finally {
+      release();
+    }
+  }, [activeRecovery, claim, focusRecovery, noteTransactionGate, release, replaceLockedMode]);
+
+  const retryActiveRecovery = useCallback(async () => {
+    if (!activeRecovery || activeRecovery.ticket.mode !== "retry-commit" || !claim()) return;
+    setError("");
+    focusRecovery();
+    try {
+      const result = await runVocabReviewRecoveryEntryTransaction(
+        activeRecovery,
+        commitRecoveryEntry,
+      );
+      noteTransactionGate(result);
+    } finally {
+      release();
+    }
+  }, [activeRecovery, claim, commitRecoveryEntry, focusRecovery, noteTransactionGate, release]);
+
+  const refreshLockedRecovery = useCallback(async (
+    locked: VocabReviewLockedEntry,
+    applySettled: boolean,
+  ) => {
+    const entry = locked.current();
+    try {
+      await onRefresh();
+    } catch {
+      setRecoveryNotice(applySettled
+        ? `${reviewActionLabel(entry.ticket)}已保存在本机，只是页面暂时没有重新读到。没有再次提交。`
+        : "页面暂时没有重新读到数据库现状。没有覆盖或重复记录；提醒仍保留。",
+      );
+      return;
+    }
+    if (applySettled) {
+      if (entry.ticket.receipt.kind === "review-rating") {
+        locked.rememberRecentRating(entry.ticket.receipt);
+      } else {
+        locked.clearRecentRating(entry.ticket.receipt.eventId);
+      }
+      applySettledTicket(entry.ticket);
+    }
+    const removed = locked.remove();
+    if (removed.outcome === "removed") {
+      setRecoveryNotice(applySettled
+        ? `${reviewActionLabel(entry.ticket)}已确认，页面也已重新读取。`
+        : "页面已按数据库现状重新读取，只清除了这条提醒。");
+      if (!applySettled) {
+        focusAnnouncement.current = "页面已重新读取，没有覆盖数据库现状。";
+        handOffFocus.current = true;
+      }
+    } else {
+      setRecoveryNotice(removed.outcome === "stale"
+        ? "另一页已经更新这条线索；这里没有清除它的新状态。"
+        : "页面已经重新读取，但提醒暂时无法清除。没有再次提交。");
+    }
+  }, [applySettledTicket, onRefresh]);
+
+  const refreshActiveRecovery = useCallback(async () => {
+    if (!activeRecovery || activeRecovery.ticket.mode !== "refresh-only" || !claim()) return;
+    focusRecovery();
+    try {
+      const result = await runVocabReviewRecoveryEntryTransaction(
+        activeRecovery,
+        (locked) => refreshLockedRecovery(locked, true),
+      );
+      noteTransactionGate(result);
+    } finally {
+      release();
+    }
+  }, [activeRecovery, claim, focusRecovery, noteTransactionGate, refreshLockedRecovery, release]);
+
+  const refreshChangedRecovery = useCallback(async () => {
+    if (!activeRecovery || activeRecovery.ticket.mode !== "discard-only" || !claim()) return;
+    focusRecovery();
+    try {
+      const result = await runVocabReviewRecoveryEntryTransaction(
+        activeRecovery,
+        (locked) => refreshLockedRecovery(locked, false),
+      );
+      noteTransactionGate(result);
+    } finally {
+      release();
+    }
+  }, [activeRecovery, claim, focusRecovery, noteTransactionGate, refreshLockedRecovery, release]);
+
+  const clearActiveRecovery = useCallback(async () => {
+    if (!activeRecovery || activeRecovery.ticket.mode !== "discard-only" || !claim()) return;
+    focusRecovery();
+    try {
+      const result = await runVocabReviewRecoveryEntryTransaction(
+        activeRecovery,
+        async (locked) => {
+          const removed = locked.remove();
+          setRecoveryNotice(removed.outcome === "removed"
+            ? "只清除了这条提醒；数据库现状保持不变。"
+            : removed.outcome === "stale"
+              ? "另一页已经更新这条线索；这里没有清除它的新状态。"
+              : "暂时无法清除提醒；数据库现状没有改变。");
+          if (removed.outcome === "removed") {
+            focusAnnouncement.current = "只清除了恢复提醒，数据库现状没有改变。";
+            handOffFocus.current = true;
+          }
+        },
+      );
+      noteTransactionGate(result);
+    } finally {
+      release();
+    }
+  }, [activeRecovery, claim, focusRecovery, noteTransactionGate, release]);
+
+  const clearUnreadableRecovery = useCallback(async () => {
+    const unreadable = journal.unreadableEntries[0];
+    if (!unreadable || !claim()) return;
+    focusRecovery();
+    try {
+      const removed = await removeUnreadableVocabReviewEntry(unreadable);
+      reloadReviewJournal();
+      setRecoveryNotice(removed.outcome === "removed"
+        ? "只清除了无法验证的提醒；它没有被交给数据库，现有记录保持不变。"
+        : removed.outcome === "stale"
+          ? "另一页已经更新这条提醒；这里没有清除它的新内容。"
+          : "暂时无法清除提醒；数据库现状没有改变。");
+    } finally {
+      release();
+    }
+  }, [claim, focusRecovery, journal.unreadableEntries, release, reloadReviewJournal]);
+
+  const clearUnreadableRecentUndo = useCallback(async () => {
+    const unreadable = recentUndo.unreadable;
+    if (!unreadable || !claim()) return;
+    focusRecovery("recent-undo");
+    try {
+      const removed = await removeUnreadableVocabReviewRecentUndo(unreadable);
+      reloadReviewJournal();
+      setRecoveryNotice(removed.outcome === "removed"
+        ? "只清除了无法验证的撤销提醒；复习记录保持不变。"
+        : removed.outcome === "stale"
+          ? "另一页已经更新这条撤销提醒；这里没有清除它的新内容。"
+          : "暂时无法清除撤销提醒；复习记录没有改变。");
+      if (removed.outcome === "removed") {
+        focusAnnouncement.current = "只清除了无法验证的撤销提醒，复习记录没有改变。";
+        handOffFocus.current = true;
+      }
+    } finally {
+      release();
+    }
+  }, [claim, focusRecovery, recentUndo.unreadable, release, reloadReviewJournal]);
+
+  const retryJournalProtection = useCallback(async () => {
+    if (!claim()) return;
+    focusRecovery();
+    try {
+      const outcome = await probeVocabReviewJournalLock();
+      setJournalLockUnavailable(outcome !== "available");
+      reloadReviewJournal();
+      setRecoveryNotice(outcome === "available"
+        ? "跨页面保护已经恢复；没有自动核对或提交。"
+        : "跨页面保护仍不可用。没有核对、提交或清除任何结果。");
+    } finally {
+      release();
+    }
+  }, [claim, focusRecovery, release, reloadReviewJournal]);
 
   const startAnotherRound = () => {
     setRoundIds(startReviewRound(roundSource));
@@ -428,14 +979,109 @@ export function ReviewView({ cards, onRate, onUndo, onGo }: ReviewViewProps) {
         event.preventDefault();
         setRevealed(true);
       }
-      if (revealed && ["1", "2", "3", "4"].includes(event.key)) {
+      if (
+        revealed &&
+        !recoveryBlocksWrites &&
+        ["1", "2", "3", "4"].includes(event.key)
+      ) {
         const ratings: ReviewRating[] = ["again", "hard", "good", "easy"];
         void submit(ratings[Number(event.key) - 1]);
       }
     };
     window.addEventListener("keydown", key);
     return () => window.removeEventListener("keydown", key);
-  }, [card, revealed, submit]);
+  }, [card, recoveryBlocksWrites, revealed, submit]);
+
+  const recoveryPanel = (() => {
+    let title = "";
+    let copy = "";
+    let actions: React.ReactNode = null;
+    let tone = "quiet";
+    if (!journal.loaded) {
+      title = "正在查看本机核对线索";
+      copy = "确认完成前，评分按钮会先保持停用。";
+    } else if (journal.storageUnavailable) {
+      title = "暂时无法读取复习核对线索";
+      copy = "为避免重复记录，新选择先停用；已经保存的内容没有因此改变。";
+      tone = "warning";
+      actions = <button disabled={busy} onClick={() => {
+        focusRecovery();
+        reloadReviewJournal();
+        setRecoveryNotice("已重新查看本机线索；不会自动核对或提交。");
+      }}>重新查看本机线索</button>;
+    } else if (journalLockUnavailable) {
+      title = "暂时无法取得跨页面保护";
+      copy = "为避免两页同时改动，新选择与恢复动作先停用；复习记录没有因此改变。";
+      tone = "warning";
+      actions = <button disabled={busy} onClick={() => void retryJournalProtection()}>
+        重新检查跨页面保护
+      </button>;
+    } else if (journal.unreadableEntries.length > 0) {
+      title = "有一条核对提醒无法验证";
+      copy = "它不会被交给数据库，也不会触发评分或撤销。可以保留数据库现状并清除这条提醒。";
+      tone = "warning";
+      actions = <button disabled={busy} onClick={() => void clearUnreadableRecovery()}>
+        保留数据库现状并清除提醒
+      </button>;
+    } else if (activeRecovery) {
+      const label = reviewActionLabel(activeRecovery.ticket);
+      if (activeRecovery.ticket.mode === "inspect-only") {
+        title = "有一次结果待核对";
+        copy = `${label}只会做只读核对；不会自动再写一次，也不会抢走当前焦点。`;
+        actions = <button disabled={busy} onClick={() => void inspectActiveRecovery()}>
+          只读核对结果
+        </button>;
+      } else if (activeRecovery.ticket.mode === "retry-commit") {
+        title = `${label}已确认没有记录`;
+        copy = "如果仍想保留，可以用同一条凭据再试一次；不会生成第二条操作。";
+        actions = <button disabled={busy} onClick={() => void retryActiveRecovery()}>
+          用同一条凭据再试一次
+        </button>;
+      } else if (activeRecovery.ticket.mode === "refresh-only") {
+        title = activeRecovery.ticket.action === "rating"
+          ? "这次选择已记录"
+          : "这次撤销已记录";
+        copy = "数据库已经完成，只需重新读取页面；这个动作不会再次提交。";
+        actions = <button disabled={busy} onClick={() => void refreshActiveRecovery()}>
+          只重新读取页面
+        </button>;
+      } else {
+        title = "数据库里已有别的变化";
+        copy = "这里不会覆盖它。可以按数据库现状重新读取，也可以只清除这条提醒。";
+        tone = "warning";
+        actions = <>
+          <button disabled={busy} onClick={() => void refreshChangedRecovery()}>
+            只刷新页面并清除提醒
+          </button>
+          <button className="secondary" disabled={busy} onClick={() => void clearActiveRecovery()}>
+            保留现状并清除提醒
+          </button>
+        </>;
+      }
+    }
+    if (!title) return null;
+    return <section className={`sc-review-recovery ${tone}`} role={tone === "warning" ? "alert" : "status"}>
+      <div>
+        <h2 ref={recoveryHeading} tabIndex={-1}>{title}</h2>
+        <p>{copy}</p>
+        {recoveryNotice && <small>{recoveryNotice}</small>}
+        {journal.entries.length > 1 && <small>另有 {journal.entries.length - 1} 条线索，会逐条处理。</small>}
+      </div>
+      {actions && <footer>{actions}</footer>}
+    </section>;
+  })();
+  const recentUndoNote = recentUndo.loaded && recentUndo.unreadable
+    ? <section className="sc-review-recent-note" role="status">
+        <div>
+          <h2 ref={recentUndoHeading} tabIndex={-1}>最近一次撤销提醒无法验证</h2>
+          <p>它不会被交给数据库；新选择不受影响。</p>
+          {recoveryNotice && <small>{recoveryNotice}</small>}
+        </div>
+        <button disabled={busy} onClick={() => void clearUnreadableRecentUndo()}>
+          保留复习记录，只清除无法验证的撤销提醒
+        </button>
+      </section>
+    : null;
 
   if (!card) {
     const startedEmpty = roundIds.length === 0 && reviewed === 0;
@@ -445,13 +1091,16 @@ export function ReviewView({ cards, onRate, onUndo, onGo }: ReviewViewProps) {
       <p>{startedEmpty
         ? "不需要凑数量。想读一点新的内容可以，先停在这里也可以。"
         : `刚刚回看了 ${reviewed} 个词。${roundSource.length ? "其他词会留在原处，想继续时再来。" : "现在可以停下，合适的时候再回来。"}`}</p>
+      {recoveryPanel}
+      {recentUndoNote}
+      {undoNotice && <div className="sc-review-undo-note" role="status">{undoNotice}</div>}
       {error && <div className="sc-review-error" role="alert">{error}</div>}
       <div className="sc-review-complete-actions">
         <button onClick={() => onGo("today")}>{startedEmpty ? "回到今日" : "先停在这里"}</button>
         {startedEmpty
           ? <button className="primary" onClick={() => onGo("library")}>去资料库</button>
           : roundSource.length > 0 && <button className="primary" onClick={startAnotherRound}>再来一小轮</button>}
-        {lastEvent && <button disabled={busy} onClick={() => void undoLast()}>↶ 撤销上次评分</button>}
+        {lastEvent && <button disabled={busy || recoveryBlocksWrites} onClick={() => void undoLast()}>↶ 撤销上次选择</button>}
       </div>
       <div className="sc-visually-hidden" role="status" aria-live="polite">{announcement}</div>
     </div>;
@@ -466,10 +1115,13 @@ export function ReviewView({ cards, onRate, onUndo, onGo }: ReviewViewProps) {
 
   return <div className="sc-page sc-review-page">
     <header><div><span className="sc-eyebrow">BACK TO CONTEXT</span><h1>这一小轮</h1></div><div className="sc-review-pause"><strong>随时停</strong><span>已记录的评分会留在本机</span></div></header>
+    {recoveryPanel}
+    {recentUndoNote}
+    {undoNotice && <div className="sc-review-undo-note" role="status">{undoNotice}</div>}
     <section className={`sc-review-card ${revealed ? "revealed" : ""}`}><span className="sc-card-label">{revealed ? "解释" : "还记得这个语境吗？"}</span><h2>{card.headword}</h2><p className="sc-pronunciation">{revealed ? card.pronunciation : ""}</p><div className="sc-cloze">“{card.cloze_sentence || `Recall “${card.headword}” in context.`}”</div>{!revealed ? <button ref={revealButton} className="sc-reveal" onClick={() => setRevealed(true)}>查看解释 <kbd>Space</kbd></button> : <div className="sc-answer"><strong>{card.gloss_en || "No definition yet"}</strong><p>{card.context_sentence}</p></div>}</section>
-    {revealed && <div className="sc-ratings">{([['again', '再看一次', '1'], ['hard', '有点难', '2'], ['good', '记得', '3'], ['easy', '很熟', '4']] as const).map(([id, label, key]) => <button key={id} className={id} disabled={busy} onClick={() => void submit(id)}><span>{label}</span><small>{nextLabel(id)}</small><kbd>{key}</kbd></button>)}</div>}
+    {revealed && <div className="sc-ratings">{([['again', '再看一次', '1'], ['hard', '有点难', '2'], ['good', '记得', '3'], ['easy', '很熟', '4']] as const).map(([id, label, key]) => <button key={id} className={id} disabled={busy || recoveryBlocksWrites} onClick={() => void submit(id)}><span>{label}</span><small>{nextLabel(id)}</small><kbd>{key}</kbd></button>)}</div>}
     {error && <div className="sc-review-error" role="alert">{error}</div>}
-    <footer className="sc-review-footer"><span>随时停在这里，下次会从仍适合回看的词继续。</span>{lastEvent && <button disabled={busy} onClick={() => void undoLast()}>↶ 撤销上一次</button>}</footer>
+    <footer className="sc-review-footer"><span>随时停在这里，下次会从仍适合回看的词继续。</span>{lastEvent && <button disabled={busy || recoveryBlocksWrites} onClick={() => void undoLast()}>↶ 撤销上一次选择</button>}</footer>
     <div className="sc-visually-hidden" role="status" aria-live="polite">{announcement}</div>
   </div>;
 }

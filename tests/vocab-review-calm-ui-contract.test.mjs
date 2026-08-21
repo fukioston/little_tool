@@ -111,34 +111,40 @@ test("review UI uses a bounded optional round and never renders a debt meter", a
 
 test("review focus moves only after a successful receipt-backed rating", async () => {
   const views = await source("app/vocab/views.tsx");
-  assert.match(views, /const eventId = await onRate\(card, rating\)/);
-  assert.match(views, /setLastEvent\(eventId\)/);
-  assert.match(views, /setRoundIds\(\(current\) => current\.filter\(\(id\) => id !== card\.id\)\)/);
-  assert.match(views, /setLocallyRatedVersions\(\(current\) => \(\{ \.\.\.current, \[card\.id\]: card\.updated_at \}\)\)/);
+  assert.match(views, /const receipt = await prepareVocabReviewRating\(card, rating\)/);
+  assert.match(views, /runNewVocabReviewRecoveryTransaction\([\s\S]*commitRecoveryEntry/);
+  assert.match(views, /await commitVocabReviewRating\(receipt\)/);
+  assert.match(views, /setLastEvent\(receipt\.eventId\)/);
+  assert.match(views, /setRoundIds\(\(current\) => current\.filter\(\(id\) => id !== receipt\.cardId\)\)/);
+  assert.match(views, /\[receipt\.cardId\]: receipt\.before\.updated_at/);
   assert.match(views, /handOffFocus\.current = true/);
   assert.match(views, /const target = card \? revealButton\.current : completeHeading\.current/);
   assert.match(views, /target\.focus\(\{ preventScroll: true \}\)/);
   assert.match(views, /<h1 ref=\{completeHeading\} tabIndex=\{-1\}/);
   assert.match(views, /catch \(caught\) \{\s*setError/);
+  const settleStart = views.indexOf("const applySettledTicket = useCallback");
+  const transactionStart = views.indexOf("const noteTransactionGate", settleStart);
+  const settle = views.slice(settleStart, transactionStart);
+  assert.ok(settle.indexOf("handOffFocus.current = true") > settle.indexOf('if (ticket.action === "rating")'));
   const submitStart = views.indexOf("const submit = useCallback");
-  const undoStart = views.indexOf("const undoLast = useCallback", submitStart);
+  const undoStart = views.indexOf("const settleUnavailableRecentUndo", submitStart);
   const submit = views.slice(submitStart, undoStart);
-  assert.ok(submit.indexOf("handOffFocus.current = true") > submit.indexOf("await onRate(card, rating)"));
-  assert.doesNotMatch(submit.slice(submit.indexOf("catch (caught)")), /handOffFocus\.current = true/);
+  assert.doesNotMatch(submit.slice(submit.indexOf("catch (caught)")), /setRoundIds|handOffFocus\.current = true/);
 });
 
 test("durable review writes resolve even when the following page refresh fails", async () => {
-  const app = await source("app/vocab/VocabApp.tsx");
-  assert.match(
-    app,
-    /const id = await rateReview\(card, rating\); try \{ await refresh\(\); \} catch \{ setToast\("评分已记录，页面暂未重读；这一小轮仍可继续"\); \} return id;/,
-  );
-  assert.match(
-    app,
-    /await undoReview\(id\); try \{ await refresh\(\); \} catch \{ setToast\("评分已撤销，页面暂未重读；数据库不会重复改写"\); \}/,
-  );
-  assert.doesNotMatch(app, /await rateReview\(card, rating\); await refresh\(\)/);
-  assert.doesNotMatch(app, /await undoReview\(id\); await refresh\(\)/);
+  const [app, views] = await Promise.all([
+    source("app/vocab/VocabApp.tsx"),
+    source("app/vocab/views.tsx"),
+  ]);
+  assert.doesNotMatch(app, /\brateReview\b|\bundoReview\b/);
+  assert.match(views, /const moved = replaceLockedMode\(locked, "refresh-only"\)/);
+  assert.match(views, /try \{\s*await onRefresh\(\);\s*\} catch \{[\s\S]*只需稍后重新读取，不会再次提交/);
+  const refreshStart = views.indexOf("const refreshLockedRecovery = useCallback");
+  const refreshEnd = views.indexOf("const refreshActiveRecovery", refreshStart);
+  const refreshOnly = views.slice(refreshStart, refreshEnd);
+  assert.match(refreshOnly, /await onRefresh\(\)/);
+  assert.doesNotMatch(refreshOnly, /commitVocabReviewRating|commitVocabReviewUndo|prepareVocabReview/);
 });
 
 test("zero activity stays blank while sub-minute activity remains truthful", async () => {
@@ -163,7 +169,9 @@ test("mobile closed navigation is inert and zero is an explicit review setting",
   assert.match(app, /function useVocabMobileLayout\(\)/);
   assert.match(app, /window\.matchMedia\("\(max-width: 760px\)"\)/);
   assert.match(app, /const sidebarHidden = mobile && !sideOpen/);
-  assert.match(app, /useOverlayDialog<HTMLElement>\(mobile && sideOpen/);
+  assert.match(app, /useOverlayDialog<HTMLElement>\(\s*mobile && sideOpen,/);
+  assert.match(app, /const closeMobileSidebar = useCallback/);
+  assert.match(app, /opener\.focus\(\{ preventScroll: true \}\)/);
   assert.match(app, /role=\{mobile && sideOpen \? "dialog" : undefined\}/);
   assert.match(app, /aria-modal=\{mobile && sideOpen \? true : undefined\}/);
   assert.match(app, /if \(!query\.matches\) setSideOpen\(false\)/);
