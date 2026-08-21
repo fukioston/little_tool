@@ -19,6 +19,7 @@ async function loadPureFitnessUiHelpers() {
     "resolveFitnessNavigationBehavior",
     "resolveFitnessPainDraftAfterRecord",
     "resolveScheduledFitnessStartRoute",
+    "runFitnessPersistThenRefresh",
   ]);
   const helpers = sourceFile.statements
     .filter(
@@ -27,7 +28,7 @@ async function loadPureFitnessUiHelpers() {
     )
     .map((statement) => statement.getText(sourceFile))
     .join("\n");
-  assert.equal((helpers.match(/export function/g) ?? []).length, wanted.size);
+  assert.equal((helpers.match(/export (?:async )?function/g) ?? []).length, wanted.size);
 
   const { outputText, diagnostics = [] } = ts.transpileModule(helpers, {
     fileName: "fitness-ui-helpers.ts",
@@ -50,6 +51,7 @@ const {
   resolveFitnessNavigationBehavior,
   resolveFitnessPainDraftAfterRecord,
   resolveScheduledFitnessStartRoute,
+  runFitnessPersistThenRefresh,
 } = await loadPureFitnessUiHelpers();
 
 test("every fitness view route uses one reduced-motion-aware scroll reset", () => {
@@ -98,17 +100,75 @@ test("the one-shot pain note clears only after persistence succeeds", () => {
   const finishStart = source.indexOf("const finish = async", recordStart);
   assert.ok(recordStart >= 0 && finishStart > recordStart);
   const recordSource = source.slice(recordStart, finishStart);
-  const persistedAt = recordSource.indexOf("await recordFitnessSet");
+  const persistedAt = recordSource.indexOf("await runFitnessPersistThenRefresh");
+  const writeAt = recordSource.indexOf("recordFitnessSet", persistedAt);
   const clearedAt = recordSource.indexOf("setPainDraft", persistedAt);
-  const refreshedAt = recordSource.indexOf("await onRefresh", clearedAt);
-  assert.ok(persistedAt >= 0 && clearedAt > persistedAt && refreshedAt > clearedAt);
+  assert.ok(persistedAt >= 0 && writeAt > persistedAt && clearedAt > writeAt);
+});
+
+test("a committed write with a failed refresh becomes recovery, never a write retry", async () => {
+  const calls = [];
+  const result = await runFitnessPersistThenRefresh(
+    async () => {
+      calls.push("persist");
+      return "committed-row";
+    },
+    async () => {
+      calls.push("refresh");
+      throw new Error("snapshot temporarily unavailable");
+    },
+  );
+  assert.deepEqual(calls, ["persist", "refresh"]);
+  assert.deepEqual(result, { status: "refresh-failed", value: "committed-row" });
+
+  const refreshed = await runFitnessPersistThenRefresh(
+    async () => "committed-row",
+    async () => undefined,
+  );
+  assert.deepEqual(refreshed, { status: "refreshed", value: "committed-row" });
+
+  let refreshCalled = false;
+  await assert.rejects(
+    runFitnessPersistThenRefresh(
+      async () => { throw new Error("write rejected"); },
+      async () => { refreshCalled = true; },
+    ),
+    /write rejected/,
+  );
+  assert.equal(refreshCalled, false, "a genuine write failure must remain a normal failure");
+
+  const liveStart = source.indexOf("function LiveSession");
+  const pickerStart = source.indexOf("function ExercisePicker", liveStart);
+  const liveSource = source.slice(liveStart, pickerStart);
+  assert.equal(
+    (liveSource.match(/await runFitnessPersistThenRefresh\(/g) ?? []).length,
+    4,
+    "mutate, record, finish and cancel must share the commit boundary",
+  );
+  assert.equal(
+    (liveSource.match(/await onRefresh\(\)/g) ?? []).length,
+    1,
+    "only the explicit recovery path may refresh outside the shared commit helper",
+  );
+  assert.match(liveSource, /interactionLocked = mutationBusy \|\| postCommitRecovery !== null/);
+  assert.match(liveSource, /mutationGuardRef\.current \|\| recoveryRef\.current/);
+  assert.match(liveSource, /recoveryRequestRef\.current !== null/);
+  assert.match(liveSource, /recoveryRef\.current\?\.token !== pending\.token \|\| recoveryTokenRef\.current !== pending\.token/);
+  assert.match(liveSource, /已保存在本地/);
+  assert.match(liveSource, /请重新读取/);
+  assert.match(liveSource, /不要重复提交/);
+  assert.match(liveSource, /onClick=\{\(\) => void retryPostCommitRefresh\(\)\}/);
+  assert.match(liveSource, /: "重新读取"/);
+  assert.match(liveSource, /onToast\(pending\.success\)/);
+  assert.match(liveSource, /if \(pending\.nextView\) onExit\(pending\.nextView\)/);
 });
 
 test("empty live sessions offer cancellation separately from an explicit empty save", () => {
   assert.match(source, /cancelEmptyFitnessSession,/);
-  assert.match(source, /await cancelEmptyFitnessSession\(session\.id\)/);
-  assert.match(source, /onExit\(returningToCalendar \? "calendar" : "today"\)/);
-  assert.match(source, /onExit=\{\(next = "history"\) => \{ navigateToFitnessView\(next\); void refresh\(\); \}\}/);
+  assert.match(source, /\(\) => cancelEmptyFitnessSession\(session\.id\)/);
+  assert.match(source, /nextView: returningToCalendar \? "calendar" : "today"/);
+  assert.match(source, /onExit=\{navigateToFitnessView\}/);
+  assert.doesNotMatch(source, /onExit=\{[^}]*refresh/);
   const liveActionsStart = source.indexOf('<footer className="sl-live-actions">');
   const liveActionsEnd = source.indexOf("</footer>", liveActionsStart);
   assert.ok(liveActionsStart >= 0 && liveActionsEnd > liveActionsStart);

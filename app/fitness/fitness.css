@@ -2824,6 +2824,37 @@
   font-size: 20px;
 }
 
+.sl-error-toast.sl-post-commit-recovery {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  column-gap: 14px;
+}
+
+.sl-post-commit-recovery > span,
+.sl-post-commit-recovery > p {
+  grid-column: 1;
+}
+
+.sl-post-commit-recovery > p {
+  margin: 2px 0 0;
+  color: var(--sl-text);
+  line-height: 1.45;
+}
+
+.sl-error-toast.sl-post-commit-recovery > button {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+  width: auto;
+  min-width: 88px;
+  padding: 0 13px;
+  border: 1px solid rgba(162, 60, 66, 0.22);
+  background: rgba(162, 60, 66, 0.07);
+  color: var(--sl-danger);
+  font-size: 13px;
+  font-weight: 680;
+}
+
 .sl-toast > i {
   display: grid;
   width: 28px;

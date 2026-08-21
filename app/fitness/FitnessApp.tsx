@@ -296,6 +296,19 @@ export function resolveFitnessPainDraftAfterRecord(current: string, persisted: b
   return persisted ? "" : current;
 }
 
+export async function runFitnessPersistThenRefresh<T>(
+  persist: () => Promise<T>,
+  refresh: () => Promise<void>,
+): Promise<Readonly<{ status: "refreshed" | "refresh-failed"; value: T }>> {
+  const value = await persist();
+  try {
+    await refresh();
+    return { status: "refreshed", value };
+  } catch {
+    return { status: "refresh-failed", value };
+  }
+}
+
 export default function FitnessApp() {
   const [snapshot, setSnapshot] = useState<FitnessSnapshot>(emptySnapshot);
   const [ready, setReady] = useState(false);
@@ -699,7 +712,7 @@ export default function FitnessApp() {
       setDialog={setDialog}
       selectedExerciseId={sessionExerciseId}
       setSelectedExerciseId={setSessionExerciseId}
-      onExit={(next = "history") => { navigateToFitnessView(next); void refresh(); }}
+      onExit={navigateToFitnessView}
     />;
   }
 
@@ -1063,9 +1076,20 @@ function MoreDialog({ open, current, onClose, onView }: { open: boolean; current
   return <><button type="button" className="sl-scrim" tabIndex={-1} aria-hidden="true" onClick={onClose}/><aside ref={dialog} className="sl-more-sheet" role="dialog" aria-modal="true" aria-label="更多页面" tabIndex={-1}><header><span>更多</span><button data-dialog-close onClick={onClose} aria-label="关闭更多页面">×</button></header>{pages.map(([id, label, copy]) => <button key={id} aria-current={current === id ? "page" : undefined} onClick={() => onView(id)}><i>{label.slice(0, 1)}</i><span><b>{label}</b><small>{copy}</small></span><strong>→</strong></button>)}<Link href="/"><i>台</i><span><b>私人工作台</b><small>返回各个独立空间的入口</small></span><strong>→</strong></Link></aside></>;
 }
 
-function LiveSession({ snapshot, sessionId, now, onRefresh, onToast, toast, error, setError, dialog, setDialog, selectedExerciseId, setSelectedExerciseId, onExit }: { snapshot: FitnessSnapshot; sessionId: string; now: number; onRefresh: () => Promise<void>; onToast: (message: string) => void; toast: string; error: string; setError: (message: string) => void; dialog: DialogState; setDialog: (dialog: DialogState) => void; selectedExerciseId: string | null; setSelectedExerciseId: (id: string | null) => void; onExit: (view?: FitnessView) => void }) {
+function LiveSession({ snapshot, sessionId, now, onRefresh, onToast, toast, error, setError, dialog, setDialog, selectedExerciseId, setSelectedExerciseId, onExit }: { snapshot: FitnessSnapshot; sessionId: string; now: number; onRefresh: () => Promise<void>; onToast: (message: string) => void; toast: string; error: string; setError: (message: string) => void; dialog: DialogState; setDialog: (dialog: DialogState) => void; selectedExerciseId: string | null; setSelectedExerciseId: (id: string | null) => void; onExit: (view: FitnessView) => void }) {
   const [mutationBusy, setMutationBusy] = useState(false);
   const [painDraft, setPainDraft] = useState<{ exerciseId: string | null; value: string }>({ exerciseId: null, value: "" });
+  const [postCommitRecovery, setPostCommitRecovery] = useState<Readonly<{
+    token: number;
+    success: string;
+    nextView?: FitnessView;
+    retryFailed: boolean;
+  }> | null>(null);
+  const [recoveryBusy, setRecoveryBusy] = useState(false);
+  const mutationGuardRef = useRef(false);
+  const recoveryTokenRef = useRef(0);
+  const recoveryRef = useRef(postCommitRecovery);
+  const recoveryRequestRef = useRef<number | null>(null);
   const session = snapshot.sessions.find((entry) => entry.id === sessionId)!;
   const rows = snapshot.sessionExercises.filter((entry) => entry.session_id === sessionId).sort((a, b) => a.order_index - b.order_index);
   const current = rows.find((entry) => entry.status === "active") ?? rows.find((entry) => entry.status === "pending") ?? null;
@@ -1093,90 +1117,150 @@ function LiveSession({ snapshot, sessionId, now, onRefresh, onToast, toast, erro
     (set.completed || set.reps !== null || set.duration_seconds !== null),
   )) || snapshot.cardioEntries.some((entry) => entry.session_id === session.id && entry.duration_seconds !== null);
   const actualRowCount = rows.filter((row) => snapshot.sets.some((set) => set.session_exercise_id === row.id && set.completed)).length;
-  const mutate = async (operation: () => Promise<void>, success: string) => {
-    if (mutationBusy) return;
-    setMutationBusy(true); setError("");
+  const interactionLocked = mutationBusy || postCommitRecovery !== null;
+  const beginMutation = () => {
+    if (mutationGuardRef.current || recoveryRef.current) return false;
+    mutationGuardRef.current = true;
+    setMutationBusy(true);
+    setError("");
+    return true;
+  };
+  const finishMutation = () => {
+    setMutationBusy(false);
+    if (!recoveryRef.current) mutationGuardRef.current = false;
+  };
+  const settleCommittedRefresh = (
+    status: "refreshed" | "refresh-failed",
+    details: Readonly<{ success: string; nextView?: FitnessView }>,
+  ) => {
+    const token = ++recoveryTokenRef.current;
+    if (status === "refresh-failed") {
+      const recovery = { ...details, token, retryFailed: false };
+      recoveryRef.current = recovery;
+      setPostCommitRecovery(recovery);
+      setError("");
+      return false;
+    }
+    onToast(details.success);
+    if (details.nextView) onExit(details.nextView);
+    return true;
+  };
+  const retryPostCommitRefresh = async () => {
+    const pending = recoveryRef.current;
+    if (!pending || recoveryRequestRef.current !== null) return;
+    recoveryRequestRef.current = pending.token;
+    setRecoveryBusy(true);
     try {
-      await operation();
       await onRefresh();
-      onToast(success);
+      if (recoveryRef.current?.token !== pending.token || recoveryTokenRef.current !== pending.token) return;
+      recoveryRef.current = null;
+      setPostCommitRecovery(null);
+      mutationGuardRef.current = false;
+      onToast(pending.success);
+      if (pending.nextView) onExit(pending.nextView);
+    } catch {
+      if (recoveryRef.current?.token === pending.token && recoveryTokenRef.current === pending.token) {
+        const recovery = { ...pending, retryFailed: true };
+        recoveryRef.current = recovery;
+        setPostCommitRecovery(recovery);
+      }
+    } finally {
+      if (recoveryRequestRef.current === pending.token) {
+        recoveryRequestRef.current = null;
+        setRecoveryBusy(false);
+      }
+    }
+  };
+  const mutate = async (operation: () => Promise<void>, success: string) => {
+    if (!beginMutation()) return;
+    try {
+      const result = await runFitnessPersistThenRefresh(operation, onRefresh);
+      settleCommittedRefresh(result.status, { success });
     } catch (reason) {
       setError(errorMessage(reason));
     } finally {
-      setMutationBusy(false);
+      finishMutation();
     }
   };
   const record = async (formEvent: FormEvent<HTMLFormElement>) => {
     formEvent.preventDefault();
-    if (!current || mutationBusy) return;
+    if (!current || !beginMutation()) return;
     const data = new FormData(formEvent.currentTarget);
     const weight = String(data.get("weight") ?? "").trim();
     const durationMinutes = String(data.get("durationMinutes") ?? "").trim();
-    setMutationBusy(true); setError("");
     try {
-      const id = await recordFitnessSet({
-        sessionExerciseId: current.id,
-        setIndex: sets.length,
-        setKind: "work",
-        loadGrams: weight ? Math.round(Number(weight) * (unit === "kg" ? 1_000 : 453.59237)) : null,
-        reps: isTimed ? null : String(data.get("reps") ?? "") ? Number(data.get("reps")) : null,
-        durationSeconds: isTimed && durationMinutes ? Math.round(Number(durationMinutes) * 60) : null,
-        rir: !isTimed && String(data.get("rir") ?? "") ? Number(data.get("rir")) : null,
-        rpe: isTimed && String(data.get("rpe") ?? "") ? Number(data.get("rpe")) : null,
-        painNote: currentPainDraft,
-        clientMutationId: crypto.randomUUID(),
-      });
+      const result = await runFitnessPersistThenRefresh(
+        () => recordFitnessSet({
+          sessionExerciseId: current.id,
+          setIndex: sets.length,
+          setKind: "work",
+          loadGrams: weight ? Math.round(Number(weight) * (unit === "kg" ? 1_000 : 453.59237)) : null,
+          reps: isTimed ? null : String(data.get("reps") ?? "") ? Number(data.get("reps")) : null,
+          durationSeconds: isTimed && durationMinutes ? Math.round(Number(durationMinutes) * 60) : null,
+          rir: !isTimed && String(data.get("rir") ?? "") ? Number(data.get("rir")) : null,
+          rpe: isTimed && String(data.get("rpe") ?? "") ? Number(data.get("rpe")) : null,
+          painNote: currentPainDraft,
+          clientMutationId: crypto.randomUUID(),
+        }),
+        onRefresh,
+      );
       setPainDraft((draft) => draft.exerciseId === current.id
         ? { exerciseId: current.id, value: resolveFitnessPainDraftAfterRecord(draft.value, true) }
         : draft);
-      try {
-        await onRefresh();
-      } catch {
-        setError("这一条已经保存在本地，但当前页面没有重新读取成功。请刷新页面，不要重复记录。");
-        return id;
+      if (settleCommittedRefresh(result.status, {
+        success: isTimed ? "这段时长已保存在本地" : "这一组已保存在本地",
+      })) {
+        (formEvent.currentTarget.elements.namedItem(isTimed ? "durationMinutes" : "reps") as HTMLInputElement | null)?.focus();
       }
-      onToast(isTimed ? "这段时长已保存在本地" : "这一组已保存在本地");
-      (formEvent.currentTarget.elements.namedItem(isTimed ? "durationMinutes" : "reps") as HTMLInputElement | null)?.focus();
-      return id;
+      return result.value;
     } catch (reason) {
       setError(errorMessage(reason));
     } finally {
-      setMutationBusy(false);
+      finishMutation();
     }
   };
   const finish = async (endedEarly: boolean) => {
-    if (mutationBusy) return;
+    if (mutationGuardRef.current || recoveryRef.current) return;
     if (!window.confirm(hasActualFacts
       ? endedEarly ? "已经完成的部分会保留。保存到这里并离开吗？" : "结束这场训练并保留实际记录吗？"
       : "这场训练还没有实际组数或时长。仍要把这段空时段保存为一条记录吗？")) return;
-    setMutationBusy(true); setError("");
+    if (!beginMutation()) return;
     try {
-      await finishFitnessSession(session.id, { endedEarly });
-      await onRefresh(); onExit();
-      onToast(endedEarly ? "已保存到这里" : "这场训练已保存");
+      const result = await runFitnessPersistThenRefresh(
+        () => finishFitnessSession(session.id, { endedEarly }),
+        onRefresh,
+      );
+      settleCommittedRefresh(result.status, {
+        success: endedEarly ? "已保存到这里" : "这场训练已保存",
+        nextView: "history",
+      });
     } catch (reason) { setError(errorMessage(reason)); }
-    finally { setMutationBusy(false); }
+    finally { finishMutation(); }
   };
   const cancelEmpty = async () => {
-    if (mutationBusy || hasActualFacts) return;
+    if (mutationGuardRef.current || recoveryRef.current || hasActualFacts) return;
     const returningToCalendar = Boolean(session.event_id);
     if (!window.confirm(returningToCalendar
       ? "取消这场误开的训练吗？不会留下训练记录，原来的日历安排会回到待进行。"
       : "取消这场误开的训练吗？不会留下训练记录。")) return;
-    setMutationBusy(true); setError("");
+    if (!beginMutation()) return;
     try {
-      await cancelEmptyFitnessSession(session.id);
-      await onRefresh();
-      onExit(returningToCalendar ? "calendar" : "today");
-      onToast(returningToCalendar ? "已取消误开的训练，原安排仍可进行" : "已取消误开的临时训练，没有留下记录");
+      const result = await runFitnessPersistThenRefresh(
+        () => cancelEmptyFitnessSession(session.id),
+        onRefresh,
+      );
+      settleCommittedRefresh(result.status, {
+        success: returningToCalendar ? "已取消误开的训练，原安排仍可进行" : "已取消误开的临时训练，没有留下记录",
+        nextView: returningToCalendar ? "calendar" : "today",
+      });
     } catch (reason) {
       setError(errorMessage(reason));
     } finally {
-      setMutationBusy(false);
+      finishMutation();
     }
   };
   return <main className="shilian sl-live">
-    <header><Logo/><div><span>{venue?.name ?? "当前场地"}</span><strong>{formatMinutes(now - session.started_at)} 分钟</strong><small>每条实际记录即时保存</small></div><button disabled={mutationBusy} onClick={() => void finish(true)}>{hasActualFacts ? "保存并离开" : "保存空时段"}</button></header>
+    <header><Logo/><div><span>{venue?.name ?? "当前场地"}</span><strong>{formatMinutes(now - session.started_at)} 分钟</strong><small>每条实际记录即时保存</small></div><button disabled={interactionLocked} onClick={() => void finish(true)}>{hasActualFacts ? "保存并离开" : "保存空时段"}</button></header>
     {rows.length ? <>
       <nav aria-label="本场动作">{rows.map((row, index) => <span key={row.id} aria-current={current?.id === row.id ? "step" : undefined} className={`${row.status} ${current?.id === row.id ? "active" : ""}`}><i>{row.status === "completed" ? "✓" : index + 1}</i><b>{getFitnessExercise(row.exercise_id)?.name_zh ?? row.exercise_id}</b></span>)}</nav>
       {current ? <section className="sl-live-focus">
@@ -1189,16 +1273,17 @@ function LiveSession({ snapshot, sessionId, now, onRefresh, onToast, toast, erro
             {isTimed ? <label><span>实际时长 <small>分钟</small></span><input required inputMode="decimal" name="durationMinutes" type="number" min="0.5" max="1440" step="0.5" defaultValue={sets.at(-1)?.duration_seconds ? Number((sets.at(-1)!.duration_seconds! / 60).toFixed(1)) : Math.max(1, Math.round((planned?.duration_seconds ?? 60) / 60))}/></label> : <><label><span>重量 <small>{unit}</small></span><input inputMode="decimal" name="weight" type="number" min="0" step="0.01" defaultValue={sets.at(-1)?.load_grams ? Number((sets.at(-1)!.load_grams! / (unit === "kg" ? 1_000 : 453.59237)).toFixed(2)) : ""} placeholder="可留空"/></label><label><span>次数</span><input required inputMode="numeric" name="reps" type="number" min="0" max="1000" defaultValue={sets.at(-1)?.reps ?? planned?.rep_min ?? ""}/></label></>}
             {isTimed ? <label><span>主观强度 <small>RPE</small></span><input inputMode="numeric" name="rpe" type="number" min="1" max="10" defaultValue={sets.at(-1)?.rpe ?? ""} placeholder="1–10，可跳过"/></label> : <label><span>还可做几次 <small>RIR</small></span><input inputMode="numeric" name="rir" type="number" min="0" max="5" defaultValue={snapshot.profile?.preferred_rir ?? ""} placeholder="可跳过"/></label>}
             <label className="sl-pain-field"><span>有不适？（可选）</span><input name="pain" value={currentPainDraft} onChange={(event) => setPainDraft({ exerciseId: current.id, value: event.target.value })} placeholder="出现疼痛时先停下，不用完成这条记录"/></label>
-            <button className="sl-live-record" disabled={mutationBusy}>{mutationBusy ? "正在保存…" : isTimed ? "记录这段时长" : "记录这一组"}</button>
+            <button className="sl-live-record" disabled={interactionLocked}>{mutationBusy ? "正在保存…" : isTimed ? "记录这段时长" : "记录这一组"}</button>
           </form>
-          {sets.length > 0 && <div className="sl-set-history"><header><span>这次已经记录</span><small>撤销只删除对应这一条</small></header>{sets.map((set) => <div key={set.id}><i>{set.set_index + 1}</i><span><b>{set.duration_seconds !== null ? `${Number((set.duration_seconds / 60).toFixed(1))} 分钟` : displayLoad(set.load_grams, unit)}</b><small>{set.duration_seconds !== null ? `计时记录 · RPE ${set.rpe ?? "—"}` : `${set.reps ?? "—"} 次 · RIR ${set.rir ?? "—"}`}</small></span>{set.pain_note && <em>已记不适</em>}<button disabled={mutationBusy} aria-label={`撤销第${set.set_index + 1}条记录`} onClick={() => void mutate(() => undoFitnessSet(set.id), "已撤销这一条记录")}>↶</button></div>)}</div>}
-          <footer className="sl-live-actions"><button disabled={mutationBusy} onClick={() => { setSelectedExerciseId(current.id); setDialog("substitution"); }}>器材被占 / 换动作</button><button disabled={mutationBusy} onClick={() => void mutate(() => completeSessionExercise(current.id, true), "已跳过这个动作，不会变成欠账")}>今天不做这个动作</button>{sets.length > 0 && <button disabled={mutationBusy} className="sl-primary" onClick={() => void mutate(() => completeSessionExercise(current.id), "动作已保存到这里")}>完成这个动作</button>}</footer>
+          {sets.length > 0 && <div className="sl-set-history"><header><span>这次已经记录</span><small>撤销只删除对应这一条</small></header>{sets.map((set) => <div key={set.id}><i>{set.set_index + 1}</i><span><b>{set.duration_seconds !== null ? `${Number((set.duration_seconds / 60).toFixed(1))} 分钟` : displayLoad(set.load_grams, unit)}</b><small>{set.duration_seconds !== null ? `计时记录 · RPE ${set.rpe ?? "—"}` : `${set.reps ?? "—"} 次 · RIR ${set.rir ?? "—"}`}</small></span>{set.pain_note && <em>已记不适</em>}<button disabled={interactionLocked} aria-label={`撤销第${set.set_index + 1}条记录`} onClick={() => void mutate(() => undoFitnessSet(set.id), "已撤销这一条记录")}>↶</button></div>)}</div>}
+          <footer className="sl-live-actions"><button disabled={interactionLocked} onClick={() => { setSelectedExerciseId(current.id); setDialog("substitution"); }}>器材被占 / 换动作</button><button disabled={interactionLocked} onClick={() => void mutate(() => completeSessionExercise(current.id, true), "已跳过这个动作，不会变成欠账")}>今天不做这个动作</button>{sets.length > 0 && <button disabled={interactionLocked} className="sl-primary" onClick={() => void mutate(() => completeSessionExercise(current.id), "动作已保存到这里")}>完成这个动作</button>}</footer>
         </article>
-      </section> : <section className="sl-live-done"><span>THIS SESSION, SO FAR</span><h1>本场动作已到这里。</h1><p>没有新的记录表单。你可以结束保存，或按当前场地再加一个动作。</p><button disabled={mutationBusy} onClick={() => setDialog("exercise-picker")}>＋ 再加一个动作</button></section>}
-    </> : <section className="sl-live-empty"><span>临时训练</span><h1>从现在想做的动作开始。</h1><p>只会显示当前场地真实可完成的动作；第一次负荷不用猜。</p><button disabled={mutationBusy} className="sl-primary" onClick={() => setDialog("exercise-picker")}>＋ 添加一个动作</button></section>}
-    <footer className="sl-live-bottom"><span>{hasActualFacts ? `${actualRowCount} 个动作有实际记录` : "还没有实际组数或时长记录"}</span><div className="sl-live-bottom-actions">{!hasActualFacts && <button disabled={mutationBusy} onClick={() => void cancelEmpty()}>取消误开的训练</button>}<button disabled={mutationBusy} onClick={() => void finish(false)}>{hasActualFacts ? "结束并保存" : "保存空时段"}</button></div></footer>
+      </section> : <section className="sl-live-done"><span>THIS SESSION, SO FAR</span><h1>本场动作已到这里。</h1><p>没有新的记录表单。你可以结束保存，或按当前场地再加一个动作。</p><button disabled={interactionLocked} onClick={() => setDialog("exercise-picker")}>＋ 再加一个动作</button></section>}
+    </> : <section className="sl-live-empty"><span>临时训练</span><h1>从现在想做的动作开始。</h1><p>只会显示当前场地真实可完成的动作；第一次负荷不用猜。</p><button disabled={interactionLocked} className="sl-primary" onClick={() => setDialog("exercise-picker")}>＋ 添加一个动作</button></section>}
+    <footer className="sl-live-bottom"><span>{hasActualFacts ? `${actualRowCount} 个动作有实际记录` : "还没有实际组数或时长记录"}</span><div className="sl-live-bottom-actions">{!hasActualFacts && <button disabled={interactionLocked} onClick={() => void cancelEmpty()}>取消误开的训练</button>}<button disabled={interactionLocked} onClick={() => void finish(false)}>{hasActualFacts ? "结束并保存" : "保存空时段"}</button></div></footer>
     <ExercisePicker open={dialog === "exercise-picker"} title="添加现场动作" exercises={availableExercises} equipment={sessionEquipment} equipmentLoads={sessionLoads} onClose={() => { if (!mutationBusy) { setDialog(null); setSelectedExerciseId(null); } }} onPick={async (exercise) => { const resources = resourcesForExercise(exercise, sessionEquipment, sessionLoads) ?? []; const primary = resources[0] ?? null; await mutate(async () => { await addSessionExercise(session.id, exercise.id, primary, JSON.stringify(resources)); setDialog(null); setSelectedExerciseId(null); }, "动作已加入这次训练"); }} />
     <ExercisePicker open={dialog === "substitution"} title="换一个现在能做的版本" exercises={current ? availableExercises.filter((exercise) => exercise.pattern === currentExercise?.pattern && exercise.id !== current.exercise_id) : []} equipment={sessionEquipment} equipmentLoads={sessionLoads} onClose={() => { if (!mutationBusy) { setDialog(null); setSelectedExerciseId(null); } }} onPick={async (exercise) => { if (!selectedExerciseId) return; const resources = resourcesForExercise(exercise, sessionEquipment, sessionLoads) ?? []; await mutate(async () => { await substituteSessionExercise({ sessionExerciseId: selectedExerciseId, exerciseId: exercise.id, equipmentId: resources[0] ?? null, reason: "器材占用或现场调整" }); setDialog(null); setSelectedExerciseId(null); }, "只调整了本次训练，未来计划没有被悄悄修改"); }} />
+    {postCommitRecovery && <div className="sl-error-toast sl-post-commit-recovery" role="alert"><span>已保存在本地</span><p>{postCommitRecovery.retryFailed ? "仍未重新读取成功。请保持此页打开，确认本地服务可用后再重新读取；" : "当前页面没有重新读取成功。请重新读取；"}不要重复提交。</p><button type="button" disabled={recoveryBusy} onClick={() => void retryPostCommitRefresh()}>{recoveryBusy ? "正在重新读取…" : "重新读取"}</button></div>}
     {error && <div className="sl-error-toast" role="alert"><span>需要确认</span>{error}<button onClick={() => setError("")} aria-label="关闭错误">×</button></div>}
     {toast && <div className="sl-toast" role="status"><i>✓</i>{toast}</div>}
   </main>;
