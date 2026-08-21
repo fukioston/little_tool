@@ -463,6 +463,132 @@ test("prepare verifies a complete backup into a serializable candidate without a
   assert.deepEqual(fixture.state.broadcasts, []);
 });
 
+test("an awaited recovery checkpoint precedes database staging with attachments", async () => {
+  const fixture = await runtimeFixture();
+  let enterHook;
+  let releaseHook;
+  const hookEntered = new Promise((resolve) => { enterHook = resolve; });
+  const hookGate = new Promise((resolve) => { releaseHook = resolve; });
+  let checkpoint;
+
+  const operation = backupService.prepareCareerBackupRestore(
+    await completeContainer(),
+    {
+      async onRecoveryPrepared(value) {
+        checkpoint = JSON.parse(JSON.stringify(value));
+        assert.equal(Object.isFrozen(value), true);
+        assert.equal(Object.isFrozen(value.summary), true);
+        assert.equal(Object.isFrozen(value.stagedAttachmentKeys), true);
+        enterHook();
+        await hookGate;
+      },
+    },
+  );
+
+  await hookEntered;
+  assert.equal(fixture.state.saved.length, 1);
+  assert.equal(fixture.state.staged.length, 0);
+  assert.equal(checkpoint.operationId, GENERATION_ID);
+  assert.equal(checkpoint.generationId, GENERATION_ID);
+  assert.deepEqual(checkpoint.stagedAttachmentKeys, [STAGED_KEY]);
+  assert.deepEqual(JSON.parse(JSON.stringify(checkpoint)), checkpoint);
+
+  releaseHook();
+  const prepared = await operation;
+  assert.equal(fixture.state.staged.length, 1);
+  assert.equal(prepared.generationId, checkpoint.generationId);
+  assert.equal(prepared.projectionSha256, checkpoint.projectionSha256);
+  assert.equal(
+    fixture.state.staged[0].options.recovery.prepareOperation.operationToken,
+    checkpoint.operationToken,
+  );
+});
+
+test("a legacy restore without attachments also checkpoints before database staging", async () => {
+  const fixture = await runtimeFixture();
+  let checkpoint;
+
+  await backupService.prepareCareerBackupRestore(
+    new File([sqliteBytes(3)], "career-v3.sqlite3"),
+    {
+      onRecoveryPrepared(value) {
+        checkpoint = JSON.parse(JSON.stringify(value));
+        assert.equal(fixture.state.saved.length, 0);
+        assert.equal(fixture.state.staged.length, 0);
+      },
+    },
+  );
+
+  assert.equal(checkpoint.summary.kind, "legacy-career-sqlite");
+  assert.deepEqual(checkpoint.stagedAttachmentKeys, []);
+  assert.equal(fixture.state.staged.length, 1);
+});
+
+test("a rejected recovery checkpoint prevents database staging and rolls back attachments", async () => {
+  const fixture = await runtimeFixture();
+
+  await assert.rejects(
+    backupService.prepareCareerBackupRestore(await completeContainer(), {
+      async onRecoveryPrepared() {
+        throw new Error("persistent recovery write rejected");
+      },
+    }),
+    (error) => error?.code === "PREPARE_FAILED" &&
+      error?.message.includes("没有开始建立候选"),
+  );
+
+  assert.equal(fixture.state.saved.length, 1);
+  assert.equal(fixture.state.staged.length, 0);
+  assert.deepEqual(fixture.state.deleted, [
+    { database: "career", key: STAGED_KEY },
+  ]);
+  assert.equal(fixture.state.prepareReceipt, null);
+});
+
+test("a rejected checkpoint plus unknown rollback exposes durable bound cleanup", async () => {
+  const fixture = await runtimeFixture();
+  const originalRegister = fixture.runtime.registerPrepareCleanup;
+  fixture.runtime.deleteLocalFile = async (database, key) => {
+    fixture.state.deleted.push({ database, key });
+    throw new Error("temporary OPFS delete failure");
+  };
+  fixture.runtime.registerPrepareCleanup = async (...args) => {
+    await originalRegister(...args);
+    throw new Error("cleanup binding response lost");
+  };
+  let cleanupError;
+
+  try {
+    await backupService.prepareCareerBackupRestore(await completeContainer(), {
+      onRecoveryPrepared() {
+        throw new Error("persistent recovery write rejected");
+      },
+    });
+  } catch (error) {
+    cleanupError = error;
+  }
+
+  assert.equal(cleanupError?.code, "PREPARE_CLEANUP_INCOMPLETE");
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(cleanupError.receipt)),
+    cleanupError.receipt,
+  );
+  assert.equal(fixture.state.staged.length, 0);
+  assert.deepEqual(fixture.state.prepareReceipt, cleanupError.receipt);
+
+  fixture.runtime.deleteLocalFile = async (database, key) => {
+    fixture.state.deleted.push({ database, key });
+  };
+  fixture.runtime.registerPrepareCleanup = originalRegister;
+  assert.deepEqual(
+    await backupService.retryCareerPrepareCleanup(
+      JSON.parse(JSON.stringify(cleanupError.receipt)),
+    ),
+    { cleaned: true },
+  );
+  assert.equal(fixture.state.prepareStatus, "cleanup-complete");
+});
+
 test("activate performs one guarded activation and treats broadcast failure as best-effort", async () => {
   const fixture = await runtimeFixture();
   const receipt = await backupService.prepareCareerBackupRestore(
@@ -778,6 +904,7 @@ test("an unknown or malformed stage response retains attachments and never claim
 test("a lost READY response recovers the same candidate across refresh without restaging", async () => {
   const fixture = await runtimeFixture();
   const originalStage = fixture.runtime.stageImport;
+  let checkpoint;
   fixture.runtime.stageImport = async (...args) => {
     await originalStage(...args);
     throw new Error("READY response lost after durable commit");
@@ -785,7 +912,11 @@ test("a lost READY response recovers the same candidate across refresh without r
 
   let uncertain;
   try {
-    await backupService.prepareCareerBackupRestore(await completeContainer());
+    await backupService.prepareCareerBackupRestore(await completeContainer(), {
+      onRecoveryPrepared(value) {
+        checkpoint = JSON.parse(JSON.stringify(value));
+      },
+    });
   } catch (error) {
     uncertain = error;
   }
@@ -795,6 +926,7 @@ test("a lost READY response recovers the same candidate across refresh without r
   assert.equal(serialized.operationId, GENERATION_ID);
   assert.equal(serialized.generationId, GENERATION_ID);
   assert.equal(serialized.stagedAttachmentKeys[0], STAGED_KEY);
+  assert.deepEqual(serialized, checkpoint);
 
   const recovered = await backupService.recoverCareerBackupPrepare(serialized);
   assert.equal(recovered.status, "ready");

@@ -146,6 +146,18 @@ export type CareerPrepareRecovery =
     }>
   | Readonly<{ status: "discarded" }>;
 
+export type CareerBackupRestoreOptions = Readonly<{
+  signal?: AbortSignal;
+  /**
+   * Persist this JSON-safe receipt before the worker may create a READY
+   * database generation. Rejecting the hook prevents stageImport from
+   * starting; any attachments already staged by this attempt are rolled back.
+   */
+  onRecoveryPrepared?(
+    prepared: CareerPrepareRecoveryReceipt,
+  ): void | Promise<void>;
+}>;
+
 export type CareerRestoreActivation = Readonly<{
   generationId: string;
   summary: CareerRestoreSummary;
@@ -631,6 +643,16 @@ function prepareRecoveryReceiptFor(
     summary: projection.summary,
     stagedAttachmentKeys: [...projection.stagedAttachmentKeys],
   };
+}
+
+function recoveryCheckpointFor(
+  receipt: CareerPrepareRecoveryReceipt,
+): CareerPrepareRecoveryReceipt {
+  return Object.freeze({
+    ...receipt,
+    summary: Object.freeze({ ...receipt.summary }),
+    stagedAttachmentKeys: Object.freeze([...receipt.stagedAttachmentKeys]),
+  });
 }
 
 function parseStagedRecoveryReceipt(
@@ -1147,6 +1169,7 @@ async function stageSourceInContext(
   source: PreparedRestoreSource,
   context: CareerLockContext,
   signal?: AbortSignal,
+  onRecoveryPrepared?: CareerBackupRestoreOptions["onRecoveryPrepared"],
 ): Promise<CareerRestoreReceipt> {
   assertExclusiveContext(context);
   throwIfAborted(signal);
@@ -1181,6 +1204,19 @@ async function stageSourceInContext(
       attachmentDigest,
       newPrepareOperationCapability(),
     );
+    throwIfAborted(signal);
+
+    if (onRecoveryPrepared) {
+      try {
+        await onRecoveryPrepared(recoveryCheckpointFor(prepareRecoveryReceipt));
+      } catch (error) {
+        throw new CareerRestoreError(
+          "恢复信息未能安全保存，因此没有开始建立候选。当前职迹没有改变。",
+          "PREPARE_FAILED",
+          error,
+        );
+      }
+    }
     throwIfAborted(signal);
 
     // Once atomic worker staging starts, a late AbortSignal is ignored. A
@@ -1630,14 +1666,34 @@ export async function exportCompleteCareerBackup(): Promise<CompleteCareerBackup
 /** Validate and migrate into an isolated READY generation without activation. */
 export async function prepareCareerBackupRestore(
   backup: Blob,
-  options: Readonly<{ signal?: AbortSignal }> = {},
+  options: CareerBackupRestoreOptions = {},
 ): Promise<CareerRestoreReceipt> {
   if (!(backup instanceof Blob)) {
     throw new CareerRestoreError("请选择一个可以读取的职迹备份文件。", "PREPARE_FAILED");
   }
+  if (!options || typeof options !== "object" || Array.isArray(options)) {
+    throw new CareerRestoreError(
+      "恢复准备配置无效。当前资料没有改变。",
+      "PREPARE_FAILED",
+    );
+  }
+  if (
+    options.onRecoveryPrepared !== undefined &&
+    typeof options.onRecoveryPrepared !== "function"
+  ) {
+    throw new CareerRestoreError(
+      "恢复准备回调无效。当前资料没有改变。",
+      "PREPARE_FAILED",
+    );
+  }
   const source = await readAutoDetectedSource(backup, options.signal);
   return withCareerBackupLock((context) =>
-    stageSourceInContext(source, context, options.signal));
+    stageSourceInContext(
+      source,
+      context,
+      options.signal,
+      options.onRecoveryPrepared,
+    ));
 }
 
 /**
