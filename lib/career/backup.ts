@@ -75,6 +75,17 @@ function databaseBytes(value: unknown): Uint8Array {
   throw new Error("本地数据库没有返回可导出的 SQLite 字节");
 }
 
+function sqliteUserVersion(database: Uint8Array): number {
+  if (database.byteLength < 64) {
+    throw new Error("这份 SQLite 备份不完整，已在迁移前拒绝");
+  }
+  return new DataView(
+    database.buffer,
+    database.byteOffset,
+    database.byteLength,
+  ).getUint32(60, false);
+}
+
 function attachedMaterials(materials: readonly Material[]) {
   return materials.filter((material): material is Material & { file_key: string } =>
     typeof material.file_key === "string" && material.file_key.length > 0);
@@ -215,7 +226,10 @@ export async function restoreCompleteCareerBackup(
     const stagedAttachments = await stageAttachments(parsed);
     await stageAndActivate(
       parsed.database,
-      createCompleteCareerRestoreStatements(stagedAttachments),
+      createCompleteCareerRestoreStatements(
+        stagedAttachments,
+        parsed.manifest.database.userVersion,
+      ),
       context,
       stagedAttachments,
     );
@@ -238,7 +252,7 @@ export async function restoreLegacyCareerDatabase(
   return withCareerBackupLock(async (context) => {
     await stageAndActivate(
       database,
-      createLegacyCareerRestoreStatements(),
+      createLegacyCareerRestoreStatements(sqliteUserVersion(database)),
       context,
       [],
     );

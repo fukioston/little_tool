@@ -419,14 +419,16 @@ test("legacy restore clears all four attachment columns", () => {
 
 test("restore plan publishes the canonical Career schema identity", () => {
   assert.equal(CAREER_APPLICATION_ID, 0x5a484a49);
-  assert.equal(CAREER_USER_VERSION, 1);
+  assert.equal(CAREER_USER_VERSION, 2);
   assert.deepEqual(CAREER_SCHEMA_REQUIREMENTS.sourceApplicationIds, [
     0,
     CAREER_APPLICATION_ID,
   ]);
   assert.equal(CAREER_SCHEMA_REQUIREMENTS.applicationId, CAREER_APPLICATION_ID);
-  assert.equal(CAREER_SCHEMA_REQUIREMENTS.minimumUserVersion, 1);
-  assert.equal(CAREER_SCHEMA_REQUIREMENTS.maximumUserVersion, 1);
+  assert.equal(CAREER_SCHEMA_REQUIREMENTS.minimumUserVersion, 2);
+  assert.equal(CAREER_SCHEMA_REQUIREMENTS.maximumUserVersion, 2);
+  assert.equal(CAREER_SCHEMA_REQUIREMENTS.sourceMinimumUserVersion, 0);
+  assert.equal(CAREER_SCHEMA_REQUIREMENTS.sourceMaximumUserVersion, 2);
   const materials = CAREER_SCHEMA_REQUIREMENTS.requiredTables.find(
     ({ name }) => name === "career_materials",
   );
@@ -436,6 +438,111 @@ test("restore plan publishes the canonical Career schema identity", () => {
     "mime_type",
     "byte_size",
   ]);
+  const sourceContacts = CAREER_SCHEMA_REQUIREMENTS.sourceRequiredTables.find(
+    ({ name }) => name === "career_contacts",
+  );
+  const canonicalContacts = CAREER_SCHEMA_REQUIREMENTS.requiredTables.find(
+    ({ name }) => name === "career_contacts",
+  );
+  assert.equal(sourceContacts.columns.includes("updated_at"), false);
+  assert.equal(sourceContacts.columns.includes("archived"), false);
+  assert.equal(canonicalContacts.columns.includes("updated_at"), true);
+  assert.equal(canonicalContacts.columns.includes("archived"), true);
+  assert.ok(CAREER_SCHEMA_REQUIREMENTS.requiredTables.some(
+    ({ name }) => name === "career_contact_jobs",
+  ));
+  assert.ok(CAREER_SCHEMA_REQUIREMENTS.requiredTables.some(
+    ({ name }) => name === "career_contact_interactions",
+  ));
+});
+
+test("v1 restore migrates contacts without inventing interactions, links, or tasks", () => {
+  const database = new sqlite3.oo1.DB(":memory:", "c");
+  try {
+    database.exec(`
+      PRAGMA foreign_keys = ON;
+      PRAGMA application_id = ${CAREER_APPLICATION_ID};
+      PRAGMA user_version = 1;
+      CREATE TABLE career_jobs (id TEXT PRIMARY KEY);
+      CREATE TABLE career_tasks (
+        id TEXT PRIMARY KEY,
+        job_id TEXT REFERENCES career_jobs(id) ON DELETE SET NULL,
+        title TEXT NOT NULL,
+        due_at TEXT,
+        kind TEXT NOT NULL,
+        priority INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE TABLE career_contacts (
+        id TEXT PRIMARY KEY,
+        company TEXT NOT NULL DEFAULT '',
+        name TEXT NOT NULL,
+        role TEXT NOT NULL DEFAULT '',
+        channel TEXT NOT NULL,
+        email TEXT NOT NULL DEFAULT '',
+        phone TEXT NOT NULL DEFAULT '',
+        last_contact_at TEXT,
+        next_follow_up TEXT,
+        notes TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL
+      );
+      CREATE TABLE career_materials (
+        id TEXT PRIMARY KEY,
+        file_key TEXT,
+        file_name TEXT,
+        mime_type TEXT,
+        byte_size INTEGER
+      );
+      INSERT INTO career_contacts
+        (id,name,channel,last_contact_at,next_follow_up,created_at)
+        VALUES (
+          'legacy-contact',
+          '旧联系人',
+          'LinkedIn',
+          '2026-01-02T00:00:00.000Z',
+          '2026-01-09T00:00:00.000Z',
+          '2026-01-01T00:00:00.000Z'
+        );
+    `);
+
+    executeStatementsAtomically(
+      database,
+      createCompleteCareerRestoreStatements([], 1),
+    );
+
+    assertCanonicalIdentity(database);
+    const contactColumns = new Set(
+      database.selectObjects("PRAGMA table_info(career_contacts)")
+        .map(({ name }) => name),
+    );
+    const taskColumns = new Set(
+      database.selectObjects("PRAGMA table_info(career_tasks)")
+        .map(({ name }) => name),
+    );
+    assert.equal(contactColumns.has("updated_at"), true);
+    assert.equal(contactColumns.has("archived"), true);
+    assert.equal(taskColumns.has("contact_id"), true);
+    assert.deepEqual(database.selectObjects(`SELECT
+      last_contact_at,next_follow_up,updated_at,archived
+      FROM career_contacts`).map((row) => ({ ...row })), [{
+      last_contact_at: "2026-01-02T00:00:00.000Z",
+      next_follow_up: "2026-01-09T00:00:00.000Z",
+      updated_at: "2026-01-01T00:00:00.000Z",
+      archived: 0,
+    }]);
+    assert.equal(
+      Number(database.selectValue("SELECT COUNT(*) FROM career_contact_interactions")),
+      0,
+    );
+    assert.equal(
+      Number(database.selectValue("SELECT COUNT(*) FROM career_contact_jobs")),
+      0,
+    );
+    assert.equal(Number(database.selectValue("SELECT COUNT(*) FROM career_tasks")), 0);
+  } finally {
+    database.close();
+  }
 });
 
 test("restore plan rejects duplicate and overlapping keys before SQL", () => {

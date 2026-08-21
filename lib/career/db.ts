@@ -1,9 +1,14 @@
 import { localDb } from "@/lib/local-db/client";
+import type { SqlStatement } from "@/lib/local-db/types";
 import {
   withCareerReadLock,
   withCareerWriteLock,
   type CareerLockContext,
 } from "./lock";
+import {
+  CAREER_APPLICATION_ID,
+  CAREER_USER_VERSION,
+} from "./backup-plan";
 import type {
   Activity,
   CareerData,
@@ -16,10 +21,6 @@ import type {
 } from "./types";
 
 const DB = "career";
-const CAREER_APPLICATION_ID = 0x5a484a49;
-const CAREER_USER_VERSION = 1;
-
-type SqlStatement = { sql: string; params?: unknown[] };
 
 function id(prefix: string) {
   return `${prefix}_${crypto.randomUUID()}`;
@@ -66,7 +67,7 @@ export async function runCareerSql(
 }
 
 export async function runCareerBatch(
-  statements: SqlStatement[],
+  statements: readonly SqlStatement[],
   context?: CareerLockContext,
 ) {
   assertExclusiveContext(context);
@@ -112,6 +113,7 @@ const schemaStatements: SqlStatement[] = [
     sql: `CREATE TABLE IF NOT EXISTS career_tasks (
       id TEXT PRIMARY KEY,
       job_id TEXT REFERENCES career_jobs(id) ON DELETE SET NULL,
+      contact_id TEXT REFERENCES career_contacts(id) ON DELETE SET NULL,
       title TEXT NOT NULL,
       due_at TEXT,
       kind TEXT NOT NULL DEFAULT '跟进',
@@ -145,12 +147,37 @@ const schemaStatements: SqlStatement[] = [
       company TEXT NOT NULL DEFAULT '',
       name TEXT NOT NULL,
       role TEXT NOT NULL DEFAULT '',
-      channel TEXT NOT NULL DEFAULT 'LinkedIn',
+      channel TEXT NOT NULL DEFAULT '',
       email TEXT NOT NULL DEFAULT '',
       phone TEXT NOT NULL DEFAULT '',
       last_contact_at TEXT,
       next_follow_up TEXT,
       notes TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      archived INTEGER NOT NULL DEFAULT 0
+    )`,
+  },
+  {
+    sql: `CREATE TABLE IF NOT EXISTS career_contact_jobs (
+      contact_id TEXT NOT NULL REFERENCES career_contacts(id) ON DELETE CASCADE,
+      job_id TEXT NOT NULL REFERENCES career_jobs(id) ON DELETE CASCADE,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (contact_id, job_id)
+    )`,
+  },
+  {
+    sql: `CREATE TABLE IF NOT EXISTS career_contact_interactions (
+      id TEXT PRIMARY KEY,
+      contact_id TEXT NOT NULL REFERENCES career_contacts(id) ON DELETE CASCADE,
+      job_id TEXT REFERENCES career_jobs(id) ON DELETE SET NULL,
+      interaction_type TEXT NOT NULL DEFAULT 'message',
+      direction TEXT NOT NULL DEFAULT 'outbound'
+        CHECK (direction IN ('outbound', 'inbound', 'mutual')),
+      channel TEXT NOT NULL DEFAULT '',
+      summary TEXT NOT NULL,
+      notes TEXT NOT NULL DEFAULT '',
+      occurred_at TEXT NOT NULL,
       created_at TEXT NOT NULL
     )`,
   },
@@ -184,6 +211,14 @@ const schemaStatements: SqlStatement[] = [
   { sql: "CREATE INDEX IF NOT EXISTS idx_career_jobs_stage ON career_jobs(stage_id, archived, position)" },
   { sql: "CREATE INDEX IF NOT EXISTS idx_career_tasks_due ON career_tasks(status, due_at)" },
   { sql: "CREATE INDEX IF NOT EXISTS idx_career_interviews_date ON career_interviews(scheduled_at)" },
+];
+
+const contactIndexes: SqlStatement[] = [
+  { sql: "CREATE INDEX IF NOT EXISTS idx_career_contacts_archived_name ON career_contacts(archived, name)" },
+  { sql: "CREATE INDEX IF NOT EXISTS idx_career_tasks_contact_due ON career_tasks(contact_id, status, due_at)" },
+  { sql: "CREATE INDEX IF NOT EXISTS idx_career_contact_jobs_job ON career_contact_jobs(job_id, contact_id)" },
+  { sql: "CREATE INDEX IF NOT EXISTS idx_career_contact_interactions_contact_date ON career_contact_interactions(contact_id, occurred_at DESC)" },
+  { sql: "CREATE INDEX IF NOT EXISTS idx_career_contact_interactions_job_date ON career_contact_interactions(job_id, occurred_at DESC)" },
 ];
 
 function seedStatements(): SqlStatement[] {
@@ -281,16 +316,16 @@ function seedStatements(): SqlStatement[] {
       params: [id("interview"), jobs.figma, "Hiring Manager", "视频面试", isoOffset(-6, 15), 45, "Sarah · Growth Design", "", "completed", "讨论增长实验、设计质量与数据之间的取舍。", "整体交流顺畅，对 onboarding 实验追问较深。", q, "案例结构清楚；下次应更早说明实验基线。", now, now],
     },
     {
-      sql: "INSERT INTO career_contacts (id,company,name,role,channel,email,phone,last_contact_at,next_follow_up,notes,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-      params: [id("contact"), "Arc", "林然", "招聘顾问", "BOSS直聘", "", "", isoOffset(-2, 10), isoOffset(2, 10), "回复快，偏好在 BOSS 上沟通。", now],
+      sql: "INSERT INTO career_contacts (id,company,name,role,channel,email,phone,last_contact_at,next_follow_up,notes,created_at,updated_at,archived) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0)",
+      params: [id("contact"), "Arc", "林然", "招聘顾问", "BOSS直聘", "", "", isoOffset(-2, 10), isoOffset(2, 10), "回复快，偏好在 BOSS 上沟通。", now, now],
     },
     {
-      sql: "INSERT INTO career_contacts (id,company,name,role,channel,email,phone,last_contact_at,next_follow_up,notes,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-      params: [id("contact"), "Notion", "Evan Lin", "Recruiter", "LinkedIn", "evan@example.com", "", isoOffset(-4, 10), isoOffset(0, 16), "通过共同联系人认识。", now],
+      sql: "INSERT INTO career_contacts (id,company,name,role,channel,email,phone,last_contact_at,next_follow_up,notes,created_at,updated_at,archived) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0)",
+      params: [id("contact"), "Notion", "Evan Lin", "Recruiter", "LinkedIn", "evan@example.com", "", isoOffset(-4, 10), isoOffset(0, 16), "通过共同联系人认识。", now, now],
     },
     {
-      sql: "INSERT INTO career_contacts (id,company,name,role,channel,email,phone,last_contact_at,next_follow_up,notes,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-      params: [id("contact"), "Figma", "Sophie Tan", "People Partner", "邮件", "sophie@example.com", "", isoOffset(-1, 17), isoOffset(2, 11), "负责 Offer 流程。", now],
+      sql: "INSERT INTO career_contacts (id,company,name,role,channel,email,phone,last_contact_at,next_follow_up,notes,created_at,updated_at,archived) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0)",
+      params: [id("contact"), "Figma", "Sophie Tan", "People Partner", "邮件", "sophie@example.com", "", isoOffset(-1, 17), isoOffset(2, 11), "负责 Offer 流程。", now, now],
     },
     {
       sql: "INSERT INTO career_materials (id,name,kind,version,updated_at,linked_job_id,status,notes) VALUES (?,?,?,?,?,?,?,?)",
@@ -369,6 +404,38 @@ export async function initializeCareerDb(context?: CareerLockContext) {
       await runCareerBatch(missingMaterialColumns, lockContext);
     }
 
+    const [contactColumns, taskColumns] = await Promise.all([
+      query<{ name: string }>("PRAGMA table_info(career_contacts)", [], lockContext),
+      query<{ name: string }>("PRAGMA table_info(career_tasks)", [], lockContext),
+    ]);
+    const existingContactColumns = new Set(contactColumns.map((column) => column.name));
+    const existingTaskColumns = new Set(taskColumns.map((column) => column.name));
+    const contactMigrations: SqlStatement[] = [];
+    if (!existingContactColumns.has("updated_at")) {
+      contactMigrations.push({ sql: "ALTER TABLE career_contacts ADD COLUMN updated_at TEXT" });
+    }
+    if (!existingContactColumns.has("archived")) {
+      contactMigrations.push({
+        sql: "ALTER TABLE career_contacts ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
+      });
+    }
+    if (!existingTaskColumns.has("contact_id")) {
+      contactMigrations.push({
+        sql: "ALTER TABLE career_tasks ADD COLUMN contact_id TEXT REFERENCES career_contacts(id) ON DELETE SET NULL",
+      });
+    }
+    if (contactMigrations.length > 0) {
+      await runCareerBatch(contactMigrations, lockContext);
+    }
+    await runCareerBatch([
+      {
+        sql: `UPDATE career_contacts
+          SET updated_at = created_at
+          WHERE updated_at IS NULL OR updated_at = ''`,
+      },
+      ...contactIndexes,
+    ], lockContext);
+
     const count = await query<{ count: number }>(
       "SELECT COUNT(*) AS count FROM career_stages",
       [],
@@ -392,7 +459,7 @@ export async function loadCareerData(context?: CareerLockContext): Promise<Caree
       query<Job>("SELECT * FROM career_jobs WHERE archived = 0 ORDER BY position, updated_at DESC", [], lockContext),
       query<Task>("SELECT * FROM career_tasks ORDER BY status, due_at", [], lockContext),
       query<Interview>("SELECT * FROM career_interviews ORDER BY scheduled_at", [], lockContext),
-      query<Contact>("SELECT * FROM career_contacts ORDER BY next_follow_up, name", [], lockContext),
+      query<Contact>("SELECT * FROM career_contacts WHERE archived = 0 ORDER BY next_follow_up, name", [], lockContext),
       query<Material>("SELECT * FROM career_materials ORDER BY updated_at DESC", [], lockContext),
       query<Activity>("SELECT * FROM career_activity ORDER BY created_at DESC LIMIT 40", [], lockContext),
     ]);

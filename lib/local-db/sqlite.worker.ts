@@ -54,6 +54,10 @@ type NormalizedSchemaRequirements = Readonly<{
   sourceApplicationIds: readonly number[];
   sourceMinimumUserVersion: number;
   sourceMaximumUserVersion: number;
+  sourceRequiredTables: readonly Readonly<{
+    name: string;
+    columns: readonly string[];
+  }>[];
   requiredTables: readonly Readonly<{
     name: string;
     columns: readonly string[];
@@ -237,6 +241,42 @@ function normalizeIdentifiers(value: unknown, label: string): string[] {
   return [...unique].sort();
 }
 
+function normalizeTableRequirements(
+  value: unknown,
+  label: string,
+): Array<{ name: string; columns: string[] }> {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new LocalDbWorkerError(
+      `${label} must declare at least one Career table.`,
+      "INVALID_SCHEMA_REQUIREMENTS",
+    );
+  }
+  const tableNames = new Set<string>();
+  return value.map((table, index) => {
+    if (!isRecord(table) || typeof table.name !== "string" || !IDENTIFIER_PATTERN.test(table.name)) {
+      throw new LocalDbWorkerError(
+        `${label}[${index}] has an invalid name.`,
+        "INVALID_SCHEMA_REQUIREMENTS",
+      );
+    }
+    if (tableNames.has(table.name)) {
+      throw new LocalDbWorkerError(
+        `${label} contains duplicate table ${table.name}.`,
+        "INVALID_SCHEMA_REQUIREMENTS",
+      );
+    }
+    tableNames.add(table.name);
+    const columns = normalizeIdentifiers(table.columns, `${label}[${index}].columns`);
+    if (columns.length === 0) {
+      throw new LocalDbWorkerError(
+        `${label}[${index}] must declare at least one column.`,
+        "INVALID_SCHEMA_REQUIREMENTS",
+      );
+    }
+    return { name: table.name, columns };
+  }).sort((left, right) => left.name.localeCompare(right.name));
+}
+
 function normalizeSchemaRequirements(
   value: unknown,
 ): NormalizedSchemaRequirements {
@@ -298,36 +338,13 @@ function normalizeSchemaRequirements(
     );
   }
 
-  if (!Array.isArray(value.requiredTables) || value.requiredTables.length === 0) {
-    throw new LocalDbWorkerError(
-      "At least one required Career table must be declared.",
-      "INVALID_SCHEMA_REQUIREMENTS",
-    );
-  }
-  const tableNames = new Set<string>();
-  const requiredTables = value.requiredTables.map((table, index) => {
-    if (!isRecord(table) || typeof table.name !== "string" || !IDENTIFIER_PATTERN.test(table.name)) {
-      throw new LocalDbWorkerError(
-        `requiredTables[${index}] has an invalid name.`,
-        "INVALID_SCHEMA_REQUIREMENTS",
-      );
-    }
-    if (tableNames.has(table.name)) {
-      throw new LocalDbWorkerError(
-        `requiredTables contains duplicate table ${table.name}.`,
-        "INVALID_SCHEMA_REQUIREMENTS",
-      );
-    }
-    tableNames.add(table.name);
-    const columns = normalizeIdentifiers(table.columns, `requiredTables[${index}].columns`);
-    if (columns.length === 0) {
-      throw new LocalDbWorkerError(
-        `requiredTables[${index}] must declare at least one column.`,
-        "INVALID_SCHEMA_REQUIREMENTS",
-      );
-    }
-    return { name: table.name, columns };
-  }).sort((left, right) => left.name.localeCompare(right.name));
+  const requiredTables = normalizeTableRequirements(
+    value.requiredTables,
+    "requiredTables",
+  );
+  const sourceRequiredTables = value.sourceRequiredTables === undefined
+    ? requiredTables
+    : normalizeTableRequirements(value.sourceRequiredTables, "sourceRequiredTables");
 
   return {
     applicationId: value.applicationId,
@@ -336,6 +353,7 @@ function normalizeSchemaRequirements(
     sourceApplicationIds,
     sourceMinimumUserVersion,
     sourceMaximumUserVersion,
+    sourceRequiredTables,
     requiredTables,
     allowedViews: normalizeIdentifiers(value.allowedViews ?? [], "allowedViews"),
     allowedTriggers: normalizeIdentifiers(value.allowedTriggers ?? [], "allowedTriggers"),
@@ -795,7 +813,10 @@ function assertDatabaseContract(
     );
   }
 
-  for (const table of requirements.requiredTables) {
+  const requiredTables = phase === "source"
+    ? requirements.sourceRequiredTables
+    : requirements.requiredTables;
+  for (const table of requiredTables) {
     const tableType = db.selectValue(
       "SELECT type FROM sqlite_schema WHERE name=?",
       [table.name],

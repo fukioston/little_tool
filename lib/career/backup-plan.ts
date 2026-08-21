@@ -4,7 +4,80 @@ import type {
 } from "../local-db/types";
 
 export const CAREER_APPLICATION_ID = 0x5a484a49;
-export const CAREER_USER_VERSION = 1;
+export const CAREER_USER_VERSION = 2;
+
+const CAREER_V1_REQUIRED_TABLES = [
+  {
+    name: "career_stages",
+    columns: ["id", "name", "color", "position", "is_terminal", "hidden"],
+  },
+  {
+    name: "career_jobs",
+    columns: [
+      "id", "company", "role", "location", "source", "source_url",
+      "stage_id", "priority", "salary", "work_mode", "description",
+      "applied_at", "deadline", "contact_name", "note", "tags",
+      "created_at", "updated_at", "archived", "position",
+    ],
+  },
+  {
+    name: "career_tasks",
+    columns: [
+      "id", "job_id", "title", "due_at", "kind", "priority", "status",
+      "created_at",
+    ],
+  },
+  {
+    name: "career_interviews",
+    columns: [
+      "id", "job_id", "round_name", "interview_type", "scheduled_at",
+      "duration", "interviewer", "meeting_url", "status", "summary",
+      "raw_notes", "questions_json", "reflection", "created_at", "updated_at",
+    ],
+  },
+  {
+    name: "career_contacts",
+    columns: [
+      "id", "company", "name", "role", "channel", "email", "phone",
+      "last_contact_at", "next_follow_up", "notes", "created_at",
+    ],
+  },
+  {
+    name: "career_materials",
+    columns: [
+      "id", "name", "kind", "version", "updated_at", "linked_job_id",
+      "status", "notes", "file_key", "file_name", "mime_type", "byte_size",
+    ],
+  },
+  {
+    name: "career_activity",
+    columns: ["id", "job_id", "type", "detail", "created_at"],
+  },
+  { name: "career_settings", columns: ["key", "value"] },
+] as const;
+
+const CAREER_V2_REQUIRED_TABLES = [
+  ...CAREER_V1_REQUIRED_TABLES.map((table) => {
+    if (table.name === "career_tasks") {
+      return { ...table, columns: [...table.columns, "contact_id"] };
+    }
+    if (table.name === "career_contacts") {
+      return { ...table, columns: [...table.columns, "updated_at", "archived"] };
+    }
+    return table;
+  }),
+  {
+    name: "career_contact_jobs",
+    columns: ["contact_id", "job_id", "created_at"],
+  },
+  {
+    name: "career_contact_interactions",
+    columns: [
+      "id", "contact_id", "job_id", "interaction_type", "direction",
+      "channel", "summary", "notes", "occurred_at", "created_at",
+    ],
+  },
+] as const;
 
 export const CAREER_SCHEMA_REQUIREMENTS = {
   applicationId: CAREER_APPLICATION_ID,
@@ -13,108 +86,8 @@ export const CAREER_SCHEMA_REQUIREMENTS = {
   sourceApplicationIds: [0, CAREER_APPLICATION_ID],
   sourceMinimumUserVersion: 0,
   sourceMaximumUserVersion: CAREER_USER_VERSION,
-  requiredTables: [
-    {
-      name: "career_stages",
-      columns: ["id", "name", "color", "position", "is_terminal", "hidden"],
-    },
-    {
-      name: "career_jobs",
-      columns: [
-        "id",
-        "company",
-        "role",
-        "location",
-        "source",
-        "source_url",
-        "stage_id",
-        "priority",
-        "salary",
-        "work_mode",
-        "description",
-        "applied_at",
-        "deadline",
-        "contact_name",
-        "note",
-        "tags",
-        "created_at",
-        "updated_at",
-        "archived",
-        "position",
-      ],
-    },
-    {
-      name: "career_tasks",
-      columns: [
-        "id",
-        "job_id",
-        "title",
-        "due_at",
-        "kind",
-        "priority",
-        "status",
-        "created_at",
-      ],
-    },
-    {
-      name: "career_interviews",
-      columns: [
-        "id",
-        "job_id",
-        "round_name",
-        "interview_type",
-        "scheduled_at",
-        "duration",
-        "interviewer",
-        "meeting_url",
-        "status",
-        "summary",
-        "raw_notes",
-        "questions_json",
-        "reflection",
-        "created_at",
-        "updated_at",
-      ],
-    },
-    {
-      name: "career_contacts",
-      columns: [
-        "id",
-        "company",
-        "name",
-        "role",
-        "channel",
-        "email",
-        "phone",
-        "last_contact_at",
-        "next_follow_up",
-        "notes",
-        "created_at",
-      ],
-    },
-    {
-      name: "career_materials",
-      columns: [
-        "id",
-        "name",
-        "kind",
-        "version",
-        "updated_at",
-        "linked_job_id",
-        "status",
-        "notes",
-        "file_key",
-        "file_name",
-        "mime_type",
-        "byte_size",
-      ],
-    },
-    {
-      name: "career_activity",
-      columns: ["id", "job_id", "type", "detail", "created_at"],
-    },
-    { name: "career_settings", columns: ["key", "value"] },
-  ],
+  sourceRequiredTables: CAREER_V1_REQUIRED_TABLES,
+  requiredTables: CAREER_V2_REQUIRED_TABLES,
   allowedViews: [],
   allowedTriggers: [],
 } as const satisfies DatabaseSchemaRequirements;
@@ -256,18 +229,83 @@ function canonicalIdentityStatements(): SqlStatement[] {
   ];
 }
 
+function careerV2MigrationStatements(sourceUserVersion: number): SqlStatement[] {
+  if (
+    !Number.isSafeInteger(sourceUserVersion) ||
+    sourceUserVersion < 0 ||
+    sourceUserVersion > CAREER_USER_VERSION
+  ) {
+    throw new TypeError("Unsupported Career restore source user_version.");
+  }
+  if (sourceUserVersion === CAREER_USER_VERSION) return [];
+  return [
+    { sql: "ALTER TABLE career_contacts ADD COLUMN updated_at TEXT" },
+    {
+      sql: "ALTER TABLE career_contacts ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
+    },
+    {
+      sql: "ALTER TABLE career_tasks ADD COLUMN contact_id TEXT REFERENCES career_contacts(id) ON DELETE SET NULL",
+    },
+    {
+      sql: `UPDATE career_contacts
+        SET updated_at = created_at
+        WHERE updated_at IS NULL OR updated_at = ''`,
+    },
+    {
+      sql: `CREATE TABLE career_contact_jobs (
+        contact_id TEXT NOT NULL REFERENCES career_contacts(id) ON DELETE CASCADE,
+        job_id TEXT NOT NULL REFERENCES career_jobs(id) ON DELETE CASCADE,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (contact_id, job_id)
+      )`,
+    },
+    {
+      sql: `CREATE TABLE career_contact_interactions (
+        id TEXT PRIMARY KEY,
+        contact_id TEXT NOT NULL REFERENCES career_contacts(id) ON DELETE CASCADE,
+        job_id TEXT REFERENCES career_jobs(id) ON DELETE SET NULL,
+        interaction_type TEXT NOT NULL DEFAULT 'message',
+        direction TEXT NOT NULL DEFAULT 'outbound'
+          CHECK (direction IN ('outbound', 'inbound', 'mutual')),
+        channel TEXT NOT NULL DEFAULT '',
+        summary TEXT NOT NULL,
+        notes TEXT NOT NULL DEFAULT '',
+        occurred_at TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      )`,
+    },
+    {
+      sql: "CREATE INDEX idx_career_contacts_archived_name ON career_contacts(archived, name)",
+    },
+    {
+      sql: "CREATE INDEX idx_career_tasks_contact_due ON career_tasks(contact_id, status, due_at)",
+    },
+    {
+      sql: "CREATE INDEX idx_career_contact_jobs_job ON career_contact_jobs(job_id, contact_id)",
+    },
+    {
+      sql: "CREATE INDEX idx_career_contact_interactions_contact_date ON career_contact_interactions(contact_id, occurred_at DESC)",
+    },
+    {
+      sql: "CREATE INDEX idx_career_contact_interactions_job_date ON career_contact_interactions(job_id, occurred_at DESC)",
+    },
+  ];
+}
+
 /**
  * Builds the fixed SQL mapping transaction for a verified complete backup.
  * The caller must execute every returned statement in one transaction.
  */
 export function createCompleteCareerRestoreStatements(
   mappings: readonly CareerRestoreAttachmentMapping[],
+  sourceUserVersion = CAREER_USER_VERSION,
 ): SqlStatement[] {
   assertMappings(mappings);
   const original = mappings.map((mapping) => mapping.original);
   const staged = mappings.map((mapping) => mapping.staged);
 
   return [
+    ...careerV2MigrationStatements(sourceUserVersion),
     {
       sql: `CREATE TEMP TABLE __career_restore_guard (
         value INTEGER NOT NULL CHECK (value = 1)
@@ -297,8 +335,11 @@ export function createCompleteCareerRestoreStatements(
  * Clear every attachment column so the restored database never points at
  * unrelated files left in this browser.
  */
-export function createLegacyCareerRestoreStatements(): SqlStatement[] {
+export function createLegacyCareerRestoreStatements(
+  sourceUserVersion = CAREER_USER_VERSION,
+): SqlStatement[] {
   return [
+    ...careerV2MigrationStatements(sourceUserVersion),
     {
       sql: `UPDATE career_materials
         SET file_key = NULL, file_name = NULL, mime_type = NULL, byte_size = NULL`,

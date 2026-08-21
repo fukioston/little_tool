@@ -90,6 +90,12 @@ export type DatabaseSchemaRequirements = Readonly<{
   sourceApplicationIds?: readonly number[];
   sourceMinimumUserVersion?: number;
   sourceMaximumUserVersion?: number;
+  /**
+   * Minimum table contract checked before trusted migrations run. This lets a
+   * legacy source be accepted without weakening the stricter canonical
+   * contract below. Omit to reuse `requiredTables` for both phases.
+   */
+  sourceRequiredTables?: readonly DatabaseTableRequirement[];
   requiredTables: readonly DatabaseTableRequirement[];
   allowedViews?: readonly string[];
   allowedTriggers?: readonly string[];

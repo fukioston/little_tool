@@ -44,6 +44,7 @@ export type Job = {
 export type Task = {
   id: string;
   job_id: string | null;
+  contact_id: string | null;
   title: string;
   due_at: string | null;
   kind: string;
@@ -88,6 +89,35 @@ export type Contact = {
   next_follow_up: string | null;
   notes: string;
   created_at: string;
+  updated_at: string;
+  archived: number;
+};
+
+export type ContactJobAssociation = {
+  contact_id: string;
+  job_id: string;
+  created_at: string;
+};
+
+export type ContactInteraction = {
+  id: string;
+  contact_id: string;
+  job_id: string | null;
+  interaction_type: string;
+  direction: "outbound" | "inbound" | "mutual";
+  channel: string;
+  summary: string;
+  notes: string;
+  occurred_at: string;
+  created_at: string;
+};
+
+export type CareerContactDetail = {
+  contact: Contact;
+  associations: ContactJobAssociation[];
+  jobs: Job[];
+  interactions: ContactInteraction[];
+  tasks: Task[];
 };
 
 export type Material = {
