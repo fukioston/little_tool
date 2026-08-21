@@ -169,6 +169,19 @@ export type CareerMaterialSaveCleanupResult =
       retryable: true;
     }>;
 
+/** Persist this value before allowing the corresponding INSERT to begin. */
+export type CareerMaterialSaveRecoveryPrepared = Readonly<{
+  materialId: string;
+  expectedSnapshot: CareerMaterialSaveExpectedSnapshot;
+  cleanupReceipt: CareerMaterialSaveCleanupReceipt | null;
+}>;
+
+export type CareerMaterialSaveOptions = Readonly<{
+  onRecoveryPrepared?(
+    prepared: CareerMaterialSaveRecoveryPrepared,
+  ): void | Promise<void>;
+}>;
+
 export type CareerMaterialSaveErrorCode =
   | "invalid_input"
   | "conflict"
@@ -178,6 +191,7 @@ export type CareerMaterialSaveErrorCode =
   | "attachment_metadata_mismatch"
   | "temporary_file_cleanup_failed"
   | "invalid_cleanup_receipt"
+  | "recovery_prepare_failed"
   | "write_failed";
 
 export class CareerMaterialSaveError extends Error {
@@ -209,6 +223,10 @@ type NormalizedSaveInput = Readonly<{
   status: "ready" | "draft" | "sent";
   notes: string;
   attachment: NormalizedAttachmentInput | null;
+}>;
+
+type NormalizedSaveOptions = Readonly<{
+  onRecoveryPrepared: CareerMaterialSaveOptions["onRecoveryPrepared"] | null;
 }>;
 
 type CareerMaterialSaveCleanupPayload = Readonly<{
@@ -375,6 +393,20 @@ function normalizeInput(input: CareerMaterialSaveInput): NormalizedSaveInput {
     notes: notesText(input.notes),
     attachment,
   });
+}
+
+function normalizeOptions(
+  options: CareerMaterialSaveOptions | undefined,
+): NormalizedSaveOptions {
+  if (options === undefined) return { onRecoveryPrepared: null };
+  if (!options || typeof options !== "object" || Array.isArray(options)) {
+    invalid("材料保存恢复配置无效。");
+  }
+  const callback = options.onRecoveryPrepared;
+  if (callback !== undefined && typeof callback !== "function") {
+    invalid("材料保存恢复回调无效。");
+  }
+  return Object.freeze({ onRecoveryPrepared: callback ?? null });
 }
 
 function freezeSnapshot(
@@ -952,6 +984,14 @@ function uncertainResult(
   };
 }
 
+function preparedRecovery(
+  materialId: string,
+  expectedSnapshot: CareerMaterialSaveExpectedSnapshot,
+  cleanupReceipt: CareerMaterialSaveCleanupReceipt | null,
+): CareerMaterialSaveRecoveryPrepared {
+  return Object.freeze({ materialId, expectedSnapshot, cleanupReceipt });
+}
+
 async function tryCleanupStagedFileInCurrentLock(
   runtime: CareerMaterialSaveRuntime,
   payload: CareerMaterialSaveCleanupPayload,
@@ -1114,9 +1154,11 @@ export function createCareerMaterialSaveService(
 
   async function save(
     input: CareerMaterialSaveInput,
+    options?: CareerMaterialSaveOptions,
   ): Promise<CareerMaterialSaveResult> {
     // Copy every mutable caller-owned field before waiting for the Web Lock.
     const normalized = normalizeInput(input);
+    const normalizedOptions = normalizeOptions(options);
     return runtime.withExclusiveLock(async () => {
       let existing: StoredMaterial | null;
       try {
@@ -1215,6 +1257,40 @@ export function createCareerMaterialSaveService(
           throw new CareerMaterialSaveError(
             "write_failed",
             "无法建立这次保存的恢复凭据；暂存附件已清理，材料记录没有写入。",
+          );
+        }
+      }
+
+      const recovery = preparedRecovery(
+        normalized.materialId,
+        expected,
+        stagedCleanupReceipt,
+      );
+      if (normalizedOptions.onRecoveryPrepared) {
+        try {
+          await normalizedOptions.onRecoveryPrepared(recovery);
+        } catch {
+          if (metadata && stagedGeneration && stagedCleanupReceipt) {
+            const cleaned = await tryCleanupStagedFileInCurrentLock(
+              runtime,
+              canonicalCleanupPayload(
+                stagedGeneration,
+                normalized.materialId,
+                expected,
+                normalizeStagedFileMetadata(metadata),
+              ),
+            );
+            if (!cleaned) {
+              throw new CareerMaterialSaveError(
+                "temporary_file_cleanup_failed",
+                "恢复信息未能安全保存；材料记录没有写入，暂存附件仍需继续核对。",
+                stagedCleanupReceipt,
+              );
+            }
+          }
+          throw new CareerMaterialSaveError(
+            "recovery_prepare_failed",
+            "恢复信息未能安全保存，因此材料记录没有开始写入。",
           );
         }
       }
@@ -1318,11 +1394,36 @@ export function createCareerMaterialSaveService(
   } as const;
 }
 
+function isSaveRuntime(value: unknown): value is CareerMaterialSaveRuntime {
+  return Boolean(
+    value && typeof value === "object" &&
+    "withExclusiveLock" in value &&
+    typeof value.withExclusiveLock === "function",
+  );
+}
+
 export function saveCareerMaterial(
   input: CareerMaterialSaveInput,
-  runtime: CareerMaterialSaveRuntime = defaultRuntime,
-) {
-  return createCareerMaterialSaveService(runtime).saveCareerMaterial(input);
+  options?: CareerMaterialSaveOptions,
+): Promise<CareerMaterialSaveResult>;
+export function saveCareerMaterial(
+  input: CareerMaterialSaveInput,
+  runtime: CareerMaterialSaveRuntime,
+  options?: CareerMaterialSaveOptions,
+): Promise<CareerMaterialSaveResult>;
+export function saveCareerMaterial(
+  input: CareerMaterialSaveInput,
+  runtimeOrOptions?: CareerMaterialSaveRuntime | CareerMaterialSaveOptions,
+  maybeOptions?: CareerMaterialSaveOptions,
+): Promise<CareerMaterialSaveResult> {
+  const runtime = isSaveRuntime(runtimeOrOptions)
+    ? runtimeOrOptions
+    : defaultRuntime;
+  const options = isSaveRuntime(runtimeOrOptions)
+    ? maybeOptions
+    : runtimeOrOptions;
+  return createCareerMaterialSaveService(runtime)
+    .saveCareerMaterial(input, options);
 }
 
 export function inspectCareerMaterialSave(

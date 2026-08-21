@@ -393,6 +393,135 @@ test("a successful attached save persists every field from OPFS-authored metadat
   assert.deepEqual(context.state.broadcasts, ["career-material-saved"]);
 });
 
+test("the awaited recovery hook closes the stage-to-INSERT crash window", async (t) => {
+  const context = await fixture();
+  t.after(() => context.close());
+  let releaseHook;
+  let enterHook;
+  const hookEntered = new Promise((resolve) => {
+    enterHook = resolve;
+  });
+  const hookGate = new Promise((resolve) => {
+    releaseHook = resolve;
+  });
+  let prepared;
+  const operation = context.service.saveCareerMaterial(materialInput(), {
+    async onRecoveryPrepared(value) {
+      prepared = JSON.parse(JSON.stringify(value));
+      context.state.operations.push(["recovery-prepared"]);
+      enterHook();
+      await hookGate;
+    },
+  });
+
+  await hookEntered;
+  assert.ok(prepared.cleanupReceipt);
+  assert.equal(JSON.stringify(prepared).includes(FILE_KEY_A), false);
+  assert.equal(context.state.saveCalls, 1);
+  assert.equal(context.state.runCalls, 0);
+  assert.equal(context.state.files.has(FILE_KEY_A), true);
+  releaseHook();
+
+  assert.equal((await operation).outcome, "saved");
+  const saveIndex = context.state.operations.findIndex(([kind]) => kind === "save");
+  const preparedIndex = context.state.operations.findIndex(
+    ([kind]) => kind === "recovery-prepared",
+  );
+  const runIndex = context.state.operations.findIndex(([kind]) => kind === "run");
+  assert.ok(saveIndex >= 0 && preparedIndex > saveIndex && runIndex > preparedIndex);
+});
+
+test("a rejected recovery hook prevents INSERT and removes its staged attachment", async (t) => {
+  const context = await fixture();
+  t.after(() => context.close());
+
+  await assert.rejects(
+    context.service.saveCareerMaterial(materialInput(), {
+      async onRecoveryPrepared() {
+        throw new Error("session storage unavailable");
+      },
+    }),
+    (error) => error.code === "recovery_prepare_failed",
+  );
+  assert.equal(context.state.runCalls, 0);
+  assert.equal(context.state.deleteCalls, 1);
+  assert.equal(context.state.files.has(FILE_KEY_A), false);
+  assert.equal(selectMaterial(context.database, "material-stable-a"), null);
+});
+
+test("a rejected hook plus failed cleanup preserves the prepared receipt", async (t) => {
+  const context = await fixture();
+  t.after(() => context.close());
+  context.state.deleteFailuresRemaining = 1;
+  let prepared;
+  let receipt;
+
+  await assert.rejects(
+    context.service.saveCareerMaterial(materialInput(), {
+      onRecoveryPrepared(value) {
+        prepared = JSON.parse(JSON.stringify(value));
+        throw new Error("persistent recovery write rejected");
+      },
+    }),
+    (error) => {
+      assert.equal(error.code, "temporary_file_cleanup_failed");
+      assert.ok(error.cleanupReceipt);
+      receipt = error.cleanupReceipt;
+      return true;
+    },
+  );
+  assert.equal(context.state.runCalls, 0);
+  assert.deepEqual(receipt, prepared.cleanupReceipt);
+  assert.equal(context.state.files.has(FILE_KEY_A), true);
+  assert.deepEqual(
+    await context.service.retryCareerMaterialSaveCleanup(
+      JSON.parse(JSON.stringify(receipt)),
+    ),
+    { outcome: "cleaned" },
+  );
+});
+
+test("a no-attachment INSERT still waits for a null-receipt recovery checkpoint", async (t) => {
+  const context = await fixture();
+  t.after(() => context.close());
+  const input = materialInput({ attachment: null });
+  let prepared;
+
+  const result = await context.service.saveCareerMaterial(input, {
+    onRecoveryPrepared(value) {
+      prepared = value;
+      assert.equal(context.state.runCalls, 0);
+    },
+  });
+  assert.equal(result.outcome, "saved");
+  assert.deepEqual(prepared, {
+    materialId: input.materialId,
+    expectedSnapshot: await expectedSnapshot(input),
+    cleanupReceipt: null,
+  });
+  assert.equal(context.state.saveCalls, 0);
+  assert.equal(context.state.runCalls, 1);
+});
+
+test("top-level save keeps the legacy runtime argument and accepts hook options", async (t) => {
+  const context = await fixture();
+  t.after(() => context.close());
+  let prepared = false;
+
+  const result = await materialSave.saveCareerMaterial(
+    materialInput({ attachment: null }),
+    context.runtime,
+    {
+      onRecoveryPrepared() {
+        prepared = true;
+        assert.equal(context.state.runCalls, 0);
+      },
+    },
+  );
+  assert.equal(result.outcome, "saved");
+  assert.equal(prepared, true);
+});
+
 test("an OPFS failure performs no SQLite insert", async (t) => {
   const context = await fixture();
   t.after(() => context.close());
@@ -500,14 +629,21 @@ test("durable insert plus failed verification stays uncertain and hides the file
   t.after(() => context.close());
   context.state.insertFailure = "after";
   context.state.recoveryQueryFailures = 1;
+  let prepared;
 
-  const result = await context.service.saveCareerMaterial(materialInput());
+  const result = await context.service.saveCareerMaterial(materialInput(), {
+    onRecoveryPrepared(value) {
+      prepared = JSON.parse(JSON.stringify(value));
+    },
+  });
   assert.equal(result.outcome, "outcome_uncertain");
   assert.equal(result.materialId, "material-stable-a");
   assert.equal(result.retryable, true);
   assert.equal("fileKey" in result, false);
   assert.equal(JSON.stringify(result).includes(FILE_KEY_A), false);
   assert.ok(result.cleanupReceipt);
+  assert.deepEqual(result.cleanupReceipt, prepared.cleanupReceipt);
+  assert.deepEqual(result.expectedSnapshot, prepared.expectedSnapshot);
   assert.notEqual(selectMaterial(context.database, result.materialId), null);
   assert.equal(context.state.files.has(FILE_KEY_A), true);
   assert.equal(context.state.deleteCalls, 0);
