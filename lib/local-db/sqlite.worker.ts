@@ -18,6 +18,8 @@ import {
   type DatabaseExportResult,
   type DatabaseImportResult,
   type DatabaseInitResult,
+  type DatabasePrepareOperationReceipt,
+  type DatabasePrepareRecoveryResult,
   type DatabaseRecoveryReceipt,
   type DatabaseRecoveryStageOptions,
   type DatabaseSchemaRequirements,
@@ -124,6 +126,27 @@ type DiscardedBoundGenerationCore = Readonly<{
 type DiscardedBoundGeneration = DiscardedBoundGenerationCore &
   Readonly<{ checksum: string }>;
 
+type PrepareOperationStatus =
+  | "staging"
+  | "ready"
+  | "cleanup-pending"
+  | "cleanup-complete";
+
+type PrepareOperationCore = Readonly<{
+  version: 1;
+  status: PrepareOperationStatus;
+  database: LocalDatabaseName;
+  operationId: string;
+  generationId: string;
+  operationTokenSha256: string;
+  projectionSha256: string;
+  attachmentKeysSha256: string;
+  stagedAttachmentKeys: readonly string[];
+}>;
+
+type PrepareOperationRecord = PrepareOperationCore &
+  Readonly<{ checksum: string }>;
+
 class LocalDbWorkerError extends Error {
   constructor(
     message: string,
@@ -175,6 +198,7 @@ const GENERATION_FILES = {
 >;
 const IDENTIFIER_PATTERN = /^[A-Za-z_][A-Za-z0-9_]{0,62}$/;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
+const MAX_PREPARE_ATTACHMENT_KEYS = 10_000;
 let sqlitePromise: Promise<Sqlite3Static> | undefined;
 let operationQueue = Promise.resolve();
 
@@ -278,6 +302,13 @@ function discardedGenerationFilename(
   generationId: string,
 ): string {
   return `${name}.${generationId}.discarded.json`;
+}
+
+function prepareOperationFilename(
+  name: LocalDatabaseName,
+  operationId: string,
+): string {
+  return `${name}.${operationId}.prepare.json`;
 }
 
 function assertIntegerInRange(
@@ -691,12 +722,15 @@ async function readStagedReady(
 }
 
 function normalizeRecoveryStageOptions(
+  name: LocalDatabaseName,
   value: DatabaseRecoveryStageOptions | undefined,
 ): DatabaseRecoveryStageOptions | null {
   if (value === undefined) return null;
   if (
     !isRecord(value) ||
-    !hasExactKeys(value, ["projectionSha256"]) ||
+    !hasExactKeys(value, value.prepareOperation === undefined
+      ? ["projectionSha256"]
+      : ["projectionSha256", "prepareOperation"]) ||
     typeof value.projectionSha256 !== "string" ||
     !SHA256_PATTERN.test(value.projectionSha256)
   ) {
@@ -705,7 +739,22 @@ function normalizeRecoveryStageOptions(
       "INVALID_RECOVERY_PROJECTION",
     );
   }
-  return { projectionSha256: value.projectionSha256 };
+  const prepareOperation = value.prepareOperation === undefined
+    ? undefined
+    : normalizePrepareOperationReceipt(name, value.prepareOperation);
+  if (
+    prepareOperation &&
+    prepareOperation.projectionSha256 !== value.projectionSha256
+  ) {
+    throw new LocalDbWorkerError(
+      "The prepare operation projection does not match the staged recovery projection.",
+      "INVALID_RECOVERY_PROJECTION",
+    );
+  }
+  return {
+    projectionSha256: value.projectionSha256,
+    ...(prepareOperation ? { prepareOperation } : {}),
+  };
 }
 
 function parseStoredRecoveryBinding(
@@ -844,6 +893,193 @@ async function readDiscardedBoundGeneration(
     );
   }
   return { ...core, checksum };
+}
+
+function prepareOperationChecksumInput(value: PrepareOperationCore): string {
+  return JSON.stringify(value);
+}
+
+function prepareOperationWithStatus(
+  record: PrepareOperationRecord,
+  status: PrepareOperationStatus,
+): PrepareOperationCore {
+  return {
+    version: 1,
+    status,
+    database: record.database,
+    operationId: record.operationId,
+    generationId: record.generationId,
+    operationTokenSha256: record.operationTokenSha256,
+    projectionSha256: record.projectionSha256,
+    attachmentKeysSha256: record.attachmentKeysSha256,
+    stagedAttachmentKeys: [...record.stagedAttachmentKeys],
+  };
+}
+
+function normalizePrepareOperationReceipt(
+  name: LocalDatabaseName,
+  value: unknown,
+): DatabasePrepareOperationReceipt {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, [
+      "version", "database", "operationId", "generationId", "operationToken",
+      "projectionSha256", "attachmentKeysSha256", "stagedAttachmentKeys",
+    ]) ||
+    value.version !== 1 ||
+    value.database !== name ||
+    typeof value.operationId !== "string" ||
+    !isDatabaseGenerationId(value.operationId) ||
+    value.generationId !== value.operationId ||
+    typeof value.operationToken !== "string" ||
+    !SHA256_PATTERN.test(value.operationToken) ||
+    typeof value.projectionSha256 !== "string" ||
+    !SHA256_PATTERN.test(value.projectionSha256) ||
+    typeof value.attachmentKeysSha256 !== "string" ||
+    !SHA256_PATTERN.test(value.attachmentKeysSha256) ||
+    !Array.isArray(value.stagedAttachmentKeys) ||
+    value.stagedAttachmentKeys.length > MAX_PREPARE_ATTACHMENT_KEYS ||
+    value.stagedAttachmentKeys.some((key) =>
+      typeof key !== "string" || !isDatabaseGenerationId(key)) ||
+    new Set(value.stagedAttachmentKeys).size !== value.stagedAttachmentKeys.length
+  ) {
+    throw new LocalDbWorkerError(
+      "The prepare operation receipt is invalid.",
+      "INVALID_PREPARE_OPERATION_RECEIPT",
+    );
+  }
+  return {
+    version: 1,
+    database: name,
+    operationId: value.operationId,
+    generationId: value.operationId,
+    operationToken: value.operationToken,
+    projectionSha256: value.projectionSha256,
+    attachmentKeysSha256: value.attachmentKeysSha256,
+    stagedAttachmentKeys: [...value.stagedAttachmentKeys] as string[],
+  };
+}
+
+async function writePrepareOperation(
+  name: LocalDatabaseName,
+  value: PrepareOperationCore,
+): Promise<void> {
+  const checksum = await sha256Text(prepareOperationChecksumInput(value));
+  await writeJsonFile(prepareOperationFilename(name, value.operationId), {
+    ...value,
+    checksum,
+  } satisfies PrepareOperationRecord);
+}
+
+async function readPrepareOperation(
+  name: LocalDatabaseName,
+  operationId: string,
+): Promise<PrepareOperationRecord | null> {
+  const file = await readOptionalFile(prepareOperationFilename(name, operationId));
+  if (!file) return null;
+  if (file.size > 1024 * 1024) {
+    throw new LocalDbWorkerError(
+      "The prepare operation record is invalid.",
+      "PREPARE_OPERATION_RECORD_INVALID",
+    );
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(await file.text());
+  } catch {
+    throw new LocalDbWorkerError(
+      "The prepare operation record is invalid.",
+      "PREPARE_OPERATION_RECORD_INVALID",
+    );
+  }
+  if (
+    !isRecord(parsed) ||
+    !hasExactKeys(parsed, [
+      "version", "status", "database", "operationId", "generationId",
+      "operationTokenSha256", "projectionSha256", "attachmentKeysSha256",
+      "stagedAttachmentKeys", "checksum",
+    ]) ||
+    parsed.version !== 1 ||
+    !["staging", "ready", "cleanup-pending", "cleanup-complete"].includes(
+      typeof parsed.status === "string" ? parsed.status : "",
+    ) ||
+    parsed.database !== name ||
+    parsed.operationId !== operationId ||
+    parsed.generationId !== operationId ||
+    typeof parsed.operationTokenSha256 !== "string" ||
+    !SHA256_PATTERN.test(parsed.operationTokenSha256) ||
+    typeof parsed.projectionSha256 !== "string" ||
+    !SHA256_PATTERN.test(parsed.projectionSha256) ||
+    typeof parsed.attachmentKeysSha256 !== "string" ||
+    !SHA256_PATTERN.test(parsed.attachmentKeysSha256) ||
+    !Array.isArray(parsed.stagedAttachmentKeys) ||
+    parsed.stagedAttachmentKeys.length > MAX_PREPARE_ATTACHMENT_KEYS ||
+    parsed.stagedAttachmentKeys.some((key) =>
+      typeof key !== "string" || !isDatabaseGenerationId(key)) ||
+    new Set(parsed.stagedAttachmentKeys).size !== parsed.stagedAttachmentKeys.length ||
+    typeof parsed.checksum !== "string" ||
+    !SHA256_PATTERN.test(parsed.checksum)
+  ) {
+    throw new LocalDbWorkerError(
+      "The prepare operation record is invalid.",
+      "PREPARE_OPERATION_RECORD_INVALID",
+    );
+  }
+  const core: PrepareOperationCore = {
+    version: 1,
+    status: parsed.status as PrepareOperationStatus,
+    database: name,
+    operationId,
+    generationId: operationId,
+    operationTokenSha256: parsed.operationTokenSha256,
+    projectionSha256: parsed.projectionSha256,
+    attachmentKeysSha256: parsed.attachmentKeysSha256,
+    stagedAttachmentKeys: [...parsed.stagedAttachmentKeys] as string[],
+  };
+  const checksum = await sha256Text(prepareOperationChecksumInput(core));
+  if (!equalDigest(checksum, parsed.checksum)) {
+    throw new LocalDbWorkerError(
+      "The prepare operation checksum is invalid.",
+      "PREPARE_OPERATION_RECORD_INVALID",
+    );
+  }
+  return { ...core, checksum };
+}
+
+async function assertPrepareOperationReceiptMatches(
+  name: LocalDatabaseName,
+  record: PrepareOperationRecord,
+  rawReceipt: unknown,
+): Promise<DatabasePrepareOperationReceipt> {
+  const receipt = normalizePrepareOperationReceipt(name, rawReceipt);
+  if (
+    receipt.operationId !== record.operationId ||
+    receipt.projectionSha256 !== record.projectionSha256 ||
+    receipt.attachmentKeysSha256 !== record.attachmentKeysSha256 ||
+    receipt.stagedAttachmentKeys.length !== record.stagedAttachmentKeys.length ||
+    receipt.stagedAttachmentKeys.some(
+      (key, index) => key !== record.stagedAttachmentKeys[index],
+    ) ||
+    !equalDigest(
+      await sha256Text(receipt.operationToken),
+      record.operationTokenSha256,
+    )
+  ) {
+    throw new LocalDbWorkerError(
+      "The prepare operation receipt does not match its durable binding.",
+      "PREPARE_OPERATION_BINDING_MISMATCH",
+    );
+  }
+  return receipt;
+}
+
+async function derivePrepareCapability(
+  operationToken: string,
+  purpose: "activation" | "recovery",
+): Promise<string> {
+  return sha256Text(
+    `private-ai-suite:prepare-${purpose}:v1\n${operationToken}\n`,
+  );
 }
 
 async function assertActivationToken(
@@ -1255,7 +1491,8 @@ async function stageDatabaseImport(
   assertSQLiteFile(replacement);
   assertMappingStatements(statements);
   const requirements = normalizeSchemaRequirements(rawRequirements);
-  const recoveryOptions = normalizeRecoveryStageOptions(rawRecovery);
+  const recoveryOptions = normalizeRecoveryStageOptions(name, rawRecovery);
+  const prepareOperation = recoveryOptions?.prepareOperation ?? null;
   const sqlite3 = await getSqlite();
   // The worker, not the caller, captures the durable baseline. This happens
   // before candidate writes and is persisted in READY for the later compare.
@@ -1273,7 +1510,8 @@ async function stageDatabaseImport(
         ),
       }
     : null;
-  const generationId = crypto.randomUUID().toLowerCase();
+  const generationId = prepareOperation?.operationId ??
+    crypto.randomUUID().toLowerCase();
   if (!isDatabaseGenerationId(generationId)) {
     throw new LocalDbWorkerError(
       `The browser could not create a safe ${label} generation id.`,
@@ -1282,8 +1520,12 @@ async function stageDatabaseImport(
   }
   const filename = databaseGenerationFilename(name, generationId);
   const readyFilename = stagedReadyFilename(name, generationId);
-  const activationToken = newActivationToken();
-  const recoveryToken = recoveryOptions ? newActivationToken() : null;
+  const activationToken = prepareOperation
+    ? await derivePrepareCapability(prepareOperation.operationToken, "activation")
+    : newActivationToken();
+  const recoveryToken = prepareOperation
+    ? await derivePrepareCapability(prepareOperation.operationToken, "recovery")
+    : recoveryOptions ? newActivationToken() : null;
   let canonicalSchemaVersion = requirements.minimumUserVersion;
   let candidate: Database | undefined;
 
@@ -1292,17 +1534,40 @@ async function stageDatabaseImport(
     existingReady,
     existingActivation,
     existingDiscard,
+    existingPrepareOperation,
   ] = await Promise.all([
     readOptionalFile(filename),
     readOptionalFile(readyFilename),
     readOptionalFile(activatedGenerationFilename(name, generationId)),
     readOptionalFile(discardedGenerationFilename(name, generationId)),
+    readOptionalFile(prepareOperationFilename(name, generationId)),
   ]);
-  if (existingCandidate || existingReady || existingActivation || existingDiscard) {
+  if (
+    existingCandidate || existingReady || existingActivation || existingDiscard ||
+    existingPrepareOperation
+  ) {
     throw new LocalDbWorkerError(
-      `The random ${label} generation id already exists; retry the staged import.`,
-      "GENERATION_ID_COLLISION",
+      prepareOperation
+        ? `This ${label} prepare operation has already started; recover it instead of staging again.`
+        : `The random ${label} generation id already exists; retry the staged import.`,
+      prepareOperation
+        ? "PREPARE_OPERATION_ALREADY_STARTED"
+        : "GENERATION_ID_COLLISION",
     );
+  }
+
+  if (prepareOperation) {
+    await writePrepareOperation(name, {
+      version: 1,
+      status: "staging",
+      database: name,
+      operationId: prepareOperation.operationId,
+      generationId,
+      operationTokenSha256: await sha256Text(prepareOperation.operationToken),
+      projectionSha256: prepareOperation.projectionSha256,
+      attachmentKeysSha256: prepareOperation.attachmentKeysSha256,
+      stagedAttachmentKeys: [...prepareOperation.stagedAttachmentKeys],
+    });
   }
 
   try {
@@ -1377,6 +1642,20 @@ async function stageDatabaseImport(
       });
     }
 
+    if (prepareOperation) {
+      await writePrepareOperation(name, {
+        version: 1,
+        status: "ready",
+        database: name,
+        operationId: prepareOperation.operationId,
+        generationId,
+        operationTokenSha256: await sha256Text(prepareOperation.operationToken),
+        projectionSha256: prepareOperation.projectionSha256,
+        attachmentKeysSha256: prepareOperation.attachmentKeysSha256,
+        stagedAttachmentKeys: [...prepareOperation.stagedAttachmentKeys],
+      });
+    }
+
     return {
       database: name,
       generationId,
@@ -1388,11 +1667,29 @@ async function stageDatabaseImport(
     };
   } catch (error) {
     candidate?.close();
-    await Promise.allSettled([
+    const cleanup = await Promise.allSettled([
       removeOpfsEntryIfPresent(readyFilename),
       removeOpfsEntryIfPresent(activatedGenerationFilename(name, generationId)),
       removeOpfsEntryIfPresent(filename),
     ]);
+    if (
+      prepareOperation &&
+      cleanup.every((result) => result.status === "fulfilled")
+    ) {
+      await writePrepareOperation(name, {
+        version: 1,
+        status: prepareOperation.stagedAttachmentKeys.length > 0
+          ? "cleanup-pending"
+          : "cleanup-complete",
+        database: name,
+        operationId: prepareOperation.operationId,
+        generationId,
+        operationTokenSha256: await sha256Text(prepareOperation.operationToken),
+        projectionSha256: prepareOperation.projectionSha256,
+        attachmentKeysSha256: prepareOperation.attachmentKeysSha256,
+        stagedAttachmentKeys: [...prepareOperation.stagedAttachmentKeys],
+      }).catch(() => undefined);
+    }
     throw error;
   }
 }
@@ -1418,6 +1715,230 @@ async function validateReadyCandidate(
   } finally {
     candidate?.close();
   }
+}
+
+function prepareCleanupResult(
+  name: LocalDatabaseName,
+  record: PrepareOperationRecord,
+): DatabasePrepareRecoveryResult {
+  if (
+    record.status !== "cleanup-pending" &&
+    record.status !== "cleanup-complete"
+  ) {
+    throw new LocalDbWorkerError(
+      "The prepare operation has not authorized attachment cleanup.",
+      "PREPARE_CLEANUP_NOT_AUTHORIZED",
+    );
+  }
+  return {
+    database: name,
+    operationId: record.operationId,
+    status: record.status,
+    stagedAttachmentKeys: [...record.stagedAttachmentKeys],
+  };
+}
+
+async function registerPrepareCleanup(
+  name: LocalDatabaseName,
+  rawReceipt: DatabasePrepareOperationReceipt,
+): Promise<DatabasePrepareRecoveryResult> {
+  const receipt = normalizePrepareOperationReceipt(name, rawReceipt);
+  const existing = await readPrepareOperation(name, receipt.operationId);
+  if (existing) {
+    await assertPrepareOperationReceiptMatches(name, existing, receipt);
+    return prepareCleanupResult(name, existing);
+  }
+
+  const filename = databaseGenerationFilename(name, receipt.operationId);
+  if (
+    await readOptionalFile(stagedReadyFilename(name, receipt.operationId)) ||
+    await readOptionalFile(activatedGenerationFilename(name, receipt.operationId)) ||
+    await readOptionalFile(discardedGenerationFilename(name, receipt.operationId)) ||
+    await rawPointerReferences(name, filename)
+  ) {
+    throw new LocalDbWorkerError(
+      "This prepare operation has database state and cannot authorize attachment cleanup.",
+      "PREPARE_CLEANUP_NOT_AUTHORIZED",
+    );
+  }
+
+  // A database file without READY cannot be activated. Removing it before the
+  // cleanup tombstone is what closes the race between an uncertain stage and
+  // attachment deletion.
+  await removeOpfsEntryIfPresent(filename);
+  const core: PrepareOperationCore = {
+    version: 1,
+    status: receipt.stagedAttachmentKeys.length > 0
+      ? "cleanup-pending"
+      : "cleanup-complete",
+    database: name,
+    operationId: receipt.operationId,
+    generationId: receipt.operationId,
+    operationTokenSha256: await sha256Text(receipt.operationToken),
+    projectionSha256: receipt.projectionSha256,
+    attachmentKeysSha256: receipt.attachmentKeysSha256,
+    stagedAttachmentKeys: [...receipt.stagedAttachmentKeys],
+  };
+  await writePrepareOperation(name, core);
+  return prepareCleanupResult(name, {
+    ...core,
+    checksum: await sha256Text(prepareOperationChecksumInput(core)),
+  });
+}
+
+async function transitionPrepareOperationToCleanup(
+  name: LocalDatabaseName,
+  record: PrepareOperationRecord,
+): Promise<DatabasePrepareRecoveryResult> {
+  const filename = databaseGenerationFilename(name, record.operationId);
+  if (
+    await readOptionalFile(activatedGenerationFilename(name, record.operationId)) ||
+    await rawPointerReferences(name, filename)
+  ) {
+    throw new LocalDbWorkerError(
+      "The prepare operation may have been activated and cannot authorize cleanup.",
+      "PREPARE_CLEANUP_NOT_AUTHORIZED",
+    );
+  }
+  await removeOpfsEntryIfPresent(stagedReadyFilename(name, record.operationId));
+  await removeOpfsEntryIfPresent(filename);
+  const cleanup = prepareOperationWithStatus(
+    record,
+    record.stagedAttachmentKeys.length > 0
+      ? "cleanup-pending"
+      : "cleanup-complete",
+  );
+  await writePrepareOperation(name, cleanup);
+  return prepareCleanupResult(name, {
+    ...cleanup,
+    checksum: await sha256Text(prepareOperationChecksumInput(cleanup)),
+  });
+}
+
+async function recoverPrepareOperation(
+  name: LocalDatabaseName,
+  rawReceipt: DatabasePrepareOperationReceipt,
+): Promise<DatabasePrepareRecoveryResult> {
+  const receipt = normalizePrepareOperationReceipt(name, rawReceipt);
+  const record = await readPrepareOperation(name, receipt.operationId);
+  if (!record) {
+    throw new LocalDbWorkerError(
+      "The prepare operation has no durable record.",
+      "PREPARE_OPERATION_NOT_FOUND",
+    );
+  }
+  await assertPrepareOperationReceiptMatches(name, record, receipt);
+  if (
+    record.status === "cleanup-pending" ||
+    record.status === "cleanup-complete"
+  ) {
+    return prepareCleanupResult(name, record);
+  }
+
+  const discarded = await readDiscardedBoundGeneration(name, receipt.operationId);
+  if (discarded) {
+    return {
+      database: name,
+      operationId: receipt.operationId,
+      status: "discarded",
+    };
+  }
+
+  const readyFile = await readOptionalFile(
+    stagedReadyFilename(name, receipt.operationId),
+  );
+  if (readyFile) {
+    const activationToken = await derivePrepareCapability(
+      receipt.operationToken,
+      "activation",
+    );
+    const recoveryToken = await derivePrepareCapability(
+      receipt.operationToken,
+      "recovery",
+    );
+    let ready: StagedGenerationReady;
+    let recoveryReceipt: DatabaseRecoveryReceipt;
+    try {
+      ready = await readStagedReady(name, receipt.operationId);
+      if (ready.version !== 2) {
+        throw new LocalDbWorkerError(
+          "The prepare operation READY record lacks its recovery binding.",
+          "PREPARE_OPERATION_BINDING_MISMATCH",
+        );
+      }
+      recoveryReceipt = {
+        version: 1,
+        database: name,
+        generationId: receipt.operationId,
+        recoveryToken,
+        expectedCurrentGenerationId: ready.recovery.expectedCurrentGenerationId,
+        expectedCurrentSequence: ready.recovery.expectedCurrentSequence,
+        canonicalApplicationId: ready.recovery.canonicalApplicationId,
+        canonicalUserVersion: ready.recovery.canonicalUserVersion,
+        projectionSha256: ready.recovery.projectionSha256,
+      };
+      await assertActivationToken(name, ready, activationToken);
+      await assertRecoveryReceipt(name, ready, recoveryReceipt);
+      await validateReadyCandidate(name, ready);
+    } catch (error) {
+      if (!(error instanceof LocalDbWorkerError)) throw error;
+      // A malformed or incomplete READY cannot ever be activated. Prove no
+      // pointer references it, remove both artifacts, then authorize only the
+      // exact attachment scope already bound in the operation record.
+      return transitionPrepareOperationToCleanup(name, record);
+    }
+    if (record.status === "staging") {
+      await writePrepareOperation(
+        name,
+        prepareOperationWithStatus(record, "ready"),
+      ).catch(() => undefined);
+    }
+    return {
+      database: name,
+      operationId: receipt.operationId,
+      status: "ready",
+      staged: {
+        database: name,
+        generationId: receipt.operationId,
+        filename: ready.filename as `${LocalDatabaseName}.${string}.sqlite3`,
+        activationToken,
+        importedBytes: ready.importedBytes,
+        schemaVersion: ready.recovery.canonicalUserVersion,
+        recoveryReceipt,
+      },
+    };
+  }
+  return transitionPrepareOperationToCleanup(name, record);
+}
+
+async function completePrepareCleanup(
+  name: LocalDatabaseName,
+  rawReceipt: DatabasePrepareOperationReceipt,
+): Promise<DatabasePrepareRecoveryResult> {
+  const receipt = normalizePrepareOperationReceipt(name, rawReceipt);
+  const record = await readPrepareOperation(name, receipt.operationId);
+  if (!record) {
+    throw new LocalDbWorkerError(
+      "The prepare cleanup operation has no durable record.",
+      "PREPARE_OPERATION_NOT_FOUND",
+    );
+  }
+  await assertPrepareOperationReceiptMatches(name, record, receipt);
+  if (record.status === "cleanup-complete") {
+    return prepareCleanupResult(name, record);
+  }
+  if (record.status !== "cleanup-pending") {
+    throw new LocalDbWorkerError(
+      "The prepare operation has not authorized attachment cleanup.",
+      "PREPARE_CLEANUP_NOT_AUTHORIZED",
+    );
+  }
+  const complete = prepareOperationWithStatus(record, "cleanup-complete");
+  await writePrepareOperation(name, complete);
+  return prepareCleanupResult(name, {
+    ...complete,
+    checksum: await sha256Text(prepareOperationChecksumInput(complete)),
+  });
 }
 
 async function activateStagedDatabaseGeneration(
@@ -1802,6 +2323,12 @@ async function handleRequest(request: LocalDbWorkerRequest): Promise<unknown> {
         request.requirements,
         request.recovery,
       );
+    case "registerPrepareCleanup":
+      return registerPrepareCleanup(request.database, request.receipt);
+    case "recoverPrepare":
+      return recoverPrepareOperation(request.database, request.receipt);
+    case "completePrepareCleanup":
+      return completePrepareCleanup(request.database, request.receipt);
     case "activateStaged":
       return activateStagedDatabaseGeneration(
         request.database,

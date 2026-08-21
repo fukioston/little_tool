@@ -6,6 +6,8 @@ import {
   type DatabaseExportResult,
   type DatabaseImportResult,
   type DatabaseInitResult,
+  type DatabasePrepareOperationReceipt,
+  type DatabasePrepareRecoveryResult,
   type DatabaseRecoveryReceipt,
   type DatabaseRecoveryStageOptions,
   type DatabaseSchemaRequirements,
@@ -206,6 +208,36 @@ export class LocalDatabaseClient {
     );
   }
 
+  registerPrepareCleanup(
+    receipt: DatabasePrepareOperationReceipt<typeof this.database>,
+  ): Promise<DatabasePrepareRecoveryResult<typeof this.database>> {
+    return rpc.request({
+      operation: "registerPrepareCleanup",
+      database: this.database,
+      receipt,
+    });
+  }
+
+  recoverPrepare(
+    receipt: DatabasePrepareOperationReceipt<typeof this.database>,
+  ): Promise<DatabasePrepareRecoveryResult<typeof this.database>> {
+    return rpc.request({
+      operation: "recoverPrepare",
+      database: this.database,
+      receipt,
+    });
+  }
+
+  completePrepareCleanup(
+    receipt: DatabasePrepareOperationReceipt<typeof this.database>,
+  ): Promise<DatabasePrepareRecoveryResult<typeof this.database>> {
+    return rpc.request({
+      operation: "completePrepareCleanup",
+      database: this.database,
+      receipt,
+    });
+  }
+
   activateStaged(
     generationId: string,
     activationToken: string,
@@ -326,6 +358,27 @@ export const localDb = {
     options: Readonly<{ recovery?: DatabaseRecoveryStageOptions }> = {},
   ): Promise<StagedDatabaseImportResult> {
     return getLocalDatabase(database).stageImport(data, statements, requirements, options);
+  },
+
+  registerPrepareCleanup(
+    database: LocalDatabaseId,
+    receipt: DatabasePrepareOperationReceipt,
+  ): Promise<DatabasePrepareRecoveryResult> {
+    return getLocalDatabase(database).registerPrepareCleanup(receipt);
+  },
+
+  recoverPrepare(
+    database: LocalDatabaseId,
+    receipt: DatabasePrepareOperationReceipt,
+  ): Promise<DatabasePrepareRecoveryResult> {
+    return getLocalDatabase(database).recoverPrepare(receipt);
+  },
+
+  completePrepareCleanup(
+    database: LocalDatabaseId,
+    receipt: DatabasePrepareOperationReceipt,
+  ): Promise<DatabasePrepareRecoveryResult> {
+    return getLocalDatabase(database).completePrepareCleanup(receipt);
   },
 
   activateStaged(

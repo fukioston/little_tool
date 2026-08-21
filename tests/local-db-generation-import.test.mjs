@@ -267,6 +267,9 @@ test("public RPC stages all three products independently without cross-product p
   ]);
   for (const operation of [
     "stageImport",
+    "registerPrepareCleanup",
+    "recoverPrepare",
+    "completePrepareCleanup",
     "activateStaged",
     "inspectStaged",
     "currentGeneration",
@@ -325,6 +328,112 @@ test("bound recovery READY records persist a worker-owned baseline and app proje
     /expectedCurrentGenerationId:\s*rawRecovery/,
     "the app may provide a projection digest, never its own baseline",
   );
+});
+
+test("prepare operations bind a caller-stable generation before candidate writes", async () => {
+  const [types, worker] = await Promise.all([
+    readFile(new URL("lib/local-db/types.ts", projectRoot), "utf8"),
+    readFile(new URL("lib/local-db/sqlite.worker.ts", projectRoot), "utf8"),
+  ]);
+  const staging = section(
+    worker,
+    "async function stageDatabaseImport(",
+    "async function validateReadyCandidate(",
+  );
+  const stableId = staging.indexOf("prepareOperation?.operationId");
+  const operationWrite = staging.indexOf("status: \"staging\"");
+  const importWrite = staging.indexOf("OpfsDb.importDb");
+  const readyStatus = staging.indexOf("status: \"ready\"");
+  assert.ok(
+    stableId >= 0 && stableId < operationWrite &&
+      operationWrite < importWrite && importWrite < readyStatus,
+    "the durable operation claim must precede the candidate and READY response",
+  );
+  assert.match(types, /export type DatabasePrepareOperationReceipt/);
+  assert.match(types, /generationId: string/);
+  assert.match(types, /attachmentKeysSha256: string/);
+  assert.match(staging, /derivePrepareCapability\(prepareOperation\.operationToken, "activation"\)/);
+  assert.match(staging, /derivePrepareCapability\(prepareOperation\.operationToken, "recovery"\)/);
+  assert.match(staging, /stagedAttachmentKeys: \[\.\.\.prepareOperation\.stagedAttachmentKeys\]/);
+  assert.match(staging, /PREPARE_OPERATION_ALREADY_STARTED/);
+});
+
+test("prepare recovery authenticates durable scope and never repeats stage or activation", async () => {
+  const worker = await readFile(
+    new URL("lib/local-db/sqlite.worker.ts", projectRoot),
+    "utf8",
+  );
+  const transition = section(
+    worker,
+    "async function transitionPrepareOperationToCleanup(",
+    "async function recoverPrepareOperation(",
+  );
+  const recovery = section(
+    worker,
+    "async function recoverPrepareOperation(",
+    "async function completePrepareCleanup(",
+  );
+  const record = recovery.indexOf("readPrepareOperation");
+  const binding = recovery.indexOf("assertPrepareOperationReceiptMatches");
+  const discard = recovery.indexOf("readDiscardedBoundGeneration");
+  const ready = recovery.indexOf("readStagedReady");
+  const candidateValidation = recovery.indexOf("validateReadyCandidate");
+  assert.ok(
+    record >= 0 && record < binding && binding < discard && discard < ready &&
+      ready < candidateValidation,
+  );
+  const pointerGuard = transition.indexOf("rawPointerReferences");
+  const cleanupDelete = transition.indexOf("removeOpfsEntryIfPresent(filename)");
+  assert.ok(pointerGuard >= 0 && pointerGuard < cleanupDelete);
+  assert.match(recovery, /status: "ready"/);
+  assert.match(recovery, /status: "discarded"/);
+  assert.match(transition, /PREPARE_CLEANUP_NOT_AUTHORIZED/);
+  assert.doesNotMatch(
+    recovery,
+    /stageDatabaseImport|activateStagedDatabaseGeneration|OpfsDb\.importDb|writeGenerationPointer/,
+  );
+});
+
+test("prepare cleanup uses an exact checksummed tombstone and completes idempotently", async () => {
+  const worker = await readFile(
+    new URL("lib/local-db/sqlite.worker.ts", projectRoot),
+    "utf8",
+  );
+  const validation = section(
+    worker,
+    "function normalizePrepareOperationReceipt(",
+    "async function derivePrepareCapability(",
+  );
+  assert.match(validation, /new Set\(value\.stagedAttachmentKeys\)\.size/);
+  assert.match(validation, /receipt\.attachmentKeysSha256 !== record\.attachmentKeysSha256/);
+  assert.match(validation, /key !== record\.stagedAttachmentKeys\[index\]/);
+  assert.match(validation, /sha256Text\(receipt\.operationToken\)/);
+  assert.match(validation, /prepareOperationChecksumInput/);
+
+  const registration = section(
+    worker,
+    "async function registerPrepareCleanup(",
+    "async function recoverPrepareOperation(",
+  );
+  const readyGuard = registration.indexOf("stagedReadyFilename");
+  const activationGuard = registration.indexOf("activatedGenerationFilename");
+  const pointerGuard = registration.indexOf("rawPointerReferences");
+  const orphanDelete = registration.indexOf("removeOpfsEntryIfPresent(filename)");
+  const tombstone = registration.indexOf("writePrepareOperation(name, core)");
+  assert.ok(
+    readyGuard >= 0 && readyGuard < activationGuard &&
+      activationGuard < pointerGuard && pointerGuard < orphanDelete &&
+      orphanDelete < tombstone,
+  );
+
+  const completion = section(
+    worker,
+    "async function completePrepareCleanup(",
+    "async function activateStagedDatabaseGeneration(",
+  );
+  assert.match(completion, /record\.status === "cleanup-complete"/);
+  assert.match(completion, /record\.status !== "cleanup-pending"/);
+  assert.match(completion, /prepareOperationWithStatus\(record, "cleanup-complete"\)/);
 });
 
 test("v1 READY stays compatible while v2 requires an exact durable recovery binding", async () => {

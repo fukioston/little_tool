@@ -103,11 +103,34 @@ export type DatabaseSchemaRequirements = Readonly<{
 
 /**
  * App-owned data which must remain byte-for-byte associated with a staged
- * database generation. The worker persists only this digest; it never needs
- * access to product-specific attachment identifiers or restore summaries.
+ * database generation. Restore summaries and source bytes remain outside the
+ * worker. When a prepare operation is supplied, its opaque attachment keys
+ * are durably bound solely to authorize an exact, fail-closed cleanup retry.
  */
 export type DatabaseRecoveryStageOptions = Readonly<{
   projectionSha256: string;
+  /**
+   * A caller-owned, random capability which makes a lost stage response
+   * recoverable without submitting the database bytes a second time.
+   *
+   * The worker binds this receipt, the exact opaque attachment keys and the
+   * staged generation before it creates any candidate files. The operation id
+   * becomes the generation id; the token is stored only as a SHA-256 digest.
+   */
+  prepareOperation?: DatabasePrepareOperationReceipt;
+}>;
+
+export type DatabasePrepareOperationReceipt<
+  DatabaseName extends LocalDatabaseName = LocalDatabaseName,
+> = Readonly<{
+  version: 1;
+  database: DatabaseName;
+  operationId: string;
+  generationId: string;
+  operationToken: string;
+  projectionSha256: string;
+  attachmentKeysSha256: string;
+  stagedAttachmentKeys: readonly string[];
 }>;
 
 /**
@@ -143,6 +166,27 @@ export type StagedDatabaseImportResult<
   /** Present only when stageImport was given recovery options. */
   recoveryReceipt?: DatabaseRecoveryReceipt<DatabaseName>;
 }>;
+
+export type DatabasePrepareRecoveryResult<
+  DatabaseName extends LocalDatabaseName = LocalDatabaseName,
+> =
+  | Readonly<{
+      database: DatabaseName;
+      operationId: string;
+      status: "ready";
+      staged: StagedDatabaseImportResult<DatabaseName>;
+    }>
+  | Readonly<{
+      database: DatabaseName;
+      operationId: string;
+      status: "cleanup-pending" | "cleanup-complete";
+      stagedAttachmentKeys: readonly string[];
+    }>
+  | Readonly<{
+      database: DatabaseName;
+      operationId: string;
+      status: "discarded";
+    }>;
 
 export type ActivatedDatabaseGeneration<
   DatabaseName extends LocalDatabaseName = LocalDatabaseName,
@@ -277,6 +321,9 @@ export type WorkerOperation =
   | "export"
   | "import"
   | "stageImport"
+  | "registerPrepareCleanup"
+  | "recoverPrepare"
+  | "completePrepareCleanup"
   | "activateStaged"
   | "inspectStaged"
   | "currentGeneration"
@@ -304,6 +351,15 @@ export type LocalDbWorkerRequest =
       statements: readonly SqlStatement[];
       requirements: DatabaseSchemaRequirements;
       recovery?: DatabaseRecoveryStageOptions;
+    })
+  | (RequestBase<"registerPrepareCleanup"> & {
+      receipt: DatabasePrepareOperationReceipt;
+    })
+  | (RequestBase<"recoverPrepare"> & {
+      receipt: DatabasePrepareOperationReceipt;
+    })
+  | (RequestBase<"completePrepareCleanup"> & {
+      receipt: DatabasePrepareOperationReceipt;
     })
   | (RequestBase<"activateStaged"> & {
       generationId: string;

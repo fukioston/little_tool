@@ -14,6 +14,9 @@ const RECOVERY_TOKEN = "b".repeat(64);
 const SOURCE_KEY = "10000000-0000-4000-8000-000000000001";
 const STAGED_KEY = "20000000-0000-4000-8000-000000000001";
 
+// Stable caller operation id keeps the fixture assertions deterministic.
+globalThis.crypto.randomUUID = () => GENERATION_ID;
+
 function moduleUrl(source) {
   return `data:text/javascript;base64,${Buffer.from(source).toString("base64")}`;
 }
@@ -65,6 +68,15 @@ const clientUrl = moduleUrl(`
   export const localDb={
     stageImport(database,bytes,statements,requirements,options){
       return runtime().stageImport(database,bytes,statements,requirements,options);
+    },
+    registerPrepareCleanup(database,receipt){
+      return runtime().registerPrepareCleanup(database,receipt);
+    },
+    recoverPrepare(database,receipt){
+      return runtime().recoverPrepare(database,receipt);
+    },
+    completePrepareCleanup(database,receipt){
+      return runtime().completePrepareCleanup(database,receipt);
     },
     activateStaged(database,generationId,activationToken,recoveryReceipt){
       return runtime().activateStaged(database,generationId,activationToken,recoveryReceipt);
@@ -159,6 +171,12 @@ async function projectionDigestForReceipt(receipt) {
   })], { type: "application/json" }));
 }
 
+async function attachmentKeysDigest(keys) {
+  return hashBlob(new Blob([
+    JSON.stringify({ version: 1, stagedAttachmentKeys: keys }),
+  ], { type: "application/json" }));
+}
+
 function sqliteBytes(userVersion = 3, applicationId = userVersion === 0 ? 0 : ZHIJI_APPLICATION_ID) {
   const bytes = new Uint8Array(512);
   bytes.set(new TextEncoder().encode("SQLite format 3\0"));
@@ -226,6 +244,9 @@ async function runtimeFixture(overrides = {}) {
     currentDatabaseSha256: "e".repeat(64),
     boundRecovery: null,
     boundCurrentDatabaseSha256: null,
+    prepareReceipt: null,
+    prepareStatus: null,
+    preparedStageResult: null,
     discarded: [],
     broadcasts: [],
   };
@@ -258,6 +279,11 @@ async function runtimeFixture(overrides = {}) {
     },
     async stageImport(database, bytes, statements, requirements, options) {
       state.staged.push({ database, bytes, statements, requirements, options });
+      const prepareReceipt = options.recovery.prepareOperation;
+      assert.equal(prepareReceipt.operationId, GENERATION_ID);
+      assert.equal(prepareReceipt.generationId, GENERATION_ID);
+      state.prepareReceipt = structuredClone(prepareReceipt);
+      state.prepareStatus = "ready";
       const recoveryReceipt = {
         version: 1,
         database: "zhiji",
@@ -271,9 +297,72 @@ async function runtimeFixture(overrides = {}) {
       };
       state.boundRecovery = recoveryReceipt;
       state.boundCurrentDatabaseSha256 = state.currentDatabaseSha256;
-      return {
+      state.preparedStageResult = {
         ...stagedResult,
         recoveryReceipt,
+      };
+      return state.preparedStageResult;
+    },
+    async registerPrepareCleanup(database, receipt) {
+      assert.equal(database, "career");
+      if (state.prepareReceipt &&
+          JSON.stringify(state.prepareReceipt) !== JSON.stringify(receipt)) {
+        const error = new Error("prepare binding mismatch");
+        error.code = "PREPARE_OPERATION_BINDING_MISMATCH";
+        throw error;
+      }
+      state.prepareReceipt = structuredClone(receipt);
+      state.prepareStatus = receipt.stagedAttachmentKeys.length
+        ? "cleanup-pending"
+        : "cleanup-complete";
+      return {
+        database: "zhiji",
+        operationId: receipt.operationId,
+        status: state.prepareStatus,
+        stagedAttachmentKeys: [...receipt.stagedAttachmentKeys],
+      };
+    },
+    async recoverPrepare(database, receipt) {
+      assert.equal(database, "career");
+      if (!state.prepareReceipt) {
+        const error = new Error("prepare operation absent");
+        error.code = "PREPARE_OPERATION_NOT_FOUND";
+        throw error;
+      }
+      if (JSON.stringify(state.prepareReceipt) !== JSON.stringify(receipt)) {
+        const error = new Error("prepare binding mismatch");
+        error.code = "PREPARE_OPERATION_BINDING_MISMATCH";
+        throw error;
+      }
+      if (state.prepareStatus === "ready") {
+        return {
+          database: "zhiji",
+          operationId: receipt.operationId,
+          status: "ready",
+          staged: state.preparedStageResult,
+        };
+      }
+      return {
+        database: "zhiji",
+        operationId: receipt.operationId,
+        status: state.prepareStatus,
+        stagedAttachmentKeys: [...receipt.stagedAttachmentKeys],
+      };
+    },
+    async completePrepareCleanup(database, receipt) {
+      assert.equal(database, "career");
+      if (JSON.stringify(state.prepareReceipt) !== JSON.stringify(receipt) ||
+          state.prepareStatus !== "cleanup-pending") {
+        const error = new Error("cleanup not authorized");
+        error.code = "PREPARE_CLEANUP_NOT_AUTHORIZED";
+        throw error;
+      }
+      state.prepareStatus = "cleanup-complete";
+      return {
+        database: "zhiji",
+        operationId: receipt.operationId,
+        status: "cleanup-complete",
+        stagedAttachmentKeys: [...receipt.stagedAttachmentKeys],
       };
     },
     async activateStaged(database, generationId, activationToken, recoveryReceipt) {
@@ -686,6 +775,100 @@ test("an unknown or malformed stage response retains attachments and never claim
   }
 });
 
+test("a lost READY response recovers the same candidate across refresh without restaging", async () => {
+  const fixture = await runtimeFixture();
+  const originalStage = fixture.runtime.stageImport;
+  fixture.runtime.stageImport = async (...args) => {
+    await originalStage(...args);
+    throw new Error("READY response lost after durable commit");
+  };
+
+  let uncertain;
+  try {
+    await backupService.prepareCareerBackupRestore(await completeContainer());
+  } catch (error) {
+    uncertain = error;
+  }
+  assert.equal(uncertain?.name, "CareerPrepareUncertainError");
+  assert.equal(uncertain?.code, "PREPARE_UNCERTAIN");
+  const serialized = JSON.parse(JSON.stringify(uncertain.receipt));
+  assert.equal(serialized.operationId, GENERATION_ID);
+  assert.equal(serialized.generationId, GENERATION_ID);
+  assert.equal(serialized.stagedAttachmentKeys[0], STAGED_KEY);
+
+  const recovered = await backupService.recoverCareerBackupPrepare(serialized);
+  assert.equal(recovered.status, "ready");
+  assert.equal(recovered.receipt.generationId, GENERATION_ID);
+  assert.equal(fixture.state.staged.length, 1, "recovery must not stage twice");
+  assert.equal(fixture.state.activated.length, 0, "recovery must not activate");
+  assert.deepEqual(fixture.state.deleted, []);
+
+  const activated = await backupService.activatePreparedCareerRestore(
+    recovered.receipt,
+  );
+  assert.equal(activated.outcome, "activated");
+  assert.equal(fixture.state.staged.length, 1);
+});
+
+test("a failed atomic stage recovers only its worker-bound cleanup scope", async () => {
+  const fixture = await runtimeFixture();
+  fixture.runtime.stageImport = async (database, bytes, statements, requirements, options) => {
+    fixture.state.staged.push({ database, bytes, statements, requirements, options });
+    fixture.state.prepareReceipt = structuredClone(options.recovery.prepareOperation);
+    fixture.state.prepareStatus = "cleanup-pending";
+    throw new Error("candidate validation failed after operation tombstone");
+  };
+
+  let uncertain;
+  try {
+    await backupService.prepareCareerBackupRestore(await completeContainer());
+  } catch (error) {
+    uncertain = error;
+  }
+  const recovered = await backupService.recoverCareerBackupPrepare(
+    JSON.parse(JSON.stringify(uncertain.receipt)),
+  );
+  assert.equal(recovered.status, "cleanup-pending");
+  assert.deepEqual(recovered.cleanupReceipt.stagedAttachmentKeys, [STAGED_KEY]);
+  assert.equal(fixture.state.staged.length, 1);
+  assert.equal(fixture.state.activated.length, 0);
+
+  assert.deepEqual(
+    await backupService.retryCareerPrepareCleanup(
+      JSON.parse(JSON.stringify(recovered.cleanupReceipt)),
+    ),
+    { cleaned: true },
+  );
+  assert.deepEqual(fixture.state.deleted, [{ database: "career", key: STAGED_KEY }]);
+  assert.equal(fixture.state.prepareStatus, "cleanup-complete");
+});
+
+test("tampered prepare capability fails closed before recovery or attachment deletion", async () => {
+  const fixture = await runtimeFixture();
+  const originalStage = fixture.runtime.stageImport;
+  fixture.runtime.stageImport = async (...args) => {
+    await originalStage(...args);
+    throw new Error("READY response lost");
+  };
+  let uncertain;
+  try {
+    await backupService.prepareCareerBackupRestore(await completeContainer());
+  } catch (error) {
+    uncertain = error;
+  }
+  const forged = {
+    ...JSON.parse(JSON.stringify(uncertain.receipt)),
+    operationToken: "f".repeat(64),
+  };
+  await assert.rejects(
+    backupService.recoverCareerBackupPrepare(forged),
+    (error) => error?.code === "PREPARE_UNCERTAIN",
+  );
+  assert.equal(fixture.state.staged.length, 1);
+  assert.equal(fixture.state.activated.length, 0);
+  assert.deepEqual(fixture.state.deleted, []);
+});
+
 test("failed pre-stage attachment rollback is explicit and exposes a capability-bound retry", async () => {
   const fixture = await runtimeFixture();
   const controller = new AbortController();
@@ -714,11 +897,107 @@ test("failed pre-stage attachment rollback is explicit and exposes a capability-
   assert.equal(cleanupError?.code, "PREPARE_CLEANUP_INCOMPLETE");
   assert.equal(cleanupError?.failedAttachmentCount, 1);
   assert.equal(typeof cleanupError?.retryCleanup, "function");
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(cleanupError.receipt)),
+    cleanupError.receipt,
+  );
   assert.equal(fixture.state.staged.length, 0);
   assert.equal(fixture.state.current.generationId, OLD_GENERATION_ID);
 
-  assert.deepEqual(await cleanupError.retryCleanup(), { cleaned: true });
+  assert.deepEqual(
+    await backupService.retryCareerPrepareCleanup(
+      JSON.parse(JSON.stringify(cleanupError.receipt)),
+    ),
+    { cleaned: true },
+  );
   assert.equal(deleteAttempts, 2);
+});
+
+test("lost cleanup completion is recovered idempotently without widening keys", async () => {
+  const fixture = await runtimeFixture();
+  const controller = new AbortController();
+  const originalSave = fixture.runtime.saveLocalFile;
+  fixture.runtime.saveLocalFile = async (...args) => {
+    const metadata = await originalSave(...args);
+    controller.abort();
+    return metadata;
+  };
+  let deleteAttempts = 0;
+  fixture.runtime.deleteLocalFile = async (database, key) => {
+    fixture.state.deleted.push({ database, key });
+    deleteAttempts += 1;
+    if (deleteAttempts === 1) throw new Error("first cleanup failed");
+  };
+  let cleanupError;
+  try {
+    await backupService.prepareCareerBackupRestore(
+      await completeContainer(),
+      { signal: controller.signal },
+    );
+  } catch (error) {
+    cleanupError = error;
+  }
+  const receipt = JSON.parse(JSON.stringify(cleanupError.receipt));
+  const originalComplete = fixture.runtime.completePrepareCleanup;
+  let loseCompletion = true;
+  fixture.runtime.completePrepareCleanup = async (...args) => {
+    const completed = await originalComplete(...args);
+    if (loseCompletion) {
+      loseCompletion = false;
+      throw new Error("cleanup completion response lost");
+    }
+    return completed;
+  };
+
+  await assert.rejects(
+    backupService.retryCareerPrepareCleanup(receipt),
+    (error) => error?.code === "PREPARE_CLEANUP_INCOMPLETE",
+  );
+  assert.equal(fixture.state.prepareStatus, "cleanup-complete");
+  const attemptsAfterLostResponse = deleteAttempts;
+  assert.deepEqual(await backupService.retryCareerPrepareCleanup(receipt), {
+    cleaned: true,
+  });
+  assert.equal(deleteAttempts, attemptsAfterLostResponse);
+  assert.deepEqual(
+    new Set(fixture.state.deleted.map(({ key }) => key)),
+    new Set([STAGED_KEY]),
+  );
+});
+
+test("a re-signed cleanup key list is rejected by the worker-owned binding", async () => {
+  const fixture = await runtimeFixture();
+  const controller = new AbortController();
+  const originalSave = fixture.runtime.saveLocalFile;
+  fixture.runtime.saveLocalFile = async (...args) => {
+    const metadata = await originalSave(...args);
+    controller.abort();
+    return metadata;
+  };
+  fixture.runtime.deleteLocalFile = async (database, key) => {
+    fixture.state.deleted.push({ database, key });
+    throw new Error("cleanup unavailable");
+  };
+  let cleanupError;
+  try {
+    await backupService.prepareCareerBackupRestore(
+      await completeContainer(),
+      { signal: controller.signal },
+    );
+  } catch (error) {
+    cleanupError = error;
+  }
+  const forged = {
+    ...JSON.parse(JSON.stringify(cleanupError.receipt)),
+    stagedAttachmentKeys: [OTHER_GENERATION_ID],
+    attachmentKeysSha256: await attachmentKeysDigest([OTHER_GENERATION_ID]),
+  };
+  await assert.rejects(
+    backupService.retryCareerPrepareCleanup(forged),
+    (error) => error?.code === "PREPARE_CLEANUP_INCOMPLETE",
+  );
+  assert.deepEqual(fixture.state.deleted, [{ database: "career", key: STAGED_KEY }]);
+  assert.ok(!rawServiceJavaScript.includes("WeakMap"));
 });
 
 test("legacy Career SQLite v0 through v3 prepare without activation", async () => {

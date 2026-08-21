@@ -9,6 +9,8 @@ import {
 import type {
   ActivatedDatabaseGeneration,
   CurrentDatabaseGeneration,
+  DatabasePrepareOperationReceipt,
+  DatabasePrepareRecoveryResult,
   DatabaseRecoveryReceipt,
   SqlStatement,
   StagedDatabaseImportResult,
@@ -105,6 +107,44 @@ export type CareerRestoreReceipt = Readonly<{
   summary: CareerRestoreSummary;
   stagedAttachmentKeys: readonly string[];
 }>;
+
+/**
+ * Serializable capability retained before the atomic database stage starts.
+ * It contains no backup bytes or SQL and can therefore be stored across a
+ * refresh to recover exactly this operation without staging it twice.
+ */
+export type CareerPrepareRecoveryReceipt = Readonly<{
+  version: 1;
+  database: "zhiji";
+  operationId: string;
+  generationId: string;
+  operationToken: string;
+  projectionSha256: string;
+  attachmentKeysSha256: string;
+  preparedAt: string;
+  summary: CareerRestoreSummary;
+  stagedAttachmentKeys: readonly string[];
+}>;
+
+/** Worker-bound authorization to retry deletion of only these staged files. */
+export type CareerPrepareCleanupReceipt = Readonly<{
+  version: 1;
+  database: "zhiji";
+  operationId: string;
+  generationId: string;
+  operationToken: string;
+  projectionSha256: string;
+  attachmentKeysSha256: string;
+  stagedAttachmentKeys: readonly string[];
+}>;
+
+export type CareerPrepareRecovery =
+  | Readonly<{ status: "ready"; receipt: CareerRestoreReceipt }>
+  | Readonly<{
+      status: "cleanup-pending" | "cleanup-complete";
+      cleanupReceipt: CareerPrepareCleanupReceipt;
+    }>
+  | Readonly<{ status: "discarded" }>;
 
 export type CareerRestoreActivation = Readonly<{
   generationId: string;
@@ -203,39 +243,38 @@ export class CareerDiscardUncertainError extends CareerRestoreError {
   }
 }
 
-const prepareCleanupKeys = new WeakMap<
-  CareerPrepareCleanupIncompleteError,
-  readonly string[]
->();
+export class CareerPrepareUncertainError extends CareerRestoreError {
+  constructor(
+    readonly receipt: CareerPrepareRecoveryReceipt,
+    cause?: unknown,
+  ) {
+    super(
+      "候选建立结果暂时无法确认。操作凭据已保留；请只恢复这次准备，不要重新选择备份。",
+      "PREPARE_UNCERTAIN",
+      cause,
+    );
+    this.name = "CareerPrepareUncertainError";
+  }
+}
 
-class CareerPrepareCleanupIncompleteError extends CareerRestoreError {
+export class CareerPrepareCleanupIncompleteError extends CareerRestoreError {
   readonly failedAttachmentCount: number;
 
-  constructor(keys: readonly string[], cause?: unknown) {
+  constructor(
+    readonly receipt: CareerPrepareCleanupReceipt,
+    cause?: unknown,
+  ) {
     super(
-      `有 ${keys.length} 个未启用的暂存附件尚未清理。当前职迹没有改变；可直接重试清理。`,
+      `有 ${receipt.stagedAttachmentKeys.length} 个未启用的暂存附件尚未清理。当前职迹没有改变；可凭清理收据跨刷新重试。`,
       "PREPARE_CLEANUP_INCOMPLETE",
       cause,
     );
     this.name = "CareerPrepareCleanupIncompleteError";
-    this.failedAttachmentCount = keys.length;
-    prepareCleanupKeys.set(this, [...keys]);
+    this.failedAttachmentCount = receipt.stagedAttachmentKeys.length;
   }
 
   async retryCleanup(): Promise<Readonly<{ cleaned: true }>> {
-    const keys = prepareCleanupKeys.get(this);
-    if (!keys) {
-      throw new CareerRestoreError(
-        "这次暂存清理已经完成或不再可用。",
-        "PREPARE_CLEANUP_INCOMPLETE",
-      );
-    }
-    const failed = await deleteAttachmentKeys(keys);
-    if (failed.length > 0) {
-      throw new CareerPrepareCleanupIncompleteError(failed, this);
-    }
-    prepareCleanupKeys.delete(this);
-    return { cleaned: true };
+    return retryCareerPrepareCleanup(this.receipt);
   }
 }
 
@@ -414,30 +453,21 @@ async function deleteStagedAttachments(staged: readonly StagedAttachment[]): Pro
 
 async function stageAttachments(
   parsed: ParsedCareerBackup,
+  staged: StagedAttachment[],
   signal?: AbortSignal,
-): Promise<StagedAttachment[]> {
-  const staged: StagedAttachment[] = [];
-  try {
-    for (const attachment of parsed.attachments) {
-      throwIfAborted(signal);
-      const metadata = await saveLocalFile(DB, attachment.blob, {
-        originalName: attachment.metadata.originalName,
-        mimeType: attachment.metadata.mimeType,
-        category: attachment.metadata.category ?? undefined,
-        createdAt: attachment.metadata.createdAt,
-        updatedAt: attachment.metadata.updatedAt,
-      });
-      staged.push({ original: attachment.metadata, staged: metadata });
-      assertStagedAttachment(attachment.metadata, metadata);
-      throwIfAborted(signal);
-    }
-    return staged;
-  } catch (error) {
-    const failed = await deleteStagedAttachments(staged);
-    if (failed.length > 0) {
-      throw new CareerPrepareCleanupIncompleteError(failed, error);
-    }
-    throw error;
+): Promise<void> {
+  for (const attachment of parsed.attachments) {
+    throwIfAborted(signal);
+    const metadata = await saveLocalFile(DB, attachment.blob, {
+      originalName: attachment.metadata.originalName,
+      mimeType: attachment.metadata.mimeType,
+      category: attachment.metadata.category ?? undefined,
+      createdAt: attachment.metadata.createdAt,
+      updatedAt: attachment.metadata.updatedAt,
+    });
+    staged.push({ original: attachment.metadata, staged: metadata });
+    assertStagedAttachment(attachment.metadata, metadata);
+    throwIfAborted(signal);
   }
 }
 
@@ -507,6 +537,100 @@ async function restoreProjectionSha256(
       stagedAttachmentKeys: projection.stagedAttachmentKeys,
     }),
   ], { type: "application/json" }));
+}
+
+async function cleanupProjectionSha256(
+  operationId: string,
+  stagedAttachmentKeys: readonly string[],
+): Promise<string> {
+  return sha256Blob(new Blob([JSON.stringify({
+    version: 1,
+    database: CANONICAL_DB,
+    operationId,
+    generationId: operationId,
+    stagedAttachmentKeys,
+  })], { type: "application/json" }));
+}
+
+async function attachmentKeysSha256(
+  stagedAttachmentKeys: readonly string[],
+): Promise<string> {
+  return sha256Blob(new Blob([
+    JSON.stringify({ version: 1, stagedAttachmentKeys }),
+  ], { type: "application/json" }));
+}
+
+function newPrepareOperationCapability(): Readonly<{
+  operationId: string;
+  operationToken: string;
+}> {
+  const operationId = crypto.randomUUID().toLowerCase();
+  const bytes = crypto.getRandomValues(new Uint8Array(32));
+  const operationToken = Array.from(
+    bytes,
+    (byte) => byte.toString(16).padStart(2, "0"),
+  ).join("");
+  if (!UUID_V4_PATTERN.test(operationId) || !SHA256_PATTERN.test(operationToken)) {
+    throw new CareerRestoreError(
+      "浏览器无法建立安全的恢复操作凭据。当前资料没有改变。",
+      "PREPARE_FAILED",
+    );
+  }
+  return { operationId, operationToken };
+}
+
+function databasePrepareReceiptFor(
+  receipt: CareerPrepareRecoveryReceipt | CareerPrepareCleanupReceipt,
+): DatabasePrepareOperationReceipt<"zhiji"> {
+  return {
+    version: 1,
+    database: CANONICAL_DB,
+    operationId: receipt.operationId,
+    generationId: receipt.generationId,
+    operationToken: receipt.operationToken,
+    projectionSha256: receipt.projectionSha256,
+    attachmentKeysSha256: receipt.attachmentKeysSha256,
+    stagedAttachmentKeys: [...receipt.stagedAttachmentKeys],
+  };
+}
+
+async function cleanupReceiptFor(
+  keys: readonly string[],
+): Promise<CareerPrepareCleanupReceipt> {
+  const capability = newPrepareOperationCapability();
+  return {
+    version: 1,
+    database: CANONICAL_DB,
+    operationId: capability.operationId,
+    generationId: capability.operationId,
+    operationToken: capability.operationToken,
+    projectionSha256: await cleanupProjectionSha256(
+      capability.operationId,
+      keys,
+    ),
+    attachmentKeysSha256: await attachmentKeysSha256(keys),
+    stagedAttachmentKeys: [...keys],
+  };
+}
+
+function prepareRecoveryReceiptFor(
+  projection: CareerRestoreProjection,
+  projectionSha256: string,
+  attachmentDigest: string,
+  capability: Readonly<{ operationId: string; operationToken: string }>,
+): CareerPrepareRecoveryReceipt {
+  return {
+    version: 1,
+    database: CANONICAL_DB,
+    operationId: capability.operationId,
+    generationId: capability.operationId,
+    operationToken: capability.operationToken,
+    projectionSha256,
+    attachmentKeysSha256: attachmentDigest,
+    preparedAt: projection.preparedAt,
+    summary: projection.summary,
+    stagedAttachmentKeys: [...projection.stagedAttachmentKeys],
+  };
 }
 
 function parseStagedRecoveryReceipt(
@@ -633,6 +757,131 @@ function parseRestoreSummary(value: unknown): CareerRestoreSummary {
     materialCount: null,
     verification: value.verification,
   };
+}
+
+function parsePrepareReceiptCore(
+  value: unknown,
+  expectedKeys: readonly string[],
+): Readonly<{
+  operationId: string;
+  generationId: string;
+  operationToken: string;
+  projectionSha256: string;
+  attachmentKeysSha256: string;
+  stagedAttachmentKeys: readonly string[];
+}> {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, expectedKeys) ||
+    value.version !== 1 ||
+    value.database !== CANONICAL_DB ||
+    typeof value.operationId !== "string" ||
+    !UUID_V4_PATTERN.test(value.operationId) ||
+    value.generationId !== value.operationId ||
+    typeof value.operationToken !== "string" ||
+    !SHA256_PATTERN.test(value.operationToken) ||
+    typeof value.projectionSha256 !== "string" ||
+    !SHA256_PATTERN.test(value.projectionSha256) ||
+    typeof value.attachmentKeysSha256 !== "string" ||
+    !SHA256_PATTERN.test(value.attachmentKeysSha256) ||
+    !Array.isArray(value.stagedAttachmentKeys) ||
+    value.stagedAttachmentKeys.length > CAREER_BACKUP_LIMITS.attachmentCount ||
+    value.stagedAttachmentKeys.some((key) =>
+      typeof key !== "string" || !UUID_V4_PATTERN.test(key)) ||
+    new Set(value.stagedAttachmentKeys).size !== value.stagedAttachmentKeys.length
+  ) {
+    throw new CareerRestoreError(
+      "恢复准备凭据无效。为保护当前资料，没有继续操作。",
+      "INVALID_RECEIPT",
+    );
+  }
+  return {
+    operationId: value.operationId,
+    generationId: value.operationId,
+    operationToken: value.operationToken,
+    projectionSha256: value.projectionSha256,
+    attachmentKeysSha256: value.attachmentKeysSha256,
+    stagedAttachmentKeys: [...value.stagedAttachmentKeys] as string[],
+  };
+}
+
+async function verifyPrepareRecoveryReceipt(
+  value: unknown,
+): Promise<CareerPrepareRecoveryReceipt> {
+  const core = parsePrepareReceiptCore(value, [
+    "version", "database", "operationId", "generationId", "operationToken",
+    "projectionSha256", "attachmentKeysSha256", "preparedAt", "summary",
+    "stagedAttachmentKeys",
+  ]);
+  if (
+    !isRecord(value) ||
+    typeof value.preparedAt !== "string" ||
+    !isCanonicalIsoTimestamp(value.preparedAt)
+  ) {
+    throw new CareerRestoreError(
+      "恢复准备凭据无效。为保护当前资料，没有继续操作。",
+      "INVALID_RECEIPT",
+    );
+  }
+  const summary = parseRestoreSummary(value.summary);
+  if (summary.attachmentCount !== core.stagedAttachmentKeys.length) {
+    throw new CareerRestoreError(
+      "恢复准备凭据彼此不一致。为保护当前资料，没有继续操作。",
+      "INVALID_RECEIPT",
+    );
+  }
+  const receipt: CareerPrepareRecoveryReceipt = {
+    version: 1,
+    database: CANONICAL_DB,
+    ...core,
+    preparedAt: value.preparedAt,
+    summary,
+  };
+  const projectionDigest = await restoreProjectionSha256(restoreProjection(
+    receipt.preparedAt,
+    receipt.summary,
+    receipt.stagedAttachmentKeys,
+  ));
+  if (projectionDigest !== receipt.projectionSha256) {
+    throw new CareerRestoreError(
+      "恢复准备凭据与暂存内容不一致。为保护当前资料，没有继续操作。",
+      "INVALID_RECEIPT",
+    );
+  }
+  if (
+    await attachmentKeysSha256(receipt.stagedAttachmentKeys) !==
+      receipt.attachmentKeysSha256
+  ) {
+    throw new CareerRestoreError(
+      "恢复准备凭据的附件范围不一致。为保护当前资料，没有继续操作。",
+      "INVALID_RECEIPT",
+    );
+  }
+  return receipt;
+}
+
+async function verifyPrepareCleanupReceipt(
+  value: unknown,
+): Promise<CareerPrepareCleanupReceipt> {
+  const core = parsePrepareReceiptCore(value, [
+    "version", "database", "operationId", "generationId", "operationToken",
+    "projectionSha256", "attachmentKeysSha256", "stagedAttachmentKeys",
+  ]);
+  const receipt: CareerPrepareCleanupReceipt = {
+    version: 1,
+    database: CANONICAL_DB,
+    ...core,
+  };
+  if (
+    await attachmentKeysSha256(receipt.stagedAttachmentKeys) !==
+      receipt.attachmentKeysSha256
+  ) {
+    throw new CareerRestoreError(
+      "暂存清理凭据与附件范围不一致。没有删除任何附件。",
+      "INVALID_RECEIPT",
+    );
+  }
+  return receipt;
 }
 
 function parseRestoreReceipt(value: unknown): CareerRestoreReceipt {
@@ -902,13 +1151,14 @@ async function stageSourceInContext(
   assertExclusiveContext(context);
   throwIfAborted(signal);
 
-  let stagedAttachments: StagedAttachment[] = [];
+  const stagedAttachments: StagedAttachment[] = [];
   let stagedDatabase: StagedDatabaseImportResult | null = null;
   let preparedReceipt: CareerRestoreReceipt | null = null;
+  let prepareRecoveryReceipt: CareerPrepareRecoveryReceipt | null = null;
   let atomicStageStarted = false;
   try {
     if (source.kind === "complete-backup") {
-      stagedAttachments = await stageAttachments(source.parsed, signal);
+      await stageAttachments(source.parsed, stagedAttachments, signal);
     }
     throwIfAborted(signal);
     const statements: readonly SqlStatement[] = source.kind === "complete-backup"
@@ -922,6 +1172,15 @@ async function stageSourceInContext(
       stagedAttachments.map(({ staged: metadata }) => metadata.key),
     );
     const projectionSha256 = await restoreProjectionSha256(projection);
+    const attachmentDigest = await attachmentKeysSha256(
+      projection.stagedAttachmentKeys,
+    );
+    prepareRecoveryReceipt = prepareRecoveryReceiptFor(
+      projection,
+      projectionSha256,
+      attachmentDigest,
+      newPrepareOperationCapability(),
+    );
     throwIfAborted(signal);
 
     // Once atomic worker staging starts, a late AbortSignal is ignored. A
@@ -932,10 +1191,16 @@ async function stageSourceInContext(
       source.database,
       statements,
       CAREER_SCHEMA_REQUIREMENTS,
-      { recovery: { projectionSha256 } },
+      {
+        recovery: {
+          projectionSha256,
+          prepareOperation: databasePrepareReceiptFor(prepareRecoveryReceipt),
+        },
+      },
     );
     if (
       stagedDatabase.database !== CANONICAL_DB ||
+      stagedDatabase.generationId !== prepareRecoveryReceipt.operationId ||
       !UUID_V4_PATTERN.test(stagedDatabase.generationId) ||
       !SHA256_PATTERN.test(stagedDatabase.activationToken) ||
       stagedDatabase.filename !==
@@ -979,16 +1244,38 @@ async function stageSourceInContext(
         );
       }
     }
-    if (atomicStageStarted && !preparedReceipt) {
-      throw new CareerRestoreError(
-        "候选建立结果暂时无法确认。为避免破坏可能已建立的候选，暂存内容已保留；请不要直接重试恢复。",
-        "PREPARE_UNCERTAIN",
-        error,
-      );
+    if (atomicStageStarted && !preparedReceipt && prepareRecoveryReceipt) {
+      throw new CareerPrepareUncertainError(prepareRecoveryReceipt, error);
     }
     const failed = await deleteStagedAttachments(stagedAttachments);
     if (failed.length > 0) {
-      throw new CareerPrepareCleanupIncompleteError(failed, error);
+      const cleanupReceipt = await cleanupReceiptFor(failed);
+      try {
+        const bound = await localDb.registerPrepareCleanup(
+          DB,
+          databasePrepareReceiptFor(cleanupReceipt),
+        );
+        if (
+          !isRecord(bound) ||
+          bound.database !== CANONICAL_DB ||
+          bound.operationId !== cleanupReceipt.operationId ||
+          (bound.status !== "cleanup-pending" &&
+            bound.status !== "cleanup-complete") ||
+          !Array.isArray(bound.stagedAttachmentKeys) ||
+          bound.stagedAttachmentKeys.length !== failed.length ||
+          bound.stagedAttachmentKeys.some(
+            (key, index) => key !== failed[index],
+          )
+        ) {
+          throw new Error("Invalid prepare cleanup binding response.");
+        }
+      } catch (bindingError) {
+        throw new CareerPrepareCleanupIncompleteError(
+          cleanupReceipt,
+          { prepareError: error, bindingError },
+        );
+      }
+      throw new CareerPrepareCleanupIncompleteError(cleanupReceipt, error);
     }
     if (error instanceof CareerRestoreError || error instanceof CareerBackupFormatError) throw error;
     throw new CareerRestoreError(
@@ -997,6 +1284,140 @@ async function stageSourceInContext(
       error,
     );
   }
+}
+
+function cleanupReceiptFromPrepare(
+  receipt: CareerPrepareRecoveryReceipt,
+): CareerPrepareCleanupReceipt {
+  return {
+    version: 1,
+    database: CANONICAL_DB,
+    operationId: receipt.operationId,
+    generationId: receipt.generationId,
+    operationToken: receipt.operationToken,
+    projectionSha256: receipt.projectionSha256,
+    attachmentKeysSha256: receipt.attachmentKeysSha256,
+    stagedAttachmentKeys: [...receipt.stagedAttachmentKeys],
+  };
+}
+
+function assertPrepareCleanupResult(
+  value: unknown,
+  receipt: CareerPrepareCleanupReceipt,
+): Extract<DatabasePrepareRecoveryResult, {
+  status: "cleanup-pending" | "cleanup-complete";
+}> {
+  if (
+    !isRecord(value) ||
+    value.database !== CANONICAL_DB ||
+    value.operationId !== receipt.operationId ||
+    (value.status !== "cleanup-pending" &&
+      value.status !== "cleanup-complete") ||
+    !Array.isArray(value.stagedAttachmentKeys) ||
+    value.stagedAttachmentKeys.length !== receipt.stagedAttachmentKeys.length ||
+    value.stagedAttachmentKeys.some(
+      (key, index) => key !== receipt.stagedAttachmentKeys[index],
+    )
+  ) {
+    throw new CareerRestoreError(
+      "暂存清理授权无法核对。没有删除任何附件。",
+      "INVALID_RECEIPT",
+    );
+  }
+  return value as Extract<DatabasePrepareRecoveryResult, {
+    status: "cleanup-pending" | "cleanup-complete";
+  }>;
+}
+
+async function recoverPrepareInContext(
+  rawReceipt: CareerPrepareRecoveryReceipt,
+  context: CareerLockContext,
+): Promise<CareerPrepareRecovery> {
+  assertExclusiveContext(context);
+  const receipt = await verifyPrepareRecoveryReceipt(rawReceipt);
+  let result: DatabasePrepareRecoveryResult;
+  try {
+    result = await localDb.recoverPrepare(
+      DB,
+      databasePrepareReceiptFor(receipt),
+    );
+  } catch (error) {
+    if (!isRecord(error) || error.code !== "PREPARE_OPERATION_NOT_FOUND") {
+      throw new CareerRestoreError(
+        "暂时无法核对这次恢复准备。操作凭据已保留，请不要重新选择备份。",
+        "PREPARE_UNCERTAIN",
+        error,
+      );
+    }
+    // Input validation can fail before the worker creates its operation
+    // tombstone. Registration checks every generation artifact before it can
+    // authorize attachment cleanup, so an in-flight/READY candidate fails
+    // closed here.
+    try {
+      result = await localDb.registerPrepareCleanup(
+        DB,
+        databasePrepareReceiptFor(receipt),
+      );
+    } catch (registrationError) {
+      throw new CareerRestoreError(
+        "暂时无法确认这次准备是否可以安全清理。操作凭据已保留，没有删除任何附件。",
+        "PREPARE_UNCERTAIN",
+        registrationError,
+      );
+    }
+  }
+
+  if (result.status === "ready") {
+    const staged = result.staged;
+    if (
+      result.database !== CANONICAL_DB ||
+      result.operationId !== receipt.operationId ||
+      staged.database !== CANONICAL_DB ||
+      staged.generationId !== receipt.generationId ||
+      staged.filename !== `${CANONICAL_DB}.${receipt.generationId}.sqlite3` ||
+      !SHA256_PATTERN.test(staged.activationToken) ||
+      staged.importedBytes !== receipt.summary.databaseByteSize ||
+      staged.schemaVersion !== CAREER_SCHEMA_REQUIREMENTS.maximumUserVersion
+    ) {
+      throw new CareerRestoreError(
+        "恢复准备结果与操作凭据不一致。当前资料没有改变。",
+        "INVALID_RECEIPT",
+      );
+    }
+    const recovery = parseStagedRecoveryReceipt(
+      staged.recoveryReceipt,
+      staged.generationId,
+      receipt.projectionSha256,
+    );
+    return {
+      status: "ready",
+      receipt: receiptFor(
+        staged,
+        recovery,
+        restoreProjection(
+          receipt.preparedAt,
+          receipt.summary,
+          receipt.stagedAttachmentKeys,
+        ),
+        receipt.projectionSha256,
+      ),
+    };
+  }
+  if (result.status === "discarded") {
+    if (
+      result.database !== CANONICAL_DB ||
+      result.operationId !== receipt.operationId
+    ) {
+      throw new CareerRestoreError(
+        "恢复准备结果与操作凭据不一致。当前资料没有改变。",
+        "INVALID_RECEIPT",
+      );
+    }
+    return { status: "discarded" };
+  }
+  const cleanupReceipt = cleanupReceiptFromPrepare(receipt);
+  const cleanup = assertPrepareCleanupResult(result, cleanupReceipt);
+  return { status: cleanup.status, cleanupReceipt };
 }
 
 async function activatePreparedInContext(
@@ -1217,6 +1638,78 @@ export async function prepareCareerBackupRestore(
   const source = await readAutoDetectedSource(backup, options.signal);
   return withCareerBackupLock((context) =>
     stageSourceInContext(source, context, options.signal));
+}
+
+/**
+ * Recover a prepare whose worker response was lost. This never resubmits the
+ * backup bytes and never activates a candidate.
+ */
+export async function recoverCareerBackupPrepare(
+  receipt: CareerPrepareRecoveryReceipt,
+): Promise<CareerPrepareRecovery> {
+  return withCareerBackupLock((context) =>
+    recoverPrepareInContext(receipt, context));
+}
+
+/**
+ * Delete only the attachment keys authorized by a durable worker tombstone.
+ * Repeating this after a lost response is idempotent.
+ */
+export async function retryCareerPrepareCleanup(
+  rawReceipt: CareerPrepareCleanupReceipt,
+): Promise<Readonly<{ cleaned: true }>> {
+  return withCareerBackupLock(async (context) => {
+    assertExclusiveContext(context);
+    const receipt = await verifyPrepareCleanupReceipt(rawReceipt);
+    let rawState: unknown;
+    try {
+      rawState = await localDb.recoverPrepare(
+        DB,
+        databasePrepareReceiptFor(receipt),
+      );
+    } catch (error) {
+      if (!isRecord(error) || error.code !== "PREPARE_OPERATION_NOT_FOUND") {
+        throw new CareerPrepareCleanupIncompleteError(receipt, error);
+      }
+      try {
+        rawState = await localDb.registerPrepareCleanup(
+          DB,
+          databasePrepareReceiptFor(receipt),
+        );
+      } catch (registrationError) {
+        throw new CareerPrepareCleanupIncompleteError(
+          receipt,
+          registrationError,
+        );
+      }
+    }
+    const state = assertPrepareCleanupResult(rawState, receipt);
+    if (state.status === "cleanup-complete") return { cleaned: true };
+
+    const failed = await deleteAttachmentKeys(state.stagedAttachmentKeys);
+    if (failed.length > 0) {
+      throw new CareerPrepareCleanupIncompleteError(receipt, { failed });
+    }
+    let completed: unknown;
+    try {
+      completed = await localDb.completePrepareCleanup(
+        DB,
+        databasePrepareReceiptFor(receipt),
+      );
+    } catch (error) {
+      // The deletes are idempotent. Keeping the pending receipt lets the next
+      // retry prove completion instead of expanding the deletion scope.
+      throw new CareerPrepareCleanupIncompleteError(receipt, error);
+    }
+    const completion = assertPrepareCleanupResult(completed, receipt);
+    if (completion.status !== "cleanup-complete") {
+      throw new CareerPrepareCleanupIncompleteError(
+        receipt,
+        new Error("Prepare cleanup completion was not durable."),
+      );
+    }
+    return { cleaned: true };
+  });
 }
 
 export async function activatePreparedCareerRestore(
