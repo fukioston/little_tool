@@ -175,7 +175,13 @@ async function stageAndActivate(
     );
     await activateCandidate(stagedDatabase);
     activated = true;
-    broadcastCareerGenerationChanged(stagedDatabase.generationId);
+    try {
+      broadcastCareerGenerationChanged(stagedDatabase.generationId);
+    } catch {
+      // Activation has already made this generation durable. A best-effort
+      // cross-tab notification must never turn that success into a retry or
+      // trigger cleanup of the active database and its restored attachments.
+    }
   } catch (error) {
     if (!activated && !(error instanceof CareerActivationUncertainError)) {
       await discardCandidate(stagedDatabase);
