@@ -40,10 +40,22 @@ import {
   type CareerContactDetail,
 } from "@/lib/career/contacts";
 import {
+  CareerActivationUncertainError,
+  CareerCurrentGenerationChangedError,
+  CareerDiscardUncertainError,
+  CareerPrepareCleanupIncompleteError,
+  CareerPrepareUncertainError,
+  activatePreparedCareerRestore,
+  discardPreparedCareerRestore,
   exportCompleteCareerBackup,
-  isCompleteCareerBackup,
-  restoreCompleteCareerBackup,
-  restoreLegacyCareerDatabase,
+  inspectCareerRestoreActivation,
+  prepareCareerBackupRestore,
+  recoverCareerBackupPrepare,
+  retryCareerPrepareCleanup,
+  type CareerPrepareCleanupReceipt,
+  type CareerPrepareRecoveryReceipt,
+  type CareerRestoreReceipt,
+  type CareerRestoreSummary,
 } from "@/lib/career/backup";
 import { createStructuredInterviewDraft } from "@/lib/career/interview-ai";
 import {
@@ -133,6 +145,58 @@ const CAREER_MATERIAL_SAVE_RECOVERY_PREFIX = "career.material-save-recovery.v1:"
 const CAREER_MATERIAL_SAVE_RECOVERY_MAX_BYTES = 256 * 1024;
 const CAREER_MATERIAL_ATTACHMENT_MAX_BYTES = 512 * 1024 * 1024;
 const CAREER_SHA256_PATTERN = /^[0-9a-f]{64}$/;
+const CAREER_UUID_V4_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const CAREER_BACKUP_RECOVERY_PREFIX = "career.backup-recovery.v1:";
+const CAREER_BACKUP_RECOVERY_MAX_BYTES = 256 * 1024;
+
+type CareerBackupCandidateMode = "review" | "activation-check" | "discard-only";
+
+type CareerBackupRecoveryTicket =
+  | Readonly<{
+      version: 1;
+      kind: "prepare";
+      receipt: CareerPrepareRecoveryReceipt;
+      recordedAt: string;
+    }>
+  | Readonly<{
+      version: 1;
+      kind: "candidate";
+      mode: CareerBackupCandidateMode;
+      receipt: CareerRestoreReceipt;
+      recordedAt: string;
+    }>
+  | Readonly<{
+      version: 1;
+      kind: "prepare-cleanup";
+      receipt: CareerPrepareCleanupReceipt;
+      recordedAt: string;
+    }>
+  | Readonly<{
+      version: 1;
+      kind: "refresh-only";
+      receipt: CareerRestoreReceipt;
+      recordedAt: string;
+    }>;
+
+type CareerBackupRecoveryEntry = Readonly<{
+  storageKey: string;
+  ticket: CareerBackupRecoveryTicket;
+  persisted: boolean;
+}>;
+
+type CareerBackupFlow =
+  | Readonly<{ phase: "idle" }>
+  | Readonly<{ phase: "preparing"; fileName: string }>
+  | Readonly<{ phase: "checking"; title: string; text: string }>
+  | Readonly<{ phase: "review"; receipt: CareerRestoreReceipt; message?: string }>
+  | Readonly<{ phase: "activating"; receipt: CareerRestoreReceipt }>
+  | Readonly<{ phase: "activation-check"; receipt: CareerRestoreReceipt; message: string }>
+  | Readonly<{ phase: "discard-only"; receipt: CareerRestoreReceipt; message: string }>
+  | Readonly<{ phase: "discarding"; receipt: CareerRestoreReceipt }>
+  | Readonly<{ phase: "prepare-cleanup"; receipt: CareerPrepareCleanupReceipt; message: string }>
+  | Readonly<{ phase: "cleaning"; receipt: CareerPrepareCleanupReceipt }>
+  | Readonly<{ phase: "refresh-only"; receipt: CareerRestoreReceipt; message: string }>
+  | Readonly<{ phase: "error"; title: string; message: string }>;
 
 type CareerMaterialSaveRecoveryTicket =
   | Readonly<{
@@ -256,6 +320,165 @@ function readMaterialSaveRecoveryStorage() {
   }
   tickets.sort((left, right) => left.recordedAt.localeCompare(right.recordedAt));
   return { tickets, unreadableKeys, storageUnavailable: false };
+}
+
+function isBackupRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function isBackupIsoDate(value: unknown) {
+  return typeof value === "string" && value.length <= 64 && Number.isFinite(Date.parse(value));
+}
+
+function isBackupGenerationId(value: unknown, allowLegacy = false) {
+  return typeof value === "string" &&
+    ((allowLegacy && value === "legacy") || CAREER_UUID_V4_PATTERN.test(value));
+}
+
+function isBackupAttachmentKeys(value: unknown): value is readonly string[] {
+  return Array.isArray(value) && value.length <= 10_000 &&
+    value.every((key) => typeof key === "string" && CAREER_UUID_V4_PATTERN.test(key)) &&
+    new Set(value).size === value.length;
+}
+
+function isCareerRestoreSummary(value: unknown): value is CareerRestoreSummary {
+  if (!isBackupRecord(value) || !hasExactObjectKeys(value, [
+    "kind", "fileName", "byteSize", "databaseByteSize", "exportedAt",
+    "sourceUserVersion", "canonicalUserVersion", "attachmentCount", "jobCount",
+    "materialCount", "verification",
+  ])) return false;
+  return (value.kind === "complete-backup" || value.kind === "legacy-career-sqlite") &&
+    (value.fileName === null || (typeof value.fileName === "string" && isRecoveryText(value.fileName, 512) && Boolean(value.fileName.trim()))) &&
+    Number.isSafeInteger(value.byteSize) && Number(value.byteSize) >= 0 &&
+    Number.isSafeInteger(value.databaseByteSize) && Number(value.databaseByteSize) > 0 &&
+    (value.exportedAt === null || isBackupIsoDate(value.exportedAt)) &&
+    Number.isSafeInteger(value.sourceUserVersion) && Number(value.sourceUserVersion) >= 0 &&
+    Number.isSafeInteger(value.canonicalUserVersion) && Number(value.canonicalUserVersion) >= 0 &&
+    Number.isSafeInteger(value.attachmentCount) && Number(value.attachmentCount) >= 0 &&
+    value.jobCount === null && value.materialCount === null &&
+    (value.verification === "container-and-payload-verified" || value.verification === "career-schema-verified");
+}
+
+function isCareerRestoreReceipt(value: unknown): value is CareerRestoreReceipt {
+  if (!isBackupRecord(value) || !hasExactObjectKeys(value, [
+    "version", "database", "generationId", "activationToken", "recoveryToken",
+    "expectedCurrentGenerationId", "expectedCurrentSequence", "canonicalApplicationId",
+    "canonicalUserVersion", "projectionSha256", "preparedAt", "summary",
+    "stagedAttachmentKeys",
+  ])) return false;
+  return value.version === 1 && value.database === "zhiji" &&
+    isBackupGenerationId(value.generationId) &&
+    typeof value.activationToken === "string" && CAREER_SHA256_PATTERN.test(value.activationToken) &&
+    typeof value.recoveryToken === "string" && CAREER_SHA256_PATTERN.test(value.recoveryToken) &&
+    isBackupGenerationId(value.expectedCurrentGenerationId, true) &&
+    Number.isSafeInteger(value.expectedCurrentSequence) && Number(value.expectedCurrentSequence) >= 0 &&
+    Number.isSafeInteger(value.canonicalApplicationId) && Number(value.canonicalApplicationId) > 0 &&
+    Number.isSafeInteger(value.canonicalUserVersion) && Number(value.canonicalUserVersion) >= 0 &&
+    typeof value.projectionSha256 === "string" && CAREER_SHA256_PATTERN.test(value.projectionSha256) &&
+    isBackupIsoDate(value.preparedAt) && isCareerRestoreSummary(value.summary) &&
+    isBackupAttachmentKeys(value.stagedAttachmentKeys);
+}
+
+function isCareerPrepareRecoveryReceipt(value: unknown): value is CareerPrepareRecoveryReceipt {
+  if (!isBackupRecord(value) || !hasExactObjectKeys(value, [
+    "version", "database", "operationId", "generationId", "operationToken",
+    "projectionSha256", "attachmentKeysSha256", "preparedAt", "summary",
+    "stagedAttachmentKeys",
+  ])) return false;
+  return value.version === 1 && value.database === "zhiji" &&
+    isBackupGenerationId(value.operationId) && value.generationId === value.operationId &&
+    typeof value.operationToken === "string" && CAREER_SHA256_PATTERN.test(value.operationToken) &&
+    typeof value.projectionSha256 === "string" && CAREER_SHA256_PATTERN.test(value.projectionSha256) &&
+    typeof value.attachmentKeysSha256 === "string" && CAREER_SHA256_PATTERN.test(value.attachmentKeysSha256) &&
+    isBackupIsoDate(value.preparedAt) && isCareerRestoreSummary(value.summary) &&
+    isBackupAttachmentKeys(value.stagedAttachmentKeys);
+}
+
+function isCareerPrepareCleanupReceipt(value: unknown): value is CareerPrepareCleanupReceipt {
+  if (!isBackupRecord(value) || !hasExactObjectKeys(value, [
+    "version", "database", "operationId", "generationId", "operationToken",
+    "projectionSha256", "attachmentKeysSha256", "stagedAttachmentKeys",
+  ])) return false;
+  return value.version === 1 && value.database === "zhiji" &&
+    isBackupGenerationId(value.operationId) && value.generationId === value.operationId &&
+    typeof value.operationToken === "string" && CAREER_SHA256_PATTERN.test(value.operationToken) &&
+    typeof value.projectionSha256 === "string" && CAREER_SHA256_PATTERN.test(value.projectionSha256) &&
+    typeof value.attachmentKeysSha256 === "string" && CAREER_SHA256_PATTERN.test(value.attachmentKeysSha256) &&
+    isBackupAttachmentKeys(value.stagedAttachmentKeys);
+}
+
+function careerBackupRecoveryIdentity(ticket: CareerBackupRecoveryTicket) {
+  return `operation:${ticket.receipt.generationId}`;
+}
+
+function careerBackupRecoveryStorageKey(ticket: CareerBackupRecoveryTicket) {
+  return `${CAREER_BACKUP_RECOVERY_PREFIX}${careerBackupRecoveryIdentity(ticket)}`;
+}
+
+function isCareerBackupRecoveryTicket(value: unknown): value is CareerBackupRecoveryTicket {
+  if (!isBackupRecord(value) || value.version !== 1 || !isBackupIsoDate(value.recordedAt)) return false;
+  if (value.kind === "prepare") {
+    return hasExactObjectKeys(value, ["version", "kind", "receipt", "recordedAt"]) &&
+      isCareerPrepareRecoveryReceipt(value.receipt);
+  }
+  if (value.kind === "prepare-cleanup") {
+    return hasExactObjectKeys(value, ["version", "kind", "receipt", "recordedAt"]) &&
+      isCareerPrepareCleanupReceipt(value.receipt);
+  }
+  if (value.kind === "refresh-only") {
+    return hasExactObjectKeys(value, ["version", "kind", "receipt", "recordedAt"]) &&
+      isCareerRestoreReceipt(value.receipt);
+  }
+  return value.kind === "candidate" &&
+    hasExactObjectKeys(value, ["version", "kind", "mode", "receipt", "recordedAt"]) &&
+    (value.mode === "review" || value.mode === "activation-check" || value.mode === "discard-only") &&
+    isCareerRestoreReceipt(value.receipt);
+}
+
+function careerBackupRecoveryPriority(ticket: CareerBackupRecoveryTicket) {
+  if (ticket.kind === "refresh-only") return 0;
+  if (ticket.kind === "candidate") {
+    if (ticket.mode === "activation-check") return 1;
+    if (ticket.mode === "discard-only") return 2;
+    return 3;
+  }
+  return ticket.kind === "prepare-cleanup" ? 4 : 5;
+}
+
+function readCareerBackupRecoveryStorage() {
+  const entries: CareerBackupRecoveryEntry[] = [];
+  const unreadableKeys: string[] = [];
+  if (typeof window === "undefined") return { entries, unreadableKeys, storageUnavailable: false };
+  try {
+    for (let index = 0; index < window.localStorage.length; index += 1) {
+      const storageKey = window.localStorage.key(index);
+      if (!storageKey?.startsWith(CAREER_BACKUP_RECOVERY_PREFIX)) continue;
+      try {
+        const raw = window.localStorage.getItem(storageKey);
+        if (!raw || raw.length > CAREER_BACKUP_RECOVERY_MAX_BYTES) throw new Error("invalid recovery size");
+        const parsed: unknown = JSON.parse(raw);
+        if (!isCareerBackupRecoveryTicket(parsed)) throw new Error("invalid recovery ticket");
+        if (storageKey !== careerBackupRecoveryStorageKey(parsed)) throw new Error("misbound recovery key");
+        entries.push({ storageKey, ticket: parsed, persisted: true });
+      } catch {
+        unreadableKeys.push(storageKey);
+      }
+    }
+  } catch {
+    return { entries, unreadableKeys, storageUnavailable: true };
+  }
+  entries.sort((left, right) =>
+    careerBackupRecoveryPriority(left.ticket) - careerBackupRecoveryPriority(right.ticket) ||
+    left.ticket.recordedAt.localeCompare(right.ticket.recordedAt));
+  return { entries, unreadableKeys, storageUnavailable: false };
+}
+
+function formatCareerBackupBytes(value: number) {
+  if (!Number.isFinite(value) || value < 0) return "大小未确认";
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(value < 10 * 1024 ? 1 : 0)} KB`;
+  if (value < 1024 * 1024 * 1024) return `${(value / 1024 / 1024).toFixed(value < 10 * 1024 * 1024 ? 1 : 0)} MB`;
+  return `${(value / 1024 / 1024 / 1024).toFixed(1)} GB`;
 }
 
 const CAREER_AI_SHARED_FIELDS_BY_ACTION = Object.freeze({
@@ -1409,24 +1632,6 @@ export default function CareerApp() {
             window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
             notify(`完整备份已交给浏览器下载，包含 ${exported.attachmentCount} 个材料附件`);
           } catch (error) { notify(error instanceof Error ? error.message : "导出失败", "error"); }
-        }} onImport={async (file) => {
-          const complete = await isCompleteCareerBackup(file);
-          const confirmation = complete
-            ? "恢复完整备份会切换当前职迹数据与已关联材料。文件会先完整校验并写入安全候选，切换前不会改动现有数据。确定继续吗？"
-            : "这是旧版 SQLite 备份，只能恢复结构化数据，不包含材料附件原件。它也会先写入安全候选；备份中的附件索引会被清空，避免显示不存在的原件。确定继续吗？";
-          if (!window.confirm(confirmation)) return;
-          try {
-            if (complete) {
-              const restored = await restoreCompleteCareerBackup(file);
-              await requireRefresh();
-              notify(`数据与 ${restored.attachmentCount} 个附件已完整恢复；上一版本已保留作安全回退`);
-            } else {
-              await restoreLegacyCareerDatabase(file);
-              await requireRefresh();
-              notify("旧版 SQLite 数据已恢复；附件索引已清空，上一版本已保留作安全回退", "info");
-            }
-          }
-          catch (error) { notify(error instanceof Error ? error.message : "恢复失败", "error"); }
         }} notify={notify} />}
       </div>
     </section>
@@ -1882,10 +2087,154 @@ function AnalyticsView({ data, now }: { data: CareerData; now: number }) {
   </div>;
 }
 
-function SettingsView({ data, onRefresh, onExport, onImport, notify }: { data: CareerData; onRefresh: () => Promise<void>; onExport: () => Promise<void>; onImport: (file: File) => Promise<void>; notify: (text: string, tone?: Notice["tone"]) => void }) {
+function SettingsView({ data, onRefresh, onExport, notify }: {
+  data: CareerData;
+  onRefresh: () => Promise<void>;
+  onExport: () => Promise<void>;
+  notify: (text: string, tone?: Notice["tone"]) => void;
+}) {
   const [savingStage, setSavingStage] = useState<string | null>(null);
-  const [backupBusy, setBackupBusy] = useState<"export" | "import" | null>(null);
+  const [exportBusy, setExportBusy] = useState(false);
+  const [backupPrepareStopping, setBackupPrepareStopping] = useState(false);
+  const [backupFlow, setBackupFlow] = useState<CareerBackupFlow>({ phase: "idle" });
+  const [persistedBackupRecoveries, setPersistedBackupRecoveries] = useState<CareerBackupRecoveryEntry[]>([]);
+  const [volatileBackupRecoveries, setVolatileBackupRecoveries] = useState<CareerBackupRecoveryEntry[]>([]);
+  const [backupRecoveryUnreadableKeys, setBackupRecoveryUnreadableKeys] = useState<string[]>([]);
+  const [backupRecoveryStorageUnavailable, setBackupRecoveryStorageUnavailable] = useState(false);
+  const [backupRecoveryLoaded, setBackupRecoveryLoaded] = useState(false);
   const [aiHealth, setAiHealth] = useState<{ status: "checking" | "configured" | "missing" | "error"; model: string }>({ status: "checking", model: "" });
+  const backupOperationRef = useRef(false);
+  const backupPrepareControllerRef = useRef<AbortController | null>(null);
+  const allowInitialBackupResumeRef = useRef(true);
+  const handledBackupTicketRef = useRef("");
+  const backupFlowHeadingRef = useRef<HTMLHeadingElement>(null);
+  const backupFileInputRef = useRef<HTMLInputElement>(null);
+  const backupPickerButtonRef = useRef<HTMLButtonElement>(null);
+  const durableBackupRecoveryKeysRef = useRef<Set<string>>(new Set());
+
+  const reloadBackupRecoveries = useCallback(() => {
+    const result = readCareerBackupRecoveryStorage();
+    if (!result.storageUnavailable) {
+      durableBackupRecoveryKeysRef.current = new Set([
+        ...result.entries.map((entry) => entry.storageKey),
+        ...result.unreadableKeys,
+      ]);
+    }
+    setPersistedBackupRecoveries(result.entries);
+    setBackupRecoveryUnreadableKeys(result.unreadableKeys);
+    setBackupRecoveryStorageUnavailable(result.storageUnavailable);
+    setBackupRecoveryLoaded(true);
+  }, []);
+
+  const backupRecoveryEntries = useMemo(() => {
+    const byKey = new Map<string, CareerBackupRecoveryEntry>();
+    for (const entry of persistedBackupRecoveries) byKey.set(entry.storageKey, entry);
+    for (const entry of volatileBackupRecoveries) byKey.set(entry.storageKey, entry);
+    return [...byKey.values()].sort((left, right) =>
+      careerBackupRecoveryPriority(left.ticket) - careerBackupRecoveryPriority(right.ticket) ||
+      left.ticket.recordedAt.localeCompare(right.ticket.recordedAt));
+  }, [persistedBackupRecoveries, volatileBackupRecoveries]);
+  const activeBackupRecovery = backupRecoveryEntries[0] ?? null;
+  const backupStorageNeedsAttention = backupRecoveryStorageUnavailable || volatileBackupRecoveries.length > 0;
+  const backupFlowBusy = backupFlow.phase === "preparing" || backupFlow.phase === "checking" ||
+    backupFlow.phase === "activating" || backupFlow.phase === "discarding" || backupFlow.phase === "cleaning";
+  const backupWriteLocked = !backupRecoveryLoaded || backupFlowBusy || Boolean(activeBackupRecovery) ||
+    backupRecoveryUnreadableKeys.length > 0 || backupStorageNeedsAttention;
+
+  const persistBackupRecovery = useCallback((ticket: CareerBackupRecoveryTicket) => {
+    const storageKey = careerBackupRecoveryStorageKey(ticket);
+    const entry = { storageKey, ticket, persisted: true } satisfies CareerBackupRecoveryEntry;
+    try {
+      const serialized = JSON.stringify(ticket);
+      if (serialized.length > CAREER_BACKUP_RECOVERY_MAX_BYTES) throw new Error("recovery ticket is too large");
+      window.localStorage.setItem(storageKey, serialized);
+      durableBackupRecoveryKeysRef.current.add(storageKey);
+      setPersistedBackupRecoveries((current) => [...current.filter((item) => item.storageKey !== storageKey), entry]);
+      setVolatileBackupRecoveries((current) => current.filter((item) => item.storageKey !== storageKey));
+      return true;
+    } catch {
+      setVolatileBackupRecoveries((current) => [
+        ...current.filter((item) => item.storageKey !== storageKey),
+        { storageKey, ticket, persisted: false },
+      ]);
+      setBackupRecoveryStorageUnavailable(true);
+      return false;
+    }
+  }, []);
+
+  const removeBackupRecoveryKeys = useCallback((storageKeys: readonly string[]) => {
+    const cleared = new Set<string>();
+    let failed = false;
+    for (const storageKey of storageKeys) {
+      if (!durableBackupRecoveryKeysRef.current.has(storageKey)) {
+        cleared.add(storageKey);
+        continue;
+      }
+      try {
+        window.localStorage.removeItem(storageKey);
+        cleared.add(storageKey);
+      } catch {
+        failed = true;
+      }
+    }
+    if (cleared.size > 0) {
+      cleared.forEach((storageKey) => durableBackupRecoveryKeysRef.current.delete(storageKey));
+      setPersistedBackupRecoveries((current) => current.filter((entry) => !cleared.has(entry.storageKey)));
+      setVolatileBackupRecoveries((current) => current.filter((entry) => !cleared.has(entry.storageKey)));
+      setBackupRecoveryUnreadableKeys((current) => current.filter((key) => !cleared.has(key)));
+    }
+    if (failed) setBackupRecoveryStorageUnavailable(true);
+    return !failed;
+  }, []);
+
+  function removeBackupRecoveryFor(receipt: CareerRestoreReceipt | CareerPrepareRecoveryReceipt | CareerPrepareCleanupReceipt) {
+    return removeBackupRecoveryKeys([`${CAREER_BACKUP_RECOVERY_PREFIX}operation:${receipt.generationId}`]);
+  }
+
+  function markBackupRecoveryUnreadable(storageKey: string) {
+    durableBackupRecoveryKeysRef.current.add(storageKey);
+    setPersistedBackupRecoveries((current) => current.filter((entry) => entry.storageKey !== storageKey));
+    setVolatileBackupRecoveries((current) => current.filter((entry) => entry.storageKey !== storageKey));
+    setBackupRecoveryUnreadableKeys((current) => current.includes(storageKey) ? current : [...current, storageKey]);
+  }
+
+  useEffect(() => {
+    const initialFrame = window.requestAnimationFrame(reloadBackupRecoveries);
+    function onStorage(event: StorageEvent) {
+      if (!event.key || event.key.startsWith(CAREER_BACKUP_RECOVERY_PREFIX)) {
+        allowInitialBackupResumeRef.current = false;
+        reloadBackupRecoveries();
+      }
+    }
+    function onFocus() {
+      allowInitialBackupResumeRef.current = false;
+      reloadBackupRecoveries();
+    }
+    window.addEventListener("storage", onStorage);
+    window.addEventListener("focus", onFocus);
+    return () => {
+      window.cancelAnimationFrame(initialFrame);
+      window.removeEventListener("storage", onStorage);
+      window.removeEventListener("focus", onFocus);
+    };
+  }, [reloadBackupRecoveries]);
+
+  useEffect(() => {
+    if (backupFlow.phase !== "preparing" && volatileBackupRecoveries.length === 0) return;
+    function protectUnfinishedRestore(event: BeforeUnloadEvent) {
+      event.preventDefault();
+      event.returnValue = "";
+    }
+    window.addEventListener("beforeunload", protectUnfinishedRestore);
+    return () => window.removeEventListener("beforeunload", protectUnfinishedRestore);
+  }, [backupFlow.phase, volatileBackupRecoveries.length]);
+
+  useEffect(() => {
+    if (backupFlow.phase === "idle") return;
+    const frame = window.requestAnimationFrame(() => backupFlowHeadingRef.current?.focus({ preventScroll: true }));
+    return () => window.cancelAnimationFrame(frame);
+  }, [backupFlow.phase]);
+
   useEffect(() => {
     let active = true;
     void (async () => {
@@ -1898,17 +2247,432 @@ function SettingsView({ data, onRefresh, onExport, onImport, notify }: { data: C
     })();
     return () => { active = false; };
   }, []);
-  async function rename(stage: Stage, name: string) { if (!name.trim() || name === stage.name) return; setSavingStage(stage.id); await runCareerSql("UPDATE career_stages SET name = ? WHERE id = ?", [name.trim(), stage.id]); await onRefresh(); setSavingStage(null); }
-  const bookmarklet = `javascript:(()=>{const t=window.getSelection()?.toString().trim()||'';const u='http://localhost:3000/career?capture='+encodeURIComponent(location.href)+'&text='+encodeURIComponent(t);window.open(u,'_blank')})()`;
+
+  async function rename(stage: Stage, name: string) {
+    if (!name.trim() || name === stage.name) return;
+    setSavingStage(stage.id);
+    try {
+      await runCareerSql("UPDATE career_stages SET name = ? WHERE id = ?", [name.trim(), stage.id]);
+      await onRefresh();
+    } finally {
+      setSavingStage(null);
+    }
+  }
+
   const aiStatusLabel = aiHealth.status === "checking" ? "正在检查" : aiHealth.status === "configured" ? "已配置" : aiHealth.status === "missing" ? "尚未配置" : "检查失败";
-  async function copyHelper() { try { await navigator.clipboard.writeText(bookmarklet); notify("浏览器采集器已复制，可拖到书签栏保存", "info"); } catch { notify("浏览器不允许复制，请在安全页面重试", "error"); } }
-  async function exportBackup() { setBackupBusy("export"); try { await onExport(); } finally { setBackupBusy(null); } }
-  async function importBackup(file: File) { setBackupBusy("import"); try { await onImport(file); } finally { setBackupBusy(null); } }
-  return <div className="career-view"><SectionHeading eyebrow="PREFERENCES" title="设置" description="隐私、流程与数据，都由你掌控" /><div className="career-settings-layout"><nav><a href="#workflow">求职流程</a><a href="#privacy">AI 与隐私</a><a href="#data">数据与备份</a><a href="#capture">浏览器采集器</a></nav><div><section className="career-settings-card" id="workflow"><header><div><h3>看板阶段</h3><p>按你的求职习惯调整名称，工作台会保持一致。</p></div></header><div className="career-stage-settings">{data.stages.map((stage) => <label key={stage.id}><i style={{ background: stage.color }} /><input defaultValue={stage.name} onBlur={(event) => void rename(stage, event.target.value)} aria-label={`${stage.name}阶段名称`} /><span>{savingStage === stage.id ? <LoaderCircle className="spin" size={14} /> : stage.is_terminal ? "终态" : "进行中"}</span></label>)}</div></section>
-    <section className="career-settings-card" id="privacy"><header><div><h3>AI 与隐私</h3><p>只有你主动使用 AI 时，所选内容才会发送至配置的服务。</p></div><span className={aiHealth.status === "configured" ? "career-status-good" : "career-status-neutral"} aria-live="polite"><i />{aiStatusLabel}</span></header><div className="career-setting-row"><span><b>当前模型</b><small>由服务器环境安全配置</small></span><code>{aiHealth.model || "DeepSeek"}</code></div><div className="career-setting-row"><span><b>结果保留方式</b><small>关闭预览不会自动保存，也不会留下隐藏副本</small></span><code>核对后复制或填入草稿</code></div><div className="career-privacy-note"><ShieldCheck size={18} /><p>API 密钥不会进入浏览器、本地数据库或备份。职位描述和面试笔记会被当作不可信数据处理。</p></div></section>
-    <section className="career-settings-card" id="data"><header><div><h3>数据与备份</h3><p>一个文件带走结构化职迹与已关联的材料原件。</p></div></header><div className="career-data-actions"><button disabled={backupBusy !== null} onClick={() => void exportBackup()}><span>{backupBusy === "export" ? <LoaderCircle className="spin" size={19} /> : <Download size={19} />}</span><div><b>{backupBusy === "export" ? "正在校验并打包…" : "导出完整备份"}</b><small>SQLite、简历、作品集与案例附件</small></div><ChevronRight size={17} /></button><label className={backupBusy !== null ? "disabled" : ""}><span>{backupBusy === "import" ? <LoaderCircle className="spin" size={19} /> : <Upload size={19} />}</span><div><b>{backupBusy === "import" ? "正在验证并恢复…" : "恢复备份"}</b><small>支持完整备份与旧版 SQLite</small></div><ChevronRight size={17} /><input aria-label="选择要恢复的职迹备份" disabled={backupBusy !== null} type="file" accept=".career-backup,.sqlite,.sqlite3,.db,application/x-sqlite3,application/octet-stream" onChange={(event) => { const file = event.target.files?.[0]; if (file) void importBackup(file); event.currentTarget.value = ""; }} /></label></div><p className="career-settings-footnote">完整备份是明文文件，请安全保管；导出前会校验每个附件。恢复会先建立并验证安全候选，上一版本会暂时保留作回退。旧版 SQLite 不包含附件原件。</p></section>
-    <section className="career-settings-card" id="capture"><header><div><h3>浏览器采集器</h3><p>把当前 URL 与你明确选中的 JD 文本带回本机职迹，不读取整页正文。</p></div></header><div className="career-capture-steps"><span><b>1</b>复制下面的采集器</span><ArrowRight size={16} /><span><b>2</b>新建书签并粘贴到网址</span><ArrowRight size={16} /><span><b>3</b>选中 JD 后点击书签</span></div><button className="career-button secondary" onClick={() => void copyHelper()}><Command size={16} />复制采集器</button><p className="career-settings-footnote">采集器仅附带当前页面 URL 与选中文字，不包含 Cookie、登录态或站内消息；不是任何招聘平台的官方 API，也不会自动投递。</p></section>
-  </div></div></div>;
+
+  async function copyHelper() {
+    try {
+      const careerAddress = new URL("/career", window.location.origin).toString();
+      const bookmarklet = `javascript:(()=>{const t=window.getSelection()?.toString().trim()||'';const u=${JSON.stringify(careerAddress)}+'?capture='+encodeURIComponent(location.href)+'&text='+encodeURIComponent(t);window.open(u,'_blank')})()`;
+      await navigator.clipboard.writeText(bookmarklet);
+      notify("采集器已复制，会回到当前这一个职迹地址", "info");
+    } catch {
+      notify("浏览器暂时不允许复制，请在安全页面重试", "error");
+    }
+  }
+
+  async function exportBackup() {
+    setExportBusy(true);
+    try { await onExport(); }
+    finally { setExportBusy(false); }
+  }
+
+  function candidateTicket(receipt: CareerRestoreReceipt, mode: CareerBackupCandidateMode): CareerBackupRecoveryTicket {
+    return { version: 1, kind: "candidate", mode, receipt, recordedAt: new Date().toISOString() };
+  }
+
+  function refreshTicket(receipt: CareerRestoreReceipt): CareerBackupRecoveryTicket {
+    return { version: 1, kind: "refresh-only", receipt, recordedAt: new Date().toISOString() };
+  }
+
+  async function finishBackupRefresh(receipt: CareerRestoreReceipt, message: string) {
+    persistBackupRecovery(refreshTicket(receipt));
+    setBackupFlow({ phase: "refresh-only", receipt, message });
+    try {
+      await onRefresh();
+      if (removeBackupRecoveryFor(receipt)) {
+        handledBackupTicketRef.current = "";
+        setBackupFlow({ phase: "idle" });
+        notify("备份已经启用，页面资料也已重新读取");
+        window.requestAnimationFrame(() => backupPickerButtonRef.current?.focus({ preventScroll: true }));
+      } else {
+        setBackupFlow({
+          phase: "refresh-only",
+          receipt,
+          message: "备份已经启用，页面资料也已更新；本页暂时没能清除继续提醒。",
+        });
+      }
+    } catch {
+      setBackupFlow({
+        phase: "refresh-only",
+        receipt,
+        message: "备份已经启用。页面暂时没有重新读到它，只需再刷新资料，不会重复启用。",
+      });
+    }
+  }
+
+  async function inspectCandidate(entry: CareerBackupRecoveryEntry) {
+    if (entry.ticket.kind !== "candidate") return;
+    const { receipt, mode } = entry.ticket;
+    backupOperationRef.current = true;
+    setBackupFlow({ phase: "checking", title: "正在核对当前版本", text: "只读取版本状态，不会再次启用或删除候选。" });
+    try {
+      const inspection = await inspectCareerRestoreActivation(receipt);
+      if (inspection.status === "current") {
+        await finishBackupRefresh(receipt, "这份备份已经启用，只需让页面重新读取资料。");
+        return;
+      }
+      const baselineUnchanged = inspection.currentGenerationId === receipt.expectedCurrentGenerationId &&
+        inspection.currentSequence === receipt.expectedCurrentSequence;
+      if (mode === "review" && baselineUnchanged) {
+        setBackupFlow({ phase: "review", receipt, message: "候选与当前职迹仍然匹配，请核对后再决定。" });
+        return;
+      }
+      const next = candidateTicket(receipt, "discard-only");
+      persistBackupRecovery(next);
+      setBackupFlow({
+        phase: "discard-only",
+        receipt,
+        message: mode === "activation-check" && baselineUnchanged
+          ? "已经确认这次没有切换。为避免重复启用，现在只收起这份候选。"
+          : "当前职迹在候选建立后有过变化。这份候选不会覆盖它，现在只收起候选。",
+      });
+    } catch (error) {
+      if (error instanceof Error && "code" in error && error.code === "INVALID_RECEIPT") {
+        markBackupRecoveryUnreadable(entry.storageKey);
+        setBackupFlow({ phase: "error", title: "这条继续信息无法核对", message: "没有启用或删除任何内容。你可以保留本机候选，并只清除这条提醒。" });
+      } else {
+        persistBackupRecovery(candidateTicket(receipt, "activation-check"));
+        setBackupFlow({ phase: "activation-check", receipt, message: "当前版本暂时没有读到。继续时只会重新核对，不会重复启用。" });
+      }
+    } finally {
+      backupOperationRef.current = false;
+    }
+  }
+
+  async function recoverPreparation(entry: CareerBackupRecoveryEntry) {
+    if (entry.ticket.kind !== "prepare") return;
+    backupOperationRef.current = true;
+    setBackupFlow({ phase: "checking", title: "正在继续核对", text: "沿用上次留下的核对信息，不会重新读取或写入备份文件。" });
+    try {
+      const recovered = await recoverCareerBackupPrepare(entry.ticket.receipt);
+      if (recovered.status === "ready") {
+        const next = candidateTicket(recovered.receipt, "review");
+        persistBackupRecovery(next);
+        await inspectCandidate({ storageKey: careerBackupRecoveryStorageKey(next), ticket: next, persisted: true });
+        return;
+      }
+      if (recovered.status === "cleanup-pending") {
+        const next: CareerBackupRecoveryTicket = { version: 1, kind: "prepare-cleanup", receipt: recovered.cleanupReceipt, recordedAt: new Date().toISOString() };
+        persistBackupRecovery(next);
+        setBackupFlow({ phase: "prepare-cleanup", receipt: recovered.cleanupReceipt, message: "当前职迹没有改变。只需收起这次没有启用的临时内容。" });
+        return;
+      }
+      if (removeBackupRecoveryFor(entry.ticket.receipt)) {
+        handledBackupTicketRef.current = "";
+        setBackupFlow({ phase: "idle" });
+        notify(recovered.status === "discarded" ? "上次未完成的候选已经收起" : "上次的临时内容已经收尾", "info");
+      } else if (recovered.status === "cleanup-complete") {
+        setBackupFlow({ phase: "prepare-cleanup", receipt: recovered.cleanupReceipt, message: "临时内容已经收尾，本页暂时没能清除继续提醒。" });
+      } else {
+        setBackupFlow({ phase: "error", title: "候选已经收起", message: "当前职迹没有改变；本页暂时没能清除继续提醒。" });
+      }
+    } catch (error) {
+      if (error instanceof Error && "code" in error && error.code === "INVALID_RECEIPT") {
+        markBackupRecoveryUnreadable(entry.storageKey);
+        setBackupFlow({ phase: "error", title: "这条继续信息无法核对", message: "没有启用或删除任何内容。你可以保留本机候选，并只清除这条提醒。" });
+      } else {
+        setBackupFlow({ phase: "error", title: "这次核对还没完成", message: "继续信息仍保留着。稍后再试即可，不需要重新选择备份。" });
+      }
+    } finally {
+      backupOperationRef.current = false;
+    }
+  }
+
+  async function resumeBackupRecovery(entry: CareerBackupRecoveryEntry) {
+    if (entry.ticket.kind === "refresh-only") {
+      setBackupFlow({ phase: "refresh-only", receipt: entry.ticket.receipt, message: "这份备份已经启用，只需让页面重新读取资料。" });
+      return;
+    }
+    if (entry.ticket.kind === "prepare-cleanup") {
+      setBackupFlow({ phase: "prepare-cleanup", receipt: entry.ticket.receipt, message: "当前职迹没有改变。只需收起这次没有启用的临时内容。" });
+      return;
+    }
+    if (entry.ticket.kind === "prepare") {
+      await recoverPreparation(entry);
+      return;
+    }
+    await inspectCandidate(entry);
+  }
+
+  useEffect(() => {
+    if (!allowInitialBackupResumeRef.current || !backupRecoveryLoaded || !activeBackupRecovery || backupOperationRef.current || backupFlow.phase !== "idle") return;
+    const fingerprint = `${activeBackupRecovery.storageKey}:${JSON.stringify(activeBackupRecovery.ticket)}`;
+    if (handledBackupTicketRef.current === fingerprint) return;
+    allowInitialBackupResumeRef.current = false;
+    handledBackupTicketRef.current = fingerprint;
+    void resumeBackupRecovery(activeBackupRecovery);
+  // resumeBackupRecovery deliberately consumes the latest serialized capability exactly once.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeBackupRecovery, backupFlow.phase, backupRecoveryLoaded]);
+
+  async function prepareSelectedBackup(file: File) {
+    if (backupWriteLocked || backupOperationRef.current) return;
+    allowInitialBackupResumeRef.current = false;
+    backupOperationRef.current = true;
+    const controller = new AbortController();
+    backupPrepareControllerRef.current = controller;
+    setBackupPrepareStopping(false);
+    setBackupFlow({ phase: "preparing", fileName: file.name || "所选文件" });
+    const checkpoint = { current: null as CareerPrepareRecoveryReceipt | null };
+    try {
+      const receipt = await prepareCareerBackupRestore(file, {
+        signal: controller.signal,
+        onRecoveryPrepared: async (recoveryReceipt) => {
+          checkpoint.current = recoveryReceipt;
+          const ticket: CareerBackupRecoveryTicket = { version: 1, kind: "prepare", receipt: recoveryReceipt, recordedAt: new Date().toISOString() };
+          if (!persistBackupRecovery(ticket)) {
+            throw new Error("The prepare recovery receipt could not be saved on this device.");
+          }
+        },
+      });
+      const next = candidateTicket(receipt, "review");
+      persistBackupRecovery(next);
+      setBackupFlow({ phase: "review", receipt });
+    } catch (error) {
+      if (error instanceof CareerPrepareUncertainError) {
+        const next: CareerBackupRecoveryTicket = { version: 1, kind: "prepare", receipt: error.receipt, recordedAt: new Date().toISOString() };
+        persistBackupRecovery(next);
+        setBackupFlow({ phase: "error", title: "候选还在核对中", message: "继续信息已经保留。下一步只会核对这一次准备，不会重复导入。" });
+      } else if (error instanceof CareerPrepareCleanupIncompleteError) {
+        const next: CareerBackupRecoveryTicket = { version: 1, kind: "prepare-cleanup", receipt: error.receipt, recordedAt: new Date().toISOString() };
+        persistBackupRecovery(next);
+        setBackupFlow({ phase: "prepare-cleanup", receipt: error.receipt, message: "当前职迹没有改变。还有少量临时内容等待收尾。" });
+      } else if (error instanceof CareerDiscardUncertainError) {
+        const next = candidateTicket(error.receipt, "discard-only");
+        persistBackupRecovery(next);
+        setBackupFlow({ phase: "discard-only", receipt: error.receipt, message: "当前职迹没有改变。候选的收尾结果还没确认，只需继续收尾。" });
+      } else if (error instanceof Error && "code" in error && error.code === "PREPARE_ABORTED") {
+        if (checkpoint.current) removeBackupRecoveryFor(checkpoint.current);
+        setBackupFlow({ phase: "idle" });
+        notify("已停止核对，当前职迹没有改变", "info");
+        window.requestAnimationFrame(() => backupPickerButtonRef.current?.focus({ preventScroll: true }));
+      } else {
+        if (checkpoint.current) removeBackupRecoveryFor(checkpoint.current);
+        setBackupFlow({
+          phase: "error",
+          title: "没有使用这个文件",
+          message: error instanceof Error ? error.message : "这个文件暂时无法核对，当前职迹没有改变。",
+        });
+      }
+    } finally {
+      if (backupPrepareControllerRef.current === controller) backupPrepareControllerRef.current = null;
+      setBackupPrepareStopping(false);
+      backupOperationRef.current = false;
+    }
+  }
+
+  function stopBackupPreparation() {
+    if (!backupPrepareControllerRef.current || backupPrepareControllerRef.current.signal.aborted) return;
+    setBackupPrepareStopping(true);
+    backupPrepareControllerRef.current.abort();
+  }
+
+  async function activateCandidate(receipt: CareerRestoreReceipt) {
+    if (backupOperationRef.current) return;
+    const checkingTicket = candidateTicket(receipt, "activation-check");
+    if (!persistBackupRecovery(checkingTicket)) {
+      setBackupFlow({ phase: "activation-check", receipt, message: "这台设备暂时不能保存继续信息，因此没有启用。恢复本机存储后，只会先核对当前版本。" });
+      return;
+    }
+    backupOperationRef.current = true;
+    setBackupFlow({ phase: "activating", receipt });
+    try {
+      await activatePreparedCareerRestore(receipt);
+      await finishBackupRefresh(receipt, "备份已经启用，正在重新读取页面资料。");
+    } catch (error) {
+      if (error instanceof CareerCurrentGenerationChangedError) {
+        const next = candidateTicket(receipt, "discard-only");
+        persistBackupRecovery(next);
+        setBackupFlow({ phase: "discard-only", receipt, message: "当前职迹刚刚有过变化，这次没有覆盖它。现在只收起候选。" });
+      } else {
+        const uncertainReceipt = error instanceof CareerActivationUncertainError ? error.receipt : receipt;
+        persistBackupRecovery(candidateTicket(uncertainReceipt, "activation-check"));
+        setBackupFlow({ phase: "activation-check", receipt: uncertainReceipt, message: "切换结果暂时没有确认。下一步只会读取当前版本，不会重复启用。" });
+      }
+    } finally {
+      backupOperationRef.current = false;
+    }
+  }
+
+  async function discardCandidate(receipt: CareerRestoreReceipt) {
+    if (backupOperationRef.current) return;
+    const cleanupTicket = candidateTicket(receipt, "discard-only");
+    if (!persistBackupRecovery(cleanupTicket)) {
+      setBackupFlow({ phase: "discard-only", receipt, message: "这台设备暂时不能保存收尾信息，因此没有开始收尾。" });
+      return;
+    }
+    backupOperationRef.current = true;
+    setBackupFlow({ phase: "discarding", receipt });
+    try {
+      const discarded = await discardPreparedCareerRestore(receipt);
+      if (discarded.attachmentCleanup === "incomplete") {
+        setBackupFlow({ phase: "discard-only", receipt, message: "候选已经放下，还有临时附件等待收尾。继续时只会重试收尾。" });
+        return;
+      }
+      if (removeBackupRecoveryFor(receipt)) {
+        handledBackupTicketRef.current = "";
+        setBackupFlow({ phase: "idle" });
+        notify("候选已经收起，当前职迹没有改变", "info");
+        window.requestAnimationFrame(() => backupPickerButtonRef.current?.focus({ preventScroll: true }));
+      } else {
+        setBackupFlow({ phase: "discard-only", receipt, message: "候选已经收起，本页暂时没能清除继续提醒。" });
+      }
+    } catch (error) {
+      if (error instanceof Error && "code" in error && error.code === "INVALID_RECEIPT") {
+        markBackupRecoveryUnreadable(careerBackupRecoveryStorageKey(cleanupTicket));
+        setBackupFlow({ phase: "error", title: "这条收尾信息无法核对", message: "没有删除任何内容。你可以保留本机候选，并只清除这条提醒。" });
+      } else {
+        setBackupFlow({ phase: "discard-only", receipt, message: "收尾结果暂时没有确认。继续时只会重试收尾，不会启用候选。" });
+      }
+    } finally {
+      backupOperationRef.current = false;
+    }
+  }
+
+  async function cleanPreparedAttachments(receipt: CareerPrepareCleanupReceipt) {
+    if (backupOperationRef.current) return;
+    backupOperationRef.current = true;
+    setBackupFlow({ phase: "cleaning", receipt });
+    try {
+      await retryCareerPrepareCleanup(receipt);
+      if (removeBackupRecoveryFor(receipt)) {
+        handledBackupTicketRef.current = "";
+        setBackupFlow({ phase: "idle" });
+        notify("未启用的临时内容已经收尾，当前职迹没有改变", "info");
+        window.requestAnimationFrame(() => backupPickerButtonRef.current?.focus({ preventScroll: true }));
+      } else {
+        setBackupFlow({ phase: "prepare-cleanup", receipt, message: "临时内容已经收尾，本页暂时没能清除继续提醒。" });
+      }
+    } catch {
+      setBackupFlow({ phase: "prepare-cleanup", receipt, message: "临时内容暂时没有全部收尾。当前职迹没有改变，稍后继续即可。" });
+    } finally {
+      backupOperationRef.current = false;
+    }
+  }
+
+  async function continueActiveRecovery() {
+    if (!activeBackupRecovery || backupOperationRef.current) return;
+    handledBackupTicketRef.current = "";
+    await resumeBackupRecovery(activeBackupRecovery);
+  }
+
+  function clearUnreadableBackupRecovery() {
+    if (!removeBackupRecoveryKeys(backupRecoveryUnreadableKeys)) {
+      setBackupFlow({ phase: "error", title: "提醒暂时没有清除", message: "没有启用或删除任何本机内容。请恢复浏览器存储后再试。" });
+      return;
+    }
+    handledBackupTicketRef.current = "";
+    setBackupFlow({ phase: "idle" });
+    notify("提醒已经清除，本机候选与当前职迹都没有被改动", "info");
+    window.requestAnimationFrame(() => backupPickerButtonRef.current?.focus({ preventScroll: true }));
+  }
+
+  function retryBackupRecoveryStorage() {
+    const remaining: CareerBackupRecoveryEntry[] = [];
+    for (const entry of volatileBackupRecoveries) {
+      try {
+        const serialized = JSON.stringify(entry.ticket);
+        if (serialized.length > CAREER_BACKUP_RECOVERY_MAX_BYTES) throw new Error("recovery ticket is too large");
+        window.localStorage.setItem(entry.storageKey, serialized);
+        durableBackupRecoveryKeysRef.current.add(entry.storageKey);
+      } catch {
+        remaining.push(entry);
+      }
+    }
+    setVolatileBackupRecoveries(remaining);
+    setBackupRecoveryStorageUnavailable(remaining.length > 0);
+    reloadBackupRecoveries();
+  }
+
+  const renderBackupSummary = (summary: CareerRestoreSummary) => <dl className="career-backup-summary">
+    <div><dt>文件</dt><dd>{summary.fileName ?? "名称未提供"}</dd></div>
+    <div><dt>类型</dt><dd>{summary.kind === "complete-backup" ? "完整职迹备份" : "旧版职迹数据库"}</dd></div>
+    <div><dt>已核对</dt><dd>{summary.verification === "container-and-payload-verified" ? "数据库与附件内容" : "职迹数据库结构"}</dd></div>
+    <div><dt>大小</dt><dd>{formatCareerBackupBytes(summary.byteSize)}</dd></div>
+    {summary.exportedAt && <div><dt>导出时间</dt><dd>{formatDate(summary.exportedAt, true)}</dd></div>}
+    <div><dt>材料原件</dt><dd>{summary.kind === "complete-backup" ? `${summary.attachmentCount} 个已验证附件` : "不包含附件原件"}</dd></div>
+  </dl>;
+
+  const renderBackupFlow = () => {
+    if (backupFlow.phase === "idle") return null;
+    const statusProps = backupFlow.phase === "error" ? { role: "alert" as const } : { role: "status" as const };
+    return <section className={`career-backup-flow ${backupFlow.phase}`} aria-labelledby="career-backup-flow-title" {...statusProps}>
+      <header>
+        <span>{backupFlowBusy ? <LoaderCircle className="spin" size={20} /> : <ShieldCheck size={20} />}</span>
+        <div>
+          <small>RESTORE</small>
+          <h4 id="career-backup-flow-title" ref={backupFlowHeadingRef} tabIndex={-1}>
+            {backupFlow.phase === "preparing" ? "正在核对这个文件" :
+              backupFlow.phase === "checking" ? backupFlow.title :
+              backupFlow.phase === "review" ? "启用前，再看一眼" :
+              backupFlow.phase === "activating" ? "正在启用已核对的备份" :
+              backupFlow.phase === "activation-check" ? "先确认当前版本" :
+              backupFlow.phase === "discard-only" ? "只收起这份候选" :
+              backupFlow.phase === "discarding" ? "正在收起候选" :
+              backupFlow.phase === "prepare-cleanup" ? "还有一点临时内容待收尾" :
+              backupFlow.phase === "cleaning" ? "正在收尾临时内容" :
+              backupFlow.phase === "refresh-only" ? "备份已经启用" : backupFlow.title}
+          </h4>
+        </div>
+      </header>
+      {backupFlow.phase === "preparing" && <><p>{backupPrepareStopping ? "正在安全结束核对。如果候选已经开始建立，会保留同一次继续信息，不会悄悄丢下它。" : <>正在判断“{backupFlow.fileName}”是什么，并建立独立候选。核对完成前，当前职迹不会切换。</>}</p><footer><button className="career-button ghost" disabled={backupPrepareStopping} onClick={stopBackupPreparation}>{backupPrepareStopping ? "正在停止…" : "停止核对"}</button></footer></>}
+      {backupFlow.phase === "checking" && <p>{backupFlow.text}</p>}
+      {backupFlow.phase === "review" && <>
+        {backupFlow.message && <p>{backupFlow.message}</p>}
+        {renderBackupSummary(backupFlow.receipt.summary)}
+        {backupFlow.receipt.summary.kind === "legacy-career-sqlite" && <p className="career-backup-calm-note">旧版数据库不带材料原件；启用后会清空旧附件索引，避免显示并不存在的原件。</p>}
+        <p className="career-backup-calm-note">当前职迹此刻还没有改变。只有你选择“启用这份备份”后，才会切换。</p>
+        <footer><button className="career-button ghost" onClick={() => void discardCandidate(backupFlow.receipt)}>暂不使用</button><button className="career-button primary" data-backup-initial onClick={() => void activateCandidate(backupFlow.receipt)}>启用这份备份</button></footer>
+      </>}
+      {backupFlow.phase === "activating" && <p>候选已经通过核对。这里只执行一次版本切换，完成后再单独刷新页面资料。</p>}
+      {backupFlow.phase === "activation-check" && <><p>{backupFlow.message}</p><footer><button className="career-button primary" onClick={() => { const entry: CareerBackupRecoveryEntry = { storageKey: careerBackupRecoveryStorageKey(candidateTicket(backupFlow.receipt, "activation-check")), ticket: candidateTicket(backupFlow.receipt, "activation-check"), persisted: true }; void inspectCandidate(entry); }}>只核对当前版本</button></footer></>}
+      {backupFlow.phase === "discard-only" && <><p>{backupFlow.message}</p><footer><button className="career-button secondary" onClick={() => void discardCandidate(backupFlow.receipt)}>继续收尾</button></footer></>}
+      {backupFlow.phase === "discarding" && <p>只处理未启用的候选与它的临时附件，不会改动当前职迹。</p>}
+      {backupFlow.phase === "prepare-cleanup" && <><p>{backupFlow.message}</p><footer><button className="career-button secondary" onClick={() => void cleanPreparedAttachments(backupFlow.receipt)}>继续收尾</button></footer></>}
+      {backupFlow.phase === "cleaning" && <p>只重试这次准备留下的临时附件，不会重新导入或启用。</p>}
+      {backupFlow.phase === "refresh-only" && <><p>{backupFlow.message}</p><footer><button className="career-button primary" onClick={() => void finishBackupRefresh(backupFlow.receipt, backupFlow.message)}>重新读取页面资料</button></footer></>}
+      {backupFlow.phase === "error" && <><p>{backupFlow.message}</p>{activeBackupRecovery && backupRecoveryUnreadableKeys.length === 0 && <footer><button className="career-button secondary" onClick={() => void continueActiveRecovery()}>继续核对</button></footer>}</>}
+    </section>;
+  };
+
+  return <div className="career-view">
+    <SectionHeading eyebrow="PREFERENCES" title="设置" description="隐私、流程与数据，都由你掌控" />
+    <div className="career-settings-layout">
+      <nav><a href="#workflow">求职流程</a><a href="#privacy">AI 与隐私</a><a href="#data">数据与备份</a><a href="#capture">浏览器采集器</a></nav>
+      <div>
+        <section className="career-settings-card" id="workflow"><header><div><h3>看板阶段</h3><p>按你的求职习惯调整名称，工作台会保持一致。</p></div></header><div className="career-stage-settings">{data.stages.map((stage) => <label key={stage.id}><i style={{ background: stage.color }} /><input defaultValue={stage.name} onBlur={(event) => void rename(stage, event.target.value)} aria-label={`${stage.name}阶段名称`} /><span>{savingStage === stage.id ? <LoaderCircle className="spin" size={14} /> : stage.is_terminal ? "终态" : "进行中"}</span></label>)}</div></section>
+        <section className="career-settings-card" id="privacy"><header><div><h3>AI 与隐私</h3><p>只有你主动使用 AI 时，所选内容才会发送至配置的服务。</p></div><span className={aiHealth.status === "configured" ? "career-status-good" : "career-status-neutral"} aria-live="polite"><i />{aiStatusLabel}</span></header><div className="career-setting-row"><span><b>当前模型</b><small>由服务器环境安全配置</small></span><code>{aiHealth.model || "DeepSeek"}</code></div><div className="career-setting-row"><span><b>结果保留方式</b><small>关闭预览不会自动保存，也不会留下隐藏副本</small></span><code>核对后复制或填入草稿</code></div><div className="career-privacy-note"><ShieldCheck size={18} /><p>API 密钥不会进入浏览器、本地数据库或备份。职位描述和面试笔记会被当作不可信数据处理。</p></div></section>
+        <section className="career-settings-card career-backup-card" id="data">
+          <header><div><h3>数据与备份</h3><p>一个文件带走结构化职迹与已关联的材料原件。</p></div></header>
+          <div className="career-data-actions">
+            <button disabled={exportBusy || backupWriteLocked} onClick={() => void exportBackup()}><span>{exportBusy ? <LoaderCircle className="spin" size={19} /> : <Download size={19} />}</span><div><b>{exportBusy ? "正在校验并打包…" : "导出完整备份"}</b><small>SQLite、简历、作品集与案例附件</small></div><ChevronRight size={17} /></button>
+            <button ref={backupPickerButtonRef} type="button" disabled={backupWriteLocked || exportBusy} onClick={() => backupFileInputRef.current?.click()}><span>{backupFlow.phase === "preparing" ? <LoaderCircle className="spin" size={19} /> : <Upload size={19} />}</span><div><b>选择备份并核对</b><small>先识别与验证，确认前不会切换</small></div><ChevronRight size={17} /></button>
+            <input ref={backupFileInputRef} hidden aria-label="选择要核对的职迹备份" disabled={backupWriteLocked || exportBusy} type="file" accept=".career-backup,.sqlite,.sqlite3,.db,application/x-sqlite3,application/octet-stream" onChange={(event) => { const file = event.target.files?.[0]; event.currentTarget.value = ""; if (file) void prepareSelectedBackup(file); }} />
+          </div>
+          {!backupRecoveryLoaded && <p className="career-backup-quiet-status" role="status"><LoaderCircle className="spin" size={15} />正在查看是否有上次未完成的核对</p>}
+          {backupRecoveryEntries.length > 1 && <p className="career-backup-quiet-status" role="status"><ShieldCheck size={15} />还有 {backupRecoveryEntries.length} 次独立恢复需要依次确认；每次只处理自己的候选。</p>}
+          {backupFlow.phase === "idle" && activeBackupRecovery && <div className="career-backup-warning" role="status"><ShieldCheck size={18} /><div><b>有一次恢复等待继续</b><p>它可能来自上次打开或另一个标签页。先由你决定何时继续，页面不会突然抢走焦点。</p></div><button className="career-button secondary" onClick={() => void continueActiveRecovery()}>继续这次核对</button></div>}
+          {backupRecoveryUnreadableKeys.length > 0 && <div className="career-backup-warning" role="alert"><ShieldCheck size={18} /><div><b>有一条继续提醒无法读取</b><p>没有调用恢复或清理。可以保留本机候选，只清除这条提醒。</p></div><button className="career-button ghost" onClick={clearUnreadableBackupRecovery}>保留本机候选并清除提醒</button></div>}
+          {backupStorageNeedsAttention && <div className="career-backup-warning" role="status"><ShieldCheck size={18} /><div><b>继续信息暂时只在这个页面里</b><p>先不要关闭页面。恢复浏览器存储后，才能安全开始新的核对。</p></div><button className="career-button ghost" onClick={retryBackupRecoveryStorage}>重试保存继续信息</button></div>}
+          {renderBackupFlow()}
+          <p className="career-settings-footnote">完整备份是明文文件，请安全保管；导出前会校验每个附件。恢复分成“核对”和“启用”两步。旧版 SQLite 不包含附件原件。</p>
+        </section>
+        <section className="career-settings-card" id="capture"><header><div><h3>浏览器采集器</h3><p>把当前 URL 与你明确选中的 JD 文本带回当前这一个职迹地址，不读取整页正文。</p></div></header><div className="career-capture-steps"><span><b>1</b>在当前职迹复制采集器</span><ArrowRight size={16} /><span><b>2</b>新建书签并粘贴到网址</span><ArrowRight size={16} /><span><b>3</b>选中 JD 后点击书签</span></div><button className="career-button secondary" onClick={() => void copyHelper()}><Command size={16} />复制当前地址的采集器</button><p className="career-settings-footnote">采集器会回到复制它时的职迹地址，并且仅附带来源 URL 与选中文字；不包含 Cookie、登录态或站内消息，也不会自动投递。</p></section>
+      </div>
+    </div>
+  </div>;
 }
 
 function Drawer({ label, children, onClose, wide = false }: { label: string; children: ReactNode; onClose: () => void; wide?: boolean }) {
