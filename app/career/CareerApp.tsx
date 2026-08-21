@@ -30,14 +30,24 @@ import {
   loadCareerData, newId, runCareerBatch, runCareerSql,
 } from "@/lib/career/db";
 import {
-  archiveCareerContact,
-  createCareerContact,
+  archiveCareerContactSafely,
+  createCareerContactSafely,
+  createCareerContactTaskSafely,
+  inspectCareerContactWrite,
   loadCareerContactDetail,
+  loadCareerContactExpectedState,
   loadCareerContacts,
-  recordCareerContactInteraction,
-  restoreCareerContact,
-  updateCareerContact,
+  recordCareerContactInteractionSafely,
+  restoreCareerContactSafely,
+  updateCareerContactSafely,
+  CareerContactMutationError,
   type CareerContactDetail,
+  type CareerContactExpectedState,
+  type CareerContactWriteInspection,
+  type CareerContactWriteReceipt,
+  type CreateCareerContactSafeInput,
+  type CreateCareerContactTaskSafeInput,
+  type RecordCareerContactInteractionSafeInput,
 } from "@/lib/career/contacts";
 import {
   CareerActivationUncertainError,
@@ -118,7 +128,7 @@ import {
   type CareerMaterialDeletionReceipt,
   type CareerMaterialDeletionState,
 } from "@/lib/career/materials";
-import { subscribeToCareerGenerationChanges } from "@/lib/career/lock";
+import { subscribeToCareerDataChanges, subscribeToCareerGenerationChanges } from "@/lib/career/lock";
 import { createLocalFileObjectUrl } from "@/lib/local-db/files";
 import type {
   AiAction, CareerData, CareerView, Contact, Interview, InterviewQuestion,
@@ -877,6 +887,14 @@ function useDialogA11y(onClose: () => void, inertToasts = false) {
   return dialogRef;
 }
 
+type CareerContactUndoState = Readonly<{
+  id: string;
+  name: string;
+  expected: CareerContactExpectedState;
+  phase: "ready" | "writing" | "refresh-only";
+  message: string;
+}>;
+
 export default function CareerApp() {
   const careerClock = useCareerClock();
   const mobileLayout = useCareerMobileLayout();
@@ -913,7 +931,8 @@ export default function CareerApp() {
   const [contactEditorId, setContactEditorId] = useState<string | null | undefined>(undefined);
   const [contactAction, setContactAction] = useState<{ kind: "interaction" | "task"; contactId: string } | null>(null);
   const [contactRevision, setContactRevision] = useState(0);
-  const [contactUndo, setContactUndo] = useState<{ id: string; name: string } | null>(null);
+  const [contactUndo, setContactUndo] = useState<CareerContactUndoState | null>(null);
+  const [contactDataHint, setContactDataHint] = useState("");
   const [activeDragId, setActiveDragId] = useState<string | null>(null);
   const [notices, setNotices] = useState<Notice[]>([]);
   const [undo, setUndo] = useState<{ jobId: string; from: string; to: string } | null>(null);
@@ -938,6 +957,8 @@ export default function CareerApp() {
   const materialModalFocusPendingRef = useRef(false);
   const materialStaleFocusPendingRef = useRef(false);
   const materialRefreshRef = useRef(false);
+  const contactUndoWriteRef = useRef(false);
+  const contactRemovalFocusRef = useRef<HTMLElement | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
 
   const materialSaveRecoveryEntries = useMemo<CareerMaterialSaveRecoveryEntry[]>(() => {
@@ -1013,6 +1034,7 @@ export default function CareerApp() {
   const refreshContacts = useCallback(async () => {
     await requireRefresh();
     setContactRevision((current) => current + 1);
+    setContactDataHint("");
   }, [requireRefresh]);
   const refreshTasks = useCallback(async () => {
     await requireRefresh();
@@ -1115,11 +1137,47 @@ export default function CareerApp() {
 
   useEffect(() => subscribeToCareerGenerationChanges(() => window.location.reload()), []);
 
+  useEffect(() => subscribeToCareerDataChanges((reason) => {
+    if (!reason.startsWith("career-contact")) return;
+    if (contactEditorId !== undefined || contactAction) {
+      setContactDataHint("联系人资料刚在另一个页面发生了变化。当前输入没有被替换；保存时会先核对版本。");
+      return;
+    }
+    if (view === "contacts" || selectedContactId || contactUndo) {
+      void refreshContacts().catch(() => {
+        setContactDataHint("另一个页面更新了联系人，但这里暂时没有重新读到。现有画面没有被当成最新版本。");
+      });
+    }
+  }), [contactAction, contactEditorId, contactUndo, refreshContacts, selectedContactId, view]);
+
   useEffect(() => {
-    if (!contactUndo) return;
+    function refreshVisibleContactsOnFocus() {
+      if (contactEditorId !== undefined || contactAction) return;
+      if (view !== "contacts" && !selectedContactId && !contactUndo) return;
+      void refreshContacts().catch(() => {
+        setContactDataHint("回到页面后暂时没有重新读到联系人资料；现有画面没有被当成最新版本。");
+      });
+    }
+    window.addEventListener("focus", refreshVisibleContactsOnFocus);
+    return () => window.removeEventListener("focus", refreshVisibleContactsOnFocus);
+  }, [contactAction, contactEditorId, contactUndo, refreshContacts, selectedContactId, view]);
+
+  useEffect(() => {
+    if (!contactUndo || contactUndo.phase !== "ready") return;
     const timer = window.setTimeout(() => setContactUndo(null), 6_000);
     return () => window.clearTimeout(timer);
   }, [contactUndo]);
+
+  useEffect(() => {
+    if (selectedContactId || !contactRemovalFocusRef.current) return;
+    const target = contactRemovalFocusRef.current;
+    contactRemovalFocusRef.current = null;
+    const frame = window.requestAnimationFrame(() => {
+      if (target.isConnected) target.focus({ preventScroll: true });
+      else document.querySelector<HTMLElement>(".career-segmented button[aria-pressed='true'], #career-page-title")?.focus({ preventScroll: true });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [selectedContactId, contactRevision]);
 
   useEffect(() => {
     if (!sidebarOpen || !window.matchMedia("(max-width: 760px)").matches) return;
@@ -1568,6 +1626,66 @@ export default function CareerApp() {
     }
   }
 
+  function rememberContactRemovalFocus(contactId: string) {
+    const buttons = Array.from(document.querySelectorAll<HTMLButtonElement>(".career-contact-open"));
+    const index = buttons.findIndex((button) => button.dataset.contactId === contactId);
+    contactRemovalFocusRef.current = buttons[index + 1] ?? buttons[index - 1] ??
+      document.querySelector<HTMLElement>(".career-segmented button[aria-pressed='true']");
+  }
+
+  async function handleContactUndo() {
+    const ticket = contactUndo;
+    if (!ticket || contactUndoWriteRef.current) return;
+    contactUndoWriteRef.current = true;
+    if (ticket.phase === "refresh-only") {
+      setContactUndo({ ...ticket, phase: "writing", message: "正在只读核对联系人状态…" });
+      try {
+        await refreshContacts();
+        const latest = await loadCareerContactExpectedState(ticket.id);
+        if (!latest || !latest.expectedArchived) {
+          setContactUndo(null);
+          notify(latest ? `已确认恢复「${ticket.name}」` : `「${ticket.name}」已在别处变化`, "info");
+        } else {
+          setContactUndo({ ...ticket, phase: "refresh-only", message: "仍无法确认恢复结果；再次核对只会读取，不会重复恢复。" });
+        }
+      } catch {
+        setContactUndo({ ...ticket, phase: "refresh-only", message: "暂时没有读到最新状态；再次核对不会重复恢复。" });
+      } finally { contactUndoWriteRef.current = false; }
+      return;
+    }
+    setContactUndo({ ...ticket, phase: "writing", message: "正在恢复联系人…" });
+    try {
+      const result = await restoreCareerContactSafely(ticket.id, ticket.expected);
+      if (result.outcome === "saved" || result.outcome === "already_saved") {
+        setContactUndo({ ...ticket, phase: "refresh-only", message: "恢复写入已结束，正在只读刷新…" });
+        try {
+          await refreshContacts();
+          setContactUndo(null);
+          notify(`已恢复「${ticket.name}」`, "info");
+        } catch {
+          setContactUndo({ ...ticket, phase: "refresh-only", message: "联系人已恢复，但画面还没有重新读到；这里只会继续核对。" });
+        }
+      } else if (result.outcome === "changed") {
+        setContactUndo({ ...ticket, phase: "refresh-only", message: "联系人已在别处变化。旧恢复命令已停止；这里只会重新读取。" });
+        try {
+          await refreshContacts();
+          setContactUndo(null);
+          notify(`「${ticket.name}」已在别处变化，没有依据旧状态恢复`, "info");
+        } catch { /* The refresh-only ticket remains visible and cannot write again. */ }
+      } else {
+        setContactUndo({ ...ticket, phase: "refresh-only", message: "恢复结果暂时无法确认；接下来只核对，不会重复恢复。" });
+      }
+    } catch (error) {
+      if (error instanceof CareerContactMutationError && error.code === "changed") {
+        try { await refreshContacts(); } catch { /* The stale command still stays stopped. */ }
+        setContactUndo(null);
+        notify(`「${ticket.name}」已在别处变化，没有覆盖新状态`, "info");
+      } else {
+        setContactUndo({ ...ticket, phase: "ready", message: error instanceof Error ? error.message : "这次没有恢复，归档状态保持不变。" });
+      }
+    } finally { contactUndoWriteRef.current = false; }
+  }
+
   function navigate(next: CareerView) {
     setView(next);
     setSidebarOpen(false);
@@ -1602,7 +1720,7 @@ export default function CareerApp() {
         {view === "jobs" && <JobsView data={scopedData} jobs={scopedJobs} now={careerClock} scope={jobScope} scopeLoading={scopeLoading} scopeError={scopeError} stageFilter={stageFilter} sourceFilter={sourceFilter} priorityOnly={priorityOnly} onScope={(scope) => { void changeJobScope(scope); }} onStageFilter={setStageFilter} onSourceFilter={setSourceFilter} onPriorityOnly={setPriorityOnly} onSelectJob={setSelectedJobId} onImport={openCareerImport} />}
         {view === "calendar" && <CalendarView data={allData} now={careerClock} onOpenTask={openTask} onCompleteTask={completeTask} onAddTask={() => setModal("task")} onAddInterview={() => setModal("interview")} onSelectInterview={setSelectedInterviewId} />}
         {view === "interviews" && <InterviewsView data={data} now={careerClock} onAdd={() => setModal("interview")} onSelect={setSelectedInterviewId} onAi={runAi} />}
-        {view === "contacts" && <ContactsView data={data} now={careerClock} revision={contactRevision} onAdd={() => setContactEditorId(null)} onSelect={setSelectedContactId} />}
+        {view === "contacts" && <ContactsView data={data} now={careerClock} revision={contactRevision} externalHint={contactDataHint} onAdd={() => setContactEditorId(null)} onSelect={(contactId) => setSelectedContactId(contactId)} />}
         {view === "materials" && <MaterialsView
           data={data}
           stale={materialListStale}
@@ -1661,17 +1779,17 @@ export default function CareerApp() {
       onAddTask={() => setContactAction({ kind: "task", contactId: selectedContactId })}
       onOpenTask={openTask}
       onCompleteTask={completeTask}
-      onArchive={async (contact) => {
-        await archiveCareerContact(contact.id);
+      onRefresh={refreshContacts}
+      externalHint={contactDataHint}
+      onArchived={(contact, expected) => {
+        rememberContactRemovalFocus(contact.id);
         setSelectedContactId(null);
-        setContactUndo({ id: contact.id, name: contact.name });
-        await refreshContacts();
+        setContactUndo({ id: contact.id, name: contact.name, expected, phase: "ready", message: "联系人已归档" });
         notify("联系人已移入归档；历史、关联与待办都保留", "info");
       }}
-      onRestore={async (contact) => {
-        await restoreCareerContact(contact.id);
+      onRestored={(contact) => {
+        rememberContactRemovalFocus(contact.id);
         setSelectedContactId(null);
-        await refreshContacts();
         notify("联系人已恢复", "info");
       }}
       notify={notify}
@@ -1696,33 +1814,39 @@ export default function CareerApp() {
     {contactEditorId !== undefined && <ContactModal
       contactId={contactEditorId}
       data={data}
+      externalHint={contactDataHint}
       onClose={() => setContactEditorId(undefined)}
-      onSaved={async (id) => {
+      onRefresh={refreshContacts}
+      onSaved={(id) => {
         setContactEditorId(undefined);
-        await refreshContacts();
         setSelectedContactId(id);
         notify(contactEditorId ? "联系人资料已更新" : "联系人已保存");
       }}
+      notify={notify}
     />}
     {contactAction?.kind === "interaction" && <ContactInteractionModal
       contactId={contactAction.contactId}
       data={data}
+      externalHint={contactDataHint}
       onClose={() => setContactAction(null)}
-      onSaved={async () => {
+      onRefresh={refreshContacts}
+      onSaved={() => {
         setContactAction(null);
-        await refreshContacts();
         notify("真实联系已记录");
       }}
+      notify={notify}
     />}
     {contactAction?.kind === "task" && <ContactTaskModal
       contactId={contactAction.contactId}
       data={data}
+      externalHint={contactDataHint}
       onClose={() => setContactAction(null)}
-      onSaved={async () => {
-        await refreshTasks();
+      onRefresh={refreshTasks}
+      onSaved={() => {
         setContactAction(null);
         notify("下一步已安排");
       }}
+      notify={notify}
     />}
     {taskSheet && <TaskDetailSheet
       key={taskSheet.nonce}
@@ -1748,7 +1872,7 @@ export default function CareerApp() {
       } : undefined}
       applyLabel={aiState.applyLabel}
     />}
-    <div className="career-toast-stack" aria-live="polite">{contactUndo && <button className="career-toast undo" onClick={async () => { await restoreCareerContact(contactUndo.id); setContactUndo(null); await refreshContacts(); notify(`已恢复「${contactUndo.name}」`, "info"); }} aria-label={`撤销归档「${contactUndo.name}」`}><RotateCcw size={16} />联系人已归档 <b>撤销</b></button>}{undo && <button className="career-toast undo" onClick={handleUndo}><RotateCcw size={16} />阶段已更新 <b>撤销</b></button>}{notices.map((notice) => <div className={`career-toast ${notice.tone}`} key={notice.id}>{notice.tone === "success" ? <Check size={16} /> : notice.tone === "error" ? <X size={16} /> : <Bell size={16} />}{notice.text}</div>)}</div>
+    <div className="career-toast-stack" aria-live="polite">{contactUndo && <button className="career-toast undo career-contact-undo" disabled={contactUndo.phase === "writing"} onClick={() => void handleContactUndo()} aria-label={contactUndo.phase === "refresh-only" ? `核对恢复「${contactUndo.name}」` : `撤销归档「${contactUndo.name}」`}>{contactUndo.phase === "writing" ? <LoaderCircle className="spin" size={16} /> : <RotateCcw size={16} />}<span>{contactUndo.message}</span> <b>{contactUndo.phase === "refresh-only" ? "只读核对" : contactUndo.phase === "writing" ? "请稍候" : "撤销"}</b></button>}{undo && <button className="career-toast undo" onClick={handleUndo}><RotateCcw size={16} />阶段已更新 <b>撤销</b></button>}{notices.map((notice) => <div className={`career-toast ${notice.tone}`} key={notice.id}>{notice.tone === "success" ? <Check size={16} /> : notice.tone === "error" ? <X size={16} /> : <Bell size={16} />}{notice.text}</div>)}</div>
   </main>;
 }
 
@@ -1956,7 +2080,7 @@ function InterviewsView({ data, now, onAdd, onSelect, onAi }: { data: CareerData
   </div>;
 }
 
-function ContactsView({ data, now, revision, onAdd, onSelect }: { data: CareerData; now: number; revision: number; onAdd: () => void; onSelect: (contactId: string) => void }) {
+function ContactsView({ data, now, revision, externalHint, onAdd, onSelect }: { data: CareerData; now: number; revision: number; externalHint: string; onAdd: () => void; onSelect: (contactId: string, opener: HTMLButtonElement) => void }) {
   const [scope, setScope] = useState<"active" | "archived">("active");
   const [archived, setArchived] = useState<Contact[]>([]);
   const [details, setDetails] = useState<Record<string, CareerContactDetail>>({});
@@ -1981,15 +2105,15 @@ function ContactsView({ data, now, revision, onAdd, onSelect }: { data: CareerDa
     return () => { live = false; };
   }, [data.contacts, readRevision, revision, scope]);
 
-  return <div className="career-view"><SectionHeading eyebrow="RELATIONSHIPS" title="联系人" description="只记录真实发生的沟通，以及你愿意安排的下一步" action={<button className="career-button primary" onClick={onAdd}><Plus size={16} />添加联系人</button>} /><div className="career-segmented" aria-label="联系人范围"><button className={scope === "active" ? "active" : ""} aria-pressed={scope === "active"} onClick={() => { if (scope !== "active") { setLoading(true); setScope("active"); } }}>联系人</button><button className={scope === "archived" ? "active" : ""} aria-pressed={scope === "archived"} onClick={() => { if (scope !== "archived") { setLoading(true); setScope("archived"); } }}>已归档</button></div>{readError && <div className="career-scope-error" role="alert"><ShieldCheck size={17} /><span>{readError}</span><button onClick={() => { setLoading(true); setReadRevision((current) => current + 1); }}>重新读取</button></div>}{loading && contacts.length === 0 ? <div className="career-contact-loading"><LoaderCircle className="spin" size={18} />正在打开联系人…</div> : <div className="career-contact-grid">{contacts.map((contact) => {
+  return <div className="career-view"><SectionHeading eyebrow="RELATIONSHIPS" title="联系人" description="只记录真实发生的沟通，以及你愿意安排的下一步" action={<button className="career-button primary" onClick={onAdd}><Plus size={16} />添加联系人</button>} /><div className="career-segmented" aria-label="联系人范围"><button className={scope === "active" ? "active" : ""} aria-pressed={scope === "active"} onClick={() => { if (scope !== "active") { setLoading(true); setScope("active"); } }}>联系人</button><button className={scope === "archived" ? "active" : ""} aria-pressed={scope === "archived"} onClick={() => { if (scope !== "archived") { setLoading(true); setScope("archived"); } }}>已归档</button></div>{externalHint && <div className="career-contact-external-hint" role="status"><ShieldCheck size={17} /><span>{externalHint}</span></div>}{readError && <div className="career-scope-error" role="alert"><ShieldCheck size={17} /><span>{readError}</span><button onClick={() => { setLoading(true); setReadRevision((current) => current + 1); }}>重新读取</button></div>}{loading && contacts.length === 0 ? <div className="career-contact-loading"><LoaderCircle className="spin" size={18} />正在打开联系人…</div> : <div className="career-contact-grid">{contacts.map((contact) => {
     const detail = details[contact.id];
     const latest = detail?.interactions[0];
     const next = detail?.tasks.filter((task) => task.status === "todo").sort((left, right) => (left.due_at ?? "9999").localeCompare(right.due_at ?? "9999"))[0];
     const jobs = detail?.jobs.slice(0, 2) ?? [];
     const detailFailed = detailErrors[contact.id];
     const identity = [contact.role, contact.company].filter(Boolean).join(" · ");
-    return <article className="career-contact-card" key={contact.id}><button className="career-contact-open" onClick={() => onSelect(contact.id)} aria-label={`打开联系人 ${contact.name}`}><header><span className="career-contact-avatar">{initials(contact.name)}</span><div><h3>{contact.name}</h3>{identity && <p>{identity}</p>}</div><ChevronRight size={18} /></header>{jobs.length > 0 && <div className="career-contact-jobs">{jobs.map((job) => <span key={job.id}>{job.company} · {job.role}</span>)}</div>}<div className="career-contact-truth">{detailFailed ? <><span><ContactRound size={14} />相关记录暂时没有读到</span><span><CalendarDays size={14} />没有把它当成“没有安排”</span></> : <><span><ContactRound size={14} />{latest ? `${formatDate(latest.occurred_at)} · ${latest.channel || "已记录沟通"}` : "等一次真实沟通"}</span><span><CalendarDays size={14} />{next ? `${formatCareerTaskDate(next.due_at, now)} · ${next.title}` : "没有安排下一步"}</span></>}</div></button></article>;
-  })}</div>}{!loading && contacts.length === 0 && <EmptyState icon={<UsersRound />} title={scope === "archived" ? "归档里很安静" : "还没有联系人"} text={scope === "archived" ? "移入归档的联系人会保留全部历史，也可以随时恢复。" : "不需要为了数量而添加。下一次真实认识某个人时，再把关系记下来。"} action={scope === "active" ? <button className="career-button primary" onClick={onAdd}>添加第一位联系人</button> : undefined} />}</div>;
+    return <article className="career-contact-card" key={contact.id}><button className="career-contact-open" data-contact-id={contact.id} onClick={(event) => onSelect(contact.id, event.currentTarget)} aria-label={`打开联系人 ${contact.name}`}><header><span className="career-contact-avatar">{initials(contact.name)}</span><div><h3>{contact.name}</h3>{identity && <p>{identity}</p>}</div><ChevronRight size={18} /></header>{jobs.length > 0 && <div className="career-contact-jobs">{jobs.map((job) => <span key={job.id}>{job.company} · {job.role}</span>)}</div>}<div className="career-contact-truth">{detailFailed ? <><span><ContactRound size={14} />相关记录暂时没有读到</span><span><CalendarDays size={14} />没有把它当成“没有安排”</span></> : <><span><ContactRound size={14} />{latest ? `${formatDate(latest.occurred_at)} · ${latest.channel || "已记录沟通"}` : "等一次真实沟通"}</span><span><CalendarDays size={14} />{next ? `${formatCareerTaskDate(next.due_at, now)} · ${next.title}` : "没有安排下一步"}</span></>}</div></button></article>;
+  })}</div>}{!loading && !readError && contacts.length === 0 && <EmptyState icon={<UsersRound />} title={scope === "archived" ? "归档里很安静" : "还没有联系人"} text={scope === "archived" ? "移入归档的联系人会保留全部历史，也可以随时恢复。" : "不需要为了数量而添加。下一次真实认识某个人时，再把关系记下来。"} action={scope === "active" ? <button className="career-button primary" onClick={onAdd}>添加第一位联系人</button> : undefined} />}</div>;
 }
 
 function careerMaterialStatusText(status: string) {
@@ -2675,9 +2799,9 @@ function SettingsView({ data, onRefresh, onExport, notify }: {
   </div>;
 }
 
-function Drawer({ label, children, onClose, wide = false }: { label: string; children: ReactNode; onClose: () => void; wide?: boolean }) {
-  const dialogRef = useDialogA11y(onClose);
-  return <div className="career-layer"><button className="career-modal-scrim" onClick={onClose} aria-label={`关闭${label}`} /><aside ref={dialogRef} tabIndex={-1} className={`career-drawer ${wide ? "wide" : ""}`} role="dialog" aria-modal="true" aria-label={label}>{children}</aside></div>;
+function Drawer({ label, children, onClose, wide = false, dismissible = true, inertToasts = false }: { label: string; children: ReactNode; onClose: () => void; wide?: boolean; dismissible?: boolean; inertToasts?: boolean }) {
+  const dialogRef = useDialogA11y(dismissible ? onClose : () => undefined, inertToasts);
+  return <div className="career-layer">{dismissible ? <button className="career-modal-scrim" onClick={onClose} aria-label={`关闭${label}`} /> : <div className="career-modal-scrim" aria-hidden="true" />}<aside ref={dialogRef} tabIndex={-1} className={`career-drawer ${wide ? "wide" : ""}`} role="dialog" aria-modal="true" aria-label={label}>{children}</aside></div>;
 }
 function Modal({ title, description, children, onClose, wide = false, dismissible = true, inertToasts = false }: { title: string; description?: string; children: ReactNode; onClose: () => void; wide?: boolean; dismissible?: boolean; inertToasts?: boolean }) {
   const dialogRef = useDialogA11y(dismissible ? onClose : () => undefined, inertToasts);
@@ -3269,25 +3393,99 @@ function InterviewDrawer({ interview, data, onClose, onRefresh, onAi, notify }: 
   </Drawer>{closePrompt && <Modal title="保留这次编辑吗？" description="这些修改还没有写入职迹的 SQLite 数据库。" onClose={() => setClosePrompt(false)}><div className="career-draft-choice"><p>你可以继续编辑、暂存在此浏览器，或明确放弃这次修改。</p><div><button type="button" className="career-button primary" data-dialog-initial onClick={() => setClosePrompt(false)}>继续编辑</button><button type="button" className="career-button secondary" onClick={saveLocalDraftAndClose}><FileArchive size={16} />保存本机草稿并关闭</button><button type="button" className="career-button danger" onClick={discardAndClose}><Trash2 size={16} />放弃修改</button></div><small><ShieldCheck size={14} />本机草稿只在当前设备与此浏览器的站点存储中，不进入 SQLite 或导出备份；清除站点数据会同时清除它。</small></div></Modal>}</>;
 }
 
-function ContactDrawer({ contactId, revision, now, onClose, onEdit, onRecord, onAddTask, onOpenTask, onCompleteTask, onArchive, onRestore, notify }: {
+type CareerContactCommandPhase = "editing" | "writing" | "uncertain" | "checking" | "refreshing" | "refresh-only" | "blocked";
+
+function careerContactInspectionDecision(inspection: CareerContactWriteInspection) {
+  if (inspection === "exact_saved") return "refresh" as const;
+  if (inspection === "absent") return "retry-same-command" as const;
+  if (inspection === "conflict") return "block" as const;
+  return "inspect-only" as const;
+}
+
+function careerContactExpectedState(detail: CareerContactDetail): CareerContactExpectedState {
+  return {
+    expectedUpdatedAt: detail.contact.updated_at,
+    expectedArchived: detail.contact.archived === 1,
+    expectedJobIds: detail.associations.map((association) => association.job_id),
+  };
+}
+
+function careerContactErrorText(error: unknown, fallback: string) {
+  if (error instanceof CareerContactMutationError) {
+    if (error.code === "changed") return "联系人刚在另一个页面发生了变化。没有依据旧资料继续写入。";
+    if (error.code === "conflict") return "这个操作标识已对应另一份内容。没有覆盖，也不会换一个标识重试。";
+    if (error.code === "inspect_failed") return "暂时无法核对当前资料，因此没有开始写入。";
+    if (error.code === "write_failed") return "已确认这次没有写入；表单内容和原操作标识仍保留。";
+  }
+  return error instanceof Error ? error.message : fallback;
+}
+
+function useCareerContactWorkProtection(protectedWork: boolean) {
+  useEffect(() => {
+    if (!protectedWork) return;
+    function protect(event: BeforeUnloadEvent) {
+      event.preventDefault();
+      event.returnValue = "";
+    }
+    window.addEventListener("beforeunload", protect);
+    return () => window.removeEventListener("beforeunload", protect);
+  }, [protectedWork]);
+}
+
+function useCareerContactPhaseFocus(phase: string, secondary: boolean) {
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const previousSecondaryRef = useRef(secondary);
+  useEffect(() => {
+    const returningToForm = previousSecondaryRef.current && !secondary;
+    previousSecondaryRef.current = secondary;
+    if ((phase === "editing" || phase === "ready") && !secondary && !returningToForm) return;
+    const frame = window.requestAnimationFrame(() => {
+      const root = rootRef.current;
+      if (!root) return;
+      const target = root.querySelector<HTMLElement>("[data-contact-safe-focus]:not([disabled])") ??
+        (returningToForm ? root.querySelector<HTMLElement>("input:not([disabled]), textarea:not([disabled]), select:not([disabled])") : null) ?? root;
+      target.focus({ preventScroll: true });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [phase, secondary]);
+  return rootRef;
+}
+
+function ContactWriteStatus({ icon, title, message, action }: { icon: "busy" | "safe"; title: string; message: string; action?: ReactNode }) {
+  return <div className="career-contact-write-status" role="status"><span>{icon === "busy" ? <LoaderCircle className="spin" size={23} /> : <ShieldCheck size={23} />}</span><h3>{title}</h3><p>{message}</p>{action && <div>{action}</div>}</div>;
+}
+
+function ContactDiscardPrompt({ noun, onKeep, onDiscard }: { noun: string; onKeep: () => void; onDiscard: () => void }) {
+  return <div className="career-contact-discard" role="status"><ShieldCheck size={23} /><h3>放下还没保存的{noun}？</h3><p>只有表单里的输入会被放下；已经保存的联系人资料不会改变。</p><div><button type="button" className="career-button primary" data-contact-safe-focus onClick={onKeep}>继续填写</button><button type="button" className="career-button ghost" onClick={onDiscard}>放下输入</button></div></div>;
+}
+
+function ContactDrawer({ contactId, revision, now, externalHint, onClose, onEdit, onRecord, onAddTask, onOpenTask, onCompleteTask, onRefresh, onArchived, onRestored, notify }: {
   contactId: string;
   revision: number;
   now: number;
+  externalHint: string;
   onClose: () => void;
   onEdit: () => void;
   onRecord: () => void;
   onAddTask: () => void;
   onOpenTask: (taskId: string) => void;
   onCompleteTask: (task: Task) => void | Promise<void>;
-  onArchive: (contact: Contact) => Promise<void>;
-  onRestore: (contact: Contact) => Promise<void>;
+  onRefresh: () => Promise<void>;
+  onArchived: (contact: Contact, expected: CareerContactExpectedState) => void;
+  onRestored: (contact: Contact) => void;
   notify: (text: string, tone?: Notice["tone"]) => void;
 }) {
   const [detail, setDetail] = useState<CareerContactDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [readError, setReadError] = useState("");
   const [readRevision, setReadRevision] = useState(0);
-  const [busy, setBusy] = useState(false);
+  const [phase, setPhase] = useState<"ready" | "confirm-archive" | "writing" | "refresh-only" | "refreshing">("ready");
+  const [message, setMessage] = useState("");
+  const writeRef = useRef(false);
+  const targetArchivedRef = useRef<boolean | null>(null);
+  const phaseRootRef = useCareerContactPhaseFocus(phase, false);
+  const locked = phase === "writing" || phase === "refreshing" || phase === "refresh-only";
+  useCareerContactWorkProtection(locked);
   useEffect(() => {
     let live = true;
     void loadCareerContactDetail(contactId).then((next) => { if (live) { setReadError(""); setDetail(next); } }).catch(() => {
@@ -3304,13 +3502,84 @@ function ContactDrawer({ contactId, revision, now, onClose, onEdit, onRecord, on
   const nextTask = openTasks[0];
   const archived = contact.archived === 1;
   const identity = [contact.role, contact.company].filter(Boolean).join(" · ");
-  async function changeArchive() {
-    if (!detail) return;
-    setBusy(true);
-    try { if (archived) await onRestore(detail.contact); else await onArchive(detail.contact); }
-    catch (error) { notify(error instanceof Error ? error.message : "联系人状态更新失败", "error"); setBusy(false); }
+
+  async function refreshArchiveResult() {
+    const targetArchived = targetArchivedRef.current;
+    if (targetArchived === null || writeRef.current) return;
+    writeRef.current = true;
+    setPhase("refreshing");
+    setMessage("");
+    try {
+      await onRefresh();
+      const latest = await loadCareerContactExpectedState(contactId);
+      if (!latest) {
+        onClose();
+        notify("联系人已在另一个页面移除；这里没有继续更改", "info");
+      } else if (latest.expectedArchived === targetArchived) {
+        if (targetArchived) onArchived(contact, latest);
+        else onRestored(contact);
+      } else {
+        setPhase("ready");
+        setMessage(targetArchived ? "已重新读到最新资料：联系人仍未归档，没有再次提交。" : "已重新读到最新资料：联系人仍在归档中，没有再次提交。");
+        setReadRevision((current) => current + 1);
+      }
+    } catch {
+      setPhase("refresh-only");
+      setMessage("状态写入结果还没有重新读到。这里只能继续刷新，不能重复归档或恢复。");
+    } finally { writeRef.current = false; }
   }
-  return <Drawer label={`${contact.name} · 联系人详情`} onClose={onClose} wide><div className="career-contact-drawer-head"><span className="career-contact-avatar large">{initials(contact.name)}</span><div><span>{archived ? "已归档联系人" : "联系人"}</span><h2>{contact.name}</h2>{identity && <p>{identity}</p>}</div><button className="career-icon-button" onClick={onClose} aria-label="关闭联系人详情"><X size={19} /></button></div><div className="career-contact-drawer-actions">{!archived && <button className="career-button primary" onClick={onRecord}><MessageSquareText size={16} />记录联系</button>}<button className="career-button secondary" onClick={onEdit}><Pencil size={15} />编辑</button></div>{readError && <div className="career-contact-read-warning" role="alert"><ShieldCheck size={16} /><span>相关记录暂时没有重新读到，画面保留上一次成功读取的内容。</span><button onClick={() => setReadRevision((current) => current + 1)}>重新读取</button></div>}<div className="career-drawer-body career-contact-detail"><section><header><div><span>NEXT STEP</span><h3>下一步</h3></div>{!archived && <button className="career-text-button" onClick={onAddTask}>{nextTask ? "再安排一步" : "安排下一步"}<ChevronRight size={14} /></button>}</header>{nextTask ? <CareerTaskRow compact task={nextTask} data={{ ...emptyData, jobs: detail.jobs, stages: [] }} now={now} onOpen={onOpenTask} onComplete={onCompleteTask} /> : <p className="career-contact-calm-copy">没有安排下一步。需要时再决定，不必为了填满而创建提醒。</p>}{contact.next_follow_up && openTasks.length === 0 && <p className="career-contact-legacy">旧版曾记录 {formatDate(contact.next_follow_up, true)} 的提醒，但没有自动转成待办。</p>}</section><section><header><div><span>CONTEXT</span><h3>关联职位</h3></div><button className="career-text-button" onClick={onEdit}>管理关联 <ChevronRight size={14} /></button></header>{detail.jobs.length > 0 ? <div className="career-contact-related-jobs">{detail.jobs.map((job) => <span key={job.id}><CompanyMark company={job.company} small /><b>{job.role}</b><small>{job.company}</small></span>)}</div> : <p className="career-contact-calm-copy">还没有关联职位。只有你明确选择后，这里才会建立关系。</p>}</section><section><header><div><span>HISTORY</span><h3>联系记录</h3></div>{!archived && <button className="career-text-button" onClick={onRecord}>记录一次 <Plus size={14} /></button>}</header>{detail.interactions.length > 0 ? <div className="career-contact-timeline">{detail.interactions.map((interaction) => <article key={interaction.id}><i /><div><header><b>{interaction.summary}</b><time>{formatDate(interaction.occurred_at, true)}</time></header><p>{interaction.channel || "未注明渠道"} · {interaction.direction === "outbound" ? "我发出" : interaction.direction === "inbound" ? "对方发来" : "双方交流"}{interaction.job_id ? ` · ${detail.jobs.find((job) => job.id === interaction.job_id)?.role ?? "关联职位"}` : ""}</p>{interaction.notes && <small>{interaction.notes}</small>}</div></article>)}</div> : <><p className="career-contact-calm-copy">还没有联系记录。不需要为了填满而补写；下次真实交流后再记。</p>{contact.last_contact_at && <p className="career-contact-legacy">旧版只保存了 {formatDate(contact.last_contact_at, true)} 这个时间，没有沟通内容，因此没有把它冒充成联系记录。</p>}</>}</section><section><header><div><span>CONTACT</span><h3>联系方式</h3></div></header><div className="career-contact-channels">{contact.email && <a href={`mailto:${contact.email}`}><ContactRound size={16} /><span><b>邮箱</b><small>{contact.email}</small></span><ExternalLink size={14} /></a>}{contact.phone && <a href={`tel:${contact.phone.replace(/[^+\d*#,;]/g, "")}`}><Phone size={16} /><span><b>电话</b><small>{contact.phone}</small></span><ExternalLink size={14} /></a>}{!contact.email && !contact.phone && <p className="career-contact-calm-copy">还没有保存邮箱或电话。</p>}</div>{contact.notes && <p className="career-contact-notes">{contact.notes}</p>}</section></div><footer className="career-drawer-footer"><button className={archived ? "career-button secondary" : "career-button ghost"} disabled={busy} onClick={() => void changeArchive()}>{archived ? <RotateCcw size={15} /> : <Archive size={15} />}{busy ? "正在保存…" : archived ? "恢复联系人" : "移入归档"}</button></footer></Drawer>;
+
+  async function changeArchive(targetArchived: boolean) {
+    if (!detail || writeRef.current) return;
+    writeRef.current = true;
+    targetArchivedRef.current = targetArchived;
+    setPhase("writing");
+    setMessage("");
+    const expected = careerContactExpectedState(detail);
+    try {
+      const result = targetArchived
+        ? await archiveCareerContactSafely(contactId, expected)
+        : await restoreCareerContactSafely(contactId, expected);
+      if (result.outcome === "changed") {
+        setPhase("refresh-only");
+        setMessage("联系人刚在另一个页面发生了变化。没有依据旧状态继续；接下来只重新读取。");
+      } else if (result.outcome === "outcome_uncertain") {
+        setPhase("refresh-only");
+        setMessage("本机是否完成状态更新暂时无法确认。接下来只重新读取，不会重复提交。");
+      } else {
+        writeRef.current = false;
+        await refreshArchiveResult();
+        return;
+      }
+    } catch (error) {
+      if (error instanceof CareerContactMutationError && error.code === "changed") {
+        setPhase("refresh-only");
+        setMessage("联系人刚在另一个页面发生了变化。没有覆盖新状态；接下来只重新读取。");
+      } else {
+        targetArchivedRef.current = null;
+        setPhase("ready");
+        setMessage(careerContactErrorText(error, "这次没有更新联系人状态，原记录仍保持不变。"));
+      }
+    } finally { writeRef.current = false; }
+  }
+  return <Drawer label={`${contact.name} · 联系人详情`} onClose={onClose} dismissible={!locked} inertToasts={locked} wide>
+    <div ref={phaseRootRef} className="career-contact-drawer-phase" tabIndex={-1}>
+      <div className="career-contact-drawer-head"><span className="career-contact-avatar large">{initials(contact.name)}</span><div><span>{archived ? "已归档联系人" : "联系人"}</span><h2>{contact.name}</h2>{identity && <p>{identity}</p>}</div>{!locked && <button className="career-icon-button" onClick={onClose} aria-label="关闭联系人详情"><X size={19} /></button>}</div>
+      {phase === "confirm-archive" ? <div className="career-contact-archive-confirm" role="status"><Archive size={23} /><h3>把这位联系人移入归档？</h3><p>只会把联系人从常用列表收起。联系历史和职位关联会保留；已经安排的待办仍会出现在“今日”和日历，不会被取消。</p><div><button className="career-button primary" data-contact-safe-focus onClick={() => setPhase("ready")}>继续保留</button><button className="career-button ghost" onClick={() => void changeArchive(true)}>确认移入归档</button></div></div> : phase === "writing" || phase === "refreshing" ? <ContactWriteStatus icon="busy" title={phase === "writing" ? "正在核对并保存" : "已经停止写入，正在重新读取"} message={phase === "writing" ? "会先核对联系人版本；这时不能关闭，以免失去结果。" : "这里只刷新画面，不会再次提交状态更改。"} /> : phase === "refresh-only" ? <ContactWriteStatus icon="safe" title="只重新读取联系人状态" message={message} action={<button className="career-button primary" data-contact-safe-focus onClick={() => void refreshArchiveResult()}><RotateCcw size={16} />只读核对</button>} /> : <>
+        <div className="career-contact-drawer-actions">{!archived && <button className="career-button primary" onClick={onRecord}><MessageSquareText size={16} />记录联系</button>}<button className="career-button secondary" onClick={onEdit}><Pencil size={15} />编辑</button></div>
+        {externalHint && <div className="career-contact-external-hint" role="status"><ShieldCheck size={16} /><span>{externalHint}</span></div>}
+        {message && <div className="career-contact-read-warning" role="status"><ShieldCheck size={16} /><span>{message}</span></div>}
+        {readError && <div className="career-contact-read-warning" role="alert"><ShieldCheck size={16} /><span>相关记录暂时没有重新读到，画面保留上一次成功读取的内容。</span><button onClick={() => setReadRevision((current) => current + 1)}>重新读取</button></div>}
+        <div className="career-drawer-body career-contact-detail">
+          <section><header><div><span>NEXT STEP</span><h3>下一步</h3></div>{!archived && <button className="career-text-button" onClick={onAddTask}>{nextTask ? "再安排一步" : "安排下一步"}<ChevronRight size={14} /></button>}</header>{nextTask ? <CareerTaskRow compact task={nextTask} data={{ ...emptyData, jobs: detail.jobs, stages: [] }} now={now} onOpen={onOpenTask} onComplete={onCompleteTask} /> : <p className="career-contact-calm-copy">没有安排下一步。需要时再决定，不必为了填满而创建提醒。</p>}</section>
+          <section><header><div><span>CONTEXT</span><h3>关联职位</h3></div><button className="career-text-button" onClick={onEdit}>管理关联 <ChevronRight size={14} /></button></header>{detail.jobs.length > 0 ? <div className="career-contact-related-jobs">{detail.jobs.map((job) => <span key={job.id}><CompanyMark company={job.company} small /><b>{job.role}</b><small>{job.company}</small></span>)}</div> : <p className="career-contact-calm-copy">还没有关联职位。只有你明确选择后，这里才会建立关系。</p>}</section>
+          <section><header><div><span>HISTORY</span><h3>联系记录</h3></div>{!archived && <button className="career-text-button" onClick={onRecord}>记录一次 <Plus size={14} /></button>}</header>{detail.interactions.length > 0 ? <div className="career-contact-timeline">{detail.interactions.map((interaction) => <article key={interaction.id}><i /><div><header><b>{interaction.summary}</b><time>{formatDate(interaction.occurred_at, true)}</time></header><p>{interaction.channel || "未注明渠道"} · {interaction.direction === "outbound" ? "我发出" : interaction.direction === "inbound" ? "对方发来" : "双方交流"}{interaction.job_id ? ` · ${detail.jobs.find((job) => job.id === interaction.job_id)?.role ?? "关联职位"}` : ""}</p>{interaction.notes && <small>{interaction.notes}</small>}</div></article>)}</div> : <p className="career-contact-calm-copy">还没有联系记录。不需要为了填满而补写；下次真实交流后再记。</p>}</section>
+          <section><header><div><span>CONTACT</span><h3>联系方式</h3></div></header><div className="career-contact-channels">{contact.email && <a href={`mailto:${contact.email}`}><ContactRound size={16} /><span><b>邮箱</b><small>{contact.email}</small></span><ExternalLink size={14} /></a>}{contact.phone && <a href={`tel:${contact.phone.replace(/[^+\d*#,;]/g, "")}`}><Phone size={16} /><span><b>电话</b><small>{contact.phone}</small></span><ExternalLink size={14} /></a>}{!contact.email && !contact.phone && <p className="career-contact-calm-copy">还没有保存邮箱或电话。</p>}</div>{contact.notes && <p className="career-contact-notes">{contact.notes}</p>}</section>
+        </div>
+        <footer className="career-drawer-footer"><button className={archived ? "career-button secondary" : "career-button ghost"} onClick={() => archived ? void changeArchive(false) : setPhase("confirm-archive")}>{archived ? <RotateCcw size={15} /> : <Archive size={15} />}{archived ? "恢复联系人" : "移入归档"}</button></footer>
+      </>}
+    </div>
+  </Drawer>;
 }
 
 function JobModal({ data, onClose, onSaved }: { data: CareerData; onClose: () => void; onSaved: (id: string) => Promise<void> }) {
@@ -3391,22 +3660,102 @@ function InterviewModal({ data, onClose, onSaved }: { data: CareerData; onClose:
   return <Modal title="安排面试轮次" description="时间、面试官和会议入口都放在一起。" onClose={saving ? () => undefined : onClose}><form className="career-form" onSubmit={submit}><Field label="关联职位"><select required name="job_id" defaultValue=""><option value="" disabled>选择职位</option>{availableJobs.map((job) => <option key={job.id} value={job.id}>{job.company} · {job.role}</option>)}</select></Field><div className="career-form-row"><Field label="轮次名称"><input name="round_name" required placeholder="技术二面" /></Field><Field label="形式"><select name="interview_type"><option>视频面试</option><option>电话沟通</option><option>现场面试</option><option>笔试复盘</option></select></Field></div><div className="career-form-row"><Field label="时间"><input name="scheduled_at" type="datetime-local" required /></Field><Field label="时长"><select name="duration" defaultValue="45"><option value="30">30 分钟</option><option value="45">45 分钟</option><option value="60">60 分钟</option><option value="90">90 分钟</option></select></Field></div><Field label="面试官"><input name="interviewer" placeholder="姓名 · 职位" /></Field><Field label="会议链接"><input name="meeting_url" type="url" placeholder="https://" /></Field>{error && <div className="career-inline-error" role="alert"><X size={15} />{error}</div>}<div className="career-form-actions"><button type="button" className="career-button ghost" disabled={saving} onClick={onClose}>取消</button><button className="career-button primary" disabled={saving}>{saving ? <LoaderCircle className="spin" size={16} /> : <CalendarDays size={16} />}{saving ? "正在保存…" : "保存日程"}</button></div></form></Modal>;
 }
 
-function ContactModal({ contactId, data, onClose, onSaved }: { contactId: string | null; data: CareerData; onClose: () => void; onSaved: (contactId: string) => Promise<void> }) {
+function ContactModal({ contactId, data, externalHint, onClose, onRefresh, onSaved, notify }: { contactId: string | null; data: CareerData; externalHint: string; onClose: () => void; onRefresh: () => Promise<void>; onSaved: (contactId: string) => void; notify: (text: string, tone?: Notice["tone"]) => void }) {
   const [detail, setDetail] = useState<CareerContactDetail | null>(null);
   const [loading, setLoading] = useState(Boolean(contactId));
-  const [saving, setSaving] = useState(false);
+  const [readError, setReadError] = useState("");
+  const [readRevision, setReadRevision] = useState(0);
+  const [phase, setPhase] = useState<CareerContactCommandPhase>("editing");
+  const [dirty, setDirty] = useState(false);
+  const [discardPrompt, setDiscardPrompt] = useState(false);
   const [error, setError] = useState("");
+  const [receipt, setReceipt] = useState<CareerContactWriteReceipt | null>(null);
+  const [stableContactId] = useState(() => newId("contact"));
+  const [stableCreatedAt] = useState(() => new Date().toISOString());
+  const commandRef = useRef<CreateCareerContactSafeInput | null>(null);
+  const writeRef = useRef(false);
+  const refreshOutcomeRef = useRef<"saved" | "changed">("saved");
+  const phaseRootRef = useCareerContactPhaseFocus(phase, discardPrompt);
+  const locked = phase === "writing" || phase === "checking" || phase === "refreshing" || phase === "refresh-only" || phase === "uncertain";
+  useCareerContactWorkProtection(dirty || locked);
   useEffect(() => {
     if (!contactId) return;
     let live = true;
-    void loadCareerContactDetail(contactId).then((next) => { if (live) setDetail(next); }).catch((caught) => {
-      if (live) setError(caught instanceof Error ? caught.message : "联系人资料无法打开");
+    void loadCareerContactDetail(contactId).then((next) => {
+      if (!live) return;
+      if (next) setDetail(next);
+      else setReadError("没有找到这位联系人。资料可能已在另一个页面发生变化。");
+    }).catch(() => {
+      if (live) setReadError("联系人资料暂时没有打开；这里没有把未知内容当成空表单。");
     }).finally(() => { if (live) setLoading(false); });
     return () => { live = false; };
-  }, [contactId]);
+  }, [contactId, readRevision]);
+  function retryRead() {
+    setLoading(true);
+    setReadError("");
+    setReadRevision((current) => current + 1);
+  }
+  function requestClose() {
+    if (locked) return;
+    if (dirty && phase === "editing") { setDiscardPrompt(true); return; }
+    onClose();
+  }
+  async function refreshOnly(id: string) {
+    if (writeRef.current) return;
+    writeRef.current = true;
+    setPhase("refreshing");
+    setError("");
+    try {
+      await onRefresh();
+      setDirty(false);
+      if (refreshOutcomeRef.current === "saved") onSaved(id);
+      else {
+        onClose();
+        notify("联系人资料已变化；没有覆盖新版本，已重新读取", "info");
+      }
+    } catch {
+      setPhase("refresh-only");
+      setError(refreshOutcomeRef.current === "saved"
+        ? "联系人已保存在本机，但画面还没有重新读取。这里只会刷新，不会重复保存。"
+        : "旧版本写入已经停止；这里只会重新读取，不会依据旧资料继续保存。");
+    } finally { writeRef.current = false; }
+  }
+  async function inspectUncertain() {
+    if (!receipt || writeRef.current) return;
+    writeRef.current = true;
+    setPhase("checking");
+    setError("");
+    try {
+      const inspection = await inspectCareerContactWrite(receipt);
+      const decision = careerContactInspectionDecision(inspection);
+      if (decision === "refresh") {
+        refreshOutcomeRef.current = "saved";
+        writeRef.current = false;
+        await refreshOnly(stableContactId);
+        return;
+      }
+      if (decision === "retry-same-command") {
+        setReceipt(null);
+        setPhase("editing");
+        setError("已确认这次没有保存。表单和原联系人标识都保留；再次保存会复用同一个标识。");
+      } else if (decision === "block") {
+        setPhase("blocked");
+        setError("这个联系人标识已经对应另一份内容。没有覆盖；请关闭后核对联系人列表。");
+      } else {
+        setPhase("uncertain");
+        setError("本机仍无法确认是否已经保存。继续核对不会重复创建联系人。");
+      }
+    } catch {
+      setPhase("uncertain");
+      setError("暂时无法核对保存结果。这里只保留原核对凭据，不会重新提交。");
+    } finally { writeRef.current = false; }
+  }
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    setSaving(true); setError("");
+    if (writeRef.current) return;
+    writeRef.current = true;
+    setPhase("writing");
+    setError("");
     const form = new FormData(event.currentTarget);
     const input = {
       name: String(form.get("name") ?? ""),
@@ -3419,109 +3768,363 @@ function ContactModal({ contactId, data, onClose, onSaved }: { contactId: string
       jobIds: form.getAll("jobIds").map(String),
     };
     try {
-      const id = contactId ?? await createCareerContact(input);
-      if (contactId) await updateCareerContact(contactId, input);
-      await onSaved(id);
+      if (contactId && detail) {
+        const result = await updateCareerContactSafely(contactId, input, careerContactExpectedState(detail));
+        if (result.outcome === "changed" || result.outcome === "outcome_uncertain") {
+          refreshOutcomeRef.current = "changed";
+          setPhase("refresh-only");
+          setError(result.outcome === "changed"
+            ? "联系人刚在另一个页面发生了变化。没有覆盖新版本；接下来只重新读取。"
+            : "是否完成更新暂时无法确认。接下来只重新读取，不会再次保存表单。");
+        } else {
+          refreshOutcomeRef.current = "saved";
+          writeRef.current = false;
+          await refreshOnly(contactId);
+          return;
+        }
+      } else if (!contactId) {
+        const command: CreateCareerContactSafeInput = { ...input, contactId: stableContactId, createdAt: stableCreatedAt };
+        commandRef.current = command;
+        const result = await createCareerContactSafely(command);
+        if (result.outcome === "outcome_uncertain") {
+          setReceipt(result.receipt);
+          setPhase("uncertain");
+          setError("本机是否完成保存暂时无法确认。下一步只能核对同一份凭据，不能直接再创建。");
+        } else {
+          refreshOutcomeRef.current = "saved";
+          writeRef.current = false;
+          await refreshOnly(stableContactId);
+          return;
+        }
+      }
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "联系人保存失败");
-    } finally { setSaving(false); }
+      if (caught instanceof CareerContactMutationError && caught.code === "changed") {
+        refreshOutcomeRef.current = "changed";
+        setPhase("refresh-only");
+        setError("联系人刚在另一个页面发生了变化。没有覆盖新版本；接下来只重新读取。");
+      } else if (caught instanceof CareerContactMutationError && caught.code === "conflict") {
+        setPhase("blocked");
+        setError(careerContactErrorText(caught, "操作标识发生冲突，没有覆盖已有记录。"));
+      } else {
+        setPhase("editing");
+        setError(careerContactErrorText(caught, "这次没有保存，表单内容仍保留。"));
+      }
+    } finally { writeRef.current = false; }
   }
   const contact = detail?.contact;
   const linked = new Set(detail?.associations.map((association) => association.job_id) ?? []);
+  const jobsForPicker = Array.from(new Map(
+    [...(detail?.jobs ?? []), ...data.jobs].map((job) => [job.id, job]),
+  ).values());
+  const canDismiss = phase === "editing" || phase === "blocked" || Boolean(readError);
   // Nested semantic text labels each checkbox; the configured static-depth rule cannot follow it.
   // eslint-disable-next-line jsx-a11y/label-has-associated-control
-  return <Modal title={contactId ? "编辑联系人" : "添加联系人"} description="只保存你确认过的资料与职位关系；联系事实需要单独记录。" onClose={onClose} wide>{loading ? <div className="career-modal-loading"><LoaderCircle className="spin" size={20} />正在打开资料…</div> : <form className="career-form" onSubmit={submit}><div className="career-form-row"><Field label="姓名"><input name="name" required defaultValue={contact?.name ?? ""} /></Field><Field label="公司" hint="可选"><input name="company" defaultValue={contact?.company ?? ""} /></Field></div><div className="career-form-row"><Field label="身份 / 关系" hint="可选"><input name="role" defaultValue={contact?.role ?? ""} placeholder="Recruiter / 内推人" /></Field><Field label="常用渠道" hint="可选"><select name="channel" defaultValue={contact?.channel ?? ""}><option value="">不设置</option><option>LinkedIn</option><option>BOSS直聘</option><option>邮件</option><option>微信</option><option>电话</option><option>其他</option></select></Field></div><div className="career-form-row"><Field label="邮箱" hint="可选"><input name="email" type="email" defaultValue={contact?.email ?? ""} /></Field><Field label="电话" hint="可选"><input name="phone" defaultValue={contact?.phone ?? ""} /></Field></div><fieldset className="career-contact-job-picker"><legend>关联职位 <small>只建立你明确选择的关系</small></legend>{data.jobs.length > 0 ? <div>{data.jobs.map((job) => <label key={job.id}><input type="checkbox" name="jobIds" value={job.id} defaultChecked={linked.has(job.id)} /><span><b>{job.role}</b><small>{job.company}</small></span></label>)}</div> : <p>还没有可关联的职位。</p>}</fieldset><Field label="备注" hint="可选"><textarea name="notes" rows={4} defaultValue={contact?.notes ?? ""} placeholder="怎么认识、希望记住什么；不用重复写沟通记录。" /></Field>{error && <div className="career-inline-error"><X size={15} />{error}</div>}<div className="career-form-actions"><button type="button" className="career-button ghost" onClick={onClose}>取消</button><button className="career-button primary" disabled={saving}>{saving ? <LoaderCircle className="spin" size={16} /> : <Check size={16} />}{saving ? "正在保存…" : "保存联系人"}</button></div></form>}</Modal>;
+  return <Modal title={contactId ? "编辑联系人" : "添加联系人"} description="只保存你确认过的资料与职位关系；联系事实需要单独记录。" onClose={requestClose} dismissible={canDismiss} inertToasts={!canDismiss} wide><div ref={phaseRootRef} className="career-contact-modal-phase" tabIndex={-1}>{loading ? <div className="career-modal-loading"><LoaderCircle className="spin" size={20} />正在打开资料…</div> : contactId && (!detail || readError) ? <div className="career-drawer-read-error" role="status"><ShieldCheck size={22} /><h3>联系人资料暂时没有打开</h3><p>{readError || "没有把它显示成一份可覆盖的空表单。"}</p><div><button type="button" className="career-button primary" data-dialog-initial onClick={retryRead}><RotateCcw size={16} />重新读取</button><button type="button" className="career-button ghost" onClick={onClose}>关闭</button></div></div> : <>{phase === "writing" || phase === "checking" || phase === "refreshing" ? <ContactWriteStatus icon="busy" title={phase === "writing" ? "正在核对并保存" : phase === "checking" ? "正在只读核对保存结果" : "已经停止写入，正在重新读取"} message={phase === "checking" ? "只核对原凭据，不会再次创建联系人。" : phase === "refreshing" ? "这一步只刷新画面，不会再次保存。" : "写入期间会保留表单，暂时不能关闭。"} /> : phase === "uncertain" ? <ContactWriteStatus icon="safe" title="先核对这次保存" message={error} action={<button className="career-button primary" data-contact-safe-focus onClick={() => void inspectUncertain()}><Search size={16} />只读核对</button>} /> : phase === "refresh-only" ? <ContactWriteStatus icon="safe" title="只重新读取联系人" message={error} action={<button className="career-button primary" data-contact-safe-focus onClick={() => void refreshOnly(contactId ?? stableContactId)}><RotateCcw size={16} />重新读取</button>} /> : phase === "blocked" ? <ContactWriteStatus icon="safe" title="没有覆盖已有记录" message={error} action={<button className="career-button primary" data-contact-safe-focus onClick={onClose}>返回联系人</button>} /> : null}{phase === "editing" && discardPrompt && <ContactDiscardPrompt noun="联系人输入" onKeep={() => setDiscardPrompt(false)} onDiscard={() => { setDirty(false); onClose(); }} />}<form hidden={phase !== "editing" || discardPrompt} className="career-form" onChange={() => setDirty(true)} onSubmit={submit}>{externalHint && <div className="career-contact-external-hint" role="status"><ShieldCheck size={16} /><span>{externalHint}</span></div>}<div className="career-form-row"><Field label="姓名"><input name="name" required defaultValue={contact?.name ?? ""} /></Field><Field label="公司" hint="可选"><input name="company" defaultValue={contact?.company ?? ""} /></Field></div><div className="career-form-row"><Field label="身份 / 关系" hint="可选"><input name="role" defaultValue={contact?.role ?? ""} placeholder="Recruiter / 内推人" /></Field><Field label="常用渠道" hint="可选"><select name="channel" defaultValue={contact?.channel ?? ""}><option value="">不设置</option><option>LinkedIn</option><option>BOSS直聘</option><option>邮件</option><option>微信</option><option>电话</option><option>其他</option></select></Field></div><div className="career-form-row"><Field label="邮箱" hint="可选"><input name="email" type="email" defaultValue={contact?.email ?? ""} /></Field><Field label="电话" hint="可选"><input name="phone" defaultValue={contact?.phone ?? ""} /></Field></div><fieldset className="career-contact-job-picker"><legend>关联职位 <small>只建立你明确选择的关系</small></legend>{jobsForPicker.length > 0 ? <div>{jobsForPicker.map((job) => { const stage = data.stages.find((item) => item.id === job.stage_id); const context = job.archived === 1 ? "已归档" : stage?.is_terminal ? "已结束" : "进行中"; return <label key={job.id}><input type="checkbox" name="jobIds" value={job.id} defaultChecked={linked.has(job.id)} /><span><b>{job.role}</b><small>{job.company} · {context}</small></span></label>; })}</div> : <p>还没有可关联的职位。</p>}</fieldset><Field label="备注" hint="可选"><textarea name="notes" rows={4} defaultValue={contact?.notes ?? ""} placeholder="怎么认识、希望记住什么；不用重复写沟通记录。" /></Field>{error && <div className="career-inline-error" role="status"><ShieldCheck size={15} />{error}</div>}<div className="career-form-actions"><button type="button" className="career-button ghost" onClick={requestClose}>取消</button><button className="career-button primary"><Check size={16} />保存联系人</button></div></form></>}</div></Modal>;
 }
 
-function ContactInteractionModal({ contactId, data, onClose, onSaved }: { contactId: string; data: CareerData; onClose: () => void; onSaved: () => Promise<void> }) {
+function ContactInteractionModal({ contactId, data, externalHint, onClose, onRefresh, onSaved, notify }: { contactId: string; data: CareerData; externalHint: string; onClose: () => void; onRefresh: () => Promise<void>; onSaved: () => void; notify: (text: string, tone?: Notice["tone"]) => void }) {
   const [detail, setDetail] = useState<CareerContactDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [scheduleNext, setScheduleNext] = useState(false);
-  const [saving, setSaving] = useState(false);
+  const [readError, setReadError] = useState("");
+  const [readRevision, setReadRevision] = useState(0);
+  const [phase, setPhase] = useState<CareerContactCommandPhase>("editing");
+  const [dirty, setDirty] = useState(false);
+  const [discardPrompt, setDiscardPrompt] = useState(false);
   const [error, setError] = useState("");
+  const [receipt, setReceipt] = useState<CareerContactWriteReceipt | null>(null);
+  const [stableInteractionId] = useState(() => newId("interaction"));
+  const [stableFollowUpTaskId] = useState(() => newId("task"));
+  const [stableCreatedAt] = useState(() => new Date().toISOString());
+  const commandRef = useRef<RecordCareerContactInteractionSafeInput | null>(null);
+  const writeRef = useRef(false);
+  const refreshOutcomeRef = useRef<"saved" | "changed">("saved");
+  const phaseRootRef = useCareerContactPhaseFocus(phase, discardPrompt);
+  const locked = phase === "writing" || phase === "checking" || phase === "refreshing" || phase === "refresh-only" || phase === "uncertain";
+  useCareerContactWorkProtection(dirty || locked);
   useEffect(() => {
     let live = true;
-    void loadCareerContactDetail(contactId).then((next) => { if (live) setDetail(next); }).catch((caught) => {
-      if (live) setError(caught instanceof Error ? caught.message : "联系人资料无法打开");
+    void loadCareerContactDetail(contactId).then((next) => {
+      if (!live) return;
+      if (next) setDetail(next);
+      else setReadError("没有找到这位联系人。资料可能已在另一个页面发生变化。");
+    }).catch(() => {
+      if (live) setReadError("联系人资料暂时没有打开；这里不会把未知内容写成一次真实联系。");
     }).finally(() => { if (live) setLoading(false); });
     return () => { live = false; };
-  }, [contactId]);
+  }, [contactId, readRevision]);
+  function retryRead() {
+    setLoading(true);
+    setReadError("");
+    setReadRevision((current) => current + 1);
+  }
+  function requestClose() {
+    if (locked) return;
+    if (dirty && phase === "editing") { setDiscardPrompt(true); return; }
+    onClose();
+  }
+  async function refreshOnly() {
+    if (writeRef.current) return;
+    writeRef.current = true;
+    setPhase("refreshing");
+    setError("");
+    try {
+      await onRefresh();
+      setDirty(false);
+      if (refreshOutcomeRef.current === "saved") onSaved();
+      else {
+        onClose();
+        notify("联系人资料已变化；没有补写联系记录，已重新读取", "info");
+      }
+    } catch {
+      setPhase("refresh-only");
+      setError(refreshOutcomeRef.current === "saved"
+        ? "联系记录已保存在本机，但画面还没有重新读取。这里只会刷新，不会再创建。"
+        : "旧版本写入已经停止。这里只会重新读取，不会补写联系记录。");
+    } finally { writeRef.current = false; }
+  }
+  async function inspectUncertain() {
+    if (!receipt || writeRef.current) return;
+    writeRef.current = true;
+    setPhase("checking");
+    setError("");
+    try {
+      const inspection = await inspectCareerContactWrite(receipt);
+      const decision = careerContactInspectionDecision(inspection);
+      if (decision === "refresh") {
+        refreshOutcomeRef.current = "saved";
+        writeRef.current = false;
+        await refreshOnly();
+        return;
+      }
+      if (decision === "retry-same-command") {
+        setReceipt(null);
+        setPhase("editing");
+        setError("已确认这次没有保存。表单、联系记录标识和跟进待办标识都保留；可用同一份操作重试。");
+      } else if (decision === "block") {
+        setPhase("blocked");
+        setError("这个联系记录标识已经对应另一份内容。没有覆盖；请关闭后核对联系历史。");
+      } else {
+        setPhase("uncertain");
+        setError("本机仍无法确认是否已经保存。继续核对不会重复创建联系记录或待办。");
+      }
+    } catch {
+      setPhase("uncertain");
+      setError("暂时无法核对保存结果。这里只保留原核对凭据，不会重新提交。");
+    } finally { writeRef.current = false; }
+  }
   async function submit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault(); setSaving(true); setError("");
+    event.preventDefault();
+    if (!detail || writeRef.current) return;
+    writeRef.current = true;
+    setPhase("writing");
+    setError("");
     const form = new FormData(event.currentTarget);
-    const jobId = String(form.get("job_id") ?? "") || undefined;
+    const jobId = String(form.get("job_id") ?? "") || null;
     try {
       const followUpDueAt = scheduleNext
         ? fromDateInput(String(form.get("follow_up_due_at") ?? ""))
         : null;
       if (scheduleNext && !followUpDueAt) throw new Error("请为下一步选择时间");
-      await recordCareerContactInteraction({
+      const direction = String(form.get("direction") ?? "");
+      if (direction !== "outbound" && direction !== "inbound" && direction !== "mutual") throw new Error("请选择这次联系的真实方向");
+      const command: RecordCareerContactInteractionSafeInput = {
         contactId,
-        occurredAt: fromDateInput(String(form.get("occurred_at") ?? "")) ?? undefined,
+        interactionId: stableInteractionId,
+        createdAt: stableCreatedAt,
+        occurredAt: fromDateInput(String(form.get("occurred_at") ?? "")) ?? stableCreatedAt,
         interactionType: "conversation",
-        direction: String(form.get("direction")) as "outbound" | "inbound" | "mutual",
+        direction,
         channel: String(form.get("channel") ?? ""),
         summary: String(form.get("summary") ?? ""),
         notes: String(form.get("notes") ?? ""),
         jobId,
         associatedJobIds: jobId ? [jobId] : [],
+        expectedContact: careerContactExpectedState(detail),
         followUp: scheduleNext ? {
+          taskId: stableFollowUpTaskId,
           title: String(form.get("follow_up_title") ?? ""),
           dueAt: followUpDueAt!,
           kind: "跟进",
           priority: 1,
           jobId,
         } : undefined,
-      });
-      await onSaved();
-    } catch (caught) { setError(caught instanceof Error ? caught.message : "联系记录保存失败"); }
-    finally { setSaving(false); }
+      };
+      commandRef.current = command;
+      const result = await recordCareerContactInteractionSafely(command);
+      if (result.outcome === "outcome_uncertain") {
+        setReceipt(result.receipt);
+        setPhase("uncertain");
+        setError("本机是否完成保存暂时无法确认。下一步只能核对同一份凭据，不能直接再创建。");
+      } else {
+        refreshOutcomeRef.current = "saved";
+        writeRef.current = false;
+        await refreshOnly();
+        return;
+      }
+    } catch (caught) {
+      if (caught instanceof CareerContactMutationError && caught.code === "changed") {
+        refreshOutcomeRef.current = "changed";
+        setPhase("refresh-only");
+        setError("联系人刚在另一个页面发生了变化。没有补写这次联系；接下来只重新读取。");
+      } else if (caught instanceof CareerContactMutationError && caught.code === "conflict") {
+        setPhase("blocked");
+        setError(careerContactErrorText(caught, "操作标识发生冲突，没有覆盖已有记录。"));
+      } else {
+        setPhase("editing");
+        setError(careerContactErrorText(caught, "这次没有保存，表单内容仍保留。"));
+      }
+    } finally { writeRef.current = false; }
   }
-  const contact = detail?.contact;
   if (loading) return <Modal title="记录一次真实联系" description="只记录已经发生的沟通。" onClose={onClose} wide><div className="career-modal-loading"><LoaderCircle className="spin" size={20} />正在打开联系人…</div></Modal>;
+  if (!detail || readError) return <Modal title="记录一次真实联系" description="先确认联系人资料，再记录已经发生的沟通。" onClose={onClose} wide><div className="career-drawer-read-error" role="status"><ShieldCheck size={22} /><h3>联系人资料暂时没有打开</h3><p>{readError || "这里没有把未知资料当成一份空记录。"}</p><div><button type="button" className="career-button primary" data-dialog-initial onClick={retryRead}><RotateCcw size={16} />重新读取</button><button type="button" className="career-button ghost" onClick={onClose}>关闭</button></div></div></Modal>;
+  const contact = detail.contact;
+  const jobsForPicker = Array.from(new Map([...(detail.jobs ?? []), ...data.jobs].map((job) => [job.id, job])).values());
+  const canDismiss = phase === "editing" || phase === "blocked";
   // The visible title and explanation are nested so the whole row remains one generous target.
   // eslint-disable-next-line jsx-a11y/label-has-associated-control
-  return <Modal title="记录一次真实联系" description={contact ? `记录与 ${contact.name} 已经发生的沟通；不会自动发送消息。` : "只记录已经发生的沟通。"} onClose={onClose} wide><form className="career-form" onSubmit={submit}><div className="career-form-row thirds"><Field label="发生时间"><input name="occurred_at" type="datetime-local" required defaultValue={dateInputValue(new Date().toISOString())} /></Field><Field label="方向"><select name="direction" defaultValue="mutual"><option value="outbound">我发出</option><option value="inbound">对方发来</option><option value="mutual">双方交流</option></select></Field><Field label="渠道"><select name="channel" defaultValue={contact?.channel ?? ""}><option value="">未注明</option><option>LinkedIn</option><option>BOSS直聘</option><option>邮件</option><option>微信</option><option>电话</option><option>当面</option><option>其他</option></select></Field></div><Field label="沟通摘要" hint="必填，写事实而不是评价"><input name="summary" required placeholder="例如：确认了作品集评审时间" /></Field><Field label="关联职位" hint="可选；选择即明确建立关系"><select name="job_id" defaultValue=""><option value="">不关联职位</option>{data.jobs.map((job) => <option key={job.id} value={job.id}>{job.company} · {job.role}</option>)}</select></Field><Field label="补充备注" hint="可选"><textarea name="notes" rows={4} placeholder="关键信息、对方提到的事项…" /></Field><label className="career-contact-follow-toggle"><input type="checkbox" checked={scheduleNext} onChange={(event) => setScheduleNext(event.target.checked)} /><span><b>顺手安排下一步</b><small>只有你选择后才创建待办</small></span></label>{scheduleNext && <div className="career-contact-follow-fields"><Field label="下一步动作"><input name="follow_up_title" required placeholder="例如：发送更新后的案例页" /></Field><Field label="时间"><input name="follow_up_due_at" type="datetime-local" required /></Field></div>}{error && <div className="career-inline-error"><X size={15} />{error}</div>}<div className="career-form-actions"><button type="button" className="career-button ghost" onClick={onClose}>取消</button><button className="career-button primary" disabled={saving}>{saving ? <LoaderCircle className="spin" size={16} /> : <MessageSquareText size={16} />}{saving ? "正在保存…" : "保存联系记录"}</button></div></form></Modal>;
+  return <Modal title="记录一次真实联系" description={`记录与 ${contact.name} 已经发生的沟通；不会自动发送消息。`} onClose={requestClose} dismissible={canDismiss} inertToasts={!canDismiss} wide><div ref={phaseRootRef} className="career-contact-modal-phase" tabIndex={-1}>{discardPrompt ? <ContactDiscardPrompt noun="联系记录" onKeep={() => setDiscardPrompt(false)} onDiscard={() => { setDirty(false); onClose(); }} /> : <>{phase === "writing" || phase === "checking" || phase === "refreshing" ? <ContactWriteStatus icon="busy" title={phase === "writing" ? "正在核对并保存" : phase === "checking" ? "正在只读核对保存结果" : "已经停止写入，正在重新读取"} message={phase === "checking" ? "只核对原凭据，不会再次创建联系记录或待办。" : phase === "refreshing" ? "这一步只刷新画面，不会再次保存。" : "写入期间会保留表单，暂时不能关闭。"} /> : phase === "uncertain" ? <ContactWriteStatus icon="safe" title="先核对这次联系" message={error} action={<button className="career-button primary" data-contact-safe-focus onClick={() => void inspectUncertain()}><Search size={16} />只读核对</button>} /> : phase === "refresh-only" ? <ContactWriteStatus icon="safe" title="只重新读取联系人" message={error} action={<button className="career-button primary" data-contact-safe-focus onClick={() => void refreshOnly()}><RotateCcw size={16} />重新读取</button>} /> : phase === "blocked" ? <ContactWriteStatus icon="safe" title="没有覆盖已有记录" message={error} action={<button className="career-button primary" data-contact-safe-focus onClick={onClose}>返回联系历史</button>} /> : null}{phase === "editing" && discardPrompt && <ContactDiscardPrompt noun="联系记录" onKeep={() => setDiscardPrompt(false)} onDiscard={() => { setDirty(false); onClose(); }} />}<form hidden={phase !== "editing" || discardPrompt} className="career-form" onChange={() => setDirty(true)} onSubmit={submit}>{externalHint && <div className="career-contact-external-hint" role="status"><ShieldCheck size={16} /><span>{externalHint}</span></div>}<div className="career-form-row thirds"><Field label="发生时间"><input name="occurred_at" type="datetime-local" required defaultValue={dateInputValue(stableCreatedAt)} /></Field><Field label="方向"><select name="direction" required defaultValue=""><option value="" disabled>请选择</option><option value="outbound">我发出</option><option value="inbound">对方发来</option><option value="mutual">双方交流</option></select></Field><Field label="渠道"><select name="channel" defaultValue=""><option value="">未注明</option><option>LinkedIn</option><option>BOSS直聘</option><option>邮件</option><option>微信</option><option>电话</option><option>当面</option><option>其他</option></select></Field></div><Field label="沟通摘要" hint="必填，写事实而不是评价"><input name="summary" required placeholder="例如：确认了作品集评审时间" /></Field><Field label="关联职位" hint="可选；选择即明确建立关系"><select name="job_id" defaultValue=""><option value="">不关联职位</option>{jobsForPicker.map((job) => <option key={job.id} value={job.id}>{job.company} · {job.role}{job.archived === 1 ? "（已归档）" : ""}</option>)}</select></Field><Field label="补充备注" hint="可选"><textarea name="notes" rows={4} placeholder="关键信息、对方提到的事项…" /></Field><label className="career-contact-follow-toggle"><input type="checkbox" checked={scheduleNext} onChange={(event) => setScheduleNext(event.target.checked)} /><span><b>顺手安排下一步</b><small>只有你选择后才创建待办</small></span></label>{scheduleNext && <div className="career-contact-follow-fields"><Field label="下一步动作"><input name="follow_up_title" required placeholder="例如：发送更新后的案例页" /></Field><Field label="时间"><input name="follow_up_due_at" type="datetime-local" required /></Field></div>}{error && <div className="career-inline-error" role="status"><ShieldCheck size={15} />{error}</div>}<div className="career-form-actions"><button type="button" className="career-button ghost" onClick={requestClose}>取消</button><button className="career-button primary"><MessageSquareText size={16} />保存联系记录</button></div></form></>}</div></Modal>;
 }
 
-function ContactTaskModal({ contactId, data, onClose, onSaved }: { contactId: string; data: CareerData; onClose: () => void; onSaved: () => Promise<void> }) {
-  const [phase, setPhase] = useState<"idle" | "writing" | "refresh-only">("idle");
+function ContactTaskModal({ contactId, data, externalHint, onClose, onRefresh, onSaved, notify }: { contactId: string; data: CareerData; externalHint: string; onClose: () => void; onRefresh: () => Promise<void>; onSaved: () => void; notify: (text: string, tone?: Notice["tone"]) => void }) {
+  const [detail, setDetail] = useState<CareerContactDetail | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [readError, setReadError] = useState("");
+  const [readRevision, setReadRevision] = useState(0);
+  const [phase, setPhase] = useState<CareerContactCommandPhase>("editing");
+  const [dirty, setDirty] = useState(false);
+  const [discardPrompt, setDiscardPrompt] = useState(false);
   const [error, setError] = useState("");
-  const savingRef = useRef(false);
-  const stableIdRef = useRef(newId("task"));
-  const activeStageIds = new Set(data.stages.filter((stage) => stage.is_terminal !== 1).map((stage) => stage.id));
-  const availableJobs = data.jobs.filter((job) => job.archived !== 1 && activeStageIds.has(job.stage_id));
+  const [receipt, setReceipt] = useState<CareerContactWriteReceipt | null>(null);
+  const [stableTaskId] = useState(() => newId("task"));
+  const [stableCreatedAt] = useState(() => new Date().toISOString());
+  const commandRef = useRef<CreateCareerContactTaskSafeInput | null>(null);
+  const writeRef = useRef(false);
+  const refreshOutcomeRef = useRef<"saved" | "changed">("saved");
+  const phaseRootRef = useCareerContactPhaseFocus(phase, discardPrompt);
+  const locked = phase === "writing" || phase === "checking" || phase === "refreshing" || phase === "refresh-only" || phase === "uncertain";
+  useCareerContactWorkProtection(dirty || locked);
+  useEffect(() => {
+    let live = true;
+    void loadCareerContactDetail(contactId).then((next) => {
+      if (!live) return;
+      if (next) setDetail(next);
+      else setReadError("没有找到这位联系人。资料可能已在另一个页面发生变化。");
+    }).catch(() => {
+      if (live) setReadError("联系人资料暂时没有打开；这里不会把未知内容写成一条真实待办。");
+    }).finally(() => { if (live) setLoading(false); });
+    return () => { live = false; };
+  }, [contactId, readRevision]);
+  function retryRead() {
+    setLoading(true);
+    setReadError("");
+    setReadRevision((current) => current + 1);
+  }
+  function requestClose() {
+    if (locked) return;
+    if (dirty && phase === "editing") { setDiscardPrompt(true); return; }
+    onClose();
+  }
   async function refreshOnly() {
+    if (writeRef.current) return;
+    writeRef.current = true;
+    setPhase("refreshing");
     setError("");
-    try { await onSaved(); }
-    catch { setPhase("refresh-only"); setError("下一步仍已保存在本机。这里只会重新读取，不会再次创建。"); }
+    try {
+      await onRefresh();
+      setDirty(false);
+      if (refreshOutcomeRef.current === "saved") onSaved();
+      else {
+        onClose();
+        notify("联系人资料已变化；没有补建待办，已重新读取", "info");
+      }
+    } catch {
+      setPhase("refresh-only");
+      setError(refreshOutcomeRef.current === "saved"
+        ? "下一步已保存在本机，但画面还没有重新读取。这里只会刷新，不会再次创建。"
+        : "旧版本写入已经停止。这里只会重新读取，不会补建待办。");
+    } finally { writeRef.current = false; }
+  }
+  async function inspectUncertain() {
+    if (!receipt || writeRef.current) return;
+    writeRef.current = true;
+    setPhase("checking");
+    setError("");
+    try {
+      const inspection = await inspectCareerContactWrite(receipt);
+      const decision = careerContactInspectionDecision(inspection);
+      if (decision === "refresh") {
+        refreshOutcomeRef.current = "saved";
+        writeRef.current = false;
+        await refreshOnly();
+        return;
+      }
+      if (decision === "retry-same-command") {
+        setReceipt(null);
+        setPhase("editing");
+        setError("已确认这次没有保存。表单和原待办标识都保留；再次创建会复用同一个标识。");
+      } else if (decision === "block") {
+        setPhase("blocked");
+        setError("这个待办标识已经对应另一份内容。没有覆盖；请关闭后核对待办列表。");
+      } else {
+        setPhase("uncertain");
+        setError("本机仍无法确认是否已经保存。继续核对不会重复创建待办。");
+      }
+    } catch {
+      setPhase("uncertain");
+      setError("暂时无法核对保存结果。这里只保留原核对凭据，不会重新提交。");
+    } finally { writeRef.current = false; }
   }
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (savingRef.current) return;
-    savingRef.current = true;
+    if (!detail || writeRef.current) return;
+    writeRef.current = true;
     setPhase("writing");
     setError("");
     const form = new FormData(event.currentTarget);
     try {
-      await careerTaskActions.create({
-        id: stableIdRef.current,
+      const command: CreateCareerContactTaskSafeInput = {
+        taskId: stableTaskId,
+        createdAt: stableCreatedAt,
         contactId,
         title: String(form.get("title") ?? ""),
         jobId: String(form.get("job_id") ?? "") || null,
         dueAt: fromDateInput(String(form.get("due_at") ?? "")),
         kind: String(form.get("kind") ?? "跟进"),
         priority: Number(form.get("priority") ?? 1),
-      });
-      setPhase("refresh-only");
-      await refreshOnly();
+        expectedContact: careerContactExpectedState(detail),
+      };
+      commandRef.current = command;
+      const result = await createCareerContactTaskSafely(command);
+      if (result.outcome === "outcome_uncertain") {
+        setReceipt(result.receipt);
+        setPhase("uncertain");
+        setError("本机是否完成保存暂时无法确认。下一步只能核对同一份凭据，不能直接再创建。");
+      } else {
+        refreshOutcomeRef.current = "saved";
+        writeRef.current = false;
+        await refreshOnly();
+        return;
+      }
     } catch (caught) {
-      setPhase("idle");
-      setError(caught instanceof Error ? caught.message : "这次没有保存，原记录仍保持不变。");
-    } finally { savingRef.current = false; }
+      if (caught instanceof CareerContactMutationError && caught.code === "changed") {
+        refreshOutcomeRef.current = "changed";
+        setPhase("refresh-only");
+        setError("联系人刚在另一个页面发生了变化。没有补建下一步；接下来只重新读取。");
+      } else if (caught instanceof CareerContactMutationError && caught.code === "conflict") {
+        setPhase("blocked");
+        setError(careerContactErrorText(caught, "操作标识发生冲突，没有覆盖已有待办。"));
+      } else {
+        setPhase("editing");
+        setError(careerContactErrorText(caught, "这次没有保存，表单内容仍保留。"));
+      }
+    } finally { writeRef.current = false; }
   }
-  if (phase === "refresh-only") return <Modal title="下一步已保存在本机" description="画面还没有重新读取。请只重新读取，不要重复提交。" onClose={() => undefined} dismissible={false} inertToasts><div className="career-task-refresh-only" role="status"><ShieldCheck size={22} /><p>{error || "重新读取只会刷新画面，不会再创建一条待办。"}</p><button className="career-button primary" data-dialog-initial onClick={() => void refreshOnly()}><RotateCcw size={16} />重新读取</button></div></Modal>;
-  return <Modal title="安排下一步" description="这是你主动选择的提醒；计划时间可以留空。" onClose={phase === "writing" ? () => undefined : onClose}><form className="career-form" onSubmit={submit}><Field label="要做什么"><input name="title" required placeholder="例如：确认下一轮时间" /></Field><Field label="关联职位" hint="可选；不会按公司自动猜"><select name="job_id" defaultValue=""><option value="">不关联职位</option>{availableJobs.map((job) => <option key={job.id} value={job.id}>{job.company} · {job.role}</option>)}</select></Field><div className="career-form-row"><Field label="计划时间（可选）" hint="不设时间会放在“以后再说”"><input name="due_at" type="datetime-local" /></Field><Field label="类型"><select name="kind" defaultValue="跟进"><option>跟进</option><option>材料</option><option>面试准备</option><option>其他</option></select></Field></div><Field label="优先级"><select name="priority" defaultValue="1"><option value="1">普通</option><option value="2">重点</option><option value="3">时间敏感</option></select></Field>{error && <div className="career-inline-error" role="alert"><X size={15} />{error}</div>}<div className="career-form-actions"><button type="button" className="career-button ghost" disabled={phase === "writing"} onClick={onClose}>取消</button><button className="career-button primary" disabled={phase === "writing"}>{phase === "writing" ? <LoaderCircle className="spin" size={16} /> : <CalendarDays size={16} />}{phase === "writing" ? "正在保存…" : "创建待办"}</button></div></form></Modal>;
+  if (loading) return <Modal title="安排下一步" description="先确认联系人资料，再安排你主动选择的提醒。" onClose={onClose}><div className="career-modal-loading"><LoaderCircle className="spin" size={20} />正在打开联系人…</div></Modal>;
+  if (!detail || readError) return <Modal title="安排下一步" description="先确认联系人资料，再安排你主动选择的提醒。" onClose={onClose}><div className="career-drawer-read-error" role="status"><ShieldCheck size={22} /><h3>联系人资料暂时没有打开</h3><p>{readError || "这里没有把未知资料当成一份空记录。"}</p><div><button type="button" className="career-button primary" data-dialog-initial onClick={retryRead}><RotateCcw size={16} />重新读取</button><button type="button" className="career-button ghost" onClick={onClose}>关闭</button></div></div></Modal>;
+  const jobsForPicker = Array.from(new Map([...detail.jobs, ...data.jobs].map((job) => [job.id, job])).values());
+  const canDismiss = phase === "editing" || phase === "blocked";
+  return <Modal title="安排下一步" description="这是你主动选择的提醒；计划时间可以留空。" onClose={requestClose} dismissible={canDismiss} inertToasts={!canDismiss} wide><div ref={phaseRootRef} className="career-contact-modal-phase" tabIndex={-1}>{discardPrompt ? <ContactDiscardPrompt noun="下一步" onKeep={() => setDiscardPrompt(false)} onDiscard={() => { setDirty(false); onClose(); }} /> : <>{phase === "writing" || phase === "checking" || phase === "refreshing" ? <ContactWriteStatus icon="busy" title={phase === "writing" ? "正在核对并保存" : phase === "checking" ? "正在只读核对保存结果" : "已经停止写入，正在重新读取"} message={phase === "checking" ? "只核对原凭据，不会再次创建待办。" : phase === "refreshing" ? "这一步只刷新画面，不会再次保存。" : "写入期间会保留表单，暂时不能关闭。"} /> : phase === "uncertain" ? <ContactWriteStatus icon="safe" title="先核对这条待办" message={error} action={<button className="career-button primary" data-contact-safe-focus onClick={() => void inspectUncertain()}><Search size={16} />只读核对</button>} /> : phase === "refresh-only" ? <ContactWriteStatus icon="safe" title="只重新读取联系人" message={error} action={<button className="career-button primary" data-contact-safe-focus onClick={() => void refreshOnly()}><RotateCcw size={16} />重新读取</button>} /> : phase === "blocked" ? <ContactWriteStatus icon="safe" title="没有覆盖已有待办" message={error} action={<button className="career-button primary" data-contact-safe-focus onClick={onClose}>返回联系人</button>} /> : null}{phase === "editing" && discardPrompt && <ContactDiscardPrompt noun="下一步" onKeep={() => setDiscardPrompt(false)} onDiscard={() => { setDirty(false); onClose(); }} />}<form hidden={phase !== "editing" || discardPrompt} className="career-form" onChange={() => setDirty(true)} onSubmit={submit}>{externalHint && <div className="career-contact-external-hint" role="status"><ShieldCheck size={16} /><span>{externalHint}</span></div>}<Field label="要做什么"><input name="title" required placeholder="例如：确认下一轮时间" /></Field><Field label="关联职位" hint="可选；不会按公司自动猜"><select name="job_id" defaultValue=""><option value="">不关联职位</option>{jobsForPicker.map((job) => <option key={job.id} value={job.id}>{job.company} · {job.role}{job.archived === 1 ? "（已归档）" : ""}</option>)}</select></Field><div className="career-form-row"><Field label="计划时间（可选）" hint="不设时间会放在“以后再说”"><input name="due_at" type="datetime-local" /></Field><Field label="类型"><select name="kind" defaultValue="跟进"><option>跟进</option><option>材料</option><option>面试准备</option><option>其他</option></select></Field></div><Field label="优先级"><select name="priority" defaultValue="1"><option value="1">普通</option><option value="2">重点</option><option value="3">时间敏感</option></select></Field>{error && <div className="career-inline-error" role="status"><ShieldCheck size={15} />{error}</div>}<div className="career-form-actions"><button type="button" className="career-button ghost" onClick={requestClose}>取消</button><button className="career-button primary"><CalendarDays size={16} />创建待办</button></div></form></>}</div></Modal>;
 }
 
 type CareerMaterialSavePhase =

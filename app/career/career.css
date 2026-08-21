@@ -894,6 +894,98 @@
   background: #edf3ef;
 }
 
+.career-contact-modal-phase,
+.career-contact-drawer-phase {
+  min-width: 0;
+  outline: 0;
+  overflow-wrap: anywhere;
+}
+.career-contact-modal-phase .career-field,
+.career-contact-modal-phase .career-form-row > * { min-width: 0; }
+.career-contact-modal-phase .career-form[hidden] { display: none; }
+.career-contact-modal-phase .career-field input,
+.career-contact-modal-phase .career-field select {
+  min-width: 0;
+  min-height: 44px;
+  height: 44px;
+}
+.career-contact-modal-phase .career-button,
+.career-contact-write-status .career-button,
+.career-contact-discard .career-button,
+.career-contact-archive-confirm .career-button { min-height: 44px; }
+.career-contact-external-hint {
+  min-width: 0;
+  min-height: 48px;
+  margin: 0 0 13px;
+  padding: 11px 13px;
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  color: #52675d;
+  border: 1px solid #d5e0da;
+  border-radius: 14px;
+  background: #f1f5f2;
+  font-size: 12px;
+  line-height: 1.55;
+}
+.career-contact-external-hint > svg { flex: 0 0 auto; margin-top: 1px; }
+.career-contact-external-hint > span { min-width: 0; }
+.career-contact-drawer-phase > .career-contact-external-hint { margin-inline: 24px; }
+.career-contact-write-status,
+.career-contact-discard,
+.career-contact-archive-confirm {
+  min-height: 250px;
+  padding: 30px 24px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+}
+.career-contact-write-status > span,
+.career-contact-discard > svg,
+.career-contact-archive-confirm > svg {
+  width: 48px;
+  height: 48px;
+  display: grid;
+  place-items: center;
+  color: #456b5a;
+  border-radius: 15px;
+  background: #e9f1ed;
+}
+.career-contact-write-status h3,
+.career-contact-discard h3,
+.career-contact-archive-confirm h3 { margin: 15px 0 0; color: var(--career-ink); font-size: 17px; }
+.career-contact-write-status p,
+.career-contact-discard p,
+.career-contact-archive-confirm p {
+  max-width: 480px;
+  margin: 9px 0 0;
+  color: var(--career-muted);
+  font-size: 13px;
+  line-height: 1.7;
+}
+.career-contact-write-status > div,
+.career-contact-discard > div,
+.career-contact-archive-confirm > div {
+  margin-top: 19px;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+}
+.career-contact-archive-confirm { min-height: calc(100dvh - 105px); }
+.career-contact-undo { max-width: min(520px, calc(100vw - 20px)); }
+.career-contact-undo > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.career-view:has(> .career-contact-grid) > .career-section-heading .career-button,
+.career-view:has(> .career-contact-grid) > .career-segmented button,
+.career-drawer-footer .career-button,
+.career-modal:has(.career-contact-job-picker) .career-form-actions .career-button,
+.career-modal:has(.career-contact-follow-toggle) .career-form-actions .career-button {
+  min-height: 44px;
+}
+
 @media (max-width: 760px) {
   .career-contact-open { min-height: 0; padding: 19px; }
   .career-contact-grid { gap: 11px; }
@@ -910,6 +1002,16 @@
   .career-contact-timeline article header { align-items: flex-start; flex-direction: column; gap: 4px; }
   .career-contact-follow-fields { grid-template-columns: 1fr; }
   .career-contact-job-picker label { min-height: 52px; }
+  .career-contact-drawer-phase > .career-contact-external-hint { margin-inline: 18px; }
+  .career-contact-write-status,
+  .career-contact-discard,
+  .career-contact-archive-confirm { min-height: 230px; padding: 26px 18px; }
+  .career-contact-write-status > div,
+  .career-contact-discard > div,
+  .career-contact-archive-confirm > div { width: 100%; display: grid; grid-template-columns: minmax(0, 1fr); }
+  .career-contact-modal-phase .career-form { padding-inline: 18px; }
+  .career-contact-modal-phase .career-form-actions { display: grid; grid-template-columns: minmax(0, 1fr); }
+  .career-contact-modal-phase .career-form-actions .career-button { width: 100%; justify-content: center; }
 }
 
 .career-focus-symbol,
