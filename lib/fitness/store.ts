@@ -771,6 +771,34 @@ export type FitnessEquipmentWriteSnapshot = Readonly<{
   loads: readonly FitnessEquipmentLoad[];
 }>;
 
+export type FitnessSettingKey =
+  | "unit"
+  | "rest_timer_enabled"
+  | "sound_enabled"
+  | "ai_enabled";
+
+export type FitnessSettingWriteRow<
+  Key extends FitnessSettingKey = FitnessSettingKey,
+> = Readonly<{
+  key: Key;
+  value: string;
+  updated_at: number;
+}>;
+
+export type FitnessSettingsWriteRows = readonly [
+  FitnessSettingWriteRow<"unit"> | null,
+  FitnessSettingWriteRow<"rest_timer_enabled"> | null,
+  FitnessSettingWriteRow<"sound_enabled"> | null,
+  FitnessSettingWriteRow<"ai_enabled"> | null,
+];
+
+export type FitnessSettingsWriteSnapshot = Readonly<{
+  generationId: string;
+  generationSequence: number;
+  rows: FitnessSettingsWriteRows;
+  settings: FitnessSettings;
+}>;
+
 type FitnessConfigReceiptBase<Kind extends string> = Readonly<{
   purpose: "fitness-config-write";
   version: 1;
@@ -831,6 +859,11 @@ export type FitnessConstraintActiveReceipt = FitnessConfigReceiptBase<"constrain
   after: FitnessConstraint;
 }>;
 
+export type FitnessSettingsSaveReceipt = FitnessConfigReceiptBase<"settings-save"> & Readonly<{
+  before: FitnessSettingsWriteSnapshot;
+  after: FitnessSettingsWriteSnapshot;
+}>;
+
 export type FitnessConfigWriteReceipt =
   | FitnessProfileSaveReceipt
   | FitnessVenueSaveReceipt
@@ -839,7 +872,8 @@ export type FitnessConfigWriteReceipt =
   | FitnessEquipmentSaveReceipt
   | FitnessEquipmentStatusReceipt
   | FitnessConstraintSaveReceipt
-  | FitnessConstraintActiveReceipt;
+  | FitnessConstraintActiveReceipt
+  | FitnessSettingsSaveReceipt;
 
 export type FitnessConfigWriteInspection =
   | "exact_saved"
@@ -920,6 +954,12 @@ const CONFIG_GENERATION_ID_PATTERN =
   /^(?:legacy|[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/i;
 const CONFIG_ID_PATTERN =
   /^(venue|equipment|constraint|load)-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const FITNESS_SETTING_KEYS = [
+  "unit",
+  "rest_timer_enabled",
+  "sound_enabled",
+  "ai_enabled",
+] as const satisfies readonly FitnessSettingKey[];
 
 function configError(
   code: FitnessConfigMutationErrorCode,
@@ -1107,6 +1147,93 @@ function isEquipmentSnapshot(value: unknown): value is FitnessEquipmentWriteSnap
       (snapshot.equipment!.max_load_grams === null ||
         load_grams <= snapshot.equipment!.max_load_grams)
     );
+}
+
+function isFitnessSettings(value: unknown): value is FitnessSettings {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const settings = value as Partial<FitnessSettings>;
+  return exactObjectKeys(value, [
+    "unit", "rest_timer_enabled", "sound_enabled", "ai_enabled",
+  ]) && (settings.unit === "kg" || settings.unit === "lb") &&
+    typeof settings.rest_timer_enabled === "boolean" &&
+    typeof settings.sound_enabled === "boolean" &&
+    typeof settings.ai_enabled === "boolean";
+}
+
+function canonicalFitnessSettingValue(
+  settings: FitnessSettings,
+  key: FitnessSettingKey,
+): string {
+  return key === "unit" ? settings.unit : String(settings[key]);
+}
+
+function isFitnessSettingWriteRow<Key extends FitnessSettingKey>(
+  value: unknown,
+  key: Key,
+): value is FitnessSettingWriteRow<Key> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const row = value as Partial<FitnessSettingWriteRow>;
+  const canonicalValue = key === "unit"
+    ? row.value === "kg" || row.value === "lb"
+    : row.value === "true" || row.value === "false";
+  return exactObjectKeys(value, ["key", "value", "updated_at"]) &&
+    row.key === key && canonicalValue && safeTimestamp(row.updated_at);
+}
+
+function settingsFromWriteRows(rows: FitnessSettingsWriteRows): FitnessSettings {
+  return settingsFromRows(rows.filter(
+    (row): row is FitnessSettingWriteRow => row !== null,
+  ));
+}
+
+function isFitnessSettingsWriteSnapshot(
+  value: unknown,
+): value is FitnessSettingsWriteSnapshot {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const snapshot = value as Partial<FitnessSettingsWriteSnapshot>;
+  if (
+    !exactObjectKeys(value, [
+      "generationId", "generationSequence", "rows", "settings",
+    ]) ||
+    typeof snapshot.generationId !== "string" ||
+    !CONFIG_GENERATION_ID_PATTERN.test(snapshot.generationId) ||
+    !safeTimestamp(snapshot.generationSequence) ||
+    !Array.isArray(snapshot.rows) || snapshot.rows.length !== FITNESS_SETTING_KEYS.length ||
+    !isFitnessSettings(snapshot.settings)
+  ) return false;
+  for (let index = 0; index < FITNESS_SETTING_KEYS.length; index += 1) {
+    const row = snapshot.rows[index];
+    if (row !== null && !isFitnessSettingWriteRow(row, FITNESS_SETTING_KEYS[index])) {
+      return false;
+    }
+  }
+  return sameProjection(snapshot.settings, settingsFromWriteRows(snapshot.rows));
+}
+
+function isFitnessSettingsSaveTransition(
+  before: unknown,
+  after: unknown,
+): before is FitnessSettingsWriteSnapshot {
+  if (!isFitnessSettingsWriteSnapshot(before) || !isFitnessSettingsWriteSnapshot(after)) {
+    return false;
+  }
+  const afterRows = after.rows;
+  if (afterRows.some((row) => row === null)) return false;
+  if (
+    before.generationId !== after.generationId ||
+    before.generationSequence !== after.generationSequence
+  ) return false;
+  const timestamp = afterRows[0]?.updated_at;
+  if (!safeTimestamp(timestamp) || afterRows.some((row) => row?.updated_at !== timestamp)) {
+    return false;
+  }
+  const latestBefore = before.rows.reduce(
+    (latest, row) => row === null ? latest : Math.max(latest, row.updated_at),
+    -1,
+  );
+  return timestamp > latestBefore && afterRows.every((row) =>
+    row !== null && row.value === canonicalFitnessSettingValue(after.settings, row.key)
+  );
 }
 
 function isFitnessConstraintRow(value: unknown): value is FitnessConstraint {
@@ -1297,6 +1424,11 @@ function isFitnessConfigWriteReceiptUnchecked(
         isFitnessConstraintRow(receipt.before) && isFitnessConstraintRow(receipt.after) &&
         receipt.before.active !== receipt.after.active &&
         isStrictTarget(receipt.before, receipt.after, { active: receipt.after.active });
+    case "settings-save":
+      return hasValidReceiptBase(value, receipt.kind, ["before", "after"]) &&
+        isFitnessSettingsSaveTransition(receipt.before, receipt.after) &&
+        receipt.generationId === receipt.before.generationId &&
+        receipt.generationSequence === receipt.before.generationSequence;
     default:
       return false;
   }
@@ -1477,6 +1609,59 @@ async function readConfigConstraint(
     [id],
   ))[0];
   return row ? mapConstraint(row) : null;
+}
+
+async function readConfigSettings(
+  runtime: FitnessConfigStorageRuntime,
+  generation: Readonly<{
+    generationId: string;
+    generationSequence: number;
+  }>,
+): Promise<FitnessSettingsWriteSnapshot> {
+  const rawRows = await configRows<{
+    key: string;
+    value: string;
+    updated_at: number;
+  }>(
+    runtime,
+    `SELECT key,value,updated_at FROM fitness_settings
+      WHERE key IN (?,?,?,?) ORDER BY key`,
+    FITNESS_SETTING_KEYS,
+  );
+  const byKey = new Map(rawRows.map((row) => [row.key, row]));
+  if (byKey.size !== rawRows.length) {
+    throw configError("invalid_input", "训练设置存储包含重复键。");
+  }
+  function rowFor<Key extends FitnessSettingKey>(
+    key: Key,
+  ): FitnessSettingWriteRow<Key> | null {
+    const row = byKey.get(key);
+    if (!row) return null;
+    const candidate = {
+      key,
+      value: row.value,
+      updated_at: Number(row.updated_at),
+    };
+    if (!isFitnessSettingWriteRow(candidate, key)) {
+      throw configError("invalid_input", "训练设置存储包含非标准值。");
+    }
+    return candidate;
+  }
+  const rows: FitnessSettingsWriteRows = [
+    rowFor("unit"),
+    rowFor("rest_timer_enabled"),
+    rowFor("sound_enabled"),
+    rowFor("ai_enabled"),
+  ];
+  const snapshot: FitnessSettingsWriteSnapshot = {
+    ...generation,
+    rows,
+    settings: settingsFromWriteRows(rows),
+  };
+  if (!isFitnessSettingsWriteSnapshot(snapshot)) {
+    throw configError("invalid_input", "训练设置存储快照格式不正确。");
+  }
+  return snapshot;
 }
 
 async function readConfigVenueGuard(
@@ -1863,6 +2048,11 @@ async function receiptStateUnlocked(
       if (sameProjection(current, receipt.after)) return "exact_saved";
       return sameProjection(current, receipt.before) ? "expected" : "changed";
     }
+    case "settings-save": {
+      const current = await readConfigSettings(runtime, generation);
+      if (sameProjection(current, receipt.after)) return "exact_saved";
+      return sameProjection(current, receipt.before) ? "expected" : "changed";
+    }
   }
 }
 
@@ -1925,6 +2115,12 @@ function receiptEntity(receipt: FitnessConfigWriteReceipt): {
         updatedAt: receipt.after.updated_at,
         reason: receipt.after.active ? "constraint-activated" : "constraint-deactivated",
       };
+    case "settings-save":
+      return {
+        id: "settings",
+        updatedAt: receipt.after.rows[0]!.updated_at,
+        reason: "settings-saved",
+      };
   }
 }
 
@@ -1951,6 +2147,76 @@ export function createFitnessConfigStorageService(
       }
       throw configError("inspect_failed", "暂时无法核对最新资料；没有开始写入。");
     }
+  }
+
+  /**
+   * Cache this snapshot together with `snapshot.settings`. A later user action must
+   * pass that same cached snapshot to prepare; reloading only the expectation can
+   * pair fresh peer state with stale UI values and is intentionally unsupported.
+   */
+  async function loadSettingsExpectedState(): Promise<FitnessSettingsWriteSnapshot> {
+    return prepareLocked(async () => {
+      const generation = await readConfigGeneration(runtime);
+      return snapshotInput(await readConfigSettings(runtime, generation));
+    });
+  }
+
+  async function prepareSettingsSave(
+    nextValue: FitnessSettings,
+    expectedValue: FitnessSettingsWriteSnapshot,
+  ): Promise<FitnessSettingsSaveReceipt> {
+    const next = cloneChecked(nextValue, isFitnessSettings, "训练设置");
+    const expected = cloneChecked(
+      expectedValue,
+      isFitnessSettingsWriteSnapshot,
+      "训练设置读取快照",
+    );
+    return prepareLocked(async () => {
+      const generation = await readConfigGeneration(runtime);
+      if (
+        expected.generationId !== generation.generationId ||
+        expected.generationSequence !== generation.generationSequence
+      ) {
+        throw configError("changed", "训练设置所在数据库已经更换；没有准备这次写入。");
+      }
+      const current = await readConfigSettings(runtime, generation);
+      assertPreparedExpected(current, expected, "训练设置");
+      const latestBefore = expected.rows.reduce<number | null>(
+        (latest, row) => row === null
+          ? latest
+          : Math.max(latest ?? row.updated_at, row.updated_at),
+        null,
+      );
+      const timestamp = nextConfigTimestamp(latestBefore, runtime.now());
+      const rows: FitnessSettingsWriteRows = [
+        { key: "unit", value: next.unit, updated_at: timestamp },
+        {
+          key: "rest_timer_enabled",
+          value: String(next.rest_timer_enabled),
+          updated_at: timestamp,
+        },
+        {
+          key: "sound_enabled",
+          value: String(next.sound_enabled),
+          updated_at: timestamp,
+        },
+        {
+          key: "ai_enabled",
+          value: String(next.ai_enabled),
+          updated_at: timestamp,
+        },
+      ];
+      const after: FitnessSettingsWriteSnapshot = { ...generation, rows, settings: next };
+      return sealConfigReceipt<FitnessSettingsSaveReceipt>({
+        purpose: "fitness-config-write",
+        version: 1,
+        operationId: generatedOperationId(runtime),
+        ...generation,
+        kind: "settings-save",
+        before: expected,
+        after,
+      });
+    });
   }
 
   async function prepareProfileSave(
@@ -2364,6 +2630,25 @@ export function createFitnessConfigStorageService(
     return joinedPredicate(predicates);
   }
 
+  function settingsSetPredicate(rows: FitnessSettingsWriteRows): ConfigPredicate {
+    const present = rows.filter(
+      (row): row is FitnessSettingWriteRow => row !== null,
+    );
+    return joinedPredicate([{
+      sql: `(SELECT COUNT(*) FROM fitness_settings WHERE key IN (?,?,?,?))=?`,
+      params: [...FITNESS_SETTING_KEYS, present.length],
+    }, ...rows.map((row, index): ConfigPredicate => row === null
+      ? {
+          sql: "NOT EXISTS(SELECT 1 FROM fitness_settings WHERE key=?)",
+          params: [FITNESS_SETTING_KEYS[index]],
+        }
+      : {
+          sql: `EXISTS(SELECT 1 FROM fitness_settings
+            WHERE key=? AND value IS ? AND updated_at IS ?)`,
+          params: [row.key, row.value, row.updated_at],
+        })]);
+  }
+
   function transitionSetPredicate(
     table: "fitness_programs" | "fitness_calendar_events",
     venueId: string,
@@ -2597,6 +2882,8 @@ export function createFitnessConfigStorageService(
           : absentPredicate("fitness_constraints", receipt.after.id);
       case "constraint-active":
         return constraintPredicate(receipt.before);
+      case "settings-save":
+        return settingsSetPredicate(receipt.before.rows);
     }
   }
 
@@ -2668,37 +2955,54 @@ export function createFitnessConfigStorageService(
           params: [Number(receipt.after.active), receipt.after.updated_at, receipt.after.id],
         });
         break;
+      case "settings-save":
+        for (const row of receipt.after.rows) {
+          statements.push({
+            sql: `INSERT INTO fitness_settings(key,value,updated_at) VALUES(?,?,?)
+              ON CONFLICT(key) DO UPDATE SET
+                value=excluded.value,updated_at=excluded.updated_at`,
+            params: [row!.key, row!.value, row!.updated_at],
+          });
+        }
+        break;
     }
     return statements;
   }
 
   async function inspectWrite(value: unknown): Promise<FitnessConfigWriteInspection> {
-    if (!isFitnessConfigWriteReceipt(value)) return "invalid_receipt";
+    let receipt: FitnessConfigWriteReceipt;
     try {
-      if (!await receiptHashIsValid(value)) return "invalid_receipt";
+      const stableValue = snapshotInput(value);
+      if (!isFitnessConfigWriteReceipt(stableValue)) return "invalid_receipt";
+      receipt = stableValue;
+      if (!await receiptHashIsValid(receipt)) return "invalid_receipt";
     } catch {
       return "invalid_receipt";
     }
     try {
-      return await runtime.withExclusiveLock(() => inspectReceiptUnlocked(runtime, value));
+      return await runtime.withExclusiveLock(() => inspectReceiptUnlocked(runtime, receipt));
     } catch {
       return "still_unknown";
     }
   }
 
   async function commitWrite(value: unknown): Promise<FitnessConfigWriteResult> {
-    if (!isFitnessConfigWriteReceipt(value)) {
-      throw configError("invalid_receipt", "写入回执无效；没有改动任何资料。");
-    }
+    let receipt: FitnessConfigWriteReceipt;
     try {
-      if (!await receiptHashIsValid(value)) {
+      const stableValue = snapshotInput(value);
+      if (!isFitnessConfigWriteReceipt(stableValue)) {
+        throw configError("invalid_receipt", "写入回执无效；没有改动任何资料。");
+      }
+      receipt = stableValue;
+      if (!await receiptHashIsValid(receipt)) {
         throw configError("invalid_receipt", "写入回执无效；没有改动任何资料。");
       }
     } catch (error) {
-      if (error instanceof FitnessConfigMutationError) throw error;
+      if (error instanceof FitnessConfigMutationError && error.code === "invalid_receipt") {
+        throw error;
+      }
       throw configError("invalid_receipt", "写入回执无法验证；没有改动任何资料。");
     }
-    const receipt = value;
     const entity = receiptEntity(receipt);
     try {
       return await runtime.withExclusiveLock(async () => {
@@ -2767,6 +3071,8 @@ export function createFitnessConfigStorageService(
   }
 
   return {
+    loadFitnessSettingsExpectedState: loadSettingsExpectedState,
+    prepareFitnessSettingsSave: prepareSettingsSave,
     prepareFitnessProfileSave: prepareProfileSave,
     prepareFitnessVenueSave: prepareVenueSave,
     prepareFitnessVenueArchive: prepareVenueArchive,
@@ -2782,6 +3088,10 @@ export function createFitnessConfigStorageService(
 
 const defaultFitnessConfigStorageService = createFitnessConfigStorageService();
 
+export const loadFitnessSettingsExpectedState =
+  defaultFitnessConfigStorageService.loadFitnessSettingsExpectedState;
+export const prepareFitnessSettingsSave =
+  defaultFitnessConfigStorageService.prepareFitnessSettingsSave;
 export const prepareFitnessProfileSave =
   defaultFitnessConfigStorageService.prepareFitnessProfileSave;
 export const prepareFitnessVenueSave =

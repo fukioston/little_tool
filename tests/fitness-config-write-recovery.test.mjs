@@ -235,6 +235,53 @@ const constraintInput = {
   active: true,
 };
 
+const defaultSettings = {
+  unit: "kg",
+  rest_timer_enabled: true,
+  sound_enabled: false,
+  ai_enabled: true,
+};
+
+const changedSettings = {
+  unit: "lb",
+  rest_timer_enabled: false,
+  sound_enabled: true,
+  ai_enabled: false,
+};
+
+const canonicalSettingKeys = [
+  "unit",
+  "rest_timer_enabled",
+  "sound_enabled",
+  "ai_enabled",
+];
+
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value).sort().map((key) =>
+      `${JSON.stringify(key)}:${canonicalJson(value[key])}`
+    ).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+async function resignReceipt(receipt) {
+  const projection = structuredClone(receipt);
+  delete projection.projectionSha256;
+  const digest = new Uint8Array(await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(canonicalJson(projection)),
+  ));
+  return {
+    ...projection,
+    projectionSha256: Array.from(
+      digest,
+      (byte) => byte.toString(16).padStart(2, "0"),
+    ).join(""),
+  };
+}
+
 async function createVenue(service, input = venueInput) {
   const receipt = await service.prepareFitnessVenueSave(input, null);
   assert.equal((await service.commitFitnessConfigWrite(receipt)).outcome, "saved");
@@ -711,6 +758,365 @@ test("safe config service performs zero reads and writes when its lock is unavai
     assert.equal(state.queryCalls, 0);
     assert.equal(state.batchCalls, 0);
     assert.equal(database.selectValue("SELECT COUNT(*) FROM fitness_profiles"), 0);
+  } finally {
+    database.close();
+  }
+});
+
+test("settings loader exposes one cached display generation and prepare snapshots callers before awaiting", async () => {
+  const { database, state, service } = await fixture({ now: 90_000 });
+  try {
+    executeRun(
+      database,
+      "INSERT INTO fitness_settings(key,value,updated_at) VALUES('__fitness_live_receipt__:kept','marker',7)",
+    );
+    const expected = await service.loadFitnessSettingsExpectedState();
+    assert.deepEqual(expected, {
+      generationId: "legacy",
+      generationSequence: 0,
+      rows: [null, null, null, null],
+      settings: defaultSettings,
+    });
+    assert.equal(state.batchCalls, 0);
+
+    const next = { ...changedSettings };
+    const mutableExpected = structuredClone(expected);
+    const prepare = service.prepareFitnessSettingsSave(next, mutableExpected);
+    next.unit = "kg";
+    mutableExpected.generationId = "22222222-2222-4222-8222-222222222222";
+    mutableExpected.generationSequence = 1;
+    mutableExpected.settings.unit = "lb";
+    mutableExpected.rows[0] = { key: "unit", value: "lb", updated_at: 1 };
+    const receipt = await prepare;
+
+    assert.equal(state.batchCalls, 0);
+    assert.deepEqual(receipt.before, expected);
+    assert.deepEqual(receipt.after.settings, changedSettings);
+    assert.deepEqual(receipt.after.rows.map(({ key }) => key), canonicalSettingKeys);
+    assert.deepEqual(receipt.after.rows.map(({ value }) => value), [
+      "lb", "false", "true", "false",
+    ]);
+    assert.deepEqual(receipt.after.rows.map(({ updated_at }) => updated_at), [
+      90_000, 90_000, 90_000, 90_000,
+    ]);
+    assert.equal(store.isFitnessConfigWriteReceipt(receipt), true);
+    assert.equal(
+      database.selectValue(
+        "SELECT value FROM fitness_settings WHERE key='__fitness_live_receipt__:kept'",
+      ),
+      "marker",
+    );
+
+    const invalidValue = structuredClone(receipt);
+    invalidValue.after.rows[1].value = "yes";
+    invalidValue.after.settings.rest_timer_enabled = true;
+    const resignedInvalidValue = await resignReceipt(invalidValue);
+    assert.equal(store.isFitnessConfigWriteReceipt(resignedInvalidValue), false);
+    assert.equal(
+      await service.inspectFitnessConfigWrite(resignedInvalidValue),
+      "invalid_receipt",
+    );
+    for (const target of ["top", "before", "after"]) {
+      const generationTamper = structuredClone(receipt);
+      if (target === "top") {
+        generationTamper.generationId = "33333333-3333-4333-8333-333333333333";
+      } else {
+        generationTamper[target].generationId =
+          "33333333-3333-4333-8333-333333333333";
+      }
+      const resignedGenerationTamper = await resignReceipt(generationTamper);
+      assert.equal(store.isFitnessConfigWriteReceipt(resignedGenerationTamper), false, target);
+      assert.equal(
+        await service.inspectFitnessConfigWrite(resignedGenerationTamper),
+        "invalid_receipt",
+        target,
+      );
+    }
+    await assert.rejects(
+      service.prepareFitnessSettingsSave({ ...changedSettings, sound_enabled: Number.NaN }, expected),
+      (error) => error instanceof store.FitnessConfigMutationError &&
+        error.code === "invalid_input",
+    );
+    assert.equal(state.batchCalls, 0);
+  } finally {
+    database.close();
+  }
+});
+
+test("settings display generation replacement blocks prepare despite byte-identical rows", async () => {
+  const { database, state, service } = await fixture({ now: 90_500 });
+  try {
+    for (const [key, value, updatedAt] of [
+      ["unit", "kg", 1],
+      ["rest_timer_enabled", "true", 2],
+      ["sound_enabled", "false", 3],
+      ["ai_enabled", "true", 4],
+    ]) {
+      executeRun(
+        database,
+        "INSERT INTO fitness_settings(key,value,updated_at) VALUES(?,?,?)",
+        [key, value, updatedAt],
+      );
+    }
+    const displayed = await service.loadFitnessSettingsExpectedState();
+    const rawBefore = database.selectObjects(
+      "SELECT key,value,updated_at FROM fitness_settings ORDER BY key",
+    ).map((row) => ({ ...row }));
+    state.generation = {
+      generationId: "22222222-2222-4222-8222-222222222222",
+      sequence: 1,
+    };
+    await assert.rejects(
+      service.prepareFitnessSettingsSave(changedSettings, displayed),
+      (error) => error instanceof store.FitnessConfigMutationError &&
+        error.code === "changed",
+    );
+    assert.equal(state.batchCalls, 0);
+    assert.deepEqual(
+      database.selectObjects(
+        "SELECT key,value,updated_at FROM fitness_settings ORDER BY key",
+      ).map((row) => ({ ...row })),
+      rawBefore,
+    );
+  } finally {
+    database.close();
+  }
+});
+
+test("a cached settings expectation rejects a peer edit to any canonical key without writing", async () => {
+  const initialRows = [
+    ["unit", "kg", 90_001],
+    ["rest_timer_enabled", "true", 90_002],
+    ["sound_enabled", "false", 90_003],
+    ["ai_enabled", "true", 90_004],
+  ];
+  for (const [key, peerValue] of [
+    ["unit", "lb"],
+    ["rest_timer_enabled", "false"],
+    ["sound_enabled", "true"],
+    ["ai_enabled", "false"],
+  ]) {
+    const initial = initialRows.find(([candidate]) => candidate === key);
+    for (const field of ["value", "updated_at"]) {
+      const { database, state, service } = await fixture({ now: 91_000 });
+      try {
+        for (const row of initialRows) {
+          executeRun(
+            database,
+            "INSERT INTO fitness_settings(key,value,updated_at) VALUES(?,?,?)",
+            row,
+          );
+        }
+        // This snapshot and its .settings value represent the UI's one cached read.
+        const displayed = await service.loadFitnessSettingsExpectedState();
+        const receipt = await service.prepareFitnessSettingsSave(changedSettings, displayed);
+        const value = field === "value" ? peerValue : initial[1];
+        const updatedAt = field === "updated_at" ? 90_500 : initial[2];
+        executeRun(
+          database,
+          "UPDATE fitness_settings SET value=?,updated_at=? WHERE key=?",
+          [value, updatedAt, key],
+        );
+        const label = `${key}/${field}`;
+        const batches = state.batchCalls;
+        assert.equal(await service.inspectFitnessConfigWrite(receipt), "changed", label);
+        assert.equal((await service.commitFitnessConfigWrite(receipt)).outcome, "changed", label);
+        assert.equal(state.batchCalls, batches, label);
+        assert.deepEqual(
+          database.selectObjects(
+            "SELECT key,value,updated_at FROM fitness_settings WHERE key=?",
+            [key],
+          ).map((row) => ({ ...row })),
+          [{ key, value, updated_at: updatedAt }],
+          label,
+        );
+      } finally {
+        database.close();
+      }
+    }
+  }
+});
+
+test("settings response loss settles exact, writes all four rows, and retry is idempotent", async () => {
+  const { database, state, service } = await fixture({ now: 1 });
+  try {
+    for (const [key, value, updatedAt] of [
+      ["unit", "lb", 11],
+      ["rest_timer_enabled", "false", 22],
+      ["sound_enabled", "true", 33],
+      ["ai_enabled", "false", 44],
+    ]) {
+      executeRun(
+        database,
+        "INSERT INTO fitness_settings(key,value,updated_at) VALUES(?,?,?)",
+        [key, value, updatedAt],
+      );
+    }
+    executeRun(
+      database,
+      "INSERT INTO fitness_settings(key,value,updated_at) VALUES('__fitness_structure_receipt__:kept','proof',99)",
+    );
+    const expected = await service.loadFitnessSettingsExpectedState();
+    assert.deepEqual(expected.rows.map((row) => row.updated_at), [11, 22, 33, 44]);
+    assert.deepEqual(expected.settings, changedSettings);
+
+    const receipt = await service.prepareFitnessSettingsSave(defaultSettings, expected);
+    assert.deepEqual(receipt.after.rows.map((row) => row.updated_at), [45, 45, 45, 45]);
+    state.throwAfterBatch = true;
+    state.broadcastThrows = true;
+    const saved = await service.commitFitnessConfigWrite(receipt);
+    assert.equal(saved.outcome, "saved");
+    assert.equal(saved.entityId, "settings");
+    assert.equal(saved.updatedAt, 45);
+    assert.deepEqual(
+      database.selectObjects(
+        "SELECT key,value,updated_at FROM fitness_settings WHERE key IN (?,?,?,?) ORDER BY key",
+        canonicalSettingKeys,
+      ).map((row) => ({ ...row })),
+      [
+        { key: "ai_enabled", value: "true", updated_at: 45 },
+        { key: "rest_timer_enabled", value: "true", updated_at: 45 },
+        { key: "sound_enabled", value: "false", updated_at: 45 },
+        { key: "unit", value: "kg", updated_at: 45 },
+      ],
+    );
+    assert.equal(
+      database.selectValue(
+        "SELECT value FROM fitness_settings WHERE key='__fitness_structure_receipt__:kept'",
+      ),
+      "proof",
+    );
+    assert.equal(await service.inspectFitnessConfigWrite(receipt), "exact_saved");
+    const batches = state.batchCalls;
+    assert.equal((await service.commitFitnessConfigWrite(receipt)).outcome, "already_saved");
+    assert.equal(state.batchCalls, batches);
+    assert.deepEqual(state.broadcasts, ["settings-saved", "settings-saved"]);
+  } finally {
+    database.close();
+  }
+});
+
+test("settings recovery reports changed after a peer advances a committed uncertain result", async () => {
+  const { database, state, service } = await fixture({ now: 92_000 });
+  try {
+    const expected = await service.loadFitnessSettingsExpectedState();
+    const receipt = await service.prepareFitnessSettingsSave(changedSettings, expected);
+    state.throwAfterBatch = true;
+    state.failQueryAfterBatch = true;
+    assert.equal(
+      (await service.commitFitnessConfigWrite(receipt)).outcome,
+      "outcome_uncertain",
+    );
+    executeRun(
+      database,
+      "UPDATE fitness_settings SET value='kg',updated_at=updated_at+1 WHERE key='unit'",
+    );
+    const batches = state.batchCalls;
+    assert.equal(await service.inspectFitnessConfigWrite(receipt), "changed");
+    assert.equal((await service.commitFitnessConfigWrite(receipt)).outcome, "changed");
+    assert.equal(state.batchCalls, batches);
+    assert.equal(
+      database.selectValue("SELECT value FROM fitness_settings WHERE key='unit'"),
+      "kg",
+    );
+  } finally {
+    database.close();
+  }
+});
+
+test("settings generation ABA and stale concurrent writers both fail closed with zero write", async () => {
+  const generationFixture = await fixture({ now: 93_000 });
+  try {
+    const { database, state, service } = generationFixture;
+    const expected = await service.loadFitnessSettingsExpectedState();
+    const receipt = await service.prepareFitnessSettingsSave(changedSettings, expected);
+    state.generation = {
+      generationId: "22222222-2222-4222-8222-222222222222",
+      sequence: 1,
+    };
+    assert.equal(await service.inspectFitnessConfigWrite(receipt), "changed");
+    assert.equal((await service.commitFitnessConfigWrite(receipt)).outcome, "changed");
+    assert.equal(state.batchCalls, 0);
+    assert.equal(
+      database.selectValue(
+        "SELECT COUNT(*) FROM fitness_settings WHERE key IN (?,?,?,?)",
+        canonicalSettingKeys,
+      ),
+      0,
+    );
+  } finally {
+    generationFixture.database.close();
+  }
+
+  const raceFixture = await fixture({ now: 94_000 });
+  try {
+    const { database, state, service } = raceFixture;
+    const expected = await service.loadFitnessSettingsExpectedState();
+    const a = await service.prepareFitnessSettingsSave(changedSettings, expected);
+    const b = await service.prepareFitnessSettingsSave({
+      ...changedSettings,
+      unit: "kg",
+    }, expected);
+    assert.equal((await service.commitFitnessConfigWrite(a)).outcome, "saved");
+    const batches = state.batchCalls;
+    assert.equal((await service.commitFitnessConfigWrite(b)).outcome, "changed");
+    assert.equal(state.batchCalls, batches);
+    assert.equal(database.selectValue("SELECT value FROM fitness_settings WHERE key='unit'"), "lb");
+  } finally {
+    raceFixture.database.close();
+  }
+});
+
+test("settings transaction rollback restores every value and timestamp", async () => {
+  const { database, state, service } = await fixture({ now: 1 });
+  try {
+    for (const [key, value, updatedAt] of [
+      ["unit", "kg", 101],
+      ["rest_timer_enabled", "true", 102],
+      ["sound_enabled", "false", 103],
+      ["ai_enabled", "true", 104],
+    ]) {
+      executeRun(
+        database,
+        "INSERT INTO fitness_settings(key,value,updated_at) VALUES(?,?,?)",
+        [key, value, updatedAt],
+      );
+    }
+    const before = await service.loadFitnessSettingsExpectedState();
+    const receipt = await service.prepareFitnessSettingsSave(changedSettings, before);
+    assert.deepEqual(receipt.after.rows.map((row) => row.updated_at), [105, 105, 105, 105]);
+    state.failAtStatement = 3;
+    await assert.rejects(
+      service.commitFitnessConfigWrite(receipt),
+      (error) => error instanceof store.FitnessConfigMutationError &&
+        error.code === "write_failed",
+    );
+    assert.deepEqual(await service.loadFitnessSettingsExpectedState(), before);
+    assert.equal(await service.inspectFitnessConfigWrite(receipt), "expected");
+  } finally {
+    database.close();
+  }
+});
+
+test("settings inspect and commit consume one synchronous receipt snapshot", async () => {
+  const { database, service } = await fixture({ now: 96_000 });
+  try {
+    const expected = await service.loadFitnessSettingsExpectedState();
+    const prepared = await service.prepareFitnessSettingsSave(changedSettings, expected);
+    const mutableCommitReceipt = structuredClone(prepared);
+    const committing = service.commitFitnessConfigWrite(mutableCommitReceipt);
+    mutableCommitReceipt.after.rows[0].value = "kg";
+    mutableCommitReceipt.after.settings.unit = "kg";
+    const saved = await committing;
+    assert.equal(saved.outcome, "saved");
+    assert.equal(database.selectValue("SELECT value FROM fitness_settings WHERE key='unit'"), "lb");
+    assert.equal(saved.receipt.after.rows[0].value, "lb");
+
+    const mutableInspectReceipt = structuredClone(saved.receipt);
+    const inspecting = service.inspectFitnessConfigWrite(mutableInspectReceipt);
+    mutableInspectReceipt.after.rows[2].value = "false";
+    mutableInspectReceipt.after.settings.sound_enabled = false;
+    assert.equal(await inspecting, "exact_saved");
   } finally {
     database.close();
   }
