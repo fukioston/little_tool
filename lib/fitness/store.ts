@@ -6759,6 +6759,2511 @@ export const inspectFitnessLiveStructureWrite =
 export const commitFitnessLiveStructureWrite =
   defaultFitnessLiveStructureStorageService.commitFitnessLiveStructureWrite;
 
+export type PrepareFitnessProgramVersionScheduleInput = Readonly<{
+  draft: FitnessPlanDraft;
+  source?: FitnessProgram["source"];
+  anchorAt: number;
+}>;
+
+export type PrepareFitnessProgramWeekScheduleInput = Readonly<{
+  programId: string;
+  anchorAt: number;
+}>;
+
+export type FitnessProgramEnvironmentExpectation = Readonly<{
+  activePrograms: readonly FitnessProgram[];
+  logicalPrograms: readonly FitnessProgram[];
+  venue: FitnessVenue;
+  equipment: readonly FitnessEquipment[];
+  equipmentLoads: readonly FitnessEquipmentLoad[];
+  activeConstraints: readonly FitnessConstraint[];
+}>;
+
+export type FitnessProgramVersionScheduleExpectation =
+  FitnessProgramEnvironmentExpectation;
+
+export type FitnessProgramWeekScheduleExpectation =
+  FitnessProgramEnvironmentExpectation & Readonly<{
+    anchorAt: number;
+    program: FitnessProgram;
+    days: readonly FitnessProgramDay[];
+    items: readonly FitnessProgramItem[];
+    occurrences: readonly FitnessCalendarEvent[];
+  }>;
+
+type FitnessProgramReceiptBase<Kind extends string> = Readonly<{
+  purpose: "fitness-program-write";
+  version: 1;
+  operationId: string;
+  generationId: string;
+  generationSequence: number;
+  preparedAt: number;
+  kind: Kind;
+  projectionSha256: string;
+}>;
+
+export type FitnessProgramVersionScheduleReceipt =
+  FitnessProgramReceiptBase<"program-version-schedule"> & Readonly<{
+    request: Readonly<{
+      draft: FitnessPlanDraft;
+      source: FitnessProgram["source"];
+      anchorAt: number;
+      scheduleTimeZone: string;
+    }>;
+    before: FitnessProgramVersionScheduleExpectation;
+    after: Readonly<{
+      archivedPrograms: readonly FitnessProgram[];
+      program: FitnessProgram;
+      days: readonly FitnessProgramDay[];
+      items: readonly FitnessProgramItem[];
+      events: readonly FitnessCalendarEvent[];
+    }>;
+  }>;
+
+export type FitnessProgramWeekScheduleReceipt =
+  FitnessProgramReceiptBase<"program-week-schedule"> & Readonly<{
+    request: Readonly<{
+      programId: string;
+      anchorAt: number;
+      scheduleTimeZone: string;
+    }>;
+    before: FitnessProgramWeekScheduleExpectation;
+    after: Readonly<{
+      events: readonly FitnessCalendarEvent[];
+      createdEventIds: readonly string[];
+    }>;
+  }>;
+
+export type FitnessProgramWriteReceipt =
+  | FitnessProgramVersionScheduleReceipt
+  | FitnessProgramWeekScheduleReceipt;
+
+export type FitnessProgramWriteInspection = FitnessLiveWriteInspection;
+
+export type FitnessProgramWriteResult =
+  | Readonly<{
+      outcome: "saved" | "already_saved";
+      receipt: FitnessProgramWriteReceipt;
+      entityId: string;
+      updatedAt: number;
+    }>
+  | Readonly<{
+      outcome: "changed";
+      receipt: FitnessProgramWriteReceipt;
+      entityId: string;
+      retryable: false;
+    }>
+  | Readonly<{
+      outcome: "outcome_uncertain";
+      receipt: FitnessProgramWriteReceipt;
+      entityId: string;
+      retryable: true;
+    }>;
+
+export class FitnessProgramMutationError extends Error {
+  readonly name = "FitnessProgramMutationError";
+
+  constructor(
+    readonly code: FitnessLiveMutationErrorCode,
+    message: string,
+    readonly receipt?: FitnessProgramWriteReceipt,
+  ) {
+    super(message);
+  }
+}
+
+export type PrepareFitnessCalendarRescheduleInput = Readonly<{
+  eventId: string;
+  startsAt: number;
+}>;
+
+export type PrepareFitnessCalendarNotPerformedInput = Readonly<{
+  eventId: string;
+  note?: string;
+}>;
+
+type FitnessCalendarReceiptBase<Kind extends string> = Readonly<{
+  purpose: "fitness-calendar-write";
+  version: 1;
+  operationId: string;
+  generationId: string;
+  generationSequence: number;
+  preparedAt: number;
+  kind: Kind;
+  projectionSha256: string;
+}>;
+
+export type FitnessCalendarRescheduleReceipt =
+  FitnessCalendarReceiptBase<"calendar-reschedule"> & Readonly<{
+    before: FitnessCalendarEvent;
+    after: FitnessCalendarEvent;
+  }>;
+
+export type FitnessCalendarNotPerformedReceipt =
+  FitnessCalendarReceiptBase<"calendar-not-performed"> & Readonly<{
+    before: FitnessCalendarEvent;
+    after: FitnessCalendarEvent;
+  }>;
+
+export type FitnessCalendarWriteReceipt =
+  | FitnessCalendarRescheduleReceipt
+  | FitnessCalendarNotPerformedReceipt;
+
+export type FitnessCalendarWriteInspection = FitnessLiveWriteInspection;
+
+export type FitnessCalendarWriteResult =
+  | Readonly<{
+      outcome: "saved" | "already_saved";
+      receipt: FitnessCalendarWriteReceipt;
+      entityId: string;
+      updatedAt: number;
+    }>
+  | Readonly<{
+      outcome: "changed";
+      receipt: FitnessCalendarWriteReceipt;
+      entityId: string;
+      retryable: false;
+    }>
+  | Readonly<{
+      outcome: "outcome_uncertain";
+      receipt: FitnessCalendarWriteReceipt;
+      entityId: string;
+      retryable: true;
+    }>;
+
+export class FitnessCalendarMutationError extends Error {
+  readonly name = "FitnessCalendarMutationError";
+
+  constructor(
+    readonly code: FitnessLiveMutationErrorCode,
+    message: string,
+    readonly receipt?: FitnessCalendarWriteReceipt,
+  ) {
+    super(message);
+  }
+}
+
+const PROGRAM_OPERATION_ID_PATTERN =
+  /^fitness-program-operation-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const CALENDAR_OPERATION_ID_PATTERN =
+  /^fitness-calendar-operation-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const PROGRAM_ID_PATTERN =
+  /^program-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const PROGRAM_DAY_ID_PATTERN =
+  /^program-day-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const PROGRAM_ITEM_ID_PATTERN =
+  /^program-item-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const PROGRAM_EVENT_ID_PATTERN =
+  /^event-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const PROGRAM_RECEIPT_MARKER_PREFIX = "__fitness_program_receipt__:";
+
+function programError(
+  code: FitnessLiveMutationErrorCode,
+  message: string,
+  receipt?: FitnessProgramWriteReceipt,
+): FitnessProgramMutationError {
+  return new FitnessProgramMutationError(code, message, receipt);
+}
+
+function calendarError(
+  code: FitnessLiveMutationErrorCode,
+  message: string,
+  receipt?: FitnessCalendarWriteReceipt,
+): FitnessCalendarMutationError {
+  return new FitnessCalendarMutationError(code, message, receipt);
+}
+
+function sortedPrograms(rows: readonly FitnessProgram[]): FitnessProgram[] {
+  return [...rows].sort((left, right) =>
+    left.version - right.version || compareLiveId(left.id, right.id)
+  );
+}
+
+function sortedProgramDays(rows: readonly FitnessProgramDay[]): FitnessProgramDay[] {
+  return [...rows].sort((left, right) =>
+    left.day_index - right.day_index || compareLiveId(left.id, right.id)
+  );
+}
+
+function sortedProgramEvents(rows: readonly FitnessCalendarEvent[]): FitnessCalendarEvent[] {
+  return [...rows].sort((left, right) =>
+    compareLiveId(left.program_day_id ?? "", right.program_day_id ?? "") ||
+    compareLiveId(left.occurrence_key ?? "", right.occurrence_key ?? "") ||
+    compareLiveId(left.id, right.id)
+  );
+}
+
+type ProgramLogicalKey = Readonly<{
+  venueId: string;
+  name: string;
+  goal: FitnessProgram["goal"];
+  split: FitnessProgram["split"];
+}>;
+
+function programLogicalKeyFromDraft(draft: FitnessPlanDraft): ProgramLogicalKey {
+  return {
+    venueId: draft.venue_id,
+    name: draft.name.trim(),
+    goal: draft.goal,
+    split: draft.split,
+  };
+}
+
+function programLogicalKeyFromProgram(program: FitnessProgram): ProgramLogicalKey {
+  return {
+    venueId: program.venue_id,
+    name: program.name,
+    goal: program.goal,
+    split: program.split,
+  };
+}
+
+function programMatchesLogicalKey(
+  program: FitnessProgram,
+  key: ProgramLogicalKey,
+): boolean {
+  return program.venue_id === key.venueId && program.name === key.name &&
+    program.goal === key.goal && program.split === key.split;
+}
+
+function isFitnessProgramDraftForReceipt(value: unknown): value is FitnessPlanDraft {
+  if (!value || typeof value !== "object" || Array.isArray(value) ||
+      !jsonWithinUnits(value, LIVE_MAX_EXPECTATION_JSON_UNITS) || !exactObjectKeys(value, [
+        "name", "venue_id", "goal", "split", "assumptions", "warnings", "days",
+      ])) return false;
+  const draft = value as Partial<FitnessPlanDraft>;
+  if (!safeString(draft.name, 160) || draft.name.trim().length === 0 ||
+      !safeOpaqueId(draft.venue_id) || !FITNESS_GOALS.has(String(draft.goal)) ||
+      !["auto", "full_body", "upper_lower", "push_pull_legs", "custom"]
+        .includes(String(draft.split)) ||
+      !safeStringArray(draft.assumptions, 100) || !uniqueExactStrings(draft.assumptions) ||
+      !draft.assumptions.every((entry) => safeString(entry, 500) && entry.trim().length > 0) ||
+      !safeStringArray(draft.warnings, 100) ||
+      !draft.warnings.every((entry) => safeString(entry, 1_000)) ||
+      !Array.isArray(draft.days) || draft.days.length === 0 || draft.days.length > 28) return false;
+  let itemCount = 0;
+  for (const [dayIndex, day] of draft.days.entries()) {
+    if (!day || typeof day !== "object" || Array.isArray(day) || !exactObjectKeys(day, [
+      "weekday", "kind", "name", "focus", "estimated_minutes", "items",
+    ]) || !(day.weekday === null || liveInteger(day.weekday, 0, 6)) ||
+        !["resistance", "cardio", "rest"].includes(String(day.kind)) ||
+        !safeString(day.name, 10_000) || day.name.trim().length === 0 ||
+        !safeString(day.focus, 10_000) || !liveInteger(day.estimated_minutes, 0, 240) ||
+        !Array.isArray(day.items) || day.items.length > LIVE_MAX_ATOMIC_ROWS) return false;
+    itemCount += day.items.length;
+    if (itemCount > LIVE_MAX_ATOMIC_ROWS) return false;
+    for (const [itemIndex, item] of day.items.entries()) {
+      if (!item || typeof item !== "object" || Array.isArray(item) ||
+          !exactObjectKeys(item, [
+            "exercise_id", "equipment_id", "resource_equipment_ids", "order_index",
+            "sets", "rep_min", "rep_max", "duration_seconds", "target_rir",
+            "rest_seconds", "load_grams", "load_guidance", "rationale",
+            "substitution_exercise_ids", "equipment_snapshot",
+          ]) || item.order_index !== itemIndex || !isFitnessLiveProgramItem({
+            ...item,
+            id: `draft-item-${dayIndex}-${itemIndex}`,
+            program_day_id: `draft-day-${dayIndex}`,
+            created_at: 0,
+          })) return false;
+    }
+  }
+  return true;
+}
+
+function isFitnessProgramEnvironment(
+  value: unknown,
+): value is FitnessProgramEnvironmentExpectation {
+  if (!value || typeof value !== "object" || Array.isArray(value) ||
+      !jsonWithinUnits(value, LIVE_MAX_EXPECTATION_JSON_UNITS) || !exactObjectKeys(value, [
+        "activePrograms", "logicalPrograms", "venue", "equipment", "equipmentLoads",
+        "activeConstraints",
+      ])) return false;
+  const expected = value as Partial<FitnessProgramEnvironmentExpectation>;
+  if (!Array.isArray(expected.activePrograms) || !Array.isArray(expected.logicalPrograms) ||
+      !Array.isArray(expected.equipment) || !Array.isArray(expected.equipmentLoads) ||
+      !Array.isArray(expected.activeConstraints) || !isFitnessVenueRow(expected.venue)) return false;
+  const total = expected.activePrograms.length + expected.logicalPrograms.length +
+    expected.equipment.length + expected.equipmentLoads.length +
+    expected.activeConstraints.length;
+  if (total > LIVE_MAX_ATOMIC_ROWS || !uniqueIds(expected.activePrograms) ||
+      !uniqueIds(expected.logicalPrograms) || !uniqueIds(expected.equipment) ||
+      !uniqueIds(expected.equipmentLoads) || !uniqueIds(expected.activeConstraints) ||
+      !expected.activePrograms.every((row) => isFitnessLiveProgram(row) && row.status === "active") ||
+      !expected.logicalPrograms.every(isFitnessLiveProgram) ||
+      !expected.equipment.every((row) => isFitnessEquipmentRow(row) &&
+        row.venue_id === expected.venue?.id) ||
+      !expected.equipmentLoads.every(isFitnessEquipmentLoadRow) ||
+      !expected.activeConstraints.every((row) => isFitnessConstraintRow(row) && row.active) ||
+      !isSortedProjection(expected.activePrograms, sortedPrograms) ||
+      !isSortedProjection(expected.logicalPrograms, sortedPrograms) ||
+      !isSortedProjection(expected.equipment, sortedEquipment) ||
+      !isSortedProjection(expected.equipmentLoads, sortedEquipmentLoads) ||
+      !isSortedProjection(expected.activeConstraints, sortedConstraints)) return false;
+  const equipmentIds = new Set(expected.equipment.map(({ id }) => id));
+  return expected.equipmentLoads.every(({ equipment_id }) => equipmentIds.has(equipment_id));
+}
+
+function programEnvironmentOnly(
+  value: FitnessProgramEnvironmentExpectation,
+): FitnessProgramEnvironmentExpectation {
+  return {
+    activePrograms: value.activePrograms,
+    logicalPrograms: value.logicalPrograms,
+    venue: value.venue,
+    equipment: value.equipment,
+    equipmentLoads: value.equipmentLoads,
+    activeConstraints: value.activeConstraints,
+  };
+}
+
+function isFitnessProgramVersionScheduleExpectation(
+  value: unknown,
+): value is FitnessProgramVersionScheduleExpectation {
+  return isFitnessProgramEnvironment(value);
+}
+
+type ProgramScheduleSlot = Readonly<{
+  day: FitnessProgramDay;
+  startsAt: number;
+  occurrenceKey: string;
+}>;
+
+type ProgramCivilDateTime = Readonly<{
+  year: number;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
+  second: number;
+}>;
+
+function isCanonicalProgramTimeZone(value: unknown): value is string {
+  if (typeof value !== "string" || value.length === 0 || value.length > 100 ||
+      value !== value.trim()) return false;
+  try {
+    return new Intl.DateTimeFormat("en-US", { timeZone: value })
+      .resolvedOptions().timeZone === value;
+  } catch {
+    return false;
+  }
+}
+
+function currentProgramTimeZone(): string {
+  const value = new Intl.DateTimeFormat().resolvedOptions().timeZone;
+  if (!isCanonicalProgramTimeZone(value)) {
+    throw programError("invalid_input", "无法冻结当前时区，未准备计划排期。");
+  }
+  return value;
+}
+
+function civilDateTimeAt(timestamp: number, timeZone: string): ProgramCivilDateTime {
+  const parts = new Intl.DateTimeFormat("en-US-u-ca-gregory-nu-latn", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(new Date(timestamp));
+  const values = new Map(parts.map(({ type, value }) => [type, value]));
+  const result = {
+    year: Number(values.get("year")),
+    month: Number(values.get("month")),
+    day: Number(values.get("day")),
+    hour: Number(values.get("hour")),
+    minute: Number(values.get("minute")),
+    second: Number(values.get("second")),
+  };
+  if (!Object.values(result).every(Number.isSafeInteger)) {
+    throw new RangeError("invalid zoned civil time");
+  }
+  return result;
+}
+
+function addProgramCivilDays(
+  value: Pick<ProgramCivilDateTime, "year" | "month" | "day">,
+  days: number,
+): Pick<ProgramCivilDateTime, "year" | "month" | "day"> {
+  const next = new Date(Date.UTC(value.year, value.month - 1, value.day + days));
+  return {
+    year: next.getUTCFullYear(),
+    month: next.getUTCMonth() + 1,
+    day: next.getUTCDate(),
+  };
+}
+
+function epochForProgramCivilTime(
+  value: ProgramCivilDateTime,
+  timeZone: string,
+): number {
+  const desired = Date.UTC(
+    value.year,
+    value.month - 1,
+    value.day,
+    value.hour,
+    value.minute,
+    value.second,
+  );
+  let candidate = desired;
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const current = civilDateTimeAt(candidate, timeZone);
+    const represented = Date.UTC(
+      current.year,
+      current.month - 1,
+      current.day,
+      current.hour,
+      current.minute,
+      current.second,
+    );
+    const adjustment = desired - represented;
+    candidate += adjustment;
+    if (adjustment === 0) break;
+  }
+  const verified = civilDateTimeAt(candidate, timeZone);
+  if (!sameProjection(verified, value) || !safeTimestamp(candidate)) {
+    throw new RangeError("unrepresentable zoned civil time");
+  }
+  return candidate;
+}
+
+function programScheduleSlots(
+  days: readonly FitnessProgramDay[],
+  anchorAt: number,
+  scheduleTimeZone: string,
+): ProgramScheduleSlot[] {
+  if (!safeTimestamp(anchorAt) || !isCanonicalProgramTimeZone(scheduleTimeZone)) return [];
+  try {
+    const anchorCivil = civilDateTimeAt(anchorAt, scheduleTimeZone);
+    const anchorWeekday = new Date(Date.UTC(
+      anchorCivil.year,
+      anchorCivil.month - 1,
+      anchorCivil.day,
+    )).getUTCDay();
+    return sortedProgramDays(days).flatMap((day) => {
+      if (day.weekday === null || day.kind === "rest") return [];
+      const delta = (day.weekday - anchorWeekday + 7) % 7;
+      let targetDate = addProgramCivilDays(anchorCivil, delta);
+      let startsAt = epochForProgramCivilTime({
+        ...targetDate,
+        hour: 18,
+        minute: 0,
+        second: 0,
+      }, scheduleTimeZone);
+      if (startsAt < anchorAt) {
+        targetDate = addProgramCivilDays(targetDate, 7);
+        startsAt = epochForProgramCivilTime({
+          ...targetDate,
+          hour: 18,
+          minute: 0,
+          second: 0,
+        }, scheduleTimeZone);
+      }
+      return [{
+        day,
+        startsAt,
+        occurrenceKey: [
+          targetDate.year,
+          String(targetDate.month).padStart(2, "0"),
+          String(targetDate.day).padStart(2, "0"),
+        ].join("-"),
+      }];
+    });
+  } catch {
+    return [];
+  }
+}
+
+function isFitnessProgramWeekScheduleExpectation(
+  value: unknown,
+  scheduleTimeZone: string,
+): value is FitnessProgramWeekScheduleExpectation {
+  if (!value || typeof value !== "object" || Array.isArray(value) ||
+      !jsonWithinUnits(value, LIVE_MAX_EXPECTATION_JSON_UNITS) || !exactObjectKeys(value, [
+        "activePrograms", "logicalPrograms", "venue", "equipment", "equipmentLoads",
+        "activeConstraints", "anchorAt", "program", "days", "items", "occurrences",
+      ])) return false;
+  const expected = value as Partial<FitnessProgramWeekScheduleExpectation>;
+  if (!isFitnessProgramEnvironment(programEnvironmentOnly(
+    expected as FitnessProgramEnvironmentExpectation,
+  )) || !safeTimestamp(expected.anchorAt) || !isFitnessLiveProgram(expected.program) ||
+      expected.program.status !== "active" || expected.program.venue_id !== expected.venue?.id ||
+      !Array.isArray(expected.days) || !Array.isArray(expected.items) ||
+      !Array.isArray(expected.occurrences) || !uniqueIds(expected.days) ||
+      !uniqueIds(expected.items) || !uniqueIds(expected.occurrences) ||
+      !expected.days.every((row) => isFitnessLiveProgramDay(row) &&
+        row.program_id === expected.program?.id) ||
+      !expected.items.every(isFitnessLiveProgramItem) ||
+      !expected.occurrences.every(isFitnessLiveEvent) ||
+      !isSortedProjection(expected.days, sortedProgramDays) ||
+      !isSortedProjection(expected.items, sortedProgramItems) ||
+      !isSortedProjection(expected.occurrences, sortedProgramEvents)) return false;
+  const complete = expected as FitnessProgramWeekScheduleExpectation;
+  if (complete.days.length + complete.items.length + complete.occurrences.length +
+      complete.activePrograms.length + complete.logicalPrograms.length +
+      complete.equipment.length + complete.equipmentLoads.length +
+      complete.activeConstraints.length > LIVE_MAX_ATOMIC_ROWS) return false;
+  const dayIds = new Set(complete.days.map(({ id }) => id));
+  if (!complete.items.every(({ program_day_id }) => dayIds.has(program_day_id)) ||
+      !complete.logicalPrograms.every((row) =>
+        programMatchesLogicalKey(row, programLogicalKeyFromProgram(complete.program)))) return false;
+  const slots = programScheduleSlots(complete.days, complete.anchorAt, scheduleTimeZone);
+  if (slots.length === 0) return false;
+  const slotKeys = new Set(slots.map(({ day, occurrenceKey }) =>
+    `${day.id}\u0000${occurrenceKey}`));
+  const occurrenceKeys = complete.occurrences.map(({ program_day_id, occurrence_key }) =>
+    `${program_day_id ?? ""}\u0000${occurrence_key ?? ""}`);
+  return new Set(occurrenceKeys).size === occurrenceKeys.length &&
+    occurrenceKeys.every((key) => slotKeys.has(key));
+}
+
+function programEnvironmentFromSnapshot(
+  snapshot: FitnessSnapshot,
+  key: ProgramLogicalKey,
+): FitnessProgramEnvironmentExpectation {
+  const venue = snapshot.venues.find(({ id }) => id === key.venueId);
+  if (!venue) throw programError("invalid_input", "计划场地不在这份画面里。");
+  const equipment = sortedEquipment(snapshot.equipment.filter(
+    ({ venue_id }) => venue_id === venue.id,
+  ));
+  const equipmentIds = new Set(equipment.map(({ id }) => id));
+  return snapshotProgramInput({
+    activePrograms: sortedPrograms(snapshot.programs.filter(({ status }) => status === "active")),
+    logicalPrograms: sortedPrograms(snapshot.programs.filter((program) =>
+      programMatchesLogicalKey(program, key))),
+    venue,
+    equipment,
+    equipmentLoads: sortedEquipmentLoads(snapshot.equipmentLoads.filter(
+      ({ equipment_id }) => equipmentIds.has(equipment_id),
+    )),
+    activeConstraints: sortedConstraints(snapshot.constraints.filter(({ active }) => active)),
+  });
+}
+
+export function fitnessProgramVersionScheduleExpectationFromSnapshot(
+  snapshot: FitnessSnapshot,
+  draft: FitnessPlanDraft,
+): FitnessProgramVersionScheduleExpectation {
+  if (!isFitnessProgramDraftForReceipt(draft)) {
+    throw programError("invalid_input", "计划草稿不是可准备的完整快照。");
+  }
+  return programEnvironmentFromSnapshot(snapshot, programLogicalKeyFromDraft(draft));
+}
+
+export function fitnessProgramWeekScheduleExpectationFromSnapshot(
+  snapshot: FitnessSnapshot,
+  programId: string,
+  anchorAt: number,
+): FitnessProgramWeekScheduleExpectation {
+  const scheduleTimeZone = currentProgramTimeZone();
+  const program = snapshot.programs.find(({ id }) => id === programId);
+  if (!program || !safeTimestamp(anchorAt)) {
+    throw programError("invalid_input", "计划或排期锚点不在这份画面里。");
+  }
+  const environment = programEnvironmentFromSnapshot(
+    snapshot,
+    programLogicalKeyFromProgram(program),
+  );
+  const days = sortedProgramDays(snapshot.programDays.filter(
+    ({ program_id }) => program_id === program.id,
+  ));
+  const dayIds = new Set(days.map(({ id }) => id));
+  const items = sortedProgramItems(snapshot.programItems.filter(
+    ({ program_day_id }) => dayIds.has(program_day_id),
+  ));
+  const slotKeys = new Set(programScheduleSlots(days, anchorAt, scheduleTimeZone).map(
+    ({ day, occurrenceKey }) => `${day.id}\u0000${occurrenceKey}`,
+  ));
+  const occurrences = sortedProgramEvents(snapshot.events.filter(
+    ({ program_day_id, occurrence_key }) => slotKeys.has(
+      `${program_day_id ?? ""}\u0000${occurrence_key ?? ""}`,
+    ),
+  ));
+  return snapshotProgramInput({
+    ...environment,
+    anchorAt,
+    program,
+    days,
+    items,
+    occurrences,
+  });
+}
+
+async function readProgramEnvironment(
+  runtime: FitnessLiveStorageRuntime,
+  key: ProgramLogicalKey,
+): Promise<FitnessProgramEnvironmentExpectation | null> {
+  const [venueRows, activeRows, logicalRows, equipmentRows, loadRows, constraintRows] =
+    await Promise.all([
+      liveRows<Row>(runtime, "SELECT * FROM fitness_venues WHERE id=? LIMIT 1", [key.venueId]),
+      liveRows<Row>(runtime,
+        "SELECT * FROM fitness_programs WHERE status='active' ORDER BY version,id LIMIT ?",
+        [LIVE_MAX_ATOMIC_ROWS + 1]),
+      liveRows<Row>(runtime, `SELECT * FROM fitness_programs
+        WHERE venue_id=? AND name=? AND goal=? AND split=? ORDER BY version,id LIMIT ?`, [
+        key.venueId,
+        key.name,
+        key.goal,
+        key.split,
+        LIVE_MAX_ATOMIC_ROWS + 1,
+      ]),
+      liveRows<Row>(runtime,
+        "SELECT * FROM fitness_equipment WHERE venue_id=? ORDER BY id LIMIT ?", [
+        key.venueId,
+        LIVE_MAX_ATOMIC_ROWS + 1,
+      ]),
+      liveRows<Row>(runtime, `SELECT equipment_load.*
+        FROM fitness_equipment_loads equipment_load
+        JOIN fitness_equipment equipment ON equipment.id=equipment_load.equipment_id
+        WHERE equipment.venue_id=?
+        ORDER BY equipment_load.equipment_id,equipment_load.load_grams,equipment_load.id
+        LIMIT ?`, [key.venueId, LIVE_MAX_ATOMIC_ROWS + 1]),
+      liveRows<Row>(runtime,
+        "SELECT * FROM fitness_constraints WHERE active=1 ORDER BY id LIMIT ?",
+        [LIVE_MAX_ATOMIC_ROWS + 1]),
+    ]);
+  const venue = venueRows[0] ? mapVenue(venueRows[0]) : null;
+  if (!venue) return null;
+  return {
+    activePrograms: sortedPrograms(activeRows.map(mapProgram)),
+    logicalPrograms: sortedPrograms(logicalRows.map(mapProgram)),
+    venue,
+    equipment: sortedEquipment(equipmentRows.map(mapEquipment)),
+    equipmentLoads: sortedEquipmentLoads(loadRows.map(mapEquipmentLoad)),
+    activeConstraints: sortedConstraints(constraintRows.map(mapConstraint)),
+  };
+}
+
+async function readProgramWeekExpectation(
+  runtime: FitnessLiveStorageRuntime,
+  programId: string,
+  anchorAt: number,
+  scheduleTimeZone: string,
+): Promise<FitnessProgramWeekScheduleExpectation | null> {
+  const programRows = await liveRows<Row>(
+    runtime,
+    "SELECT * FROM fitness_programs WHERE id=? LIMIT 1",
+    [programId],
+  );
+  const program = programRows[0] ? mapProgram(programRows[0]) : null;
+  if (!program) return null;
+  const key = programLogicalKeyFromProgram(program);
+  const [environment, dayRows, itemRows] = await Promise.all([
+    readProgramEnvironment(runtime, key),
+    liveRows<FitnessProgramDay>(runtime,
+      "SELECT * FROM fitness_program_days WHERE program_id=? ORDER BY day_index,id LIMIT ?", [
+      program.id,
+      LIVE_MAX_ATOMIC_ROWS + 1,
+    ]),
+    liveRows<Row>(runtime, `SELECT item.* FROM fitness_program_items item
+      JOIN fitness_program_days day ON day.id=item.program_day_id
+      WHERE day.program_id=? ORDER BY day.day_index,item.order_index,item.id LIMIT ?`, [
+      program.id,
+      LIVE_MAX_ATOMIC_ROWS + 1,
+    ]),
+  ]);
+  if (!environment) return null;
+  const days = sortedProgramDays(dayRows);
+  const slots = programScheduleSlots(days, anchorAt, scheduleTimeZone);
+  const occurrenceRows = await Promise.all(slots.map(({ day, occurrenceKey }) =>
+    liveRows<FitnessCalendarEvent>(runtime, `SELECT * FROM fitness_calendar_events
+      WHERE program_day_id=? AND occurrence_key=? ORDER BY id LIMIT 2`, [
+      day.id,
+      occurrenceKey,
+    ])));
+  return {
+    ...environment,
+    anchorAt,
+    program,
+    days,
+    items: sortedProgramItems(itemRows.map(mapProgramItem)),
+    occurrences: sortedProgramEvents(occurrenceRows.flatMap((rows) => [...rows])),
+  };
+}
+
+function programEnvironmentVersions(
+  environment: FitnessProgramEnvironmentExpectation,
+): number[] {
+  return [
+    environment.venue.created_at,
+    environment.venue.updated_at,
+    ...environment.activePrograms.flatMap(({ created_at, updated_at }) =>
+      [created_at, updated_at]),
+    ...environment.logicalPrograms.flatMap(({ created_at, updated_at }) =>
+      [created_at, updated_at]),
+    ...environment.equipment.flatMap(({ created_at, updated_at }) =>
+      [created_at, updated_at]),
+    ...environment.equipmentLoads.map(({ created_at }) => created_at),
+    ...environment.activeConstraints.flatMap(({ created_at, updated_at }) =>
+      [created_at, updated_at]),
+  ];
+}
+
+function programWeekVersions(expected: FitnessProgramWeekScheduleExpectation): number[] {
+  return [
+    ...programEnvironmentVersions(expected),
+    expected.program.created_at,
+    expected.program.updated_at,
+    ...expected.days.map(({ created_at }) => created_at),
+    ...expected.items.map(({ created_at }) => created_at),
+    ...expected.occurrences.flatMap(({ created_at, updated_at }) =>
+      [created_at, updated_at]),
+  ];
+}
+
+function generatedProgramId(
+  runtime: FitnessLiveStorageRuntime,
+  prefix: "program-" | "program-day-" | "program-item-" | "event-" |
+    "fitness-program-operation-",
+): string {
+  const uuid = runtime.randomUUID();
+  if (!LIVE_UUID_PATTERN.test(uuid)) {
+    throw programError("invalid_input", "无法生成可靠的计划写入标识。");
+  }
+  return `${prefix}${uuid}`;
+}
+
+function generatedCalendarOperationId(runtime: FitnessLiveStorageRuntime): string {
+  const uuid = runtime.randomUUID();
+  if (!LIVE_UUID_PATTERN.test(uuid)) {
+    throw calendarError("invalid_input", "无法生成可靠的日历写入标识。");
+  }
+  return `fitness-calendar-operation-${uuid}`;
+}
+
+function canonicalProgramDraft(draft: FitnessPlanDraft): FitnessPlanDraft {
+  return { ...draft, name: draft.name.trim() };
+}
+
+function validateProgramDraftAgainstEnvironment(
+  draft: FitnessPlanDraft,
+  environment: FitnessProgramEnvironmentExpectation,
+): readonly (readonly string[])[] {
+  try {
+    return assertDraftReferences(
+      draft,
+      environment.venue,
+      environment.equipment,
+      environment.equipmentLoads,
+      environment.activeConstraints,
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "计划草稿引用无效";
+    throw programError("invalid_input", message);
+  }
+}
+
+function draftFromProgramWeek(
+  expected: FitnessProgramWeekScheduleExpectation,
+): FitnessPlanDraft {
+  const itemsByDay = new Map<string, FitnessProgramItem[]>();
+  for (const item of expected.items) {
+    const items = itemsByDay.get(item.program_day_id) ?? [];
+    items.push(item);
+    itemsByDay.set(item.program_day_id, items);
+  }
+  return {
+    name: expected.program.name,
+    venue_id: expected.program.venue_id,
+    goal: expected.program.goal,
+    split: expected.program.split,
+    assumptions: expected.program.assumptions,
+    warnings: [],
+    days: expected.days.map((day) => ({
+      weekday: day.weekday,
+      kind: day.kind,
+      name: day.name,
+      focus: day.focus,
+      estimated_minutes: day.estimated_minutes,
+      items: sortedProgramItems(itemsByDay.get(day.id) ?? []).map((item) => ({
+        exercise_id: item.exercise_id,
+        equipment_id: item.equipment_id,
+        resource_equipment_ids: item.resource_equipment_ids,
+        order_index: item.order_index,
+        sets: item.sets,
+        rep_min: item.rep_min,
+        rep_max: item.rep_max,
+        duration_seconds: item.duration_seconds,
+        target_rir: item.target_rir,
+        rest_seconds: item.rest_seconds,
+        load_grams: item.load_grams,
+        load_guidance: item.load_guidance,
+        rationale: item.rationale,
+        substitution_exercise_ids: item.substitution_exercise_ids,
+        equipment_snapshot: item.equipment_snapshot,
+      })),
+    })),
+  };
+}
+
+function isCanonicalProgramSource(value: unknown): value is FitnessProgram["source"] {
+  return value === "local" || value === "ai_draft" || value === "manual";
+}
+
+function versionScheduleTransition(
+  receipt: FitnessProgramVersionScheduleReceipt,
+): boolean {
+  const { request, before, after, preparedAt } = receipt;
+  if (!request || typeof request !== "object" || Array.isArray(request) ||
+      !exactObjectKeys(request, ["draft", "source", "anchorAt", "scheduleTimeZone"]) ||
+      !isFitnessProgramDraftForReceipt(request.draft) ||
+      request.draft.name !== request.draft.name.trim() ||
+      !isCanonicalProgramSource(request.source) || !safeTimestamp(request.anchorAt) ||
+      !isCanonicalProgramTimeZone(request.scheduleTimeZone) ||
+      !isFitnessProgramVersionScheduleExpectation(before) ||
+      !after || typeof after !== "object" || Array.isArray(after) ||
+      !exactObjectKeys(after, ["archivedPrograms", "program", "days", "items", "events"]) ||
+      !Array.isArray(after.archivedPrograms) || !Array.isArray(after.days) ||
+      !Array.isArray(after.items) || !Array.isArray(after.events) ||
+      !after.archivedPrograms.every(isFitnessLiveProgram) ||
+      !isFitnessLiveProgram(after.program) || !after.days.every(isFitnessLiveProgramDay) ||
+      !after.items.every(isFitnessLiveProgramItem) || !after.events.every(isFitnessLiveEvent) ||
+      !uniqueIds(after.archivedPrograms) || !uniqueIds(after.days) || !uniqueIds(after.items) ||
+      !uniqueIds(after.events) || !isSortedProjection(after.archivedPrograms, sortedPrograms) ||
+      !isSortedProjection(after.days, sortedProgramDays) ||
+      !isSortedProjection(after.items, sortedProgramItems) ||
+      !isSortedProjection(after.events, sortedProgramEvents) ||
+      !strictlyAfterEvery(preparedAt, programEnvironmentVersions(before))) return false;
+  const key = programLogicalKeyFromDraft(request.draft);
+  if (before.venue.id !== key.venueId || before.venue.status !== "active" ||
+      !before.logicalPrograms.every((program) => programMatchesLogicalKey(program, key)) ||
+      !sameProjection(after.archivedPrograms, sortedPrograms(before.activePrograms.map(
+        (program) => ({ ...program, status: "archived" as const, updated_at: preparedAt }),
+      )))) return false;
+  let snapshots: readonly (readonly string[])[];
+  try {
+    snapshots = validateProgramDraftAgainstEnvironment(request.draft, before);
+  } catch {
+    return false;
+  }
+  const expectedVersion = before.logicalPrograms.reduce(
+    (maximum, program) => Math.max(maximum, program.version + 1),
+    1,
+  );
+  if (!PROGRAM_ID_PATTERN.test(after.program.id) || !sameProjection(after.program, {
+    id: after.program.id,
+    name: key.name,
+    venue_id: key.venueId,
+    goal: key.goal,
+    split: key.split,
+    status: "active",
+    version: expectedVersion,
+    source: request.source,
+    assumptions: request.draft.assumptions,
+    created_at: preparedAt,
+    updated_at: preparedAt,
+  }) || after.days.length !== request.draft.days.length) return false;
+  const expectedItems: FitnessProgramItem[] = [];
+  for (const [dayIndex, draftDay] of request.draft.days.entries()) {
+    const day = after.days[dayIndex];
+    if (!day || !PROGRAM_DAY_ID_PATTERN.test(day.id) || !sameProjection(day, {
+      id: day.id,
+      program_id: after.program.id,
+      day_index: dayIndex,
+      weekday: draftDay.weekday,
+      kind: draftDay.kind,
+      name: draftDay.name,
+      focus: draftDay.focus,
+      estimated_minutes: draftDay.estimated_minutes,
+      variant: "standard",
+      created_at: preparedAt,
+    })) return false;
+    for (const [itemIndex, draftItem] of draftDay.items.entries()) {
+      const item = after.items.find((candidate) =>
+        candidate.program_day_id === day.id && candidate.order_index === itemIndex);
+      if (!item || !PROGRAM_ITEM_ID_PATTERN.test(item.id) || !sameProjection(item, {
+        ...draftItem,
+        id: item.id,
+        program_day_id: day.id,
+        equipment_snapshot: snapshots[dayIndex]?.[itemIndex] ?? "[]",
+        created_at: preparedAt,
+      })) return false;
+      expectedItems.push(item);
+    }
+  }
+  if (expectedItems.length !== after.items.length) return false;
+  const slots = programScheduleSlots(after.days, request.anchorAt, request.scheduleTimeZone);
+  if (slots.length === 0 || slots.length !== after.events.length) return false;
+  return slots.every(({ day, startsAt, occurrenceKey }) => {
+    const event = after.events.find(({ program_day_id }) => program_day_id === day.id);
+    return Boolean(event) && PROGRAM_EVENT_ID_PATTERN.test(event!.id) && sameProjection(event, {
+      id: event!.id,
+      program_day_id: day.id,
+      venue_id: after.program.venue_id,
+      title: day.name,
+      kind: day.kind,
+      starts_at: startsAt,
+      occurrence_key: occurrenceKey,
+      planned_minutes: day.estimated_minutes,
+      status: "planned",
+      rescheduled_from_id: null,
+      note: "",
+      created_at: preparedAt,
+      updated_at: preparedAt,
+    });
+  });
+}
+
+function weekScheduleTransition(
+  receipt: FitnessProgramWeekScheduleReceipt,
+): boolean {
+  const { request, before, after, preparedAt } = receipt;
+  if (!request || typeof request !== "object" || Array.isArray(request) ||
+      !exactObjectKeys(request, ["programId", "anchorAt", "scheduleTimeZone"]) ||
+      !safeOpaqueId(request.programId) || !safeTimestamp(request.anchorAt) ||
+      !isCanonicalProgramTimeZone(request.scheduleTimeZone) ||
+      !isFitnessProgramWeekScheduleExpectation(before, request.scheduleTimeZone) ||
+      request.programId !== before.program.id || request.anchorAt !== before.anchorAt ||
+      !after || typeof after !== "object" || Array.isArray(after) ||
+      !exactObjectKeys(after, ["events", "createdEventIds"]) ||
+      !Array.isArray(after.events) || !Array.isArray(after.createdEventIds) ||
+      !after.events.every(isFitnessLiveEvent) || !uniqueIds(after.events) ||
+      !safeStringArray(after.createdEventIds, LIVE_MAX_ATOMIC_ROWS) ||
+      !uniqueExactStrings(after.createdEventIds) ||
+      !after.createdEventIds.every((id) => PROGRAM_EVENT_ID_PATTERN.test(id)) ||
+      !isSortedProjection(after.events, sortedProgramEvents) ||
+      !strictlyAfterEvery(preparedAt, programWeekVersions(before))) return false;
+  const key = programLogicalKeyFromProgram(before.program);
+  if (before.venue.id !== before.program.venue_id || before.venue.status !== "active" ||
+      !before.logicalPrograms.every((program) => programMatchesLogicalKey(program, key)) ||
+      !before.activePrograms.some(({ id }) => id === before.program.id) ||
+      !before.logicalPrograms.some(({ id }) => id === before.program.id)) return false;
+  try {
+    validateProgramDraftAgainstEnvironment(draftFromProgramWeek(before), before);
+  } catch {
+    return false;
+  }
+  const slots = programScheduleSlots(before.days, request.anchorAt, request.scheduleTimeZone);
+  if (slots.length === 0 || slots.length !== after.events.length) return false;
+  const occurrenceByKey = new Map(before.occurrences.map((event) => [
+    `${event.program_day_id ?? ""}\u0000${event.occurrence_key ?? ""}`,
+    event,
+  ]));
+  const createdIds: string[] = [];
+  for (const { day, startsAt, occurrenceKey } of slots) {
+    const keyValue = `${day.id}\u0000${occurrenceKey}`;
+    const target = after.events.find((event) =>
+      event.program_day_id === day.id && event.occurrence_key === occurrenceKey);
+    if (!target) return false;
+    const existing = occurrenceByKey.get(keyValue);
+    if (existing) {
+      if (!sameProjection(target, existing)) return false;
+      continue;
+    }
+    if (!PROGRAM_EVENT_ID_PATTERN.test(target.id) || !sameProjection(target, {
+      id: target.id,
+      program_day_id: day.id,
+      venue_id: before.program.venue_id,
+      title: day.name,
+      kind: day.kind,
+      starts_at: startsAt,
+      occurrence_key: occurrenceKey,
+      planned_minutes: day.estimated_minutes,
+      status: "planned",
+      rescheduled_from_id: null,
+      note: "",
+      created_at: preparedAt,
+      updated_at: preparedAt,
+    })) return false;
+    createdIds.push(target.id);
+  }
+  return sameProjection(
+    [...after.createdEventIds].sort(compareLiveId),
+    createdIds.sort(compareLiveId),
+  );
+}
+
+function hasValidProgramReceiptBase(
+  value: object,
+  kind: FitnessProgramWriteReceipt["kind"],
+  keys: readonly string[],
+): boolean {
+  const receipt = value as Partial<FitnessProgramWriteReceipt>;
+  return exactObjectKeys(value, [
+    "purpose", "version", "operationId", "generationId", "generationSequence",
+    "preparedAt", "kind", "projectionSha256", ...keys,
+  ]) && receipt.purpose === "fitness-program-write" && receipt.version === 1 &&
+    receipt.kind === kind && typeof receipt.operationId === "string" &&
+    PROGRAM_OPERATION_ID_PATTERN.test(receipt.operationId) &&
+    typeof receipt.generationId === "string" &&
+    CONFIG_GENERATION_ID_PATTERN.test(receipt.generationId) &&
+    liveInteger(receipt.generationSequence, 0, Number.MAX_SAFE_INTEGER) &&
+    safeTimestamp(receipt.preparedAt) && typeof receipt.projectionSha256 === "string" &&
+    CONFIG_HASH_PATTERN.test(receipt.projectionSha256);
+}
+
+function isFitnessProgramWriteReceiptUnchecked(
+  value: unknown,
+): value is FitnessProgramWriteReceipt {
+  if (!value || typeof value !== "object" || Array.isArray(value) ||
+      !jsonWithinUnits(value, LIVE_MAX_RECEIPT_JSON_UNITS)) return false;
+  const receipt = value as Partial<FitnessProgramWriteReceipt>;
+  if (receipt.kind === "program-version-schedule") {
+    return hasValidProgramReceiptBase(value, receipt.kind, ["request", "before", "after"]) &&
+      versionScheduleTransition(receipt as FitnessProgramVersionScheduleReceipt);
+  }
+  if (receipt.kind === "program-week-schedule") {
+    return hasValidProgramReceiptBase(value, receipt.kind, ["request", "before", "after"]) &&
+      weekScheduleTransition(receipt as FitnessProgramWeekScheduleReceipt);
+  }
+  return false;
+}
+
+export function isFitnessProgramWriteReceipt(
+  value: unknown,
+): value is FitnessProgramWriteReceipt {
+  try {
+    return isFitnessProgramWriteReceiptUnchecked(value);
+  } catch {
+    return false;
+  }
+}
+
+async function sealProgramReceipt<Receipt extends FitnessProgramWriteReceipt>(
+  draft: Omit<Receipt, "projectionSha256">,
+): Promise<Receipt> {
+  const projectionSha256 = await sha256Hex(canonicalJson(draft));
+  return { ...draft, projectionSha256 } as Receipt;
+}
+
+async function programReceiptHashIsValid(
+  receipt: FitnessProgramWriteReceipt,
+): Promise<boolean> {
+  const { projectionSha256, ...projection } = receipt;
+  return projectionSha256 === await sha256Hex(canonicalJson(projection));
+}
+
+function snapshotProgramInput<Input>(value: Input): Input {
+  try {
+    return JSON.parse(JSON.stringify(value)) as Input;
+  } catch {
+    throw programError("invalid_input", "计划写入内容不能安全复制。");
+  }
+}
+
+export function createFitnessProgramStorageService(
+  runtime: FitnessLiveStorageRuntime = {
+    withExclusiveLock: (operation) => withFitnessWriteLock(operation, { requireSupport: true }),
+    query: async <Result extends object>(sql: string, params?: SqlParams) => ({
+      rows: await rawQuery<Result>(sql, params),
+    }),
+    batch: (statements) => rawBatch(statements),
+    currentGeneration: () => localDb.currentGeneration(DB),
+    now: () => Date.now(),
+    randomUUID: () => crypto.randomUUID(),
+    broadcast: broadcastFitnessChange,
+  },
+) {
+  async function prepareLocked<Result>(operation: () => Promise<Result>): Promise<Result> {
+    try {
+      return await runtime.withExclusiveLock(operation);
+    } catch (error) {
+      if (error instanceof FitnessProgramMutationError) throw error;
+      if (error instanceof TypeError) throw programError("invalid_input", error.message);
+      throw programError("inspect_failed", "暂时无法核对计划；没有开始写入。");
+    }
+  }
+
+  async function prepareVersionSchedule(
+    input: PrepareFitnessProgramVersionScheduleInput,
+    expected: FitnessProgramVersionScheduleExpectation,
+  ): Promise<FitnessProgramVersionScheduleReceipt> {
+    const stableInput = snapshotProgramInput(input);
+    const stableExpected = snapshotProgramInput(expected);
+    const stableSource = stableInput && typeof stableInput === "object" &&
+        !Array.isArray(stableInput) && stableInput.source !== undefined
+      ? stableInput.source
+      : "local";
+    const stableScheduleTimeZone = currentProgramTimeZone();
+    return prepareLocked(async () => {
+      if (!stableInput || typeof stableInput !== "object" || Array.isArray(stableInput) ||
+          !Object.keys(stableInput).every((key) =>
+            key === "draft" || key === "source" || key === "anchorAt") ||
+          !isFitnessProgramDraftForReceipt(stableInput.draft) ||
+          !isCanonicalProgramSource(stableSource) || !safeTimestamp(stableInput.anchorAt) ||
+          !isFitnessProgramVersionScheduleExpectation(stableExpected)) {
+        throw programError("invalid_input", "计划草稿、排期锚点或画面快照无效。");
+      }
+      const draft = canonicalProgramDraft(stableInput.draft);
+      const key = programLogicalKeyFromDraft(draft);
+      if (stableExpected.venue.id !== key.venueId ||
+          !stableExpected.logicalPrograms.every((program) =>
+            programMatchesLogicalKey(program, key))) {
+        throw programError("invalid_input", "计划版本集合与草稿身份不一致。");
+      }
+      const current = await readProgramEnvironment(runtime, key);
+      if (!current || !isFitnessProgramVersionScheduleExpectation(current) ||
+          !sameProjection(current, stableExpected)) {
+        throw programError("changed", "计划版本、场地、器材或身体边界已变化；没有准备保存。");
+      }
+      if (current.venue.status !== "active") {
+        throw programError("changed", "计划场地已不可用；没有准备保存。");
+      }
+      const snapshots = validateProgramDraftAgainstEnvironment(draft, current);
+      const schedulableDays = draft.days.filter(({ weekday, kind }) =>
+        weekday !== null && kind !== "rest");
+      if (schedulableDays.length === 0) {
+        throw programError("invalid_input", "计划至少需要一个可放入日历的训练日。");
+      }
+      const generation = await readConfigGeneration(runtime);
+      const preparedAt = nextLiveTimestamp(runtime.now(), programEnvironmentVersions(current));
+      const programId = generatedProgramId(runtime, "program-");
+      const operationId = generatedProgramId(runtime, "fitness-program-operation-");
+      const version = current.logicalPrograms.reduce(
+        (maximum, program) => Math.max(maximum, program.version + 1),
+        1,
+      );
+      const program: FitnessProgram = {
+        id: programId,
+        name: draft.name,
+        venue_id: draft.venue_id,
+        goal: draft.goal,
+        split: draft.split,
+        status: "active",
+        version,
+        source: stableSource,
+        assumptions: draft.assumptions,
+        created_at: preparedAt,
+        updated_at: preparedAt,
+      };
+      const days: FitnessProgramDay[] = [];
+      const items: FitnessProgramItem[] = [];
+      for (const [dayIndex, draftDay] of draft.days.entries()) {
+        const dayId = generatedProgramId(runtime, "program-day-");
+        const day: FitnessProgramDay = {
+          id: dayId,
+          program_id: programId,
+          day_index: dayIndex,
+          weekday: draftDay.weekday,
+          kind: draftDay.kind,
+          name: draftDay.name,
+          focus: draftDay.focus,
+          estimated_minutes: draftDay.estimated_minutes,
+          variant: "standard",
+          created_at: preparedAt,
+        };
+        days.push(day);
+        for (const [itemIndex, draftItem] of draftDay.items.entries()) {
+          items.push({
+            ...draftItem,
+            id: generatedProgramId(runtime, "program-item-"),
+            program_day_id: dayId,
+            equipment_snapshot: snapshots[dayIndex]?.[itemIndex] ?? "[]",
+            created_at: preparedAt,
+          });
+        }
+      }
+      const events = sortedProgramEvents(programScheduleSlots(
+        days,
+        stableInput.anchorAt,
+        stableScheduleTimeZone,
+      ).map(
+        ({ day, startsAt, occurrenceKey }) => ({
+          id: generatedProgramId(runtime, "event-"),
+          program_day_id: day.id,
+          venue_id: program.venue_id,
+          title: day.name,
+          kind: day.kind,
+          starts_at: startsAt,
+          occurrence_key: occurrenceKey,
+          planned_minutes: day.estimated_minutes,
+          status: "planned" as const,
+          rescheduled_from_id: null,
+          note: "",
+          created_at: preparedAt,
+          updated_at: preparedAt,
+        }),
+      ));
+      const receipt = await sealProgramReceipt<FitnessProgramVersionScheduleReceipt>({
+        purpose: "fitness-program-write",
+        version: 1,
+        operationId,
+        ...generation,
+        preparedAt,
+        kind: "program-version-schedule",
+        request: {
+          draft,
+          source: stableSource,
+          anchorAt: stableInput.anchorAt,
+          scheduleTimeZone: stableScheduleTimeZone,
+        },
+        before: current,
+        after: {
+          archivedPrograms: sortedPrograms(current.activePrograms.map((row) => ({
+            ...row,
+            status: "archived" as const,
+            updated_at: preparedAt,
+          }))),
+          program,
+          days: sortedProgramDays(days),
+          items: sortedProgramItems(items),
+          events,
+        },
+      });
+      if (!isFitnessProgramWriteReceipt(receipt)) {
+        throw programError("invalid_input", "无法构造可靠的计划版本回执。");
+      }
+      return receipt;
+    });
+  }
+
+  async function prepareWeekSchedule(
+    input: PrepareFitnessProgramWeekScheduleInput,
+    expected: FitnessProgramWeekScheduleExpectation,
+  ): Promise<FitnessProgramWeekScheduleReceipt> {
+    const stableInput = snapshotProgramInput(input);
+    const stableExpected = snapshotProgramInput(expected);
+    const stableScheduleTimeZone = currentProgramTimeZone();
+    return prepareLocked(async () => {
+      if (!stableInput || typeof stableInput !== "object" || Array.isArray(stableInput) ||
+          !exactObjectKeys(stableInput, ["programId", "anchorAt"]) ||
+          !safeOpaqueId(stableInput.programId) || !safeTimestamp(stableInput.anchorAt) ||
+          !isFitnessProgramWeekScheduleExpectation(stableExpected, stableScheduleTimeZone) ||
+          stableExpected.program.id !== stableInput.programId ||
+          stableExpected.anchorAt !== stableInput.anchorAt) {
+        throw programError("invalid_input", "计划、排期锚点或画面快照无效。");
+      }
+      const current = await readProgramWeekExpectation(
+        runtime,
+        stableInput.programId,
+        stableInput.anchorAt,
+        stableScheduleTimeZone,
+      );
+      if (!current || !isFitnessProgramWeekScheduleExpectation(current, stableScheduleTimeZone) ||
+          !sameProjection(current, stableExpected)) {
+        throw programError("changed", "计划、日历、器材或身体边界已变化；没有准备排期。");
+      }
+      if (current.program.status !== "active" || current.venue.status !== "active") {
+        throw programError("changed", "只能安排当前启用且场地可用的计划。");
+      }
+      validateProgramDraftAgainstEnvironment(draftFromProgramWeek(current), current);
+      const slots = programScheduleSlots(
+        current.days,
+        stableInput.anchorAt,
+        stableScheduleTimeZone,
+      );
+      if (slots.length === 0) {
+        throw programError("invalid_input", "这版计划没有可放入日历的训练日。");
+      }
+      const generation = await readConfigGeneration(runtime);
+      const preparedAt = nextLiveTimestamp(runtime.now(), programWeekVersions(current));
+      const operationId = generatedProgramId(runtime, "fitness-program-operation-");
+      const occurrenceByKey = new Map(current.occurrences.map((event) => [
+        `${event.program_day_id ?? ""}\u0000${event.occurrence_key ?? ""}`,
+        event,
+      ]));
+      const events: FitnessCalendarEvent[] = [];
+      const createdEventIds: string[] = [];
+      for (const { day, startsAt, occurrenceKey } of slots) {
+        const existing = occurrenceByKey.get(`${day.id}\u0000${occurrenceKey}`);
+        if (existing) {
+          events.push(existing);
+          continue;
+        }
+        const eventId = generatedProgramId(runtime, "event-");
+        createdEventIds.push(eventId);
+        events.push({
+          id: eventId,
+          program_day_id: day.id,
+          venue_id: current.program.venue_id,
+          title: day.name,
+          kind: day.kind,
+          starts_at: startsAt,
+          occurrence_key: occurrenceKey,
+          planned_minutes: day.estimated_minutes,
+          status: "planned",
+          rescheduled_from_id: null,
+          note: "",
+          created_at: preparedAt,
+          updated_at: preparedAt,
+        });
+      }
+      const receipt = await sealProgramReceipt<FitnessProgramWeekScheduleReceipt>({
+        purpose: "fitness-program-write",
+        version: 1,
+        operationId,
+        ...generation,
+        preparedAt,
+        kind: "program-week-schedule",
+        request: {
+          ...stableInput,
+          scheduleTimeZone: stableScheduleTimeZone,
+        },
+        before: current,
+        after: {
+          events: sortedProgramEvents(events),
+          createdEventIds: [...createdEventIds].sort(compareLiveId),
+        },
+      });
+      if (!isFitnessProgramWriteReceipt(receipt)) {
+        throw programError("invalid_input", "无法构造可靠的计划排期回执。");
+      }
+      return receipt;
+    });
+  }
+
+  function programTargetMatches(current: FitnessProgram, target: FitnessProgram): boolean {
+    return isFitnessLiveProgram(current) && current.id === target.id &&
+      current.name === target.name && current.venue_id === target.venue_id &&
+      current.goal === target.goal && current.split === target.split &&
+      current.version === target.version && current.source === target.source &&
+      sameProjection(current.assumptions, target.assumptions) &&
+      current.created_at === target.created_at && current.updated_at >= target.updated_at &&
+      (current.status === "active" || current.status === "archived");
+  }
+
+  function scheduledEventTargetMatches(
+    current: FitnessCalendarEvent,
+    target: FitnessCalendarEvent,
+  ): boolean {
+    if (!isFitnessLiveEvent(current) || current.id !== target.id ||
+        current.program_day_id !== target.program_day_id || current.venue_id !== target.venue_id ||
+        current.title !== target.title || current.kind !== target.kind ||
+        current.occurrence_key !== target.occurrence_key ||
+        current.planned_minutes !== target.planned_minutes ||
+        current.rescheduled_from_id !== target.rescheduled_from_id ||
+        current.created_at !== target.created_at || current.updated_at < target.updated_at) {
+      return false;
+    }
+    if (target.status === "completed" || target.status === "not_performed" ||
+        target.status === "cancelled") {
+      return current.starts_at === target.starts_at && current.status === target.status &&
+        current.note === target.note;
+    }
+    const reachableStatus = current.status === "planned" || current.status === "in_progress" ||
+      current.status === "completed" || current.status === "not_performed" ||
+      current.status === "cancelled";
+    const reachableNote = current.status === "not_performed"
+      ? safeString(current.note, 4_000) && current.note === current.note.trim()
+      : current.note === target.note;
+    return reachableStatus && reachableNote;
+  }
+
+  async function readProgramTree(
+    programId: string,
+  ): Promise<Readonly<{
+    program: FitnessProgram | null;
+    days: readonly FitnessProgramDay[];
+    items: readonly FitnessProgramItem[];
+  }>> {
+    const [programRows, dayRows, itemRows] = await Promise.all([
+      liveRows<Row>(runtime, "SELECT * FROM fitness_programs WHERE id=? LIMIT 1", [programId]),
+      liveRows<FitnessProgramDay>(runtime,
+        "SELECT * FROM fitness_program_days WHERE program_id=? ORDER BY day_index,id LIMIT ?", [
+        programId,
+        LIVE_MAX_ATOMIC_ROWS + 1,
+      ]),
+      liveRows<Row>(runtime, `SELECT item.* FROM fitness_program_items item
+        JOIN fitness_program_days day ON day.id=item.program_day_id
+        WHERE day.program_id=? ORDER BY day.day_index,item.order_index,item.id LIMIT ?`, [
+        programId,
+        LIVE_MAX_ATOMIC_ROWS + 1,
+      ]),
+    ]);
+    return {
+      program: programRows[0] ? mapProgram(programRows[0]) : null,
+      days: sortedProgramDays(dayRows),
+      items: sortedProgramItems(itemRows.map(mapProgramItem)),
+    };
+  }
+
+  async function targetEventsMatch(
+    targets: readonly FitnessCalendarEvent[],
+  ): Promise<boolean> {
+    const rows = await Promise.all(targets.map(({ id }) => liveRows<FitnessCalendarEvent>(
+      runtime,
+      "SELECT * FROM fitness_calendar_events WHERE id=? LIMIT 1",
+      [id],
+    )));
+    return rows.every((current, index) => current[0] &&
+      scheduledEventTargetMatches(current[0], targets[index]!));
+  }
+
+  function programReceiptMarkerKey(receipt: FitnessProgramWriteReceipt): string {
+    return `${PROGRAM_RECEIPT_MARKER_PREFIX}${receipt.operationId}`;
+  }
+
+  function programReceiptMarkerValue(receipt: FitnessProgramWriteReceipt): string {
+    return canonicalJson({
+      purpose: "fitness-program-receipt-marker",
+      version: 1,
+      kind: receipt.kind,
+      generationId: receipt.generationId,
+      generationSequence: receipt.generationSequence,
+      projectionSha256: receipt.projectionSha256,
+    });
+  }
+
+  async function markerState(
+    receipt: FitnessProgramWriteReceipt,
+  ): Promise<"absent" | "match" | "conflict"> {
+    const rows = await liveRows<Readonly<{ value: string; updated_at: number }>>(
+      runtime,
+      "SELECT value,updated_at FROM fitness_settings WHERE key=? LIMIT 1",
+      [programReceiptMarkerKey(receipt)],
+    );
+    const row = rows[0];
+    if (!row) return "absent";
+    return row.value === programReceiptMarkerValue(receipt) &&
+        row.updated_at === receipt.preparedAt
+      ? "match"
+      : "conflict";
+  }
+
+  async function anyGeneratedTargetExists(
+    receipt: FitnessProgramWriteReceipt,
+  ): Promise<boolean> {
+    const targets = receipt.kind === "program-version-schedule"
+      ? [
+        ["fitness_programs", receipt.after.program.id],
+        ...receipt.after.days.map(({ id }) => ["fitness_program_days", id]),
+        ...receipt.after.items.map(({ id }) => ["fitness_program_items", id]),
+        ...receipt.after.events.map(({ id }) => ["fitness_calendar_events", id]),
+      ]
+      : receipt.after.createdEventIds.map((id) => ["fitness_calendar_events", id]);
+    const rows = await Promise.all(targets.map(([table, id]) => liveRows<Readonly<{ present: 1 }>>(
+      runtime,
+      `SELECT 1 present FROM ${table} WHERE id=? LIMIT 1`,
+      [id],
+    )));
+    return rows.some((result) => result.length > 0);
+  }
+
+  async function targetMatches(receipt: FitnessProgramWriteReceipt): Promise<boolean> {
+    if (receipt.kind === "program-version-schedule") {
+      const tree = await readProgramTree(receipt.after.program.id);
+      return Boolean(tree.program) && programTargetMatches(tree.program!, receipt.after.program) &&
+        sameProjection(tree.days, receipt.after.days) &&
+        sameProjection(tree.items, receipt.after.items) &&
+        await targetEventsMatch(receipt.after.events);
+    }
+    const tree = await readProgramTree(receipt.before.program.id);
+    return Boolean(tree.program) && programTargetMatches(tree.program!, receipt.before.program) &&
+      sameProjection(tree.days, receipt.before.days) &&
+      sameProjection(tree.items, receipt.before.items) &&
+      await targetEventsMatch(receipt.after.events);
+  }
+
+  async function receiptStateUnlocked(
+    receipt: FitnessProgramWriteReceipt,
+  ): Promise<Exclude<FitnessProgramWriteInspection, "still_unknown" | "invalid_receipt">> {
+    const generation = await readConfigGeneration(runtime);
+    if (generation.generationId !== receipt.generationId ||
+        generation.generationSequence !== receipt.generationSequence) return "changed";
+    const currentMarker = await markerState(receipt);
+    if (currentMarker === "conflict") return "changed";
+    if (currentMarker === "match") {
+      return await targetMatches(receipt) ? "exact_saved" : "changed";
+    }
+    if (await anyGeneratedTargetExists(receipt)) return "changed";
+    if (receipt.kind === "program-version-schedule") {
+      const current = await readProgramEnvironment(
+        runtime,
+        programLogicalKeyFromDraft(receipt.request.draft),
+      );
+      return sameProjection(current, receipt.before) ? "expected" : "changed";
+    }
+    const current = await readProgramWeekExpectation(
+      runtime,
+      receipt.request.programId,
+      receipt.request.anchorAt,
+      receipt.request.scheduleTimeZone,
+    );
+    return sameProjection(current, receipt.before) ? "expected" : "changed";
+  }
+
+  type ProgramPredicate = Readonly<{ sql: string; params: readonly unknown[] }>;
+
+  function joinedProgramPredicate(
+    predicates: readonly ProgramPredicate[],
+  ): ProgramPredicate {
+    return {
+      sql: predicates.length === 0
+        ? "1"
+        : predicates.map(({ sql }) => `(${sql})`).join(" AND "),
+      params: predicates.flatMap(({ params }) => [...params]),
+    };
+  }
+
+  function programRowPredicate(row: FitnessProgram): ProgramPredicate {
+    return {
+      sql: `EXISTS(SELECT 1 FROM fitness_programs WHERE id=? AND name IS ?
+        AND venue_id IS ? AND goal IS ? AND split IS ? AND status IS ? AND version IS ?
+        AND source IS ? AND json(assumptions_json)=json(?) AND created_at IS ?
+        AND updated_at IS ?)`,
+      params: [
+        row.id,
+        row.name,
+        row.venue_id,
+        row.goal,
+        row.split,
+        row.status,
+        row.version,
+        row.source,
+        JSON.stringify(row.assumptions),
+        row.created_at,
+        row.updated_at,
+      ],
+    };
+  }
+
+  function programDayRowPredicate(row: FitnessProgramDay): ProgramPredicate {
+    return {
+      sql: `EXISTS(SELECT 1 FROM fitness_program_days WHERE id=? AND program_id IS ?
+        AND day_index IS ? AND weekday IS ? AND kind IS ? AND name IS ? AND focus IS ?
+        AND estimated_minutes IS ? AND variant IS ? AND created_at IS ?)`,
+      params: [
+        row.id,
+        row.program_id,
+        row.day_index,
+        row.weekday,
+        row.kind,
+        row.name,
+        row.focus,
+        row.estimated_minutes,
+        row.variant,
+        row.created_at,
+      ],
+    };
+  }
+
+  function programItemRowPredicate(row: FitnessProgramItem): ProgramPredicate {
+    return {
+      sql: `EXISTS(SELECT 1 FROM fitness_program_items WHERE id=?
+        AND program_day_id IS ? AND exercise_id IS ? AND equipment_id IS ?
+        AND json(resource_equipment_ids_json)=json(?) AND order_index IS ? AND sets IS ?
+        AND rep_min IS ? AND rep_max IS ? AND duration_seconds IS ? AND target_rir IS ?
+        AND rest_seconds IS ? AND load_grams IS ? AND load_guidance IS ?
+        AND rationale IS ? AND json(substitution_exercise_ids_json)=json(?)
+        AND equipment_snapshot IS ? AND created_at IS ?)`,
+      params: [
+        row.id,
+        row.program_day_id,
+        row.exercise_id,
+        row.equipment_id,
+        JSON.stringify(row.resource_equipment_ids),
+        row.order_index,
+        row.sets,
+        row.rep_min,
+        row.rep_max,
+        row.duration_seconds,
+        row.target_rir,
+        row.rest_seconds,
+        row.load_grams,
+        row.load_guidance,
+        row.rationale,
+        JSON.stringify(row.substitution_exercise_ids),
+        row.equipment_snapshot,
+        row.created_at,
+      ],
+    };
+  }
+
+  function programEventRowPredicate(row: FitnessCalendarEvent): ProgramPredicate {
+    return {
+      sql: `EXISTS(SELECT 1 FROM fitness_calendar_events WHERE id=?
+        AND program_day_id IS ? AND venue_id IS ? AND title IS ? AND kind IS ?
+        AND starts_at IS ? AND occurrence_key IS ? AND planned_minutes IS ?
+        AND status IS ? AND rescheduled_from_id IS ? AND note IS ?
+        AND created_at IS ? AND updated_at IS ?)`,
+      params: [
+        row.id,
+        row.program_day_id,
+        row.venue_id,
+        row.title,
+        row.kind,
+        row.starts_at,
+        row.occurrence_key,
+        row.planned_minutes,
+        row.status,
+        row.rescheduled_from_id,
+        row.note,
+        row.created_at,
+        row.updated_at,
+      ],
+    };
+  }
+
+  function programVenuePredicate(row: FitnessVenue): ProgramPredicate {
+    return {
+      sql: `EXISTS(SELECT 1 FROM fitness_venues WHERE id=? AND name IS ?
+        AND venue_type IS ? AND location IS ? AND area_notes IS ? AND busy_notes IS ?
+        AND default_session_minutes IS ? AND supersets_allowed IS ? AND is_default IS ?
+        AND status IS ? AND last_verified_at IS ? AND created_at IS ? AND updated_at IS ?)`,
+      params: [
+        row.id,
+        row.name,
+        row.venue_type,
+        row.location,
+        row.area_notes,
+        row.busy_notes,
+        row.default_session_minutes,
+        Number(row.supersets_allowed),
+        Number(row.is_default),
+        row.status,
+        row.last_verified_at,
+        row.created_at,
+        row.updated_at,
+      ],
+    };
+  }
+
+  function programEquipmentPredicate(row: FitnessEquipment): ProgramPredicate {
+    return {
+      sql: `EXISTS(SELECT 1 FROM fitness_equipment WHERE id=? AND venue_id IS ?
+        AND name IS ? AND kind IS ? AND area IS ? AND quantity IS ? AND status IS ?
+        AND load_mode IS ? AND load_semantics IS ? AND min_load_grams IS ?
+        AND max_load_grams IS ? AND increment_grams IS ? AND bar_weight_grams IS ?
+        AND unilateral IS ? AND busy_level IS ? AND json(settings_json)=json(?)
+        AND json(attachments_json)=json(?) AND notes IS ? AND created_at IS ?
+        AND updated_at IS ?)`,
+      params: [
+        row.id,
+        row.venue_id,
+        row.name,
+        row.kind,
+        row.area,
+        row.quantity,
+        row.status,
+        row.load_mode,
+        row.load_semantics,
+        row.min_load_grams,
+        row.max_load_grams,
+        row.increment_grams,
+        row.bar_weight_grams,
+        Number(row.unilateral),
+        row.busy_level,
+        JSON.stringify(row.settings),
+        JSON.stringify(row.attachments),
+        row.notes,
+        row.created_at,
+        row.updated_at,
+      ],
+    };
+  }
+
+  function programLoadPredicate(row: FitnessEquipmentLoad): ProgramPredicate {
+    return {
+      sql: `EXISTS(SELECT 1 FROM fitness_equipment_loads WHERE id=?
+        AND equipment_id IS ? AND load_grams IS ? AND quantity IS ? AND label IS ?
+        AND available IS ? AND created_at IS ?)`,
+      params: [
+        row.id,
+        row.equipment_id,
+        row.load_grams,
+        row.quantity,
+        row.label,
+        Number(row.available),
+        row.created_at,
+      ],
+    };
+  }
+
+  function programConstraintPredicate(row: FitnessConstraint): ProgramPredicate {
+    return {
+      sql: `EXISTS(SELECT 1 FROM fitness_constraints WHERE id=? AND label IS ?
+        AND body_area IS ? AND severity IS ? AND json(movement_patterns_json)=json(?)
+        AND json(exercise_ids_json)=json(?) AND note IS ? AND active IS ?
+        AND created_at IS ? AND updated_at IS ?)`,
+      params: [
+        row.id,
+        row.label,
+        row.body_area,
+        row.severity,
+        JSON.stringify(row.movement_patterns),
+        JSON.stringify(row.exercise_ids),
+        row.note,
+        Number(row.active),
+        row.created_at,
+        row.updated_at,
+      ],
+    };
+  }
+
+  function programEnvironmentPredicate(
+    environment: FitnessProgramEnvironmentExpectation,
+    key: ProgramLogicalKey,
+  ): ProgramPredicate {
+    return joinedProgramPredicate([
+      programVenuePredicate(environment.venue),
+      {
+        sql: "(SELECT COUNT(*) FROM fitness_programs WHERE status='active')=?",
+        params: [environment.activePrograms.length],
+      },
+      ...environment.activePrograms.map(programRowPredicate),
+      {
+        sql: `(SELECT COUNT(*) FROM fitness_programs
+          WHERE venue_id=? AND name=? AND goal=? AND split=?)=?`,
+        params: [key.venueId, key.name, key.goal, key.split, environment.logicalPrograms.length],
+      },
+      ...environment.logicalPrograms.map(programRowPredicate),
+      {
+        sql: "(SELECT COUNT(*) FROM fitness_equipment WHERE venue_id=?)=?",
+        params: [environment.venue.id, environment.equipment.length],
+      },
+      ...environment.equipment.map(programEquipmentPredicate),
+      {
+        sql: `(SELECT COUNT(*) FROM fitness_equipment_loads equipment_load
+          JOIN fitness_equipment equipment ON equipment.id=equipment_load.equipment_id
+          WHERE equipment.venue_id=?)=?`,
+        params: [environment.venue.id, environment.equipmentLoads.length],
+      },
+      ...environment.equipmentLoads.map(programLoadPredicate),
+      {
+        sql: "(SELECT COUNT(*) FROM fitness_constraints WHERE active=1)=?",
+        params: [environment.activeConstraints.length],
+      },
+      ...environment.activeConstraints.map(programConstraintPredicate),
+    ]);
+  }
+
+  function programTreePredicate(
+    program: FitnessProgram,
+    days: readonly FitnessProgramDay[],
+    items: readonly FitnessProgramItem[],
+  ): ProgramPredicate {
+    return joinedProgramPredicate([
+      programRowPredicate(program),
+      {
+        sql: "(SELECT COUNT(*) FROM fitness_program_days WHERE program_id=?)=?",
+        params: [program.id, days.length],
+      },
+      ...days.map(programDayRowPredicate),
+      {
+        sql: `(SELECT COUNT(*) FROM fitness_program_items item
+          JOIN fitness_program_days day ON day.id=item.program_day_id
+          WHERE day.program_id=?)=?`,
+        params: [program.id, items.length],
+      },
+      ...items.map(programItemRowPredicate),
+    ]);
+  }
+
+  function weekExpectationPredicate(
+    expected: FitnessProgramWeekScheduleExpectation,
+    scheduleTimeZone: string,
+  ): ProgramPredicate {
+    const occurrenceByKey = new Map(expected.occurrences.map((event) => [
+      `${event.program_day_id ?? ""}\u0000${event.occurrence_key ?? ""}`,
+      event,
+    ]));
+    const occurrencePredicates = programScheduleSlots(
+      expected.days,
+      expected.anchorAt,
+      scheduleTimeZone,
+    ).flatMap(({ day, occurrenceKey }) => {
+        const event = occurrenceByKey.get(`${day.id}\u0000${occurrenceKey}`);
+        return [
+          {
+            sql: `(SELECT COUNT(*) FROM fitness_calendar_events
+              WHERE program_day_id=? AND occurrence_key=?)=?`,
+            params: [day.id, occurrenceKey, event ? 1 : 0],
+          },
+          ...(event ? [programEventRowPredicate(event)] : []),
+        ];
+    });
+    return joinedProgramPredicate([
+      programEnvironmentPredicate(expected, programLogicalKeyFromProgram(expected.program)),
+      programTreePredicate(expected.program, expected.days, expected.items),
+      ...occurrencePredicates,
+    ]);
+  }
+
+  function programAbsentPredicate(table: string, id: string): ProgramPredicate {
+    return { sql: `NOT EXISTS(SELECT 1 FROM ${table} WHERE id=?)`, params: [id] };
+  }
+
+  function programMarkerAbsentPredicate(
+    receipt: FitnessProgramWriteReceipt,
+  ): ProgramPredicate {
+    return {
+      sql: "NOT EXISTS(SELECT 1 FROM fitness_settings WHERE key=?)",
+      params: [programReceiptMarkerKey(receipt)],
+    };
+  }
+
+  function programCasSentinel(predicate: ProgramPredicate): SqlStatement {
+    return {
+      sql: `INSERT INTO fitness_settings(key,value,updated_at)
+        SELECT '__fitness_program_cas_abort__',NULL,0 WHERE NOT (${predicate.sql})`,
+      params: predicate.params,
+    };
+  }
+
+  function insertProgram(row: FitnessProgram): SqlStatement {
+    return {
+      sql: `INSERT INTO fitness_programs(
+        id,name,venue_id,goal,split,status,version,source,assumptions_json,created_at,updated_at
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
+      params: [
+        row.id,
+        row.name,
+        row.venue_id,
+        row.goal,
+        row.split,
+        row.status,
+        row.version,
+        row.source,
+        JSON.stringify(row.assumptions),
+        row.created_at,
+        row.updated_at,
+      ],
+    };
+  }
+
+  function insertProgramDay(row: FitnessProgramDay): SqlStatement {
+    return {
+      sql: `INSERT INTO fitness_program_days(
+        id,program_id,day_index,weekday,kind,name,focus,estimated_minutes,variant,created_at
+      ) VALUES(?,?,?,?,?,?,?,?,?,?)`,
+      params: [
+        row.id,
+        row.program_id,
+        row.day_index,
+        row.weekday,
+        row.kind,
+        row.name,
+        row.focus,
+        row.estimated_minutes,
+        row.variant,
+        row.created_at,
+      ],
+    };
+  }
+
+  function insertProgramItem(row: FitnessProgramItem): SqlStatement {
+    return {
+      sql: `INSERT INTO fitness_program_items(
+        id,program_day_id,exercise_id,equipment_id,resource_equipment_ids_json,
+        order_index,sets,rep_min,rep_max,duration_seconds,target_rir,rest_seconds,
+        load_grams,load_guidance,rationale,substitution_exercise_ids_json,
+        equipment_snapshot,created_at
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      params: [
+        row.id,
+        row.program_day_id,
+        row.exercise_id,
+        row.equipment_id,
+        JSON.stringify(row.resource_equipment_ids),
+        row.order_index,
+        row.sets,
+        row.rep_min,
+        row.rep_max,
+        row.duration_seconds,
+        row.target_rir,
+        row.rest_seconds,
+        row.load_grams,
+        row.load_guidance,
+        row.rationale,
+        JSON.stringify(row.substitution_exercise_ids),
+        row.equipment_snapshot,
+        row.created_at,
+      ],
+    };
+  }
+
+  function insertProgramEvent(row: FitnessCalendarEvent): SqlStatement {
+    return {
+      sql: `INSERT INTO fitness_calendar_events(
+        id,program_day_id,venue_id,title,kind,starts_at,occurrence_key,planned_minutes,
+        status,rescheduled_from_id,note,created_at,updated_at
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      params: [
+        row.id,
+        row.program_day_id,
+        row.venue_id,
+        row.title,
+        row.kind,
+        row.starts_at,
+        row.occurrence_key,
+        row.planned_minutes,
+        row.status,
+        row.rescheduled_from_id,
+        row.note,
+        row.created_at,
+        row.updated_at,
+      ],
+    };
+  }
+
+  function insertProgramMarker(receipt: FitnessProgramWriteReceipt): SqlStatement {
+    return {
+      sql: "INSERT INTO fitness_settings(key,value,updated_at) VALUES(?,?,?)",
+      params: [
+        programReceiptMarkerKey(receipt),
+        programReceiptMarkerValue(receipt),
+        receipt.preparedAt,
+      ],
+    };
+  }
+
+  function receiptStatements(receipt: FitnessProgramWriteReceipt): SqlStatement[] {
+    if (receipt.kind === "program-version-schedule") {
+      const predicate = joinedProgramPredicate([
+        programEnvironmentPredicate(
+          receipt.before,
+          programLogicalKeyFromDraft(receipt.request.draft),
+        ),
+        programAbsentPredicate("fitness_programs", receipt.after.program.id),
+        ...receipt.after.days.map(({ id }) =>
+          programAbsentPredicate("fitness_program_days", id)),
+        ...receipt.after.items.map(({ id }) =>
+          programAbsentPredicate("fitness_program_items", id)),
+        ...receipt.after.events.map(({ id }) =>
+          programAbsentPredicate("fitness_calendar_events", id)),
+        programMarkerAbsentPredicate(receipt),
+      ]);
+      return [
+        programCasSentinel(predicate),
+        {
+          sql: "UPDATE fitness_programs SET status='archived',updated_at=? WHERE status='active'",
+          params: [receipt.preparedAt],
+        },
+        insertProgram(receipt.after.program),
+        ...receipt.after.days.map(insertProgramDay),
+        ...receipt.after.items.map(insertProgramItem),
+        ...receipt.after.events.map(insertProgramEvent),
+        insertProgramMarker(receipt),
+      ];
+    }
+    const createdIds = new Set(receipt.after.createdEventIds);
+    const predicate = joinedProgramPredicate([
+      weekExpectationPredicate(receipt.before, receipt.request.scheduleTimeZone),
+      ...receipt.after.createdEventIds.map((id) =>
+        programAbsentPredicate("fitness_calendar_events", id)),
+      programMarkerAbsentPredicate(receipt),
+    ]);
+    return [
+      programCasSentinel(predicate),
+      ...receipt.after.events.filter(({ id }) => createdIds.has(id)).map(insertProgramEvent),
+      insertProgramMarker(receipt),
+    ];
+  }
+
+  function safeBroadcast(reason: string): void {
+    try {
+      runtime.broadcast(reason);
+    } catch {
+      // A refresh hint cannot reverse a durable program transaction.
+    }
+  }
+
+  async function inspectWrite(value: unknown): Promise<FitnessProgramWriteInspection> {
+    if (!isFitnessProgramWriteReceipt(value)) return "invalid_receipt";
+    let receipt: FitnessProgramWriteReceipt;
+    try {
+      receipt = snapshotProgramInput(value);
+    } catch {
+      return "invalid_receipt";
+    }
+    if (!isFitnessProgramWriteReceipt(receipt)) return "invalid_receipt";
+    try {
+      if (!await programReceiptHashIsValid(receipt)) return "invalid_receipt";
+    } catch {
+      return "invalid_receipt";
+    }
+    try {
+      return await runtime.withExclusiveLock(() => receiptStateUnlocked(receipt));
+    } catch {
+      return "still_unknown";
+    }
+  }
+
+  async function commitWrite(value: unknown): Promise<FitnessProgramWriteResult> {
+    if (!isFitnessProgramWriteReceipt(value)) {
+      throw programError("invalid_receipt", "计划写入回执无效；没有改动计划或日历。");
+    }
+    let receipt: FitnessProgramWriteReceipt;
+    try {
+      receipt = snapshotProgramInput(value);
+    } catch {
+      throw programError("invalid_receipt", "计划写入回执无效；没有改动计划或日历。");
+    }
+    if (!isFitnessProgramWriteReceipt(receipt)) {
+      throw programError("invalid_receipt", "计划写入回执无效；没有改动计划或日历。");
+    }
+    try {
+      if (!await programReceiptHashIsValid(receipt)) {
+        throw programError("invalid_receipt", "计划写入回执无法验证；没有改动计划或日历。");
+      }
+    } catch (error) {
+      if (error instanceof FitnessProgramMutationError) throw error;
+      throw programError("invalid_receipt", "计划写入回执无法验证；没有改动计划或日历。");
+    }
+    const entityId = receipt.kind === "program-version-schedule"
+      ? receipt.after.program.id
+      : receipt.before.program.id;
+    try {
+      return await runtime.withExclusiveLock(async () => {
+        const before = await receiptStateUnlocked(receipt);
+        if (before === "exact_saved") {
+          safeBroadcast(receipt.kind === "program-version-schedule"
+            ? "program-saved"
+            : "program-scheduled");
+          return {
+            outcome: "already_saved" as const,
+            receipt,
+            entityId,
+            updatedAt: receipt.preparedAt,
+          };
+        }
+        if (before === "changed") {
+          return { outcome: "changed" as const, receipt, entityId, retryable: false as const };
+        }
+        try {
+          await runtime.batch(receiptStatements(receipt));
+        } catch {
+          // The transaction may have committed even when its response was lost.
+        }
+        const after = await receiptStateUnlocked(receipt);
+        if (after === "exact_saved") {
+          safeBroadcast(receipt.kind === "program-version-schedule"
+            ? "program-saved"
+            : "program-scheduled");
+          return {
+            outcome: "saved" as const,
+            receipt,
+            entityId,
+            updatedAt: receipt.preparedAt,
+          };
+        }
+        if (after === "expected") {
+          throw programError(
+            "write_failed",
+            "计划确定没有写入；保留回执后可以重试。",
+            receipt,
+          );
+        }
+        return { outcome: "changed" as const, receipt, entityId, retryable: false as const };
+      });
+    } catch (error) {
+      if (error instanceof FitnessProgramMutationError) throw error;
+      return {
+        outcome: "outcome_uncertain",
+        receipt,
+        entityId,
+        retryable: true,
+      };
+    }
+  }
+
+  return {
+    prepareFitnessProgramVersionSchedule: prepareVersionSchedule,
+    prepareFitnessProgramWeekSchedule: prepareWeekSchedule,
+    inspectFitnessProgramWrite: inspectWrite,
+    commitFitnessProgramWrite: commitWrite,
+  } as const;
+}
+
+const defaultFitnessProgramStorageService = createFitnessProgramStorageService();
+
+export const prepareFitnessProgramVersionSchedule =
+  defaultFitnessProgramStorageService.prepareFitnessProgramVersionSchedule;
+export const prepareFitnessProgramWeekSchedule =
+  defaultFitnessProgramStorageService.prepareFitnessProgramWeekSchedule;
+export const inspectFitnessProgramWrite =
+  defaultFitnessProgramStorageService.inspectFitnessProgramWrite;
+export const commitFitnessProgramWrite =
+  defaultFitnessProgramStorageService.commitFitnessProgramWrite;
+
+function calendarTransition(receipt: FitnessCalendarWriteReceipt): boolean {
+  const { before, after, preparedAt } = receipt;
+  if (!isFitnessLiveEvent(before) || !isFitnessLiveEvent(after) ||
+      before.status !== "planned" || before.id !== after.id ||
+      !strictlyAfterEvery(preparedAt, [before.created_at, before.updated_at]) ||
+      after.updated_at !== preparedAt || after.created_at !== before.created_at) return false;
+  if (receipt.kind === "calendar-reschedule") {
+    return after.starts_at !== before.starts_at && sameProjection(after, {
+      ...before,
+      starts_at: after.starts_at,
+      updated_at: preparedAt,
+    });
+  }
+  return safeString(after.note, 4_000) && after.note === after.note.trim() &&
+    sameProjection(after, {
+      ...before,
+      status: "not_performed",
+      note: after.note,
+      updated_at: preparedAt,
+    });
+}
+
+function hasValidCalendarReceiptBase(
+  value: object,
+  kind: FitnessCalendarWriteReceipt["kind"],
+): boolean {
+  const receipt = value as Partial<FitnessCalendarWriteReceipt>;
+  return exactObjectKeys(value, [
+    "purpose", "version", "operationId", "generationId", "generationSequence",
+    "preparedAt", "kind", "projectionSha256", "before", "after",
+  ]) && receipt.purpose === "fitness-calendar-write" && receipt.version === 1 &&
+    receipt.kind === kind && typeof receipt.operationId === "string" &&
+    CALENDAR_OPERATION_ID_PATTERN.test(receipt.operationId) &&
+    typeof receipt.generationId === "string" &&
+    CONFIG_GENERATION_ID_PATTERN.test(receipt.generationId) &&
+    liveInteger(receipt.generationSequence, 0, Number.MAX_SAFE_INTEGER) &&
+    safeTimestamp(receipt.preparedAt) && typeof receipt.projectionSha256 === "string" &&
+    CONFIG_HASH_PATTERN.test(receipt.projectionSha256);
+}
+
+function isFitnessCalendarWriteReceiptUnchecked(
+  value: unknown,
+): value is FitnessCalendarWriteReceipt {
+  if (!value || typeof value !== "object" || Array.isArray(value) ||
+      !jsonWithinUnits(value, LIVE_MAX_RECEIPT_JSON_UNITS)) return false;
+  const receipt = value as Partial<FitnessCalendarWriteReceipt>;
+  if (receipt.kind !== "calendar-reschedule" && receipt.kind !== "calendar-not-performed") {
+    return false;
+  }
+  return hasValidCalendarReceiptBase(value, receipt.kind) &&
+    calendarTransition(receipt as FitnessCalendarWriteReceipt);
+}
+
+export function isFitnessCalendarWriteReceipt(
+  value: unknown,
+): value is FitnessCalendarWriteReceipt {
+  try {
+    return isFitnessCalendarWriteReceiptUnchecked(value);
+  } catch {
+    return false;
+  }
+}
+
+async function sealCalendarReceipt<Receipt extends FitnessCalendarWriteReceipt>(
+  draft: Omit<Receipt, "projectionSha256">,
+): Promise<Receipt> {
+  const projectionSha256 = await sha256Hex(canonicalJson(draft));
+  return { ...draft, projectionSha256 } as Receipt;
+}
+
+async function calendarReceiptHashIsValid(
+  receipt: FitnessCalendarWriteReceipt,
+): Promise<boolean> {
+  const { projectionSha256, ...projection } = receipt;
+  return projectionSha256 === await sha256Hex(canonicalJson(projection));
+}
+
+function snapshotCalendarInput<Input>(value: Input): Input {
+  try {
+    return JSON.parse(JSON.stringify(value)) as Input;
+  } catch {
+    throw calendarError("invalid_input", "日历写入内容不能安全复制。");
+  }
+}
+
+export function createFitnessCalendarStorageService(
+  runtime: FitnessLiveStorageRuntime = {
+    withExclusiveLock: (operation) => withFitnessWriteLock(operation, { requireSupport: true }),
+    query: async <Result extends object>(sql: string, params?: SqlParams) => ({
+      rows: await rawQuery<Result>(sql, params),
+    }),
+    batch: (statements) => rawBatch(statements),
+    currentGeneration: () => localDb.currentGeneration(DB),
+    now: () => Date.now(),
+    randomUUID: () => crypto.randomUUID(),
+    broadcast: broadcastFitnessChange,
+  },
+) {
+  type CalendarPredicate = Readonly<{ sql: string; params: readonly unknown[] }>;
+
+  async function prepareLocked<Result>(operation: () => Promise<Result>): Promise<Result> {
+    try {
+      return await runtime.withExclusiveLock(operation);
+    } catch (error) {
+      if (error instanceof FitnessCalendarMutationError) throw error;
+      if (error instanceof TypeError) throw calendarError("invalid_input", error.message);
+      throw calendarError("inspect_failed", "暂时无法核对日历安排；没有开始写入。");
+    }
+  }
+
+  async function readEvent(id: string): Promise<FitnessCalendarEvent | null> {
+    const rows = await liveRows<FitnessCalendarEvent>(
+      runtime,
+      "SELECT * FROM fitness_calendar_events WHERE id=? LIMIT 1",
+      [id],
+    );
+    return rows[0] ?? null;
+  }
+
+  async function prepareReschedule(
+    input: PrepareFitnessCalendarRescheduleInput,
+    expected: FitnessCalendarEvent,
+  ): Promise<FitnessCalendarRescheduleReceipt> {
+    const stableInput = snapshotCalendarInput(input);
+    const stableExpected = snapshotCalendarInput(expected);
+    return prepareLocked(async () => {
+      if (!stableInput || typeof stableInput !== "object" || Array.isArray(stableInput) ||
+          !exactObjectKeys(stableInput, ["eventId", "startsAt"]) ||
+          !safeOpaqueId(stableInput.eventId) || !safeTimestamp(stableInput.startsAt) ||
+          !isFitnessLiveEvent(stableExpected) || stableExpected.id !== stableInput.eventId) {
+        throw calendarError("invalid_input", "日历安排、目标时间或画面快照无效。");
+      }
+      if (stableExpected.status !== "planned" ||
+          stableExpected.starts_at === stableInput.startsAt) {
+        throw calendarError("invalid_input", "只能把尚未开始的安排改到另一个时间。");
+      }
+      const current = await readEvent(stableInput.eventId);
+      if (!sameProjection(current, stableExpected)) {
+        throw calendarError("changed", "日历安排已变化；没有准备改期。");
+      }
+      const generation = await readConfigGeneration(runtime);
+      const preparedAt = nextLiveTimestamp(runtime.now(), [
+        stableExpected.created_at,
+        stableExpected.updated_at,
+      ]);
+      const receipt = await sealCalendarReceipt<FitnessCalendarRescheduleReceipt>({
+        purpose: "fitness-calendar-write",
+        version: 1,
+        operationId: generatedCalendarOperationId(runtime),
+        ...generation,
+        preparedAt,
+        kind: "calendar-reschedule",
+        before: stableExpected,
+        after: {
+          ...stableExpected,
+          starts_at: stableInput.startsAt,
+          updated_at: preparedAt,
+        },
+      });
+      if (!isFitnessCalendarWriteReceipt(receipt)) {
+        throw calendarError("invalid_input", "无法构造可靠的日历改期回执。");
+      }
+      return receipt;
+    });
+  }
+
+  async function prepareNotPerformed(
+    input: PrepareFitnessCalendarNotPerformedInput,
+    expected: FitnessCalendarEvent,
+  ): Promise<FitnessCalendarNotPerformedReceipt> {
+    const stableInput = snapshotCalendarInput(input);
+    const stableExpected = snapshotCalendarInput(expected);
+    const stableNote = stableInput && typeof stableInput === "object" &&
+        !Array.isArray(stableInput) && typeof stableInput.note === "string"
+      ? stableInput.note.trim()
+      : "";
+    return prepareLocked(async () => {
+      if (!stableInput || typeof stableInput !== "object" || Array.isArray(stableInput) ||
+          !Object.keys(stableInput).every((key) => key === "eventId" || key === "note") ||
+          !safeOpaqueId(stableInput.eventId) ||
+          !(stableInput.note === undefined || safeString(stableInput.note, 4_000)) ||
+          !safeString(stableNote, 4_000) || !isFitnessLiveEvent(stableExpected) ||
+          stableExpected.id !== stableInput.eventId) {
+        throw calendarError("invalid_input", "日历安排、说明或画面快照无效。");
+      }
+      if (stableExpected.status !== "planned") {
+        throw calendarError("invalid_input", "只能标记尚未开始的日历安排。");
+      }
+      const current = await readEvent(stableInput.eventId);
+      if (!sameProjection(current, stableExpected)) {
+        throw calendarError("changed", "日历安排已变化；没有准备标记未进行。");
+      }
+      const generation = await readConfigGeneration(runtime);
+      const preparedAt = nextLiveTimestamp(runtime.now(), [
+        stableExpected.created_at,
+        stableExpected.updated_at,
+      ]);
+      const receipt = await sealCalendarReceipt<FitnessCalendarNotPerformedReceipt>({
+        purpose: "fitness-calendar-write",
+        version: 1,
+        operationId: generatedCalendarOperationId(runtime),
+        ...generation,
+        preparedAt,
+        kind: "calendar-not-performed",
+        before: stableExpected,
+        after: {
+          ...stableExpected,
+          status: "not_performed",
+          note: stableNote,
+          updated_at: preparedAt,
+        },
+      });
+      if (!isFitnessCalendarWriteReceipt(receipt)) {
+        throw calendarError("invalid_input", "无法构造可靠的日历未进行回执。");
+      }
+      return receipt;
+    });
+  }
+
+  async function receiptStateUnlocked(
+    receipt: FitnessCalendarWriteReceipt,
+  ): Promise<Exclude<FitnessCalendarWriteInspection, "still_unknown" | "invalid_receipt">> {
+    const generation = await readConfigGeneration(runtime);
+    if (generation.generationId !== receipt.generationId ||
+        generation.generationSequence !== receipt.generationSequence) return "changed";
+    const current = await readEvent(receipt.before.id);
+    if (sameProjection(current, receipt.after)) return "exact_saved";
+    return sameProjection(current, receipt.before) ? "expected" : "changed";
+  }
+
+  function eventPredicate(row: FitnessCalendarEvent): CalendarPredicate {
+    return {
+      sql: `EXISTS(SELECT 1 FROM fitness_calendar_events WHERE id=?
+        AND program_day_id IS ? AND venue_id IS ? AND title IS ? AND kind IS ?
+        AND starts_at IS ? AND occurrence_key IS ? AND planned_minutes IS ?
+        AND status IS ? AND rescheduled_from_id IS ? AND note IS ?
+        AND created_at IS ? AND updated_at IS ?)`,
+      params: [
+        row.id,
+        row.program_day_id,
+        row.venue_id,
+        row.title,
+        row.kind,
+        row.starts_at,
+        row.occurrence_key,
+        row.planned_minutes,
+        row.status,
+        row.rescheduled_from_id,
+        row.note,
+        row.created_at,
+        row.updated_at,
+      ],
+    };
+  }
+
+  function receiptStatements(receipt: FitnessCalendarWriteReceipt): SqlStatement[] {
+    const predicate = eventPredicate(receipt.before);
+    const sentinel: SqlStatement = {
+      sql: `INSERT INTO fitness_settings(key,value,updated_at)
+        SELECT '__fitness_calendar_cas_abort__',NULL,0 WHERE NOT (${predicate.sql})`,
+      params: predicate.params,
+    };
+    if (receipt.kind === "calendar-reschedule") {
+      return [sentinel, {
+        sql: "UPDATE fitness_calendar_events SET starts_at=?,updated_at=? WHERE id=?",
+        params: [receipt.after.starts_at, receipt.after.updated_at, receipt.after.id],
+      }];
+    }
+    return [sentinel, {
+      sql: "UPDATE fitness_calendar_events SET status='not_performed',note=?,updated_at=? WHERE id=?",
+      params: [receipt.after.note, receipt.after.updated_at, receipt.after.id],
+    }];
+  }
+
+  function safeBroadcast(reason: string): void {
+    try {
+      runtime.broadcast(reason);
+    } catch {
+      // A refresh hint cannot reverse a durable calendar transaction.
+    }
+  }
+
+  async function inspectWrite(value: unknown): Promise<FitnessCalendarWriteInspection> {
+    if (!isFitnessCalendarWriteReceipt(value)) return "invalid_receipt";
+    let receipt: FitnessCalendarWriteReceipt;
+    try {
+      receipt = snapshotCalendarInput(value);
+    } catch {
+      return "invalid_receipt";
+    }
+    if (!isFitnessCalendarWriteReceipt(receipt)) return "invalid_receipt";
+    try {
+      if (!await calendarReceiptHashIsValid(receipt)) return "invalid_receipt";
+    } catch {
+      return "invalid_receipt";
+    }
+    try {
+      return await runtime.withExclusiveLock(() => receiptStateUnlocked(receipt));
+    } catch {
+      return "still_unknown";
+    }
+  }
+
+  async function commitWrite(value: unknown): Promise<FitnessCalendarWriteResult> {
+    if (!isFitnessCalendarWriteReceipt(value)) {
+      throw calendarError("invalid_receipt", "日历写入回执无效；没有改动日历。 ");
+    }
+    let receipt: FitnessCalendarWriteReceipt;
+    try {
+      receipt = snapshotCalendarInput(value);
+    } catch {
+      throw calendarError("invalid_receipt", "日历写入回执无效；没有改动日历。");
+    }
+    if (!isFitnessCalendarWriteReceipt(receipt)) {
+      throw calendarError("invalid_receipt", "日历写入回执无效；没有改动日历。");
+    }
+    try {
+      if (!await calendarReceiptHashIsValid(receipt)) {
+        throw calendarError("invalid_receipt", "日历写入回执无法验证；没有改动日历。");
+      }
+    } catch (error) {
+      if (error instanceof FitnessCalendarMutationError) throw error;
+      throw calendarError("invalid_receipt", "日历写入回执无法验证；没有改动日历。");
+    }
+    const entityId = receipt.before.id;
+    const reason = receipt.kind === "calendar-reschedule"
+      ? "event-rescheduled"
+      : "event-not-performed";
+    try {
+      return await runtime.withExclusiveLock(async () => {
+        const before = await receiptStateUnlocked(receipt);
+        if (before === "exact_saved") {
+          safeBroadcast(reason);
+          return {
+            outcome: "already_saved" as const,
+            receipt,
+            entityId,
+            updatedAt: receipt.preparedAt,
+          };
+        }
+        if (before === "changed") {
+          return { outcome: "changed" as const, receipt, entityId, retryable: false as const };
+        }
+        try {
+          await runtime.batch(receiptStatements(receipt));
+        } catch {
+          // The transaction may have committed even when its response was lost.
+        }
+        const after = await receiptStateUnlocked(receipt);
+        if (after === "exact_saved") {
+          safeBroadcast(reason);
+          return {
+            outcome: "saved" as const,
+            receipt,
+            entityId,
+            updatedAt: receipt.preparedAt,
+          };
+        }
+        if (after === "expected") {
+          throw calendarError(
+            "write_failed",
+            "日历安排确定没有写入；保留回执后可以重试。",
+            receipt,
+          );
+        }
+        return { outcome: "changed" as const, receipt, entityId, retryable: false as const };
+      });
+    } catch (error) {
+      if (error instanceof FitnessCalendarMutationError) throw error;
+      return {
+        outcome: "outcome_uncertain",
+        receipt,
+        entityId,
+        retryable: true,
+      };
+    }
+  }
+
+  return {
+    prepareFitnessCalendarReschedule: prepareReschedule,
+    prepareFitnessCalendarNotPerformed: prepareNotPerformed,
+    inspectFitnessCalendarWrite: inspectWrite,
+    commitFitnessCalendarWrite: commitWrite,
+  } as const;
+}
+
+const defaultFitnessCalendarStorageService = createFitnessCalendarStorageService();
+
+export const prepareFitnessCalendarReschedule =
+  defaultFitnessCalendarStorageService.prepareFitnessCalendarReschedule;
+export const prepareFitnessCalendarNotPerformed =
+  defaultFitnessCalendarStorageService.prepareFitnessCalendarNotPerformed;
+export const inspectFitnessCalendarWrite =
+  defaultFitnessCalendarStorageService.inspectFitnessCalendarWrite;
+export const commitFitnessCalendarWrite =
+  defaultFitnessCalendarStorageService.commitFitnessCalendarWrite;
+
 function canComposePlateLoadedWeight(
   targetGrams: number,
   primary: FitnessEquipment,
