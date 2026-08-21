@@ -9,6 +9,8 @@ const projectRoot = new URL("../", import.meta.url);
 const NOW = "2026-08-21T08:00:00.000Z";
 const FILE_KEY_A = "10000000-0000-4000-8000-000000000001";
 const FILE_KEY_B = "20000000-0000-4000-8000-000000000002";
+const GENERATION_A = "30000000-0000-4000-8000-000000000003";
+const GENERATION_B = "40000000-0000-4000-8000-000000000004";
 
 function moduleUrl(source) {
   return `data:text/javascript;base64,${Buffer.from(source).toString("base64")}`;
@@ -151,8 +153,15 @@ async function fixture(options = {}) {
     tail: Promise.resolve(),
     gate: null,
     files: new Map(),
+    fileReadErrorCodes: new Map(),
     keyQueue: [...(options.keyQueue ?? [FILE_KEY_A, FILE_KEY_B])],
     operations: [],
+    generation: {
+      database: "zhiji",
+      generationId: GENERATION_A,
+      sequence: 3,
+    },
+    generationQueue: [],
     queryCalls: 0,
     runCalls: 0,
     saveCalls: 0,
@@ -165,6 +174,7 @@ async function fixture(options = {}) {
     saveFailure: null,
     getFailuresRemaining: 0,
     deleteFailuresRemaining: 0,
+    deleteAfterFailuresRemaining: 0,
     hashFailuresRemaining: 0,
     broadcastThrows: Boolean(options.broadcastThrows),
   };
@@ -195,6 +205,12 @@ async function fixture(options = {}) {
         state.activeLocks -= 1;
         release();
       }
+    },
+    async currentGeneration() {
+      requireLock("generation read");
+      state.operations.push(["generation"]);
+      const queued = state.generationQueue.shift();
+      return { ...(queued ?? state.generation) };
     },
     async query(sql, params = []) {
       requireLock("SQLite read");
@@ -253,8 +269,18 @@ async function fixture(options = {}) {
         state.getFailuresRemaining -= 1;
         throw new Error("OPFS /private/file missing");
       }
+      const readErrorCode = state.fileReadErrorCodes.get(key);
+      if (readErrorCode) {
+        throw Object.assign(new Error("OPFS file has a missing component"), {
+          code: readErrorCode,
+        });
+      }
       const entry = state.files.get(key);
-      if (!entry) throw new Error("OPFS file absent");
+      if (!entry) {
+        throw Object.assign(new Error("OPFS file absent"), {
+          code: "FILE_NOT_FOUND",
+        });
+      }
       return { metadata: { ...entry.metadata }, file: entry.blob };
     },
     async deleteFile(key) {
@@ -265,7 +291,13 @@ async function fixture(options = {}) {
         state.deleteFailuresRemaining -= 1;
         throw new Error("OPFS cleanup path leaked");
       }
-      return state.files.delete(key);
+      const deleted = state.files.delete(key);
+      const partialDeleted = state.fileReadErrorCodes.delete(key);
+      if (state.deleteAfterFailuresRemaining > 0) {
+        state.deleteAfterFailuresRemaining -= 1;
+        throw new Error("OPFS cleanup response was lost");
+      }
+      return deleted || partialDeleted;
     },
     async hashBlob(blob) {
       requireLock("blob hash");
@@ -285,11 +317,31 @@ async function fixture(options = {}) {
   return {
     database,
     state,
+    runtime,
     service: materialSave.createCareerMaterialSaveService(runtime),
     close() {
       database.close();
     },
   };
+}
+
+async function createPendingCleanup(context) {
+  context.state.insertFailure = "before";
+  context.state.deleteFailuresRemaining = 1;
+  let receipt;
+  await assert.rejects(
+    context.service.saveCareerMaterial(materialInput()),
+    (error) => {
+      assert.equal(error.code, "temporary_file_cleanup_failed");
+      assert.ok(error.cleanupReceipt);
+      receipt = error.cleanupReceipt;
+      return true;
+    },
+  );
+  assert.ok(receipt);
+  assert.equal(selectMaterial(context.database, "material-stable-a"), null);
+  assert.equal(context.state.files.has(FILE_KEY_A), true);
+  return receipt;
 }
 
 test("source keeps saves and inspections behind the Career lock without generation broadcasts", () => {
@@ -585,4 +637,216 @@ test("invalid and zero-byte attachments are rejected before taking the lock", as
     (error) => error.code === "invalid_input",
   );
   assert.equal(context.state.lockCalls, 0);
+});
+
+test("failed temporary cleanup returns an opaque JSON-safe cross-refresh receipt", async (t) => {
+  const context = await fixture();
+  t.after(() => context.close());
+  const receipt = await createPendingCleanup(context);
+  const serialized = JSON.stringify(receipt);
+
+  assert.equal(serialized.includes(FILE_KEY_A), false);
+  assert.equal("fileKey" in receipt, false);
+  const afterRefresh = materialSave.createCareerMaterialSaveService(context.runtime);
+  const restored = JSON.parse(serialized);
+  assert.deepEqual(
+    await afterRefresh.inspectCareerMaterialSaveCleanup(restored),
+    { state: "cleanup_ready", receipt: restored },
+  );
+  assert.equal((await afterRefresh.retryCareerMaterialSaveCleanup(restored)).outcome, "cleaned");
+  assert.equal(context.state.files.has(FILE_KEY_A), false);
+});
+
+test("cleanup receipt tampering fails closed before any OPFS or SQLite action", async (t) => {
+  const context = await fixture();
+  t.after(() => context.close());
+  const receipt = await createPendingCleanup(context);
+  const calls = {
+    query: context.state.queryCalls,
+    get: context.state.getCalls,
+    delete: context.state.deleteCalls,
+  };
+  const first = receipt.opaquePayload[0];
+  const tampered = {
+    ...receipt,
+    opaquePayload: `${first === "A" ? "B" : "A"}${receipt.opaquePayload.slice(1)}`,
+  };
+
+  await assert.rejects(
+    context.service.retryCareerMaterialSaveCleanup(tampered),
+    (error) => error.code === "invalid_cleanup_receipt",
+  );
+  assert.equal(context.state.queryCalls, calls.query);
+  assert.equal(context.state.getCalls, calls.get);
+  assert.equal(context.state.deleteCalls, calls.delete);
+  assert.equal(context.state.files.has(FILE_KEY_A), true);
+});
+
+test("cleanup is generation-bound and a generation switch never deletes the file", async (t) => {
+  const context = await fixture();
+  t.after(() => context.close());
+  const receipt = await createPendingCleanup(context);
+  const deletes = context.state.deleteCalls;
+  context.state.generation = {
+    database: "zhiji",
+    generationId: GENERATION_B,
+    sequence: 4,
+  };
+
+  assert.deepEqual(
+    await context.service.retryCareerMaterialSaveCleanup(receipt),
+    { outcome: "blocked", reason: "generation_changed", receipt },
+  );
+  assert.equal(context.state.deleteCalls, deletes);
+  assert.equal(context.state.files.has(FILE_KEY_A), true);
+});
+
+test("a material row that appears later blocks cleanup even with the same stable id", async (t) => {
+  const context = await fixture();
+  t.after(() => context.close());
+  const receipt = await createPendingCleanup(context);
+  const deletes = context.state.deleteCalls;
+  const input = materialInput({ attachment: null });
+  executeRun(
+    context.database,
+    `INSERT INTO career_materials(
+       id,name,kind,version,updated_at,linked_job_id,status,notes,
+       file_key,file_name,mime_type,byte_size
+     ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
+    [
+      input.materialId, input.name, input.kind, input.version, NOW, null,
+      input.status, input.notes, null, null, null, null,
+    ],
+  );
+
+  assert.deepEqual(
+    await context.service.retryCareerMaterialSaveCleanup(receipt),
+    { outcome: "blocked", reason: "material_present", receipt },
+  );
+  assert.equal(context.state.deleteCalls, deletes);
+  assert.equal(context.state.files.has(FILE_KEY_A), true);
+});
+
+test("an attachment referenced by another material is retained", async (t) => {
+  const context = await fixture();
+  t.after(() => context.close());
+  const receipt = await createPendingCleanup(context);
+  const deletes = context.state.deleteCalls;
+  executeRun(
+    context.database,
+    `INSERT INTO career_materials(
+       id,name,kind,version,updated_at,linked_job_id,status,notes,
+       file_key,file_name,mime_type,byte_size
+     ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
+    [
+      "material-other", "共享材料", "简历", "v1", NOW, null, "ready", "",
+      FILE_KEY_A, "主简历.pdf", "application/pdf", 20,
+    ],
+  );
+
+  assert.deepEqual(
+    await context.service.retryCareerMaterialSaveCleanup(receipt),
+    { outcome: "blocked", reason: "file_referenced", receipt },
+  );
+  assert.equal(context.state.deleteCalls, deletes);
+  assert.equal(context.state.files.has(FILE_KEY_A), true);
+});
+
+test("a different file at the receipt-bound key is never deleted", async (t) => {
+  const context = await fixture();
+  t.after(() => context.close());
+  const receipt = await createPendingCleanup(context);
+  const deletes = context.state.deleteCalls;
+  const entry = context.state.files.get(FILE_KEY_A);
+  context.state.files.set(FILE_KEY_A, {
+    metadata: { ...entry.metadata, originalName: "replacement.pdf" },
+    blob: entry.blob,
+  });
+
+  assert.deepEqual(
+    await context.service.retryCareerMaterialSaveCleanup(receipt),
+    { outcome: "blocked", reason: "file_changed", receipt },
+  );
+  assert.equal(context.state.deleteCalls, deletes);
+  assert.equal(context.state.files.has(FILE_KEY_A), true);
+});
+
+test("cleanup response loss and repeated cleanup are idempotently recoverable", async (t) => {
+  const context = await fixture();
+  t.after(() => context.close());
+  const receipt = await createPendingCleanup(context);
+  context.state.deleteAfterFailuresRemaining = 1;
+
+  assert.deepEqual(
+    await context.service.retryCareerMaterialSaveCleanup(receipt),
+    { outcome: "cleanup_pending", receipt, retryable: true },
+  );
+  assert.equal(context.state.files.has(FILE_KEY_A), false);
+  assert.deepEqual(
+    await context.service.retryCareerMaterialSaveCleanup(receipt),
+    { outcome: "already_cleaned" },
+  );
+  assert.deepEqual(
+    await context.service.retryCareerMaterialSaveCleanup(receipt),
+    { outcome: "already_cleaned" },
+  );
+});
+
+for (const partialCode of ["FILE_NOT_FOUND", "FILE_BYTES_NOT_FOUND"]) {
+  test(`cleanup completes an OPFS partial deletion reported as ${partialCode}`, async (t) => {
+    const context = await fixture();
+    t.after(() => context.close());
+    const receipt = await createPendingCleanup(context);
+    context.state.fileReadErrorCodes.set(FILE_KEY_A, partialCode);
+    const deletes = context.state.deleteCalls;
+
+    assert.deepEqual(
+      await context.service.inspectCareerMaterialSaveCleanup(receipt),
+      { state: "cleanup_ready", receipt },
+    );
+    assert.deepEqual(
+      await context.service.retryCareerMaterialSaveCleanup(receipt),
+      { outcome: "cleaned" },
+    );
+    assert.equal(context.state.deleteCalls, deletes + 1);
+    assert.equal(context.state.fileReadErrorCodes.has(FILE_KEY_A), false);
+    assert.equal(context.state.files.has(FILE_KEY_A), false);
+  });
+}
+
+test("cleanup rechecks generation after database facts and fails closed on a switch", async (t) => {
+  const context = await fixture();
+  t.after(() => context.close());
+  const receipt = await createPendingCleanup(context);
+  const deletes = context.state.deleteCalls;
+  context.state.generationQueue.push(
+    { ...context.state.generation },
+    { database: "zhiji", generationId: GENERATION_B, sequence: 4 },
+  );
+
+  assert.deepEqual(
+    await context.service.retryCareerMaterialSaveCleanup(receipt),
+    { outcome: "blocked", reason: "generation_changed", receipt },
+  );
+  assert.equal(context.state.deleteCalls, deletes);
+  assert.equal(context.state.files.has(FILE_KEY_A), true);
+});
+
+test("cleanup rechecks generation once more after inspecting the exact staged file", async (t) => {
+  const context = await fixture();
+  t.after(() => context.close());
+  const receipt = await createPendingCleanup(context);
+  const deletes = context.state.deleteCalls;
+  context.state.generationQueue.push(
+    { ...context.state.generation },
+    { ...context.state.generation },
+    { database: "zhiji", generationId: GENERATION_B, sequence: 4 },
+  );
+
+  assert.deepEqual(
+    await context.service.retryCareerMaterialSaveCleanup(receipt),
+    { outcome: "blocked", reason: "generation_changed", receipt },
+  );
+  assert.equal(context.state.deleteCalls, deletes);
+  assert.equal(context.state.files.has(FILE_KEY_A), true);
 });

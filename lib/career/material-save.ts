@@ -11,8 +11,11 @@ import {
 import { withCareerWriteLock } from "./lock";
 
 const DATABASE = "career" as const;
+const CANONICAL_DATABASE = "zhiji" as const;
 const FILE_CATEGORY = "career-material";
 const CHANGE_REASON = "career-material-saved";
+const CLEANUP_RECEIPT_PURPOSE = "career-material-save-cleanup" as const;
+const CLEANUP_RECEIPT_VERSION = 1 as const;
 const MAX_ATTACHMENT_BYTES = 512 * 1024 * 1024;
 const UUID_V4_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -20,6 +23,12 @@ const SHA256_PATTERN = /^[0-9a-f]{64}$/i;
 
 type QueryResult<Row> = Readonly<{ rows: readonly Row[] }>;
 type RunResult = Readonly<{ changes: number }>;
+
+type CurrentCareerGeneration = Readonly<{
+  database: string;
+  generationId: string;
+  sequence: number;
+}>;
 
 type StoredMaterial = Readonly<{
   id: string;
@@ -38,6 +47,7 @@ type StoredMaterial = Readonly<{
 
 export type CareerMaterialSaveRuntime = Readonly<{
   withExclusiveLock<Result>(operation: () => Promise<Result>): Promise<Result>;
+  currentGeneration(): Promise<CurrentCareerGeneration>;
   query<Row extends object>(
     sql: string,
     params?: readonly unknown[],
@@ -108,6 +118,52 @@ export type CareerMaterialSaveInspection =
   | "conflict"
   | "still_unknown";
 
+/**
+ * JSON-safe recovery data for one unreferenced staged attachment. The payload
+ * is deliberately encoded so ordinary UI state and logs never expose file_key.
+ */
+export type CareerMaterialSaveCleanupReceipt = Readonly<{
+  purpose: typeof CLEANUP_RECEIPT_PURPOSE;
+  version: typeof CLEANUP_RECEIPT_VERSION;
+  opaquePayload: string;
+  digest: string;
+}>;
+
+export type CareerMaterialSaveCleanupBlockedReason =
+  | "generation_changed"
+  | "material_present"
+  | "file_referenced"
+  | "file_changed";
+
+export type CareerMaterialSaveCleanupInspection =
+  | Readonly<{
+      state: "cleanup_ready";
+      receipt: CareerMaterialSaveCleanupReceipt;
+    }>
+  | Readonly<{
+      state: "blocked";
+      reason: CareerMaterialSaveCleanupBlockedReason;
+      receipt: CareerMaterialSaveCleanupReceipt;
+    }>
+  | Readonly<{
+      state: "still_unknown";
+      receipt: CareerMaterialSaveCleanupReceipt;
+      retryable: true;
+    }>;
+
+export type CareerMaterialSaveCleanupResult =
+  | Readonly<{ outcome: "cleaned" | "already_cleaned" }>
+  | Readonly<{
+      outcome: "blocked";
+      reason: CareerMaterialSaveCleanupBlockedReason;
+      receipt: CareerMaterialSaveCleanupReceipt;
+    }>
+  | Readonly<{
+      outcome: "cleanup_pending";
+      receipt: CareerMaterialSaveCleanupReceipt;
+      retryable: true;
+    }>;
+
 export type CareerMaterialSaveErrorCode =
   | "invalid_input"
   | "conflict"
@@ -116,6 +172,7 @@ export type CareerMaterialSaveErrorCode =
   | "attachment_write_failed"
   | "attachment_metadata_mismatch"
   | "temporary_file_cleanup_failed"
+  | "invalid_cleanup_receipt"
   | "write_failed";
 
 export class CareerMaterialSaveError extends Error {
@@ -124,6 +181,7 @@ export class CareerMaterialSaveError extends Error {
   constructor(
     readonly code: CareerMaterialSaveErrorCode,
     message: string,
+    readonly cleanupReceipt?: CareerMaterialSaveCleanupReceipt,
   ) {
     super(message);
   }
@@ -148,8 +206,28 @@ type NormalizedSaveInput = Readonly<{
   attachment: NormalizedAttachmentInput | null;
 }>;
 
+type CareerMaterialSaveCleanupPayload = Readonly<{
+  database: typeof CANONICAL_DATABASE;
+  generationId: string;
+  generationSequence: number;
+  materialId: string;
+  expectedSnapshot: CareerMaterialSaveExpectedSnapshot;
+  stagedFile: LocalFileMetadata;
+}>;
+
+type CleanupSafety =
+  | Readonly<{ safe: true }>
+  | Readonly<{
+      safe: false;
+      reason: Exclude<
+        CareerMaterialSaveCleanupBlockedReason,
+        "file_changed"
+      >;
+    }>;
+
 const defaultRuntime: CareerMaterialSaveRuntime = {
   withExclusiveLock: (operation) => withCareerWriteLock(() => operation()),
+  currentGeneration: () => localDb.currentGeneration(DATABASE),
   query: <Row extends object>(sql: string, params?: readonly unknown[]) =>
     localDb.query<Row>(DATABASE, sql, params),
   run: (sql, params) => localDb.run(DATABASE, sql, params),
@@ -375,6 +453,220 @@ function normalizeExpectedSnapshot(
   });
 }
 
+function exactKeys(value: object, expected: readonly string[]): boolean {
+  const keys = Object.keys(value).sort();
+  const expectedKeys = [...expected].sort();
+  return keys.length === expectedKeys.length &&
+    keys.every((key, index) => key === expectedKeys[index]);
+}
+
+function validGeneration(value: CurrentCareerGeneration): boolean {
+  return value.database === CANONICAL_DATABASE &&
+    typeof value.generationId === "string" &&
+    value.generationId.length > 0 &&
+    value.generationId.length <= 240 &&
+    Number.isSafeInteger(value.sequence) && value.sequence >= 0;
+}
+
+function sameGeneration(
+  generation: CurrentCareerGeneration,
+  payload: CareerMaterialSaveCleanupPayload,
+): boolean {
+  return generation.database === payload.database &&
+    generation.generationId === payload.generationId &&
+    generation.sequence === payload.generationSequence;
+}
+
+function encodeOpaquePayload(value: string): string {
+  const bytes = new TextEncoder().encode(value);
+  let binary = "";
+  for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+  }
+  return btoa(binary)
+    .replaceAll("+", "-")
+    .replaceAll("/", "_")
+    .replace(/=+$/u, "");
+}
+
+function decodeOpaquePayload(value: string): string {
+  if (!/^[A-Za-z0-9_-]+$/u.test(value)) throw new Error("invalid encoding");
+  const padding = "=".repeat((4 - (value.length % 4)) % 4);
+  const binary = atob(value.replaceAll("-", "+").replaceAll("_", "/") + padding);
+  const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+  const decoded = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  if (encodeOpaquePayload(decoded) !== value) throw new Error("non-canonical encoding");
+  return decoded;
+}
+
+function cleanupReceiptDigestInput(opaquePayload: string): string {
+  // Corruption checksum, not an authentication boundary: same-origin code can
+  // already reach the local database and OPFS. Deletion safety comes from the
+  // locked generation, row-absence, reference, metadata, and hash checks.
+  return `private-ai-suite:${CLEANUP_RECEIPT_PURPOSE}:v${CLEANUP_RECEIPT_VERSION}\n${opaquePayload}\n`;
+}
+
+async function sha256Text(value: string): Promise<string> {
+  const subtle = globalThis.crypto?.subtle;
+  if (!subtle) throw new Error("digest unavailable");
+  const digest = await subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return Array.from(new Uint8Array(digest), (byte) =>
+    byte.toString(16).padStart(2, "0")).join("");
+}
+
+function normalizeStagedFileMetadata(value: unknown): LocalFileMetadata {
+  if (!value || typeof value !== "object" || Array.isArray(value) ||
+    !exactKeys(value, [
+      "version", "key", "namespace", "originalName", "mimeType", "category",
+      "byteSize", "sha256", "createdAt", "updatedAt",
+    ])) {
+    throw new Error("invalid staged file");
+  }
+  const file = value as Record<string, unknown>;
+  if (
+    file.version !== 1 ||
+    typeof file.key !== "string" || !UUID_V4_PATTERN.test(file.key) ||
+    file.namespace !== DATABASE ||
+    typeof file.originalName !== "string" ||
+    typeof file.mimeType !== "string" ||
+    !(file.category === null || typeof file.category === "string") ||
+    !Number.isSafeInteger(file.byteSize) || Number(file.byteSize) < 0 ||
+    typeof file.sha256 !== "string" || !SHA256_PATTERN.test(file.sha256) ||
+    typeof file.createdAt !== "string" ||
+    typeof file.updatedAt !== "string"
+  ) {
+    throw new Error("invalid staged file fields");
+  }
+  return Object.freeze({
+    version: 1,
+    key: file.key,
+    namespace: DATABASE,
+    originalName: file.originalName,
+    mimeType: file.mimeType,
+    category: file.category,
+    byteSize: Number(file.byteSize),
+    sha256: file.sha256.toLowerCase(),
+    createdAt: file.createdAt,
+    updatedAt: file.updatedAt,
+  });
+}
+
+function canonicalCleanupPayload(
+  generation: CurrentCareerGeneration,
+  materialId: string,
+  expectedSnapshot: CareerMaterialSaveExpectedSnapshot,
+  stagedFile: LocalFileMetadata,
+): CareerMaterialSaveCleanupPayload {
+  return {
+    database: CANONICAL_DATABASE,
+    generationId: generation.generationId,
+    generationSequence: generation.sequence,
+    materialId,
+    expectedSnapshot,
+    stagedFile,
+  };
+}
+
+async function issueCleanupReceipt(
+  generation: CurrentCareerGeneration,
+  materialId: string,
+  expectedSnapshot: CareerMaterialSaveExpectedSnapshot,
+  stagedFile: LocalFileMetadata,
+): Promise<CareerMaterialSaveCleanupReceipt> {
+  const opaquePayload = encodeOpaquePayload(JSON.stringify(canonicalCleanupPayload(
+    generation,
+    materialId,
+    expectedSnapshot,
+    stagedFile,
+  )));
+  return Object.freeze({
+    purpose: CLEANUP_RECEIPT_PURPOSE,
+    version: CLEANUP_RECEIPT_VERSION,
+    opaquePayload,
+    digest: await sha256Text(cleanupReceiptDigestInput(opaquePayload)),
+  });
+}
+
+async function consumeCleanupReceipt(
+  input: unknown,
+): Promise<Readonly<{
+  payload: CareerMaterialSaveCleanupPayload;
+  receipt: CareerMaterialSaveCleanupReceipt;
+}>> {
+  try {
+    if (!input || typeof input !== "object" || Array.isArray(input) ||
+      !exactKeys(input, ["purpose", "version", "opaquePayload", "digest"])) {
+      throw new Error("invalid receipt");
+    }
+    const candidate = input as Record<string, unknown>;
+    const receipt = Object.freeze({
+      purpose: candidate.purpose,
+      version: candidate.version,
+      opaquePayload: candidate.opaquePayload,
+      digest: candidate.digest,
+    });
+    if (
+      receipt.purpose !== CLEANUP_RECEIPT_PURPOSE ||
+      receipt.version !== CLEANUP_RECEIPT_VERSION ||
+      typeof receipt.opaquePayload !== "string" ||
+      typeof receipt.digest !== "string" ||
+      !SHA256_PATTERN.test(receipt.digest)
+    ) {
+      throw new Error("invalid receipt envelope");
+    }
+    const digest = await sha256Text(cleanupReceiptDigestInput(receipt.opaquePayload));
+    if (digest !== receipt.digest) throw new Error("receipt digest mismatch");
+    const decoded: unknown = JSON.parse(decodeOpaquePayload(receipt.opaquePayload));
+    if (!decoded || typeof decoded !== "object" || Array.isArray(decoded) ||
+      !exactKeys(decoded, [
+        "database", "generationId", "generationSequence", "materialId",
+        "expectedSnapshot", "stagedFile",
+      ])) {
+      throw new Error("invalid receipt payload");
+    }
+    const payload = decoded as Record<string, unknown>;
+    if (
+      payload.database !== CANONICAL_DATABASE ||
+      typeof payload.generationId !== "string" ||
+      payload.generationId.length === 0 || payload.generationId.length > 240 ||
+      !Number.isSafeInteger(payload.generationSequence) ||
+      Number(payload.generationSequence) < 0
+    ) {
+      throw new Error("invalid cleanup generation");
+    }
+    const materialId = identifier(payload.materialId, "材料标识");
+    const expectedSnapshot = normalizeExpectedSnapshot(
+      payload.expectedSnapshot as CareerMaterialSaveExpectedSnapshot,
+    );
+    const stagedFile = normalizeStagedFileMetadata(payload.stagedFile);
+    if (
+      !expectedSnapshot.attachment ||
+      expectedSnapshot.attachment.originalName !== stagedFile.originalName ||
+      expectedSnapshot.attachment.mimeType !== stagedFile.mimeType ||
+      expectedSnapshot.attachment.byteSize !== stagedFile.byteSize ||
+      expectedSnapshot.attachment.sha256 !== stagedFile.sha256
+    ) {
+      throw new Error("cleanup snapshot does not bind staged file");
+    }
+    return {
+      receipt: receipt as CareerMaterialSaveCleanupReceipt,
+      payload: {
+        database: CANONICAL_DATABASE,
+        generationId: payload.generationId,
+        generationSequence: Number(payload.generationSequence),
+        materialId,
+        expectedSnapshot,
+        stagedFile,
+      },
+    };
+  } catch {
+    throw new CareerMaterialSaveError(
+      "invalid_cleanup_receipt",
+      "这次暂存文件清理凭据已失效，请保留当前数据并重新核对。",
+    );
+  }
+}
+
 async function snapshotFromExistingInput(
   runtime: CareerMaterialSaveRuntime,
   input: NormalizedSaveInput,
@@ -431,6 +723,19 @@ function snapshotFromSavedMetadata(
   });
 }
 
+function snapshotForStagedFileCleanup(
+  input: NormalizedSaveInput,
+  metadata: LocalFileMetadata,
+): CareerMaterialSaveExpectedSnapshot {
+  const stagedFile = normalizeStagedFileMetadata(metadata);
+  return snapshotWithAttachment(input, {
+    originalName: stagedFile.originalName,
+    mimeType: stagedFile.mimeType,
+    byteSize: stagedFile.byteSize,
+    sha256: stagedFile.sha256,
+  });
+}
+
 async function readMaterial(
   runtime: CareerMaterialSaveRuntime,
   materialId: string,
@@ -444,6 +749,98 @@ async function readMaterial(
     [materialId],
   );
   return result.rows[0] ?? null;
+}
+
+async function inspectCleanupSafety(
+  runtime: CareerMaterialSaveRuntime,
+  payload: CareerMaterialSaveCleanupPayload,
+): Promise<CleanupSafety | null> {
+  try {
+    const before = await runtime.currentGeneration();
+    if (!validGeneration(before) || !sameGeneration(before, payload)) {
+      return { safe: false, reason: "generation_changed" };
+    }
+    const result = await runtime.query<{
+      material_present: number;
+      file_referenced: number;
+    }>(
+      `SELECT
+         EXISTS(
+           SELECT 1 FROM career_materials WHERE id = ?
+         ) AS material_present,
+         EXISTS(
+           SELECT 1 FROM career_materials WHERE file_key = ?
+         ) AS file_referenced`,
+      [payload.materialId, payload.stagedFile.key],
+    );
+    const facts = result.rows[0];
+    if (!facts) return null;
+    if (Number(facts.material_present) === 1) {
+      return { safe: false, reason: "material_present" };
+    }
+    if (Number(facts.file_referenced) === 1) {
+      return { safe: false, reason: "file_referenced" };
+    }
+    const after = await runtime.currentGeneration();
+    if (!validGeneration(after) || !sameGeneration(after, payload)) {
+      return { safe: false, reason: "generation_changed" };
+    }
+    return { safe: true };
+  } catch {
+    return null;
+  }
+}
+
+function sameStagedFile(
+  actual: LocalFileMetadata,
+  expected: LocalFileMetadata,
+): boolean {
+  return actual.version === expected.version &&
+    actual.key === expected.key &&
+    actual.namespace === expected.namespace &&
+    actual.originalName === expected.originalName &&
+    actual.mimeType === expected.mimeType &&
+    actual.category === expected.category &&
+    actual.byteSize === expected.byteSize &&
+    actual.sha256.toLowerCase() === expected.sha256.toLowerCase() &&
+    actual.createdAt === expected.createdAt &&
+    actual.updatedAt === expected.updatedAt;
+}
+
+function isPartiallyOrFullyAbsentFileError(error: unknown): boolean {
+  return Boolean(
+    error && typeof error === "object" &&
+    "code" in error &&
+    (error.code === "FILE_NOT_FOUND" || error.code === "FILE_BYTES_NOT_FOUND"),
+  );
+}
+
+type StagedFileInspection =
+  | "exact"
+  | "parts_missing"
+  | "changed"
+  | "unknown";
+
+async function inspectStagedFile(
+  runtime: CareerMaterialSaveRuntime,
+  payload: CareerMaterialSaveCleanupPayload,
+): Promise<StagedFileInspection> {
+  let stored: LocalFileResult;
+  try {
+    stored = await runtime.getFile(payload.stagedFile.key);
+  } catch (error) {
+    return isPartiallyOrFullyAbsentFileError(error) ? "parts_missing" : "unknown";
+  }
+  if (!sameStagedFile(stored.metadata, payload.stagedFile)) return "changed";
+  try {
+    const actualHash = (await runtime.hashBlob(stored.file)).toLowerCase();
+    return SHA256_PATTERN.test(actualHash) &&
+        actualHash === payload.stagedFile.sha256.toLowerCase()
+      ? "exact"
+      : "changed";
+  } catch {
+    return "unknown";
+  }
 }
 
 function baseFieldsMatch(
@@ -551,14 +948,67 @@ function uncertainResult(
 async function cleanupDefiniteTemporaryFile(
   runtime: CareerMaterialSaveRuntime,
   metadata: LocalFileMetadata | null,
+  generation: CurrentCareerGeneration | null,
+  materialId: string,
+  expectedSnapshot: CareerMaterialSaveExpectedSnapshot,
 ): Promise<void> {
   if (!metadata) return;
+  if (!generation || !validGeneration(generation)) {
+    throw new CareerMaterialSaveError(
+      "temporary_file_cleanup_failed",
+      "材料记录没有写入；暂时无法建立安全的暂存文件清理凭据。",
+    );
+  }
+  let receipt: CareerMaterialSaveCleanupReceipt;
+  try {
+    receipt = await issueCleanupReceipt(
+      generation,
+      materialId,
+      expectedSnapshot,
+      normalizeStagedFileMetadata(metadata),
+    );
+  } catch {
+    throw new CareerMaterialSaveError(
+      "temporary_file_cleanup_failed",
+      "材料记录没有写入；暂时无法建立安全的暂存文件清理凭据。",
+    );
+  }
+  const { payload } = await consumeCleanupReceipt(receipt);
+  const safety = await inspectCleanupSafety(runtime, payload);
+  if (!safety?.safe) {
+    throw new CareerMaterialSaveError(
+      "temporary_file_cleanup_failed",
+      "材料记录没有写入；暂存文件的安全清理条件需要稍后重新核对。",
+      receipt,
+    );
+  }
+  const file = await inspectStagedFile(runtime, payload);
+  if (file === "parts_missing") {
+    try {
+      await runtime.deleteFile(metadata.key);
+      return;
+    } catch {
+      throw new CareerMaterialSaveError(
+        "temporary_file_cleanup_failed",
+        "材料记录没有写入；暂存文件仍有未完成的本地清理。",
+        receipt,
+      );
+    }
+  }
+  if (file !== "exact") {
+    throw new CareerMaterialSaveError(
+      "temporary_file_cleanup_failed",
+      "材料记录没有写入；暂存文件的状态需要稍后重新核对。",
+      receipt,
+    );
+  }
   try {
     await runtime.deleteFile(metadata.key);
   } catch {
     throw new CareerMaterialSaveError(
       "temporary_file_cleanup_failed",
       "材料记录没有写入；浏览器仍有一个未关联的暂存文件待清理。",
+      receipt,
     );
   }
 }
@@ -574,6 +1024,59 @@ export function createCareerMaterialSaveService(
     const expected = normalizeExpectedSnapshot(expectedSnapshotInput);
     return runtime.withExclusiveLock(() =>
       inspectUnlocked(runtime, materialId, expected));
+  }
+
+  async function inspectCleanup(
+    receiptInput: CareerMaterialSaveCleanupReceipt,
+  ): Promise<CareerMaterialSaveCleanupInspection> {
+    const { payload, receipt } = await consumeCleanupReceipt(receiptInput);
+    return runtime.withExclusiveLock(async () => {
+      const safety = await inspectCleanupSafety(runtime, payload);
+      if (!safety) return { state: "still_unknown", receipt, retryable: true };
+      if (!safety.safe) {
+        return { state: "blocked", reason: safety.reason, receipt };
+      }
+      const file = await inspectStagedFile(runtime, payload);
+      if (file === "changed") {
+        return { state: "blocked", reason: "file_changed", receipt };
+      }
+      if (file === "unknown") {
+        return { state: "still_unknown", receipt, retryable: true };
+      }
+      return { state: "cleanup_ready", receipt };
+    });
+  }
+
+  async function retryCleanup(
+    receiptInput: CareerMaterialSaveCleanupReceipt,
+  ): Promise<CareerMaterialSaveCleanupResult> {
+    const { payload, receipt } = await consumeCleanupReceipt(receiptInput);
+    return runtime.withExclusiveLock(async () => {
+      const safety = await inspectCleanupSafety(runtime, payload);
+      if (!safety) return { outcome: "cleanup_pending", receipt, retryable: true };
+      if (!safety.safe) {
+        return { outcome: "blocked", reason: safety.reason, receipt };
+      }
+      const file = await inspectStagedFile(runtime, payload);
+      if (file === "changed") {
+        return { outcome: "blocked", reason: "file_changed", receipt };
+      }
+      if (file === "unknown") {
+        return { outcome: "cleanup_pending", receipt, retryable: true };
+      }
+      const finalGeneration = await runtime.currentGeneration().catch(() => null);
+      if (!finalGeneration || !validGeneration(finalGeneration) ||
+        !sameGeneration(finalGeneration, payload)) {
+        return { outcome: "blocked", reason: "generation_changed", receipt };
+      }
+      try {
+        return await runtime.deleteFile(payload.stagedFile.key)
+          ? { outcome: "cleaned" }
+          : { outcome: "already_cleaned" };
+      } catch {
+        return { outcome: "cleanup_pending", receipt, retryable: true };
+      }
+    });
   }
 
   async function save(
@@ -612,8 +1115,18 @@ export function createCareerMaterialSaveService(
       }
 
       let metadata: LocalFileMetadata | null = null;
+      let stagedGeneration: CurrentCareerGeneration | null = null;
       let expected = snapshotWithoutAttachment(normalized);
       if (normalized.attachment) {
+        try {
+          stagedGeneration = await runtime.currentGeneration();
+          if (!validGeneration(stagedGeneration)) throw new Error("invalid generation");
+        } catch {
+          throw new CareerMaterialSaveError(
+            "inspect_failed",
+            "暂时无法确认当前材料数据版本，没有开始新的附件写入。",
+          );
+        }
         try {
           metadata = await runtime.saveFile(normalized.attachment.blob, {
             originalName: normalized.attachment.originalName,
@@ -631,7 +1144,13 @@ export function createCareerMaterialSaveService(
         try {
           expected = snapshotFromSavedMetadata(normalized, metadata);
         } catch (error) {
-          await cleanupDefiniteTemporaryFile(runtime, metadata);
+          await cleanupDefiniteTemporaryFile(
+            runtime,
+            metadata,
+            stagedGeneration,
+            normalized.materialId,
+            snapshotForStagedFileCleanup(normalized, metadata),
+          );
           throw error;
         }
       }
@@ -683,7 +1202,13 @@ export function createCareerMaterialSaveService(
         );
       }
       if (inspection === "absent") {
-        await cleanupDefiniteTemporaryFile(runtime, metadata);
+        await cleanupDefiniteTemporaryFile(
+          runtime,
+          metadata,
+          stagedGeneration,
+          normalized.materialId,
+          expected,
+        );
         throw new CareerMaterialSaveError(
           "write_failed",
           "这次材料记录没有写入，表单内容可以保留后重试。",
@@ -702,6 +1227,8 @@ export function createCareerMaterialSaveService(
   return {
     saveCareerMaterial: save,
     inspectCareerMaterialSave: inspect,
+    inspectCareerMaterialSaveCleanup: inspectCleanup,
+    retryCareerMaterialSaveCleanup: retryCleanup,
   } as const;
 }
 
@@ -721,4 +1248,20 @@ export function inspectCareerMaterialSave(
     materialId,
     expectedSnapshot,
   );
+}
+
+export function inspectCareerMaterialSaveCleanup(
+  receipt: CareerMaterialSaveCleanupReceipt,
+  runtime: CareerMaterialSaveRuntime = defaultRuntime,
+) {
+  return createCareerMaterialSaveService(runtime)
+    .inspectCareerMaterialSaveCleanup(receipt);
+}
+
+export function retryCareerMaterialSaveCleanup(
+  receipt: CareerMaterialSaveCleanupReceipt,
+  runtime: CareerMaterialSaveRuntime = defaultRuntime,
+) {
+  return createCareerMaterialSaveService(runtime)
+    .retryCareerMaterialSaveCleanup(receipt);
 }
