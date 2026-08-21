@@ -9,6 +9,11 @@ const ZERO_SHA = "0".repeat(64);
 const FIRST_UUID = "10000000-0000-4000-8000-000000000001";
 const SECOND_UUID = "20000000-0000-4000-8000-000000000002";
 const STORED_UUID = "30000000-0000-4000-8000-000000000003";
+const FOURTH_UUID = "40000000-0000-4000-8000-000000000004";
+const GENERATION_A = "a0000000-0000-4000-8000-00000000000a";
+const GENERATION_B = "b0000000-0000-4000-8000-00000000000b";
+const OWNER_A = "a".repeat(64);
+const OWNER_B = "b".repeat(64);
 
 function moduleUrl(source) {
   return `data:text/javascript;base64,${Buffer.from(source).toString("base64")}`;
@@ -36,10 +41,13 @@ const rawJavaScript = await transpile("lib/fitness/files.ts");
 const dependencies = {
   "@/lib/local-db/client": moduleUrl("export const localDb = {};"),
   "@/lib/local-db/files": moduleUrl(`
+    export async function assertLocalFileKeyAvailable(){ throw new Error("default runtime not used"); }
+    export async function deleteOwnedLocalFile(){ throw new Error("default runtime not used"); }
     export async function deleteLocalFile(){ throw new Error("default runtime not used"); }
     export async function getLocalFile(){ throw new Error("default runtime not used"); }
     export async function listLocalFiles(){ throw new Error("default runtime not used"); }
     export async function saveLocalFile(){ throw new Error("default runtime not used"); }
+    export async function saveLocalFileAtKey(){ throw new Error("default runtime not used"); }
     export async function sha256Blob(){ throw new Error("default runtime not used"); }
   `),
   "./catalog": moduleUrl("export function getFitnessExercise(){ return null; }"),
@@ -99,7 +107,17 @@ async function fixture(options = {}) {
     deletedKeys: [],
     broadcasts: [],
     operations: [],
-    uuidQueue: [...(options.uuidQueue ?? [FIRST_UUID, SECOND_UUID, STORED_UUID])],
+    uuidQueue: [...(options.uuidQueue ?? [FIRST_UUID, SECOND_UUID, STORED_UUID, FOURTH_UUID])],
+    ownerQueue: [...(options.ownerQueue ?? [OWNER_A, OWNER_B])],
+    generation: {
+      database: "shilian",
+      generationId: GENERATION_A,
+      filename: `shilian.${GENERATION_A}.sqlite3`,
+      sequence: 1,
+      legacy: false,
+      ...(options.generation ?? {}),
+    },
+    generationQueue: [...(options.generationQueue ?? [])],
     now: 1_800_000_000_000,
   };
   const requireLock = (operation) => {
@@ -141,7 +159,9 @@ async function fixture(options = {}) {
       requireLock("run");
       state.operations.push(["run", sql, params]);
       if (/INSERT INTO fitness_files/.test(sql)) {
-        const [id, entityType, entityId, purpose, key, name, mime, size, sha, created, updated] = params;
+        if (options.insertMode === "precommit_fail") throw new Error("insert failed before commit");
+        const [id, entityType, entityId, purpose, key, name, mime, size, sha, status, created, updated] = params;
+        if (state.rows.has(id)) return { changes: 0 };
         state.rows.set(id, row({
           id,
           entity_type: entityType,
@@ -152,18 +172,20 @@ async function fixture(options = {}) {
           mime_type: mime,
           byte_size: size,
           sha256: sha,
-          status: "missing",
+          status,
           created_at: created,
           updated_at: updated,
         }));
+        if (options.insertMode === "response_loss") throw new Error("insert response lost");
         return { changes: 1 };
       }
       if (/SET file_key = \?, file_name = \?/.test(sql)) {
         if (options.failReadyUpdate) return { changes: 0 };
-        const [key, name, mime, size, sha, updated, id] = params;
-        const current = state.rows.get(id);
-        if (!current) return { changes: 0 };
-        state.rows.set(id, {
+        const [key, name, mime, size, sha, updated] = params;
+        const expected = rowFromCasParams(params.slice(6));
+        const current = state.rows.get(expected.id);
+        if (!current || !sameRow(current, expected)) return { changes: 0 };
+        state.rows.set(expected.id, {
           ...current,
           file_key: key,
           file_name: name,
@@ -180,15 +202,27 @@ async function fixture(options = {}) {
         if (current?.status === "missing" && current.sha256 === params[1]) state.rows.delete(params[0]);
         return { changes: current ? 1 : 0 };
       }
-      if (/DELETE FROM fitness_files WHERE id = \? AND status = 'deleting'/.test(sql)) {
+      if (/DELETE FROM fitness_files WHERE id = \? AND entity_type = \?/.test(sql)) {
         const current = state.rows.get(params[0]);
-        if (current?.status === "deleting") state.rows.delete(params[0]);
-        return { changes: current ? 1 : 0 };
+        const expected = rowFromCasParams(params);
+        const matches = current && sameRow(current, expected);
+        if (matches) state.rows.delete(params[0]);
+        if (matches && options.deleteRowMode === "response_loss") {
+          throw new Error("delete row response lost");
+        }
+        return { changes: matches ? 1 : 0 };
       }
-      if (/SET status = 'deleting'/.test(sql)) {
+      if (/SET status = 'deleting'/.test(sql) && /entity_type = \?/.test(sql)) {
         const current = state.rows.get(params[1]);
-        if (current) state.rows.set(current.id, { ...current, status: "deleting", updated_at: params[0] });
-        return { changes: current ? 1 : 0 };
+        const expected = rowFromCasParams(params.slice(1));
+        const matches = current && sameRow(current, expected);
+        if (matches) {
+          state.rows.set(current.id, { ...current, status: "deleting", updated_at: params[0] });
+        }
+        if (matches && options.markDeleteMode === "response_loss") {
+          throw new Error("delete mark response lost");
+        }
+        return { changes: matches ? 1 : 0 };
       }
       if (/SET status = 'missing'/.test(sql)) {
         const current = state.rows.get(params[1]);
@@ -201,6 +235,65 @@ async function fixture(options = {}) {
         return { changes: current ? 1 : 0 };
       }
       throw new Error(`Unexpected run: ${sql}`);
+    },
+    async currentGeneration() {
+      requireLock("currentGeneration");
+      const queued = state.generationQueue.shift();
+      return { ...(queued ?? state.generation) };
+    },
+    async assertFileKeyAvailable(key) {
+      requireLock("assertFileKeyAvailable");
+      if (!state.local.has(key)) return;
+      const error = new Error("file key collision");
+      error.code = "FILE_KEY_COLLISION";
+      throw error;
+    },
+    async saveFileAtKey(key, blob, saveOptions, stagingOwner) {
+      requireLock("saveFileAtKey");
+      if (state.local.has(key)) {
+        const error = new Error("file key collision");
+        error.code = "FILE_KEY_COLLISION";
+        throw error;
+      }
+      if (options.saveAtKeyMode === "precommit_fail") {
+        throw new Error("file write failed before claim");
+      }
+      if (options.saveAtKeyMode === "partial_claim") {
+        state.local.set(key, { partial: true, stagingOwner });
+        throw new Error("file write failed after claim");
+      }
+      const metadata = {
+        version: 1,
+        key,
+        namespace: "fitness",
+        originalName: saveOptions.originalName,
+        mimeType: saveOptions.mimeType,
+        category: saveOptions.category ?? null,
+        byteSize: blob.size,
+        sha256: await hashBlob(blob),
+        createdAt: saveOptions.createdAt,
+        updatedAt: saveOptions.updatedAt,
+        stagingOwner,
+      };
+      const file = new File([blob], metadata.originalName, { type: metadata.mimeType });
+      state.local.set(key, { metadata, file });
+      if (options.saveAtKeyMode === "response_loss") throw new Error("file response lost");
+      return metadata;
+    },
+    async deleteOwnedFile(key, stagingOwner) {
+      requireLock("deleteOwnedFile");
+      state.deletedKeys.push(key);
+      const current = state.local.get(key);
+      const owner = current?.metadata?.stagingOwner ?? current?.stagingOwner;
+      if (!current) return false;
+      if (owner !== stagingOwner) {
+        const error = new Error("foreign owner");
+        error.code = "FILE_OWNERSHIP_MISMATCH";
+        throw error;
+      }
+      state.local.delete(key);
+      if (options.deleteOwnedMode === "response_loss") throw new Error("owned delete response lost");
+      return true;
     },
     async saveFile(blob, saveOptions) {
       requireLock("saveFile");
@@ -225,12 +318,12 @@ async function fixture(options = {}) {
     async getFile(key) {
       requireLock("getFile");
       const found = state.local.get(key);
-      if (!found) throw new Error("FILE_BYTES_NOT_FOUND");
+      if (!found || found.partial) throw new Error("FILE_BYTES_NOT_FOUND");
       return found;
     },
     async listFiles() {
       requireLock("listFiles");
-      return [...state.local.values()].map(({ metadata }) => metadata);
+      return [...state.local.values()].flatMap((entry) => entry.metadata ? [entry.metadata] : []);
     },
     async deleteFile(key) {
       requireLock("deleteFile");
@@ -244,16 +337,49 @@ async function fixture(options = {}) {
     randomUUID() {
       return state.uuidQueue.shift() ?? STORED_UUID;
     },
+    randomOwner() {
+      return state.ownerQueue.shift() ?? OWNER_A;
+    },
     now() {
       state.now += 1;
       return state.now;
     },
     broadcast(reason) {
       requireLock("broadcast");
+      if (options.broadcastThrows) throw new Error("broadcast unavailable");
       state.broadcasts.push(reason);
     },
   };
   return { state, runtime, service: files.createFitnessFileService(runtime) };
+}
+
+function rowFromCasParams(params) {
+  const [id, entityType, entityId, purpose, key, name, mime, size, sha, status, created, updated] = params;
+  return row({
+    id,
+    entity_type: entityType,
+    entity_id: entityId,
+    purpose,
+    file_key: key,
+    file_name: name,
+    mime_type: mime,
+    byte_size: size,
+    sha256: sha,
+    status,
+    created_at: created,
+    updated_at: updated,
+  });
+}
+
+function sameRow(left, right) {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function stageReceiptFile(state, receipt, file, overrides = {}) {
+  state.local.set(receipt.expectedFile.key, {
+    metadata: { ...receipt.expectedFile, ...overrides },
+    file,
+  });
 }
 
 test("rejects mismatched extension/MIME and disguised bytes before touching storage", async () => {
@@ -312,42 +438,57 @@ test("validates the exact entity kind and only accepts catalog-backed exercises"
   assert.equal(state.rows.size, 1);
 });
 
-test("persists a pending row first, then records only OPFS-derived size, hash, name and MIME", async () => {
+test("prepares a JSON-safe stable receipt, saves the exact projection, and retries idempotently", async () => {
   const { state, service } = await fixture();
   const source = pngFile("器械 正面.png");
-  const saved = await service.saveFitnessFile({
+  const input = {
     entityType: "equipment",
     entityId: "equipment-1",
     purpose: "photo",
     file: source,
-  });
+  };
+  const prepared = await service.prepareFitnessFileSave(input);
+  const receipt = JSON.parse(JSON.stringify(prepared));
+  const result = await service.saveFitnessFileSafely(input, receipt);
   const expectedHash = await hashBlob(source);
 
-  assert.equal(state.lockCalls, 1);
-  assert.equal(saved.status, "ready");
-  assert.equal(saved.file_name, "器械 正面.png");
-  assert.equal(saved.mime_type, "image/png");
-  assert.equal(saved.byte_size, source.size);
-  assert.equal(saved.sha256, expectedHash);
+  assert.equal(state.lockCalls, 2);
+  assert.equal(result.outcome, "saved");
+  assert.equal(result.record.status, "ready");
+  assert.equal(result.record.file_name, "器械 正面.png");
+  assert.equal(result.record.mime_type, "image/png");
+  assert.equal(result.record.byte_size, source.size);
+  assert.equal(result.record.sha256, expectedHash);
   assert.deepEqual(state.broadcasts, ["fitness-file-saved"]);
   const insert = state.operations.find(([, sql]) => /INSERT INTO fitness_files/.test(sql));
-  assert.equal(insert[2][7], 0);
-  assert.equal(insert[2][8], ZERO_SHA);
-  const stored = state.local.get(saved.file_key);
-  assert.equal(stored.metadata.category, `fitness-file:${saved.id}`);
-  assert.equal(state.rows.get(saved.id).status, "ready");
+  assert.equal(insert[2][7], source.size);
+  assert.equal(insert[2][8], expectedHash);
+  assert.equal(insert[2][9], "ready");
+  const stored = state.local.get(result.record.file_key);
+  assert.equal(stored.metadata.category, `fitness-file:${result.record.id}`);
+  assert.equal(stored.metadata.stagingOwner, OWNER_A);
+  assert.equal(state.rows.get(result.record.id).status, "ready");
+
+  const operationCount = state.operations.length;
+  const retry = await service.saveFitnessFileSafely(input, receipt);
+  assert.equal(retry.outcome, "already_saved");
+  assert.equal(state.operations.filter(([, sql]) => /INSERT INTO fitness_files/.test(sql)).length, 1);
+  assert.ok(state.operations.length > operationCount, "retry performs check-only reads");
+  assert.equal(state.deletedKeys.length, 0);
 });
 
-test("cleans both the completed OPFS object and pending row when final activation fails", async () => {
-  const { state, service } = await fixture({ failReadyUpdate: true });
+test("a definite precommit row failure clears only the receipt-owned unreferenced stage", async () => {
+  const { state, service } = await fixture({ insertMode: "precommit_fail" });
+  const input = {
+    entityType: "venue",
+    entityId: "venue-1",
+    purpose: "photo",
+    file: pngFile(),
+  };
+  const receipt = await service.prepareFitnessFileSave(input);
   await assert.rejects(
-    service.saveFitnessFile({
-      entityType: "venue",
-      entityId: "venue-1",
-      purpose: "photo",
-      file: pngFile(),
-    }),
-    (error) => error.code === "PENDING_ROW_CHANGED",
+    service.saveFitnessFileSafely(input, receipt),
+    (error) => error.code === "SAVE_NOT_COMMITTED",
   );
   assert.equal(state.local.size, 0);
   assert.equal(state.rows.size, 0);
@@ -355,7 +496,229 @@ test("cleans both the completed OPFS object and pending row when final activatio
   assert.deepEqual(state.broadcasts, []);
 });
 
-test("deletion is a deleting-to-OPFS-to-row transition and is idempotent", async () => {
+test("post-ready response loss and broadcast failure preserve durable success", async () => {
+  const { state, service } = await fixture({
+    insertMode: "response_loss",
+    broadcastThrows: true,
+  });
+  const input = {
+    entityType: "venue",
+    entityId: "venue-1",
+    purpose: "photo",
+    file: pngFile(),
+  };
+  const receipt = await service.prepareFitnessFileSave(input);
+  const result = await service.saveFitnessFileSafely(input, receipt);
+  assert.equal(result.outcome, "saved");
+  assert.equal(await service.inspectFitnessFileSave(receipt), "exact_saved");
+  const refreshed = await service.listFitnessFiles();
+  assert.ok(refreshed.some((entry) => entry.id === receipt.expectedRow.id && entry.status === "ready"));
+  assert.equal(state.rows.has(receipt.expectedRow.id), true);
+  assert.equal(state.local.has(receipt.expectedFile.key), true);
+  assert.equal(state.deletedKeys.length, 0);
+  assert.deepEqual(state.broadcasts, []);
+});
+
+test("partial OPFS claim stays outcome-uncertain and check-only inspection never deletes it", async () => {
+  const { state, service } = await fixture({ saveAtKeyMode: "partial_claim" });
+  const input = {
+    entityType: "venue",
+    entityId: "venue-1",
+    purpose: "photo",
+    file: pngFile(),
+  };
+  const receipt = await service.prepareFitnessFileSave(input);
+  const result = await service.saveFitnessFileSafely(input, receipt);
+  assert.equal(result.outcome, "outcome_uncertain");
+  assert.equal(await service.inspectFitnessFileSave(receipt), "still_unknown");
+  assert.equal(state.rows.size, 0);
+  assert.equal(state.local.has(receipt.expectedFile.key), true);
+  assert.equal(state.deletedKeys.length, 0);
+  assert.deepEqual(state.broadcasts, []);
+});
+
+test("receipt-only resume survives refresh without the original File and accepts INSERT response loss", async () => {
+  const { state, service } = await fixture({
+    insertMode: "response_loss",
+    broadcastThrows: true,
+  });
+  const source = pngFile("相机临时照片.png");
+  const input = {
+    entityType: "venue",
+    entityId: "venue-1",
+    purpose: "photo",
+    file: source,
+  };
+  const receipt = JSON.parse(JSON.stringify(
+    await service.prepareFitnessFileSave(input),
+  ));
+  stageReceiptFile(state, receipt, source);
+
+  const resumed = await service.resumeFitnessFileSave(receipt);
+  assert.equal(resumed.outcome, "saved");
+  assert.equal(await service.inspectFitnessFileSave(receipt), "exact_saved");
+  assert.equal(state.rows.has(receipt.expectedRow.id), true);
+  assert.equal(state.local.has(receipt.expectedFile.key), true);
+  assert.equal(state.deletedKeys.length, 0);
+});
+
+test("receipt-only discard removes exact and partial claims only through the bound owner", async () => {
+  const empty = await fixture();
+  const emptyInput = {
+    entityType: "venue",
+    entityId: "venue-1",
+    purpose: "photo",
+    file: pngFile(),
+  };
+  const emptyReceipt = await empty.service.prepareFitnessFileSave(emptyInput);
+  assert.equal(
+    (await empty.service.discardFitnessFileSave(emptyReceipt)).outcome,
+    "already_absent",
+  );
+  assert.equal(empty.state.deletedKeys.length, 0);
+
+  const exact = await fixture();
+  const source = pngFile();
+  const input = {
+    entityType: "venue",
+    entityId: "venue-1",
+    purpose: "photo",
+    file: source,
+  };
+  const exactReceipt = await exact.service.prepareFitnessFileSave(input);
+  stageReceiptFile(exact.state, exactReceipt, source);
+  assert.equal(
+    (await exact.service.discardFitnessFileSave(exactReceipt)).outcome,
+    "discarded",
+  );
+  assert.equal(exact.state.local.has(exactReceipt.expectedFile.key), false);
+
+  const partial = await fixture();
+  const partialReceipt = await partial.service.prepareFitnessFileSave(input);
+  partial.state.local.set(partialReceipt.expectedFile.key, {
+    partial: true,
+    stagingOwner: partialReceipt.expectedFile.stagingOwner,
+  });
+  assert.equal(
+    (await partial.service.discardFitnessFileSave(partialReceipt)).outcome,
+    "discarded",
+  );
+  assert.equal(partial.state.local.has(partialReceipt.expectedFile.key), false);
+
+  const corrupted = await fixture();
+  const corruptedReceipt = await corrupted.service.prepareFitnessFileSave(input);
+  stageReceiptFile(corrupted.state, corruptedReceipt, source, {
+    originalName: "corrupted-name.png",
+  });
+  assert.equal(
+    (await corrupted.service.discardFitnessFileSave(corruptedReceipt)).outcome,
+    "discarded",
+  );
+  assert.equal(corrupted.state.local.has(corruptedReceipt.expectedFile.key), false);
+});
+
+test("foreign owner and generation changes make receipt-only recovery fail closed", async () => {
+  const source = pngFile();
+  const input = {
+    entityType: "venue",
+    entityId: "venue-1",
+    purpose: "photo",
+    file: source,
+  };
+  const foreign = await fixture();
+  const foreignReceipt = await foreign.service.prepareFitnessFileSave(input);
+  foreign.state.local.set(foreignReceipt.expectedFile.key, {
+    partial: true,
+    stagingOwner: OWNER_B,
+  });
+  const discard = await foreign.service.discardFitnessFileSave(foreignReceipt);
+  assert.equal(discard.outcome, "outcome_uncertain");
+  assert.equal(foreign.state.local.has(foreignReceipt.expectedFile.key), true);
+  assert.equal(foreign.state.deletedKeys.length, 1, "owned delete was attempted but failed closed");
+
+  const validForeign = await fixture();
+  const validForeignReceipt = await validForeign.service.prepareFitnessFileSave(input);
+  stageReceiptFile(validForeign.state, validForeignReceipt, source, {
+    stagingOwner: OWNER_B,
+  });
+  assert.deepEqual(
+    await validForeign.service.discardFitnessFileSave(validForeignReceipt),
+    { outcome: "blocked", reason: "conflict", receipt: validForeignReceipt },
+  );
+  assert.equal(validForeign.state.local.has(validForeignReceipt.expectedFile.key), true);
+
+  const switched = await fixture();
+  const switchedReceipt = await switched.service.prepareFitnessFileSave(input);
+  stageReceiptFile(switched.state, switchedReceipt, source);
+  switched.state.generation = {
+    ...switched.state.generation,
+    generationId: GENERATION_B,
+    sequence: 2,
+  };
+  await assert.rejects(
+    switched.service.resumeFitnessFileSave(switchedReceipt),
+    (error) => error.code === "GENERATION_CHANGED",
+  );
+  assert.deepEqual(
+    await switched.service.discardFitnessFileSave(switchedReceipt),
+    { outcome: "blocked", reason: "generation_changed", receipt: switchedReceipt },
+  );
+  assert.equal(switched.state.local.has(switchedReceipt.expectedFile.key), true);
+  assert.equal(switched.state.rows.size, 0);
+});
+
+test("strict receipt guards accept JSON round trips and reject extra or altered authority", async () => {
+  const { state, service } = await fixture();
+  const source = pngFile();
+  const input = {
+    entityType: "venue",
+    entityId: "venue-1",
+    purpose: "photo",
+    file: source,
+  };
+  const saveReceipt = JSON.parse(JSON.stringify(
+    await service.prepareFitnessFileSave(input),
+  ));
+  assert.equal(files.isFitnessFileSaveReceipt(saveReceipt), true);
+  assert.equal(files.isFitnessFileSaveReceipt({ ...saveReceipt, extra: true }), false);
+  assert.doesNotThrow(() => files.isFitnessFileSaveReceipt({
+    ...saveReceipt,
+    expectedRow: {
+      ...saveReceipt.expectedRow,
+      created_at: Number.MAX_SAFE_INTEGER,
+      updated_at: Number.MAX_SAFE_INTEGER,
+    },
+  }));
+  assert.equal(files.isFitnessFileSaveReceipt({
+    ...saveReceipt,
+    expectedRow: {
+      ...saveReceipt.expectedRow,
+      created_at: Number.MAX_SAFE_INTEGER,
+      updated_at: Number.MAX_SAFE_INTEGER,
+    },
+  }), false);
+  assert.equal(files.isFitnessFileSaveReceipt({
+    ...saveReceipt,
+    expectedFile: { ...saveReceipt.expectedFile, stagingOwner: OWNER_B },
+  }), true, "a structurally valid ticket is still constrained by exact storage inspection");
+
+  stageReceiptFile(state, saveReceipt, source);
+  await service.resumeFitnessFileSave(saveReceipt);
+  const deleteReceipt = JSON.parse(JSON.stringify(
+    await service.prepareFitnessFileDelete(saveReceipt.expectedRow.id),
+  ));
+  assert.equal(files.isFitnessFileDeleteReceipt(deleteReceipt), true);
+  assert.equal(files.isFitnessFileDeleteReceipt({
+    ...deleteReceipt,
+    expectedRow: { ...deleteReceipt.expectedRow, updated_at: -1 },
+  }), false);
+  assert.equal(files.isFitnessFileDeleteReceipt({
+    ...deleteReceipt,
+    deletingUpdatedAt: deleteReceipt.expectedRow.updated_at - 1,
+  }), false);
+});
+
+test("delete receipt binds the generation, complete row, OPFS owner, and is idempotent", async () => {
   const source = pngFile("venue.png");
   const metadata = {
     version: 1,
@@ -368,20 +731,165 @@ test("deletion is a deleting-to-OPFS-to-row transition and is idempotent", async
     sha256: await hashBlob(source),
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
+    stagingOwner: OWNER_A,
   };
   const record = row({ byte_size: source.size, sha256: metadata.sha256 });
   const { state, service } = await fixture({ rows: [record], local: [{ metadata, file: source }] });
 
-  assert.equal(await service.deleteFitnessFile(record.id), true);
-  assert.equal(await service.deleteFitnessFile(record.id), false);
+  const receipt = JSON.parse(JSON.stringify(
+    await service.prepareFitnessFileDelete(record.id),
+  ));
+  const deleted = await service.deleteFitnessFileSafely(receipt);
+  assert.equal(deleted.outcome, "deleted");
+  const retry = await service.deleteFitnessFileSafely(receipt);
+  assert.equal(retry.outcome, "already_deleted");
   assert.equal(state.rows.size, 0);
   assert.equal(state.local.size, 0);
   assert.deepEqual(state.deletedKeys, [STORED_UUID]);
   assert.deepEqual(state.broadcasts, ["fitness-file-deleted"]);
-  assert.equal(state.lockCalls, 2);
+  assert.equal(state.lockCalls, 3);
   const deletingIndex = state.operations.findIndex(([, sql]) => /SET status = 'deleting'/.test(sql));
-  const deleteRowIndex = state.operations.findIndex(([, sql]) => /DELETE FROM fitness_files WHERE id = \? AND status = 'deleting'/.test(sql));
+  const deleteRowIndex = state.operations.findIndex(([, sql]) => /DELETE FROM fitness_files WHERE id = \? AND entity_type = \?/.test(sql));
   assert.ok(deletingIndex >= 0 && deletingIndex < deleteRowIndex);
+  assert.match(state.operations[deletingIndex][1], /file_key = \?.*updated_at = \?/s);
+});
+
+test("delete treats lost mark, OPFS, row responses and a failed broadcast as durable success", async () => {
+  const source = pngFile("venue.png");
+  const metadata = {
+    version: 1,
+    namespace: "fitness",
+    key: STORED_UUID,
+    originalName: "venue.png",
+    mimeType: "image/png",
+    category: "fitness-file:fitness-file-existing",
+    byteSize: source.size,
+    sha256: await hashBlob(source),
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    stagingOwner: OWNER_A,
+  };
+  const record = row({ byte_size: source.size, sha256: metadata.sha256 });
+  const { state, service } = await fixture({
+    rows: [record],
+    local: [{ metadata, file: source }],
+    markDeleteMode: "response_loss",
+    deleteOwnedMode: "response_loss",
+    deleteRowMode: "response_loss",
+    broadcastThrows: true,
+  });
+  const receipt = await service.prepareFitnessFileDelete(record.id);
+  const result = await service.deleteFitnessFileSafely(receipt);
+  assert.equal(result.outcome, "deleted");
+  assert.equal(await service.inspectFitnessFileDelete(receipt), "absent");
+  assert.equal(state.rows.size, 0);
+  assert.equal(state.local.size, 0);
+  assert.deepEqual(state.broadcasts, []);
+});
+
+test("stale full-row delete receipt cannot remove a concurrently edited or replacement row", async () => {
+  const source = pngFile("venue.png");
+  const metadata = {
+    version: 1,
+    namespace: "fitness",
+    key: STORED_UUID,
+    originalName: "venue.png",
+    mimeType: "image/png",
+    category: "fitness-file:fitness-file-existing",
+    byteSize: source.size,
+    sha256: await hashBlob(source),
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    stagingOwner: OWNER_A,
+  };
+  const record = row({ byte_size: source.size, sha256: metadata.sha256 });
+  const edited = await fixture({ rows: [record], local: [{ metadata, file: source }] });
+  const editedReceipt = await edited.service.prepareFitnessFileDelete(record.id);
+  edited.state.rows.set(record.id, { ...record, updated_at: record.updated_at + 1 });
+  assert.equal(
+    (await edited.service.deleteFitnessFileSafely(editedReceipt)).outcome,
+    "conflict",
+  );
+  assert.equal(edited.state.rows.get(record.id).status, "ready");
+  assert.equal(edited.state.local.has(STORED_UUID), true);
+  assert.equal(edited.state.deletedKeys.length, 0);
+
+  const replaced = await fixture({ rows: [record], local: [{ metadata, file: source }] });
+  const replacedReceipt = await replaced.service.prepareFitnessFileDelete(record.id);
+  replaced.state.rows.set(record.id, {
+    ...record,
+    file_key: FOURTH_UUID,
+    file_name: "new.png",
+    sha256: "c".repeat(64),
+    updated_at: record.updated_at + 2,
+  });
+  assert.equal(
+    (await replaced.service.deleteFitnessFileSafely(replacedReceipt)).outcome,
+    "conflict",
+  );
+  assert.equal(replaced.state.local.has(STORED_UUID), true);
+  assert.equal(replaced.state.deletedKeys.length, 0);
+});
+
+test("foreign metadata at the shared delete key is retained even when bytes and row fields match", async () => {
+  const source = pngFile("venue.png");
+  const metadata = {
+    version: 1,
+    namespace: "fitness",
+    key: STORED_UUID,
+    originalName: "venue.png",
+    mimeType: "image/png",
+    category: "fitness-file:fitness-file-existing",
+    byteSize: source.size,
+    sha256: await hashBlob(source),
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    stagingOwner: OWNER_A,
+  };
+  const record = row({ byte_size: source.size, sha256: metadata.sha256 });
+  const { state, service } = await fixture({ rows: [record], local: [{ metadata, file: source }] });
+  const receipt = await service.prepareFitnessFileDelete(record.id);
+  state.local.set(STORED_UUID, {
+    metadata: { ...metadata, stagingOwner: OWNER_B },
+    file: source,
+  });
+  const result = await service.deleteFitnessFileSafely(receipt);
+  assert.equal(result.outcome, "conflict");
+  assert.equal(state.rows.get(record.id).status, "ready");
+  assert.equal(state.local.has(STORED_UUID), true);
+  assert.equal(state.deletedKeys.length, 0);
+});
+
+test("generation switch blocks delete before the full-row CAS", async () => {
+  const source = pngFile("venue.png");
+  const metadata = {
+    version: 1,
+    namespace: "fitness",
+    key: STORED_UUID,
+    originalName: "venue.png",
+    mimeType: "image/png",
+    category: "fitness-file:fitness-file-existing",
+    byteSize: source.size,
+    sha256: await hashBlob(source),
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    stagingOwner: OWNER_A,
+  };
+  const record = row({ byte_size: source.size, sha256: metadata.sha256 });
+  const { state, service } = await fixture({ rows: [record], local: [{ metadata, file: source }] });
+  const receipt = await service.prepareFitnessFileDelete(record.id);
+  state.generation = {
+    ...state.generation,
+    generationId: GENERATION_B,
+    sequence: 2,
+  };
+  assert.equal(
+    (await service.deleteFitnessFileSafely(receipt)).outcome,
+    "conflict",
+  );
+  assert.equal(state.rows.get(record.id).status, "ready");
+  assert.equal(state.local.has(STORED_UUID), true);
+  assert.equal(state.operations.some(([, sql]) => /SET status = 'deleting'/.test(sql)), false);
 });
 
 test("list reconciliation adopts valid pending files, finishes deletes and preserves unknown OPFS files", async () => {
@@ -450,6 +958,51 @@ test("list reconciliation adopts valid pending files, finishes deletes and prese
   assert.equal(state.local.has(unknownKey), true, "unknown complete user files must never be deleted");
   assert.ok(records.some((entry) => entry.id === pendingId && entry.status === "ready"));
   assert.deepEqual(state.broadcasts, ["fitness-files-reconciled"]);
+});
+
+test("refresh reconciliation retains receipt-owned stages and present deleting bytes", async () => {
+  const source = pngFile("staged.png");
+  const staged = await fixture();
+  const input = {
+    entityType: "venue",
+    entityId: "venue-1",
+    purpose: "photo",
+    file: source,
+  };
+  const receipt = await staged.service.prepareFitnessFileSave(input);
+  stageReceiptFile(staged.state, receipt, source);
+  assert.deepEqual(await staged.service.listFitnessFiles(), []);
+  assert.equal(staged.state.local.has(receipt.expectedFile.key), true);
+  assert.equal(staged.state.deletedKeys.length, 0);
+
+  const metadata = {
+    version: 1,
+    namespace: "fitness",
+    key: STORED_UUID,
+    originalName: "venue.png",
+    mimeType: "image/png",
+    category: "fitness-file:fitness-file-existing",
+    byteSize: source.size,
+    sha256: await hashBlob(source),
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    stagingOwner: OWNER_A,
+  };
+  const deleting = row({
+    status: "deleting",
+    file_name: metadata.originalName,
+    byte_size: metadata.byteSize,
+    sha256: metadata.sha256,
+  });
+  const inProgress = await fixture({
+    rows: [deleting],
+    local: [{ metadata, file: source }],
+  });
+  const records = await inProgress.service.listFitnessFiles();
+  assert.ok(records.some((entry) => entry.id === deleting.id && entry.status === "deleting"));
+  assert.equal(inProgress.state.rows.has(deleting.id), true);
+  assert.equal(inProgress.state.local.has(STORED_UUID), true);
+  assert.equal(inProgress.state.deletedKeys.length, 0);
 });
 
 test("blob reads verify stored bytes and mark a corrupt ready reference missing without deleting it", async () => {

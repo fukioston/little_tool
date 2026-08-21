@@ -1,13 +1,17 @@
 import { localDb } from "@/lib/local-db/client";
 import {
+  assertLocalFileKeyAvailable,
+  deleteOwnedLocalFile,
   deleteLocalFile,
   getLocalFile,
   listLocalFiles,
-  saveLocalFile,
+  saveLocalFileAtKey,
   sha256Blob,
   type LocalFileMetadata,
+  type LocalFileResult,
   type SaveLocalFileOptions,
 } from "@/lib/local-db/files";
+import type { CurrentDatabaseGeneration } from "@/lib/local-db/types";
 import { getFitnessExercise } from "./catalog";
 import { broadcastFitnessChange, withFitnessWriteLock } from "./lock";
 import type { FitnessFile } from "./types";
@@ -16,8 +20,13 @@ const DATABASE = "fitness" as const;
 const MAX_FILE_BYTES = 20 * 1024 * 1024;
 const PENDING_SHA256 = "0".repeat(64);
 const MANAGED_CATEGORY_PREFIX = "fitness-file:";
+const CANONICAL_DATABASE = "shilian" as const;
+const SAVE_RECEIPT_KIND = "fitness-file-save" as const;
+const DELETE_RECEIPT_KIND = "fitness-file-delete" as const;
+const RECEIPT_VERSION = 1 as const;
 const UUID_V4_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const SHA256_PATTERN = /^[0-9a-f]{64}$/i;
 
 export const FITNESS_FILE_LIMIT_BYTES = MAX_FILE_BYTES;
 
@@ -50,6 +59,105 @@ export type FitnessFileReconcileResult = Readonly<{
   deletedManagedOrphans: number;
 }>;
 
+export type FitnessFileSaveReceipt = Readonly<{
+  version: typeof RECEIPT_VERSION;
+  kind: typeof SAVE_RECEIPT_KIND;
+  operationId: string;
+  database: typeof CANONICAL_DATABASE;
+  generationId: string;
+  generationSequence: number;
+  expectedRow: Readonly<StoredFitnessFile>;
+  expectedFile: Readonly<{
+    version: 1;
+    key: string;
+    namespace: typeof DATABASE;
+    originalName: string;
+    mimeType: string;
+    category: string;
+    byteSize: number;
+    sha256: string;
+    createdAt: string;
+    updatedAt: string;
+    stagingOwner: string;
+  }>;
+}>;
+
+export type FitnessFileSaveInspection =
+  | "exact_saved"
+  | "staged"
+  | "absent"
+  | "conflict"
+  | "generation_changed"
+  | "still_unknown";
+
+export type FitnessFileSafeSaveResult =
+  | Readonly<{
+      outcome: "saved" | "already_saved";
+      record: FitnessFileRecord;
+      receipt: FitnessFileSaveReceipt;
+    }>
+  | Readonly<{
+      outcome: "outcome_uncertain";
+      receipt: FitnessFileSaveReceipt;
+      retryable: true;
+    }>;
+
+export type FitnessFileDiscardSaveResult =
+  | Readonly<{
+      outcome: "discarded" | "already_absent";
+      receipt: FitnessFileSaveReceipt;
+    }>
+  | Readonly<{
+      outcome: "blocked";
+      reason: "saved" | "conflict" | "generation_changed";
+      receipt: FitnessFileSaveReceipt;
+    }>
+  | Readonly<{
+      outcome: "outcome_uncertain";
+      receipt: FitnessFileSaveReceipt;
+      retryable: true;
+    }>;
+
+export type FitnessFileDeleteReceipt = Readonly<{
+  version: typeof RECEIPT_VERSION;
+  kind: typeof DELETE_RECEIPT_KIND;
+  operationId: string;
+  database: typeof CANONICAL_DATABASE;
+  generationId: string;
+  generationSequence: number;
+  expectedRow: Readonly<StoredFitnessFile>;
+  deletingUpdatedAt: number;
+  expectedFile:
+    | Readonly<{ state: "absent" }>
+    | Readonly<{
+        state: "exact";
+        metadata: LocalFileMetadata;
+      }>;
+}>;
+
+export type FitnessFileDeleteInspection =
+  | "exact_present"
+  | "deleting"
+  | "absent"
+  | "conflict"
+  | "generation_changed"
+  | "still_unknown";
+
+export type FitnessFileSafeDeleteResult =
+  | Readonly<{
+      outcome: "deleted" | "already_deleted";
+      receipt: FitnessFileDeleteReceipt;
+    }>
+  | Readonly<{
+      outcome: "outcome_uncertain";
+      receipt: FitnessFileDeleteReceipt;
+      retryable: true;
+    }>
+  | Readonly<{
+      outcome: "conflict";
+      receipt: FitnessFileDeleteReceipt;
+    }>;
+
 export class FitnessFileError extends Error {
   constructor(
     message: string,
@@ -57,6 +165,16 @@ export class FitnessFileError extends Error {
   ) {
     super(message);
     this.name = "FitnessFileError";
+  }
+}
+
+export class FitnessFileOutcomeUncertainError extends FitnessFileError {
+  constructor(
+    message: string,
+    readonly receipt: FitnessFileSaveReceipt | FitnessFileDeleteReceipt,
+  ) {
+    super(message, "FITNESS_FILE_OUTCOME_UNCERTAIN");
+    this.name = "FitnessFileOutcomeUncertainError";
   }
 }
 
@@ -73,13 +191,22 @@ export type FitnessFileServiceRuntime = Readonly<{
     sql: string,
     params?: readonly (string | number | null)[],
   ): Promise<RunResult>;
-  saveFile(blob: Blob, options: SaveLocalFileOptions): Promise<LocalFileMetadata>;
-  getFile(key: string): ReturnType<typeof getLocalFile>;
+  currentGeneration(): Promise<CurrentDatabaseGeneration>;
+  assertFileKeyAvailable(key: string): Promise<void>;
+  saveFileAtKey(
+    key: string,
+    blob: Blob,
+    options: SaveLocalFileOptions,
+    stagingOwner: string,
+  ): Promise<LocalFileMetadata>;
+  deleteOwnedFile(key: string, stagingOwner: string): Promise<boolean>;
+  getFile(key: string): Promise<LocalFileResult>;
   listFiles(): Promise<readonly LocalFileMetadata[]>;
   deleteFile(key: string): Promise<boolean>;
   hashBlob(blob: Blob): Promise<string>;
   getBuiltInExercise(id: string): ReturnType<typeof getFitnessExercise>;
   randomUUID(): string;
+  randomOwner(): string;
   now(): number;
   broadcast(reason: string): void;
 }>;
@@ -146,13 +273,22 @@ const defaultRuntime: FitnessFileServiceRuntime = {
   query: async <Row extends object>(sql: string, params?: readonly (string | number | null)[]) =>
     localDb.query<Row>(DATABASE, sql, params),
   run: (sql, params) => localDb.run(DATABASE, sql, params),
-  saveFile: (blob, options) => saveLocalFile(DATABASE, blob, options),
+  currentGeneration: () => localDb.currentGeneration(DATABASE),
+  assertFileKeyAvailable: (key) => assertLocalFileKeyAvailable(DATABASE, key),
+  saveFileAtKey: (key, blob, options, stagingOwner) =>
+    saveLocalFileAtKey(DATABASE, key, blob, options, stagingOwner),
+  deleteOwnedFile: (key, stagingOwner) =>
+    deleteOwnedLocalFile(DATABASE, key, stagingOwner),
   getFile: (key) => getLocalFile(DATABASE, key),
   listFiles: () => listLocalFiles(DATABASE),
   deleteFile: (key) => deleteLocalFile(DATABASE, key),
   hashBlob: sha256Blob,
   getBuiltInExercise: getFitnessExercise,
   randomUUID: () => crypto.randomUUID(),
+  randomOwner: () => Array.from(
+    crypto.getRandomValues(new Uint8Array(32)),
+    (byte) => byte.toString(16).padStart(2, "0"),
+  ).join(""),
   now: () => Date.now(),
   broadcast: broadcastFitnessChange,
 };
@@ -276,6 +412,402 @@ function metadataMatchesRow(metadata: LocalFileMetadata, row: StoredFitnessFile)
     metadata.sha256.toLowerCase() === row.sha256.toLowerCase();
 }
 
+function exactKeys(value: object, expected: readonly string[]): boolean {
+  const actual = Object.keys(value).sort();
+  const wanted = [...expected].sort();
+  return actual.length === wanted.length &&
+    actual.every((key, index) => key === wanted[index]);
+}
+
+function validGeneration(value: CurrentDatabaseGeneration): boolean {
+  return value.database === CANONICAL_DATABASE &&
+    typeof value.generationId === "string" &&
+    value.generationId.length > 0 &&
+    value.generationId.length <= 240 &&
+    Number.isSafeInteger(value.sequence) &&
+    value.sequence >= 0;
+}
+
+function generationMatches(
+  value: CurrentDatabaseGeneration,
+  receipt: Pick<FitnessFileSaveReceipt, "database" | "generationId" | "generationSequence">,
+): boolean {
+  return validGeneration(value) &&
+    value.database === receipt.database &&
+    value.generationId === receipt.generationId &&
+    value.sequence === receipt.generationSequence;
+}
+
+function validStoredRow(value: unknown): value is StoredFitnessFile {
+  if (!value || typeof value !== "object") return false;
+  const row = value as Partial<StoredFitnessFile>;
+  return exactKeys(value, [
+    "id", "entity_type", "entity_id", "purpose", "file_key", "file_name",
+    "mime_type", "byte_size", "sha256", "status", "created_at", "updated_at",
+  ]) &&
+    typeof row.id === "string" && row.id.length > 0 && row.id.length <= 255 &&
+    ["venue", "equipment", "exercise", "session"].includes(row.entity_type ?? "") &&
+    typeof row.entity_id === "string" && row.entity_id.length > 0 && row.entity_id.length <= 255 &&
+    ["photo", "instruction", "other"].includes(row.purpose ?? "") &&
+    typeof row.file_key === "string" && UUID_V4_PATTERN.test(row.file_key) &&
+    typeof row.file_name === "string" && row.file_name.length > 0 && row.file_name.length <= 255 &&
+    typeof row.mime_type === "string" && row.mime_type.length > 0 && row.mime_type.length <= 127 &&
+    Number.isSafeInteger(row.byte_size) && Number(row.byte_size) >= 0 &&
+    typeof row.sha256 === "string" && SHA256_PATTERN.test(row.sha256) &&
+    ["ready", "missing", "deleting"].includes(row.status ?? "") &&
+    Number.isSafeInteger(row.created_at) && Number(row.created_at) >= 0 &&
+    Number.isSafeInteger(row.updated_at) && Number(row.updated_at) >= Number(row.created_at);
+}
+
+function validMetadata(value: unknown): value is LocalFileMetadata {
+  if (!value || typeof value !== "object") return false;
+  const metadata = value as Partial<LocalFileMetadata>;
+  const allowed = [
+    "version", "key", "namespace", "originalName", "mimeType", "category",
+    "byteSize", "sha256", "createdAt", "updatedAt", "stagingOwner",
+  ];
+  return Object.keys(value).every((key) => allowed.includes(key)) &&
+    metadata.version === 1 &&
+    typeof metadata.key === "string" && UUID_V4_PATTERN.test(metadata.key) &&
+    metadata.namespace === DATABASE &&
+    typeof metadata.originalName === "string" &&
+    metadata.originalName.length > 0 && metadata.originalName.length <= 255 &&
+    typeof metadata.mimeType === "string" &&
+    metadata.mimeType.length > 0 && metadata.mimeType.length <= 127 &&
+    (metadata.category === null ||
+      (typeof metadata.category === "string" && metadata.category.length <= 255)) &&
+    Number.isSafeInteger(metadata.byteSize) && Number(metadata.byteSize) >= 0 &&
+    typeof metadata.sha256 === "string" && SHA256_PATTERN.test(metadata.sha256) &&
+    typeof metadata.createdAt === "string" && Number.isFinite(Date.parse(metadata.createdAt)) &&
+    typeof metadata.updatedAt === "string" && Number.isFinite(Date.parse(metadata.updatedAt)) &&
+    (metadata.stagingOwner === undefined ||
+      (typeof metadata.stagingOwner === "string" && SHA256_PATTERN.test(metadata.stagingOwner)));
+}
+
+function exactIsoTimestamp(value: number): string | null {
+  try {
+    const result = new Date(value).toISOString();
+    return Number.isFinite(Date.parse(result)) ? result : null;
+  } catch {
+    return null;
+  }
+}
+
+function rowsEqual(left: StoredFitnessFile, right: StoredFitnessFile): boolean {
+  return left.id === right.id &&
+    left.entity_type === right.entity_type &&
+    left.entity_id === right.entity_id &&
+    left.purpose === right.purpose &&
+    left.file_key === right.file_key &&
+    left.file_name === right.file_name &&
+    left.mime_type === right.mime_type &&
+    left.byte_size === right.byte_size &&
+    left.sha256.toLowerCase() === right.sha256.toLowerCase() &&
+    left.status === right.status &&
+    left.created_at === right.created_at &&
+    left.updated_at === right.updated_at;
+}
+
+function metadataEqual(left: LocalFileMetadata, right: LocalFileMetadata): boolean {
+  return left.version === right.version &&
+    left.key === right.key &&
+    left.namespace === right.namespace &&
+    left.originalName === right.originalName &&
+    left.mimeType === right.mimeType &&
+    left.category === right.category &&
+    left.byteSize === right.byteSize &&
+    left.sha256.toLowerCase() === right.sha256.toLowerCase() &&
+    left.createdAt === right.createdAt &&
+    left.updatedAt === right.updatedAt &&
+    left.stagingOwner === right.stagingOwner;
+}
+
+function expectedSaveMetadata(
+  receipt: FitnessFileSaveReceipt,
+): LocalFileMetadata {
+  return receipt.expectedFile;
+}
+
+export function isFitnessFileSaveReceipt(
+  value: unknown,
+): value is FitnessFileSaveReceipt {
+  if (!value || typeof value !== "object") return false;
+  const receipt = value as Partial<FitnessFileSaveReceipt>;
+  if (!exactKeys(value, [
+    "version", "kind", "operationId", "database", "generationId",
+    "generationSequence", "expectedRow", "expectedFile",
+  ])) return false;
+  if (
+    receipt.version !== RECEIPT_VERSION ||
+    receipt.kind !== SAVE_RECEIPT_KIND ||
+    typeof receipt.operationId !== "string" ||
+    !UUID_V4_PATTERN.test(receipt.operationId) ||
+    receipt.database !== CANONICAL_DATABASE ||
+    typeof receipt.generationId !== "string" ||
+    receipt.generationId.length === 0 || receipt.generationId.length > 240 ||
+    !Number.isSafeInteger(receipt.generationSequence) ||
+    Number(receipt.generationSequence) < 0 ||
+    !validStoredRow(receipt.expectedRow) ||
+    !validMetadata(receipt.expectedFile)
+  ) return false;
+  const row = receipt.expectedRow;
+  const file = receipt.expectedFile;
+  const createdAt = exactIsoTimestamp(row.created_at);
+  const updatedAt = exactIsoTimestamp(row.updated_at);
+  return row.id === `fitness-file-${receipt.operationId.toLowerCase()}` &&
+    row.status === "ready" &&
+    row.file_key === file.key &&
+    row.file_name === file.originalName &&
+    row.mime_type === file.mimeType &&
+    row.byte_size === file.byteSize &&
+    row.sha256.toLowerCase() === file.sha256.toLowerCase() &&
+    file.category === managedCategory(row.id) &&
+    typeof file.stagingOwner === "string" && SHA256_PATTERN.test(file.stagingOwner) &&
+    createdAt !== null && updatedAt !== null &&
+    file.createdAt === createdAt &&
+    file.updatedAt === updatedAt;
+}
+
+export function isFitnessFileDeleteReceipt(
+  value: unknown,
+): value is FitnessFileDeleteReceipt {
+  if (!value || typeof value !== "object") return false;
+  const receipt = value as Partial<FitnessFileDeleteReceipt>;
+  if (!exactKeys(value, [
+    "version", "kind", "operationId", "database", "generationId",
+    "generationSequence", "expectedRow", "deletingUpdatedAt", "expectedFile",
+  ])) return false;
+  if (
+    receipt.version !== RECEIPT_VERSION ||
+    receipt.kind !== DELETE_RECEIPT_KIND ||
+    typeof receipt.operationId !== "string" ||
+    !UUID_V4_PATTERN.test(receipt.operationId) ||
+    receipt.database !== CANONICAL_DATABASE ||
+    typeof receipt.generationId !== "string" ||
+    receipt.generationId.length === 0 || receipt.generationId.length > 240 ||
+    !Number.isSafeInteger(receipt.generationSequence) || Number(receipt.generationSequence) < 0 ||
+    !validStoredRow(receipt.expectedRow) ||
+    receipt.expectedRow.status === "deleting" ||
+    !Number.isSafeInteger(receipt.deletingUpdatedAt) ||
+    Number(receipt.deletingUpdatedAt) < receipt.expectedRow.updated_at ||
+    !receipt.expectedFile || typeof receipt.expectedFile !== "object"
+  ) return false;
+  if (receipt.expectedFile.state === "absent") {
+    return exactKeys(receipt.expectedFile, ["state"]);
+  }
+  if (
+    receipt.expectedFile.state !== "exact" ||
+    !exactKeys(receipt.expectedFile, ["state", "metadata"]) ||
+    !validMetadata(receipt.expectedFile.metadata)
+  ) return false;
+  const metadata = receipt.expectedFile.metadata;
+  return metadataMatchesRow(metadata, receipt.expectedRow) &&
+    metadata.category === managedCategory(receipt.expectedRow.id);
+}
+
+function assertSaveReceipt(value: unknown): asserts value is FitnessFileSaveReceipt {
+  if (!isFitnessFileSaveReceipt(value)) {
+    fail("附件保存凭据无效，没有读取或改动本地数据。", "INVALID_SAVE_RECEIPT");
+  }
+}
+
+function assertDeleteReceipt(value: unknown): asserts value is FitnessFileDeleteReceipt {
+  if (!isFitnessFileDeleteReceipt(value)) {
+    fail("附件删除凭据无效，没有读取或改动本地数据。", "INVALID_DELETE_RECEIPT");
+  }
+}
+
+type LocalFileTruth = "exact" | "absent" | "conflict" | "unknown";
+
+function errorCode(error: unknown): string | null {
+  return error && typeof error === "object" && "code" in error &&
+      typeof error.code === "string"
+    ? error.code
+    : null;
+}
+
+async function inspectLocalFileUnlocked(
+  runtime: FitnessFileServiceRuntime,
+  key: string,
+  expected: LocalFileMetadata | null,
+): Promise<LocalFileTruth> {
+  if (expected === null) {
+    try {
+      await runtime.assertFileKeyAvailable(key);
+      return "absent";
+    } catch (error) {
+      return errorCode(error) === "FILE_KEY_COLLISION" ? "conflict" : "unknown";
+    }
+  }
+  try {
+    const stored = await runtime.getFile(key);
+    if (!metadataEqual(stored.metadata, expected)) return "conflict";
+    const hash = await runtime.hashBlob(stored.file);
+    return stored.file.size === expected.byteSize &&
+        hash.toLowerCase() === expected.sha256.toLowerCase()
+      ? "exact"
+      : "conflict";
+  } catch {
+    try {
+      await runtime.assertFileKeyAvailable(key);
+      return "absent";
+    } catch (error) {
+      return errorCode(error) === "FILE_KEY_COLLISION" ? "unknown" : "unknown";
+    }
+  }
+}
+
+type SaveTruth = Readonly<{
+  state: FitnessFileSaveInspection;
+  row: StoredFitnessFile | null;
+  file: LocalFileTruth;
+}>;
+
+async function inspectSaveUnlocked(
+  runtime: FitnessFileServiceRuntime,
+  receipt: FitnessFileSaveReceipt,
+): Promise<SaveTruth> {
+  try {
+    const before = await runtime.currentGeneration();
+    if (!generationMatches(before, receipt)) {
+      return { state: "generation_changed", row: null, file: "unknown" };
+    }
+    const [row, file] = await Promise.all([
+      findRow(runtime, receipt.expectedRow.id),
+      inspectLocalFileUnlocked(runtime, receipt.expectedFile.key, expectedSaveMetadata(receipt)),
+    ]);
+    const after = await runtime.currentGeneration();
+    if (!generationMatches(after, receipt)) {
+      return { state: "generation_changed", row, file };
+    }
+    if (row && !rowsEqual(row, receipt.expectedRow)) {
+      return { state: "conflict", row, file };
+    }
+    if (file === "conflict") return { state: "conflict", row, file };
+    if (row && file === "exact") return { state: "exact_saved", row, file };
+    if (!row && file === "exact") return { state: "staged", row, file };
+    if (!row && file === "absent") return { state: "absent", row, file };
+    return { state: "still_unknown", row, file };
+  } catch {
+    return { state: "still_unknown", row: null, file: "unknown" };
+  }
+}
+
+function deletingRow(receipt: FitnessFileDeleteReceipt): StoredFitnessFile {
+  return {
+    ...receipt.expectedRow,
+    status: "deleting",
+    updated_at: receipt.deletingUpdatedAt,
+  };
+}
+
+type DeleteTruth = Readonly<{
+  state: FitnessFileDeleteInspection;
+  row: StoredFitnessFile | null;
+  file: LocalFileTruth;
+}>;
+
+async function inspectDeleteUnlocked(
+  runtime: FitnessFileServiceRuntime,
+  receipt: FitnessFileDeleteReceipt,
+): Promise<DeleteTruth> {
+  try {
+    const before = await runtime.currentGeneration();
+    if (!generationMatches(before, receipt)) {
+      return { state: "generation_changed", row: null, file: "unknown" };
+    }
+    const expectedMetadata = receipt.expectedFile.state === "exact"
+      ? receipt.expectedFile.metadata
+      : null;
+    const [row, file] = await Promise.all([
+      findRow(runtime, receipt.expectedRow.id),
+      inspectLocalFileUnlocked(runtime, receipt.expectedRow.file_key, expectedMetadata),
+    ]);
+    const after = await runtime.currentGeneration();
+    if (!generationMatches(after, receipt)) {
+      return { state: "generation_changed", row, file };
+    }
+    const isExpected = row ? rowsEqual(row, receipt.expectedRow) : false;
+    const isDeleting = row ? rowsEqual(row, deletingRow(receipt)) : false;
+    if (row && !isExpected && !isDeleting) {
+      return { state: "conflict", row, file };
+    }
+    if (file === "conflict") return { state: "conflict", row, file };
+    const expectedFileMatches = receipt.expectedFile.state === "exact"
+      ? file === "exact"
+      : file === "absent";
+    if (isExpected && expectedFileMatches) {
+      return { state: "exact_present", row, file };
+    }
+    if (isExpected && (file === "exact" || file === "absent")) {
+      return { state: "conflict", row, file };
+    }
+    if ((isDeleting || !row) && file === "exact") {
+      return { state: "deleting", row, file };
+    }
+    if (isDeleting && file === "absent") {
+      return { state: "deleting", row, file };
+    }
+    if (!row && file === "absent") return { state: "absent", row, file };
+    return { state: "still_unknown", row, file };
+  } catch {
+    return { state: "still_unknown", row: null, file: "unknown" };
+  }
+}
+
+function safeBroadcast(runtime: FitnessFileServiceRuntime, reason: string): void {
+  try {
+    runtime.broadcast(reason);
+  } catch {
+    // Notifications are advisory. Durable storage truth never rolls back because
+    // another tab could not be notified.
+  }
+}
+
+const FULL_ROW_CAS_PREDICATE = `id = ? AND entity_type = ? AND entity_id = ?
+  AND purpose = ? AND file_key = ? AND file_name = ? AND mime_type = ?
+  AND byte_size = ? AND sha256 = ? AND status = ? AND created_at = ?
+  AND updated_at = ?`;
+
+function fullRowParams(row: StoredFitnessFile): readonly (string | number)[] {
+  return [
+    row.id,
+    row.entity_type,
+    row.entity_id,
+    row.purpose,
+    row.file_key,
+    row.file_name,
+    row.mime_type,
+    row.byte_size,
+    row.sha256,
+    row.status,
+    row.created_at,
+    row.updated_at,
+  ];
+}
+
+function markDeletingCas(
+  runtime: FitnessFileServiceRuntime,
+  expected: StoredFitnessFile,
+  updatedAt: number,
+): Promise<RunResult> {
+  return runtime.run(
+    `UPDATE fitness_files SET status = 'deleting', updated_at = ?
+      WHERE ${FULL_ROW_CAS_PREDICATE}`,
+    [updatedAt, ...fullRowParams(expected)],
+  );
+}
+
+function deleteRowCas(
+  runtime: FitnessFileServiceRuntime,
+  expected: StoredFitnessFile,
+): Promise<RunResult> {
+  return runtime.run(
+    `DELETE FROM fitness_files WHERE ${FULL_ROW_CAS_PREDICATE}`,
+    fullRowParams(expected),
+  );
+}
+
 async function requireEntity(
   runtime: FitnessFileServiceRuntime,
   entityType: FitnessFileEntityType,
@@ -357,10 +889,19 @@ async function reconcileUnlocked(
   const survivingRows = new Map(rows.map((row) => [row.id, row]));
   for (const row of rows) {
     if (row.status === "deleting") {
-      await runtime.deleteFile(row.file_key);
-      await runtime.run("DELETE FROM fitness_files WHERE id = ? AND status = 'deleting'", [row.id]);
-      survivingRows.delete(row.id);
-      result.completedDeletes += 1;
+      // A deleting row alone does not carry the operation's owner capability.
+      // Reconciliation may finish only the non-destructive half when OPFS proves
+      // the key wholly absent. A persisted delete receipt performs owned cleanup.
+      try {
+        await runtime.assertFileKeyAvailable(row.file_key);
+        const removed = await deleteRowCas(runtime, row);
+        if (removed.changes === 1) {
+          survivingRows.delete(row.id);
+          result.completedDeletes += 1;
+        }
+      } catch {
+        // Present, partial, foreign, or temporarily unreadable bytes are retained.
+      }
       continue;
     }
 
@@ -378,8 +919,10 @@ async function reconcileUnlocked(
             valid.push(stored.metadata);
           }
         } catch {
-          await runtime.deleteFile(metadata.key);
-          deletedLocalKeys.add(metadata.key);
+          if (!metadata.stagingOwner) {
+            await runtime.deleteFile(metadata.key);
+            deletedLocalKeys.add(metadata.key);
+          }
         }
       }
 
@@ -392,11 +935,11 @@ async function reconcileUnlocked(
       if (entityExists && valid.length > 0) {
         const adopted = valid[0];
         const now = runtime.now();
-        await runtime.run(
+        const update = await runtime.run(
           `UPDATE fitness_files
              SET file_key = ?, file_name = ?, mime_type = ?, byte_size = ?, sha256 = ?,
                  status = 'ready', updated_at = ?
-           WHERE id = ? AND status = 'missing' AND sha256 = ?`,
+           WHERE ${FULL_ROW_CAS_PREDICATE}`,
           [
             adopted.key,
             adopted.originalName,
@@ -404,10 +947,10 @@ async function reconcileUnlocked(
             adopted.byteSize,
             adopted.sha256,
             now,
-            row.id,
-            PENDING_SHA256,
+            ...fullRowParams(row),
           ],
         );
+        if (update.changes !== 1) continue;
         survivingRows.set(row.id, {
           ...row,
           file_key: adopted.key,
@@ -420,20 +963,20 @@ async function reconcileUnlocked(
         });
         result.adoptedPending += 1;
         for (const duplicate of valid.slice(1)) {
+          if (duplicate.stagingOwner) continue;
           await runtime.deleteFile(duplicate.key);
           deletedLocalKeys.add(duplicate.key);
         }
       } else {
+        const removed = await deleteRowCas(runtime, row);
+        if (removed.changes !== 1) continue;
+        survivingRows.delete(row.id);
+        result.discardedPending += 1;
         for (const metadata of valid) {
+          if (metadata.stagingOwner) continue;
           await runtime.deleteFile(metadata.key);
           deletedLocalKeys.add(metadata.key);
         }
-        await runtime.run(
-          "DELETE FROM fitness_files WHERE id = ? AND status = 'missing' AND sha256 = ?",
-          [row.id, PENDING_SHA256],
-        );
-        survivingRows.delete(row.id);
-        result.discardedPending += 1;
       }
       continue;
     }
@@ -474,8 +1017,11 @@ async function reconcileUnlocked(
     if (deletedLocalKeys.has(metadata.key)) continue;
     const rowId = managedRowId(metadata);
     if (!rowId || referencedKeys.has(metadata.key)) continue;
-    // A managed abandoned/duplicate object is safe to clean. Unknown OPFS files
-    // and complete user files with another category are never touched.
+    // New safe writes keep an owner on their staged object. Only their persisted
+    // receipt may clean it; a refresh must not convert uncertainty into deletion.
+    if (metadata.stagingOwner) continue;
+    // A legacy managed abandoned/duplicate object remains safe to clean. Unknown
+    // OPFS files and complete user files with another category are never touched.
     await runtime.deleteFile(metadata.key);
     result.deletedManagedOrphans += 1;
   }
@@ -486,111 +1032,432 @@ export function createFitnessFileService(runtime: FitnessFileServiceRuntime) {
   async function reconcile(): Promise<FitnessFileReconcileResult> {
     return runtime.withExclusiveLock(async () => {
       const result = await reconcileUnlocked(runtime);
-      if (reconcileChanged(result)) runtime.broadcast("fitness-files-reconciled");
+      if (reconcileChanged(result)) safeBroadcast(runtime, "fitness-files-reconciled");
       return result;
     });
   }
 
-  async function save(input: SaveFitnessFileInput): Promise<FitnessFileRecord> {
+  async function prepareSave(
+    input: SaveFitnessFileInput,
+  ): Promise<FitnessFileSaveReceipt> {
     assertEntityType(input.entityType);
     assertPurpose(input.purpose);
     const entityId = normalizeIdentifier(input.entityId, "附件归属 ID");
     const format = await validateFile(input.file, input.purpose);
+    const fileSha256 = (await runtime.hashBlob(input.file)).toLowerCase();
+    if (!SHA256_PATTERN.test(fileSha256)) {
+      fail("无法核对待保存附件的完整性。", "FILE_HASH_FAILED");
+    }
 
     return runtime.withExclusiveLock(async () => {
+      const generation = await runtime.currentGeneration();
+      if (!validGeneration(generation)) {
+        fail("无法确认当前适练数据版本，没有开始附件写入。", "GENERATION_UNAVAILABLE");
+      }
       await requireEntity(runtime, input.entityType, entityId);
-      const id = `fitness-file-${runtime.randomUUID()}`;
-      const pendingKey = runtime.randomUUID();
-      if (!UUID_V4_PATTERN.test(pendingKey)) {
+      const afterEntity = await runtime.currentGeneration();
+      if (
+        afterEntity.generationId !== generation.generationId ||
+        afterEntity.sequence !== generation.sequence ||
+        afterEntity.database !== generation.database
+      ) {
+        fail("适练数据版本刚刚发生变化，请重新选择附件。", "GENERATION_CHANGED");
+      }
+      const operationId = runtime.randomUUID().toLowerCase();
+      const fileKey = runtime.randomUUID().toLowerCase();
+      const stagingOwner = runtime.randomOwner().toLowerCase();
+      if (
+        !UUID_V4_PATTERN.test(operationId) ||
+        !UUID_V4_PATTERN.test(fileKey) ||
+        !SHA256_PATTERN.test(stagingOwner)
+      ) {
         fail("无法生成安全的附件标识。", "INVALID_GENERATED_KEY");
       }
       const now = runtime.now();
-      const initialName = safeFileName(input.file.name);
-      await runtime.run(
-        `INSERT INTO fitness_files(
-           id,entity_type,entity_id,purpose,file_key,file_name,mime_type,
-           byte_size,sha256,status,created_at,updated_at
-         ) VALUES(?,?,?,?,?,?,?,?,?,'missing',?,?)`,
-        [
-          id,
-          input.entityType,
-          entityId,
-          input.purpose,
-          pendingKey,
-          initialName,
-          format.mimeType,
-          0,
-          PENDING_SHA256,
-          now,
-          now,
-        ],
+      const timestamp = Number.isSafeInteger(now) && now >= 0
+        ? exactIsoTimestamp(now)
+        : null;
+      if (timestamp === null) {
+        fail("无法建立可靠的附件时间标记。", "INVALID_TIMESTAMP");
+      }
+      const id = `fitness-file-${operationId}`;
+      const fileName = safeFileName(input.file.name);
+      const expectedRow: StoredFitnessFile = {
+        id,
+        entity_type: input.entityType,
+        entity_id: entityId,
+        purpose: input.purpose,
+        file_key: fileKey,
+        file_name: fileName,
+        mime_type: format.mimeType,
+        byte_size: input.file.size,
+        sha256: fileSha256,
+        status: "ready",
+        created_at: now,
+        updated_at: now,
+      };
+      const expectedFile = {
+        version: 1 as const,
+        key: fileKey,
+        namespace: DATABASE,
+        originalName: fileName,
+        mimeType: format.mimeType,
+        category: managedCategory(id),
+        byteSize: input.file.size,
+        sha256: fileSha256,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        stagingOwner,
+      };
+      return Object.freeze({
+        version: RECEIPT_VERSION,
+        kind: SAVE_RECEIPT_KIND,
+        operationId,
+        database: CANONICAL_DATABASE,
+        generationId: generation.generationId,
+        generationSequence: generation.sequence,
+        expectedRow: Object.freeze(expectedRow),
+        expectedFile: Object.freeze(expectedFile),
+      });
+    });
+  }
+
+  async function assertInputMatchesSaveReceipt(
+    input: SaveFitnessFileInput,
+    receipt: FitnessFileSaveReceipt,
+  ): Promise<void> {
+    assertEntityType(input.entityType);
+    assertPurpose(input.purpose);
+    const entityId = normalizeIdentifier(input.entityId, "附件归属 ID");
+    const format = await validateFile(input.file, input.purpose);
+    const hash = (await runtime.hashBlob(input.file)).toLowerCase();
+    const row = receipt.expectedRow;
+    if (
+      input.entityType !== row.entity_type ||
+      entityId !== row.entity_id ||
+      input.purpose !== row.purpose ||
+      safeFileName(input.file.name) !== row.file_name ||
+      format.mimeType !== row.mime_type ||
+      input.file.size !== row.byte_size ||
+      hash !== row.sha256.toLowerCase()
+    ) {
+      fail("当前附件与已保存的恢复凭据不一致，没有写入。", "SAVE_RECEIPT_INPUT_MISMATCH");
+    }
+  }
+
+  async function inspectSave(
+    receiptInput: FitnessFileSaveReceipt,
+  ): Promise<FitnessFileSaveInspection> {
+    assertSaveReceipt(receiptInput);
+    return runtime.withExclusiveLock(async () =>
+      (await inspectSaveUnlocked(runtime, receiptInput)).state
+    );
+  }
+
+  async function cleanupAbsentSaveStageUnlocked(
+    receipt: FitnessFileSaveReceipt,
+  ): Promise<boolean> {
+    try {
+      const generation = await runtime.currentGeneration();
+      if (!generationMatches(generation, receipt)) return false;
+      if (await findRow(runtime, receipt.expectedRow.id)) return false;
+      const file = await inspectLocalFileUnlocked(
+        runtime,
+        receipt.expectedFile.key,
+        expectedSaveMetadata(receipt),
       );
+      if (file === "absent") return true;
+      await runtime.deleteOwnedFile(
+        receipt.expectedFile.key,
+        receipt.expectedFile.stagingOwner,
+      );
+      const afterGeneration = await runtime.currentGeneration();
+      if (!generationMatches(afterGeneration, receipt)) return false;
+      if (await findRow(runtime, receipt.expectedRow.id)) return false;
+      return await inspectLocalFileUnlocked(
+        runtime,
+        receipt.expectedFile.key,
+        expectedSaveMetadata(receipt),
+      ) === "absent";
+    } catch {
+      return false;
+    }
+  }
 
-      let stored: LocalFileMetadata | null = null;
+  async function resumeSave(
+    receiptInput: FitnessFileSaveReceipt,
+  ): Promise<FitnessFileSafeSaveResult> {
+    assertSaveReceipt(receiptInput);
+    const receipt = receiptInput;
+    return runtime.withExclusiveLock(async () => {
+      let truth = await inspectSaveUnlocked(runtime, receipt);
+      if (truth.state === "exact_saved") {
+        return {
+          outcome: "already_saved",
+          record: publicRecord(receipt.expectedRow),
+          receipt,
+        };
+      }
+      if (truth.state === "generation_changed") {
+        fail("适练数据版本已变化，这张附件票据没有改动新版本。", "GENERATION_CHANGED");
+      }
+      if (truth.state === "conflict") {
+        fail("附件恢复票据与当前数据冲突，没有覆盖任何内容。", "SAVE_CONFLICT");
+      }
+      if (truth.state === "absent") {
+        fail("这张票据没有可恢复的附件字节，请重新选择原文件。", "SAVE_STAGE_ABSENT");
+      }
+      if (truth.state === "still_unknown") {
+        return { outcome: "outcome_uncertain", receipt, retryable: true };
+      }
+
+      await requireEntity(
+        runtime,
+        receipt.expectedRow.entity_type,
+        receipt.expectedRow.entity_id,
+      );
+      const generation = await runtime.currentGeneration();
+      if (!generationMatches(generation, receipt)) {
+        fail("适练数据版本已变化，没有把旧附件关联到新版本。", "GENERATION_CHANGED");
+      }
+      const row = receipt.expectedRow;
       try {
-        stored = await runtime.saveFile(input.file, {
-          originalName: input.file.name,
-          mimeType: format.mimeType,
-          category: managedCategory(id),
-          createdAt: new Date(now).toISOString(),
-          updatedAt: new Date(now).toISOString(),
-        });
-        const actualHash = await runtime.hashBlob(input.file);
-        if (
-          stored.byteSize !== input.file.size ||
-          stored.sha256.toLowerCase() !== actualHash.toLowerCase() ||
-          stored.mimeType !== format.mimeType ||
-          !UUID_V4_PATTERN.test(stored.key)
-        ) {
-          fail("浏览器写入的附件元数据与真实文件不一致。", "FILE_METADATA_MISMATCH");
-        }
-
-        const updatedAt = Math.max(now, runtime.now());
-        const update = await runtime.run(
-          `UPDATE fitness_files
-             SET file_key = ?, file_name = ?, mime_type = ?, byte_size = ?, sha256 = ?,
-                 status = 'ready', updated_at = ?
-           WHERE id = ? AND status = 'missing' AND sha256 = ? AND file_key = ?`,
+        await runtime.run(
+          `INSERT INTO fitness_files(
+             id,entity_type,entity_id,purpose,file_key,file_name,mime_type,
+             byte_size,sha256,status,created_at,updated_at
+           ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
           [
-            stored.key,
-            stored.originalName,
-            stored.mimeType,
-            stored.byteSize,
-            stored.sha256.toLowerCase(),
-            updatedAt,
-            id,
-            PENDING_SHA256,
-            pendingKey,
+            row.id,
+            row.entity_type,
+            row.entity_id,
+            row.purpose,
+            row.file_key,
+            row.file_name,
+            row.mime_type,
+            row.byte_size,
+            row.sha256,
+            row.status,
+            row.created_at,
+            row.updated_at,
           ],
         );
-        if (update.changes !== 1) {
-          fail("附件暂存记录发生变化，已停止写入。", "PENDING_ROW_CHANGED");
-        }
-        const record: FitnessFileRecord = {
-          id,
-          entity_type: input.entityType,
-          entity_id: entityId,
-          purpose: input.purpose,
-          file_key: stored.key,
-          file_name: stored.originalName,
-          mime_type: stored.mimeType,
-          byte_size: stored.byteSize,
-          sha256: stored.sha256.toLowerCase(),
-          status: "ready",
-          created_at: now,
-          updated_at: updatedAt,
-        };
-        runtime.broadcast("fitness-file-saved");
-        return record;
-      } catch (error) {
-        if (stored) await runtime.deleteFile(stored.key).catch(() => undefined);
-        await runtime.run(
-          "DELETE FROM fitness_files WHERE id = ? AND status = 'missing' AND sha256 = ?",
-          [id, PENDING_SHA256],
-        ).catch(() => undefined);
-        throw error;
+      } catch {
+        // A committed INSERT is accepted only after the exact read below.
       }
+      truth = await inspectSaveUnlocked(runtime, receipt);
+      if (truth.state === "exact_saved") {
+        safeBroadcast(runtime, "fitness-file-saved");
+        return {
+          outcome: "saved",
+          record: publicRecord(receipt.expectedRow),
+          receipt,
+        };
+      }
+      if (truth.state === "conflict") {
+        fail("附件恢复时出现了另一份记录，没有覆盖它。", "SAVE_CONFLICT");
+      }
+      return { outcome: "outcome_uncertain", receipt, retryable: true };
     });
+  }
+
+  async function discardSave(
+    receiptInput: FitnessFileSaveReceipt,
+  ): Promise<FitnessFileDiscardSaveResult> {
+    assertSaveReceipt(receiptInput);
+    const receipt = receiptInput;
+    return runtime.withExclusiveLock(async () => {
+      const generation = await runtime.currentGeneration();
+      if (!generationMatches(generation, receipt)) {
+        return { outcome: "blocked", reason: "generation_changed", receipt };
+      }
+      let row: StoredFitnessFile | null;
+      try {
+        row = await findRow(runtime, receipt.expectedRow.id);
+      } catch {
+        return { outcome: "outcome_uncertain", receipt, retryable: true };
+      }
+      if (row) {
+        return rowsEqual(row, receipt.expectedRow)
+          ? { outcome: "blocked", reason: "saved", receipt }
+          : { outcome: "blocked", reason: "conflict", receipt };
+      }
+      const fileBeforeCleanup = await inspectLocalFileUnlocked(
+        runtime,
+        receipt.expectedFile.key,
+        expectedSaveMetadata(receipt),
+      );
+      if (fileBeforeCleanup === "absent") {
+        return { outcome: "already_absent", receipt };
+      }
+      const cleaned = await cleanupAbsentSaveStageUnlocked(receipt);
+      if (!cleaned) {
+        return fileBeforeCleanup === "conflict"
+          ? { outcome: "blocked", reason: "conflict", receipt }
+          : { outcome: "outcome_uncertain", receipt, retryable: true };
+      }
+      const finalGeneration = await runtime.currentGeneration();
+      if (!generationMatches(finalGeneration, receipt)) {
+        return { outcome: "outcome_uncertain", receipt, retryable: true };
+      }
+      return { outcome: "discarded", receipt };
+    });
+  }
+
+  async function saveSafely(
+    input: SaveFitnessFileInput,
+    receiptInput: FitnessFileSaveReceipt,
+  ): Promise<FitnessFileSafeSaveResult> {
+    assertSaveReceipt(receiptInput);
+    await assertInputMatchesSaveReceipt(input, receiptInput);
+    const receipt = receiptInput;
+    return runtime.withExclusiveLock(async () => {
+      let truth = await inspectSaveUnlocked(runtime, receipt);
+      if (truth.state === "exact_saved") {
+        return {
+          outcome: "already_saved",
+          record: publicRecord(receipt.expectedRow),
+          receipt,
+        };
+      }
+      if (truth.state === "generation_changed") {
+        fail("适练数据版本已变化，这张附件票据没有改动新版本。", "GENERATION_CHANGED");
+      }
+      if (truth.state === "conflict") {
+        const cleaned = await cleanupAbsentSaveStageUnlocked(receipt);
+        if (cleaned) {
+          fail("附件字节校验失败；已按本次 owner 凭据清理，没有写入记录。", "FILE_METADATA_MISMATCH");
+        }
+        fail("附件标识已对应另一份数据，没有覆盖现有内容。", "SAVE_CONFLICT");
+      }
+      if (truth.state === "still_unknown") {
+        return { outcome: "outcome_uncertain", receipt, retryable: true };
+      }
+
+      await requireEntity(
+        runtime,
+        receipt.expectedRow.entity_type,
+        receipt.expectedRow.entity_id,
+      );
+      const beforeWrite = await runtime.currentGeneration();
+      if (!generationMatches(beforeWrite, receipt)) {
+        fail("适练数据版本已变化，这张附件票据没有改动新版本。", "GENERATION_CHANGED");
+      }
+
+      if (truth.state === "absent") {
+        try {
+          await runtime.assertFileKeyAvailable(receipt.expectedFile.key);
+          await runtime.saveFileAtKey(
+            receipt.expectedFile.key,
+            input.file,
+            {
+              originalName: receipt.expectedFile.originalName,
+              mimeType: receipt.expectedFile.mimeType,
+              category: receipt.expectedFile.category,
+              createdAt: receipt.expectedFile.createdAt,
+              updatedAt: receipt.expectedFile.updatedAt,
+            },
+            receipt.expectedFile.stagingOwner,
+          );
+        } catch {
+          // A worker response can be lost after the exact object is durable.
+        }
+        truth = await inspectSaveUnlocked(runtime, receipt);
+        if (truth.state === "absent") {
+          fail("附件字节没有写入，原文件仍可直接重试。", "FILE_WRITE_FAILED");
+        }
+        if (truth.state === "generation_changed") {
+          fail("适练数据版本已变化，未把附件关联到新版本。", "GENERATION_CHANGED");
+        }
+        if (truth.state === "conflict") {
+          const cleaned = await cleanupAbsentSaveStageUnlocked(receipt);
+          if (cleaned) {
+            fail("附件字节校验失败；已按本次 owner 凭据清理，没有写入记录。", "FILE_METADATA_MISMATCH");
+          }
+          fail("附件键已被其他内容占用，没有覆盖它。", "SAVE_CONFLICT");
+        }
+        if (truth.state === "still_unknown") {
+          return { outcome: "outcome_uncertain", receipt, retryable: true };
+        }
+      }
+
+      if (truth.state === "exact_saved") {
+        safeBroadcast(runtime, "fitness-file-saved");
+        return {
+          outcome: "saved",
+          record: publicRecord(receipt.expectedRow),
+          receipt,
+        };
+      }
+
+      const beforeInsert = await runtime.currentGeneration();
+      if (!generationMatches(beforeInsert, receipt)) {
+        fail("适练数据版本已变化，未把附件关联到新版本。", "GENERATION_CHANGED");
+      }
+      try {
+        const row = receipt.expectedRow;
+        await runtime.run(
+          `INSERT INTO fitness_files(
+             id,entity_type,entity_id,purpose,file_key,file_name,mime_type,
+             byte_size,sha256,status,created_at,updated_at
+           ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
+          [
+            row.id,
+            row.entity_type,
+            row.entity_id,
+            row.purpose,
+            row.file_key,
+            row.file_name,
+            row.mime_type,
+            row.byte_size,
+            row.sha256,
+            row.status,
+            row.created_at,
+            row.updated_at,
+          ],
+        );
+      } catch {
+        // Inspect below distinguishes a committed INSERT from a definite absence.
+      }
+
+      truth = await inspectSaveUnlocked(runtime, receipt);
+      if (truth.state === "exact_saved") {
+        safeBroadcast(runtime, "fitness-file-saved");
+        return {
+          outcome: "saved",
+          record: publicRecord(receipt.expectedRow),
+          receipt,
+        };
+      }
+      if (truth.state === "generation_changed") {
+        return { outcome: "outcome_uncertain", receipt, retryable: true };
+      }
+      if (truth.state === "conflict") {
+        fail("附件记录已出现另一份内容，没有覆盖现有数据。", "SAVE_CONFLICT");
+      }
+      if (truth.state === "staged") {
+        const cleaned = await cleanupAbsentSaveStageUnlocked(receipt);
+        if (cleaned) {
+          fail("附件记录没有写入；本次明确无引用的暂存字节已清理。", "SAVE_NOT_COMMITTED");
+        }
+      }
+      if (truth.state === "absent") {
+        fail("附件记录没有写入，原文件仍可直接重试。", "SAVE_NOT_COMMITTED");
+      }
+      return { outcome: "outcome_uncertain", receipt, retryable: true };
+    });
+  }
+
+  async function save(input: SaveFitnessFileInput): Promise<FitnessFileRecord> {
+    const receipt = await prepareSave(input);
+    const result = await saveSafely(input, receipt);
+    if (result.outcome === "outcome_uncertain") {
+      throw new FitnessFileOutcomeUncertainError(
+        "附件保存结果暂时无法确认；请保留恢复凭据并只做核对。",
+        receipt,
+      );
+    }
+    return result.record;
   }
 
   async function get(idInput: string): Promise<FitnessFileRecord | null> {
@@ -620,7 +1487,7 @@ export function createFitnessFileService(runtime: FitnessFileServiceRuntime) {
           "UPDATE fitness_files SET status = 'missing', updated_at = ? WHERE id = ? AND status = 'ready'",
           [runtime.now(), row.id],
         );
-        runtime.broadcast("fitness-file-missing");
+        safeBroadcast(runtime, "fitness-file-missing");
         throw error;
       }
     });
@@ -640,7 +1507,7 @@ export function createFitnessFileService(runtime: FitnessFileServiceRuntime) {
       const rows = (await runtime.query<StoredFitnessFile>(
         "SELECT * FROM fitness_files ORDER BY updated_at DESC,id",
       )).rows.map(publicRecord);
-      if (reconcileChanged(reconciled)) runtime.broadcast("fitness-files-reconciled");
+      if (reconcileChanged(reconciled)) safeBroadcast(runtime, "fitness-files-reconciled");
       return rows.filter((row) =>
         (input.entityType === undefined || row.entity_type === input.entityType) &&
         (entityId === undefined || row.entity_id === entityId) &&
@@ -649,30 +1516,233 @@ export function createFitnessFileService(runtime: FitnessFileServiceRuntime) {
     });
   }
 
-  async function remove(idInput: string): Promise<boolean> {
+  async function prepareDelete(
+    idInput: string,
+  ): Promise<FitnessFileDeleteReceipt | null> {
     const id = normalizeIdentifier(idInput, "附件 ID");
     return runtime.withExclusiveLock(async () => {
-      const row = await findRow(runtime, id);
-      if (!row) return false;
-      if (row.status !== "deleting") {
-        await runtime.run(
-          "UPDATE fitness_files SET status = 'deleting', updated_at = ? WHERE id = ?",
-          [runtime.now(), id],
-        );
+      const generation = await runtime.currentGeneration();
+      if (!validGeneration(generation)) {
+        fail("无法确认当前适练数据版本，没有开始删除。", "GENERATION_UNAVAILABLE");
       }
-      await runtime.deleteFile(row.file_key);
-      await runtime.run("DELETE FROM fitness_files WHERE id = ? AND status = 'deleting'", [id]);
-      runtime.broadcast("fitness-file-deleted");
-      return true;
+      const row = await findRow(runtime, id);
+      if (!row) return null;
+      if (row.status === "deleting" || isPending(row)) {
+        fail("这条附件已有未完成操作，请先完成核对。", "DELETE_PREPARE_CONFLICT");
+      }
+      let expectedFile: FitnessFileDeleteReceipt["expectedFile"];
+      try {
+        const stored = await runtime.getFile(row.file_key);
+        const hash = (await runtime.hashBlob(stored.file)).toLowerCase();
+        if (
+          !metadataMatchesRow(stored.metadata, row) ||
+          stored.metadata.category !== managedCategory(row.id) ||
+          stored.file.size !== row.byte_size ||
+          hash !== row.sha256.toLowerCase()
+        ) {
+          fail("附件记录与本地字节不一致，没有开始删除。", "DELETE_FILE_CONFLICT");
+        }
+        expectedFile = {
+          state: "exact",
+          metadata: Object.freeze({ ...stored.metadata, sha256: stored.metadata.sha256.toLowerCase() }),
+        };
+      } catch (error) {
+        if (error instanceof FitnessFileError) throw error;
+        try {
+          await runtime.assertFileKeyAvailable(row.file_key);
+          expectedFile = { state: "absent" };
+        } catch {
+          fail("暂时无法确认附件字节归属，没有开始删除。", "DELETE_FILE_INSPECTION_FAILED");
+        }
+      }
+      const afterRead = await runtime.currentGeneration();
+      if (
+        afterRead.database !== generation.database ||
+        afterRead.generationId !== generation.generationId ||
+        afterRead.sequence !== generation.sequence
+      ) {
+        fail("适练数据版本刚刚发生变化，没有删除任何内容。", "GENERATION_CHANGED");
+      }
+      const operationId = runtime.randomUUID().toLowerCase();
+      if (!UUID_V4_PATTERN.test(operationId)) {
+        fail("无法生成安全的删除标识。", "INVALID_GENERATED_KEY");
+      }
+      const deletionTime = runtime.now();
+      if (!Number.isSafeInteger(deletionTime) || deletionTime < 0) {
+        fail("无法建立可靠的删除时间标记。", "INVALID_TIMESTAMP");
+      }
+      return Object.freeze({
+        version: RECEIPT_VERSION,
+        kind: DELETE_RECEIPT_KIND,
+        operationId,
+        database: CANONICAL_DATABASE,
+        generationId: generation.generationId,
+        generationSequence: generation.sequence,
+        expectedRow: Object.freeze({ ...row }),
+        deletingUpdatedAt: Math.max(row.updated_at, deletionTime),
+        expectedFile: Object.freeze(expectedFile),
+      });
     });
+  }
+
+  async function inspectDelete(
+    receiptInput: FitnessFileDeleteReceipt,
+  ): Promise<FitnessFileDeleteInspection> {
+    assertDeleteReceipt(receiptInput);
+    return runtime.withExclusiveLock(async () =>
+      (await inspectDeleteUnlocked(runtime, receiptInput)).state
+    );
+  }
+
+  async function deleteExpectedFileUnlocked(
+    receipt: FitnessFileDeleteReceipt,
+  ): Promise<LocalFileTruth> {
+    const expected = receipt.expectedFile;
+    let truth = await inspectLocalFileUnlocked(
+      runtime,
+      receipt.expectedRow.file_key,
+      expected.state === "exact" ? expected.metadata : null,
+    );
+    if (truth === "absent") return truth;
+    if (truth !== "exact" || expected.state !== "exact") return truth;
+    try {
+      if (expected.metadata.stagingOwner) {
+        await runtime.deleteOwnedFile(
+          expected.metadata.key,
+          expected.metadata.stagingOwner,
+        );
+      } else {
+        await runtime.deleteFile(expected.metadata.key);
+      }
+    } catch {
+      // The removal response can be lost after both OPFS entries disappear.
+    }
+    truth = await inspectLocalFileUnlocked(
+      runtime,
+      receipt.expectedRow.file_key,
+      expected.metadata,
+    );
+    return truth;
+  }
+
+  async function deleteSafely(
+    receiptInput: FitnessFileDeleteReceipt,
+  ): Promise<FitnessFileSafeDeleteResult> {
+    assertDeleteReceipt(receiptInput);
+    const receipt = receiptInput;
+    return runtime.withExclusiveLock(async () => {
+      let truth = await inspectDeleteUnlocked(runtime, receipt);
+      if (truth.state === "absent") {
+        return { outcome: "already_deleted", receipt };
+      }
+      if (truth.state === "generation_changed" || truth.state === "conflict") {
+        return { outcome: "conflict", receipt };
+      }
+      if (truth.state === "still_unknown") {
+        return { outcome: "outcome_uncertain", receipt, retryable: true };
+      }
+
+      if (truth.state === "exact_present") {
+        const generation = await runtime.currentGeneration();
+        if (!generationMatches(generation, receipt)) {
+          return { outcome: "conflict", receipt };
+        }
+        try {
+          await markDeletingCas(
+            runtime,
+            receipt.expectedRow,
+            receipt.deletingUpdatedAt,
+          );
+        } catch {
+          // Inspect the complete old/deleting projection before any file delete.
+        }
+        truth = await inspectDeleteUnlocked(runtime, receipt);
+        if (truth.state === "exact_present") {
+          fail("删除标记没有写入，附件和记录都保持原样。", "DELETE_NOT_STARTED");
+        }
+        if (truth.state === "generation_changed" || truth.state === "conflict") {
+          return { outcome: "conflict", receipt };
+        }
+        if (truth.state === "still_unknown") {
+          return { outcome: "outcome_uncertain", receipt, retryable: true };
+        }
+        if (truth.state === "absent") {
+          safeBroadcast(runtime, "fitness-file-deleted");
+          return { outcome: "deleted", receipt };
+        }
+      }
+
+      const generationBeforeFile = await runtime.currentGeneration();
+      if (!generationMatches(generationBeforeFile, receipt)) {
+        return { outcome: "conflict", receipt };
+      }
+      const current = await findRow(runtime, receipt.expectedRow.id);
+      if (current && !rowsEqual(current, deletingRow(receipt))) {
+        return { outcome: "conflict", receipt };
+      }
+      const fileTruth = await deleteExpectedFileUnlocked(receipt);
+      if (fileTruth === "conflict") return { outcome: "conflict", receipt };
+      if (fileTruth !== "absent") {
+        return { outcome: "outcome_uncertain", receipt, retryable: true };
+      }
+
+      const generationBeforeRowDelete = await runtime.currentGeneration();
+      if (!generationMatches(generationBeforeRowDelete, receipt)) {
+        return { outcome: "conflict", receipt };
+      }
+      const beforeDelete = await findRow(runtime, receipt.expectedRow.id);
+      if (beforeDelete && !rowsEqual(beforeDelete, deletingRow(receipt))) {
+        return { outcome: "conflict", receipt };
+      }
+      if (beforeDelete) {
+        try {
+          await deleteRowCas(runtime, deletingRow(receipt));
+        } catch {
+          // Final read below is authoritative if the response was lost.
+        }
+      }
+      truth = await inspectDeleteUnlocked(runtime, receipt);
+      if (truth.state === "absent") {
+        safeBroadcast(runtime, "fitness-file-deleted");
+        return { outcome: "deleted", receipt };
+      }
+      if (truth.state === "generation_changed" || truth.state === "conflict") {
+        return { outcome: "conflict", receipt };
+      }
+      return { outcome: "outcome_uncertain", receipt, retryable: true };
+    });
+  }
+
+  async function remove(idInput: string): Promise<boolean> {
+    const receipt = await prepareDelete(idInput);
+    if (!receipt) return false;
+    const result = await deleteSafely(receipt);
+    if (result.outcome === "conflict") {
+      fail("附件在删除前已发生变化，没有删除新内容。", "DELETE_CONFLICT");
+    }
+    if (result.outcome === "outcome_uncertain") {
+      throw new FitnessFileOutcomeUncertainError(
+        "附件删除结果暂时无法确认；请保留恢复凭据并只做核对。",
+        receipt,
+      );
+    }
+    return true;
   }
 
   return {
     initializeFitnessFiles: reconcile,
+    prepareFitnessFileSave: prepareSave,
+    saveFitnessFileSafely: saveSafely,
+    resumeFitnessFileSave: resumeSave,
+    discardFitnessFileSave: discardSave,
+    inspectFitnessFileSave: inspectSave,
     saveFitnessFile: save,
     getFitnessFile: get,
     getFitnessFileBlob: getBlob,
     listFitnessFiles: list,
+    prepareFitnessFileDelete: prepareDelete,
+    deleteFitnessFileSafely: deleteSafely,
+    inspectFitnessFileDelete: inspectDelete,
     deleteFitnessFile: remove,
   } as const;
 }
@@ -680,8 +1750,16 @@ export function createFitnessFileService(runtime: FitnessFileServiceRuntime) {
 const service = createFitnessFileService(defaultRuntime);
 
 export const initializeFitnessFiles = service.initializeFitnessFiles;
+export const prepareFitnessFileSave = service.prepareFitnessFileSave;
+export const saveFitnessFileSafely = service.saveFitnessFileSafely;
+export const resumeFitnessFileSave = service.resumeFitnessFileSave;
+export const discardFitnessFileSave = service.discardFitnessFileSave;
+export const inspectFitnessFileSave = service.inspectFitnessFileSave;
 export const saveFitnessFile = service.saveFitnessFile;
 export const getFitnessFile = service.getFitnessFile;
 export const getFitnessFileBlob = service.getFitnessFileBlob;
 export const listFitnessFiles = service.listFitnessFiles;
+export const prepareFitnessFileDelete = service.prepareFitnessFileDelete;
+export const deleteFitnessFileSafely = service.deleteFitnessFileSafely;
+export const inspectFitnessFileDelete = service.inspectFitnessFileDelete;
 export const deleteFitnessFile = service.deleteFitnessFile;
