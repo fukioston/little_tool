@@ -1,4 +1,4 @@
-export type LocalDatabaseName = "zhiji" | "shici";
+export type LocalDatabaseName = "zhiji" | "shici" | "shilian";
 
 export type SchemaMigration = Readonly<{
   version: number;

@@ -38,6 +38,7 @@ test("Career compatibility and per-database generation identities remain determi
   const generationId = "123e4567-e89b-42d3-a456-426614174000";
   const filename = `zhiji.${generationId}.sqlite3`;
   const vocabFilename = `shici.${generationId}.sqlite3`;
+  const fitnessFilename = `shilian.${generationId}.sqlite3`;
 
   assert.equal(types.isDatabaseGenerationId(generationId), true);
   assert.equal(types.isCareerGenerationId(generationId), true);
@@ -46,6 +47,7 @@ test("Career compatibility and per-database generation identities remain determi
   assert.equal(types.careerGenerationFilename(generationId), filename);
   assert.equal(types.databaseGenerationFilename("zhiji", generationId), filename);
   assert.equal(types.databaseGenerationFilename("shici", generationId), vocabFilename);
+  assert.equal(types.databaseGenerationFilename("shilian", generationId), fitnessFilename);
   assert.throws(() => types.careerGenerationFilename("not-a-generation"));
 
   assert.equal(types.isCareerActivationToken("a".repeat(64)), true);
@@ -65,13 +67,28 @@ test("Career compatibility and per-database generation identities remain determi
     "891d1725fd9f26d9e511c7d3ffa393f6f51e6536e5a1ff8ca1254ed27bee8b15",
   );
   const vocabPointer = { ...pointer, filename: vocabFilename };
+  const fitnessPointer = { ...pointer, filename: fitnessFilename };
   assert.equal(
     types.databaseGenerationPointerChecksumInput("shici", vocabPointer),
     `private-ai-suite:vocab-pointer:v1\n7\n${vocabFilename}\n`,
   );
+  assert.equal(
+    types.databaseGenerationPointerChecksumInput("shilian", fitnessPointer),
+    `private-ai-suite:fitness-pointer:v1\n7\n${fitnessFilename}\n`,
+  );
+  assert.deepEqual(types.DATABASE_PRODUCTS, {
+    zhiji: "career",
+    shici: "vocab",
+    shilian: "fitness",
+  });
+  assert.equal(types.canonicalDatabaseName("fitness"), "shilian");
   assert.notEqual(
     types.databaseGenerationPointerChecksumInput("zhiji", pointer),
     types.databaseGenerationPointerChecksumInput("shici", vocabPointer),
+  );
+  assert.notEqual(
+    types.databaseGenerationPointerChecksumInput("shici", vocabPointer),
+    types.databaseGenerationPointerChecksumInput("shilian", fitnessPointer),
   );
 
   const ranked = types.rankCareerGenerationPointers([
@@ -161,7 +178,7 @@ test("stage failure only cleans its random candidate and never writes the live p
   assert.doesNotMatch(staging, /DATABASE_FILES|openDatabases\.set/);
 });
 
-test("public RPC stages Career and Vocabulary independently without cross-product pointers", async () => {
+test("public RPC stages all three products independently without cross-product pointers", async () => {
   const [types, client, worker] = await Promise.all([
     readFile(new URL("lib/local-db/types.ts", projectRoot), "utf8"),
     readFile(new URL("lib/local-db/client.ts", projectRoot), "utf8"),
@@ -185,6 +202,12 @@ test("public RPC stages Career and Vocabulary independently without cross-produc
   assert.match(worker, /zhiji\.active-b\.json/);
   assert.match(worker, /shici\.active-a\.json/);
   assert.match(worker, /shici\.active-b\.json/);
+  assert.match(worker, /shilian\.active-a\.json/);
+  assert.match(worker, /shilian\.active-b\.json/);
+  assert.match(client, /shilian:\s*new LocalDatabaseClient\("shilian"\)/);
+  assert.match(client, /getLocalDatabase\("fitness"\)\.init\(\)/);
+  assert.match(client, /return \{ career, vocab, fitness \}/);
+  assert.match(types, /shilian:\s*"fitness"/);
   assert.match(worker, /rawPointerReferences\(\s*name,/);
   assert.match(worker, /generationIdFromFilename\(name, filename\)/);
   assert.doesNotMatch(worker, /assertCareerOnly/);

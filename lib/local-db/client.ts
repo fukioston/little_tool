@@ -241,6 +241,7 @@ export class LocalDatabaseClient {
 const databaseClients = {
   zhiji: new LocalDatabaseClient("zhiji"),
   shici: new LocalDatabaseClient("shici"),
+  shilian: new LocalDatabaseClient("shilian"),
 } as const;
 
 export function getLocalDatabase(
@@ -252,11 +253,12 @@ export function getLocalDatabase(
 export const localDb = {
   async init(database?: LocalDatabaseId): Promise<InitAllResult | DatabaseInitResult> {
     if (database) return getLocalDatabase(database).init();
-    const [career, vocab] = await Promise.all([
+    const [career, vocab, fitness] = await Promise.all([
       getLocalDatabase("career").init(),
       getLocalDatabase("vocab").init(),
+      getLocalDatabase("fitness").init(),
     ]);
-    return { career, vocab };
+    return { career, vocab, fitness };
   },
 
   query<Row extends object = SqlRow>(

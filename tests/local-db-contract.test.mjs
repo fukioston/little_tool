@@ -71,8 +71,17 @@ for (const contract of [
     seedTable: "vocabulary_entries",
     minimumSeedRows: 6,
   },
+  {
+    path: "lib/schemas/shilian.ts",
+    exportName: "shilianSchema",
+    name: "shilian",
+    filename: "shilian.sqlite3",
+    minimumTables: 17,
+    seedTable: null,
+    minimumSeedRows: 0,
+  },
 ]) {
-  test(`${contract.name} reference schema and seed are idempotent`, async () => {
+  test(`${contract.name} reference schema and seed policy are idempotent`, async () => {
     const sqlite3 = await sqlite3InitModule();
     const loadedModule = await loadStandaloneTypeScriptModule(contract.path);
     const schema = loadedModule[contract.exportName];
@@ -89,17 +98,43 @@ for (const contract of [
         });
       }
 
-      database.transaction("IMMEDIATE", () => database.exec(schema.seedSql));
-      const firstSeedCount = Number(
-        database.selectValue(`SELECT COUNT(*) FROM ${contract.seedTable}`),
-      );
-      database.transaction("IMMEDIATE", () => database.exec(schema.seedSql));
-      const secondSeedCount = Number(
-        database.selectValue(`SELECT COUNT(*) FROM ${contract.seedTable}`),
-      );
+      if (contract.seedTable) {
+        database.transaction("IMMEDIATE", () => database.exec(schema.seedSql));
+        const firstSeedCount = Number(
+          database.selectValue(`SELECT COUNT(*) FROM ${contract.seedTable}`),
+        );
+        database.transaction("IMMEDIATE", () => database.exec(schema.seedSql));
+        const secondSeedCount = Number(
+          database.selectValue(`SELECT COUNT(*) FROM ${contract.seedTable}`),
+        );
 
-      assert.ok(firstSeedCount >= contract.minimumSeedRows);
-      assert.equal(secondSeedCount, firstSeedCount);
+        assert.ok(firstSeedCount >= contract.minimumSeedRows);
+        assert.equal(secondSeedCount, firstSeedCount);
+      } else {
+        assert.equal(schema.seedVersion, 0);
+        assert.equal(schema.seedSql, "");
+        const businessTables = database.selectObjects(
+          `SELECT name FROM sqlite_schema
+           WHERE type='table'
+             AND name NOT LIKE 'sqlite_%'
+             AND name <> 'fitness_schema_migrations'
+           ORDER BY name`,
+        );
+        assert.ok(businessTables.length >= contract.minimumTables - 1);
+        for (const { name } of businessTables) {
+          assert.equal(
+            Number(database.selectValue(`SELECT COUNT(*) FROM "${name}"`)),
+            0,
+            `${name} must not contain demo or inferred personal data`,
+          );
+        }
+        assert.deepEqual(
+          database.selectObjects(
+            "SELECT version,name FROM fitness_schema_migrations ORDER BY version",
+          ).map((row) => ({ ...row })),
+          [{ version: 1, name: "initial-truthful-fitness-runtime" }],
+        );
+      }
       assert.equal(database.selectValue("PRAGMA integrity_check"), "ok");
       assert.deepEqual(database.selectObjects("PRAGMA foreign_key_check"), []);
       assert.equal(
@@ -128,7 +163,9 @@ test("runtime maps product aliases to independent files without auto-running ref
 
   assert.match(types, /career["']\) return ["']zhiji["']/);
   assert.match(types, /vocab["']\) return ["']shici["']/);
+  assert.match(types, /fitness["']\) return ["']shilian["']/);
   assert.match(types, /zhiji:\s*["']zhiji\.sqlite3["']/);
   assert.match(types, /shici:\s*["']shici\.sqlite3["']/);
+  assert.match(types, /shilian:\s*["']shilian\.sqlite3["']/);
   assert.doesNotMatch(worker, /localDatabaseSchemas|seedSql|migrations/);
 });

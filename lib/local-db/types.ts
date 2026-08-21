@@ -2,7 +2,7 @@ import type { LocalDatabaseName } from "../schemas";
 
 export type { LocalDatabaseName } from "../schemas";
 
-export type LocalDatabaseId = "career" | "vocab";
+export type LocalDatabaseId = "career" | "vocab" | "fitness";
 export type LocalDatabaseSelector = LocalDatabaseId | LocalDatabaseName;
 
 export type SqlValue =
@@ -202,7 +202,7 @@ export function databaseGenerationPointerChecksumInput(
   database: LocalDatabaseName,
   pointer: DatabaseGenerationPointerCore,
 ): string {
-  const product = database === "zhiji" ? "career" : "vocab";
+  const product = DATABASE_PRODUCTS[database];
   return `private-ai-suite:${product}-pointer:v${pointer.version}\n${pointer.sequence}\n${pointer.filename}\n`;
 }
 
@@ -234,6 +234,7 @@ export function rankCareerGenerationPointers(
 export type InitAllResult = Readonly<{
   career: DatabaseInitResult;
   vocab: DatabaseInitResult;
+  fitness: DatabaseInitResult;
 }>;
 
 export type WorkerOperation =
@@ -302,6 +303,15 @@ export const DATABASE_FILES: Readonly<
 > = {
   zhiji: "zhiji.sqlite3",
   shici: "shici.sqlite3",
+  shilian: "shilian.sqlite3",
+};
+
+export const DATABASE_PRODUCTS: Readonly<
+  Record<LocalDatabaseName, LocalDatabaseId>
+> = {
+  zhiji: "career",
+  shici: "vocab",
+  shilian: "fitness",
 };
 
 export function canonicalDatabaseName(
@@ -309,5 +319,6 @@ export function canonicalDatabaseName(
 ): LocalDatabaseName {
   if (database === "career") return "zhiji";
   if (database === "vocab") return "shici";
+  if (database === "fitness") return "shilian";
   return database;
 }

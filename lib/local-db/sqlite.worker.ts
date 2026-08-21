@@ -115,6 +115,14 @@ const GENERATION_FILES = {
     },
     legacyFilename: DATABASE_FILES.shici,
   },
+  shilian: {
+    label: "Fitness",
+    pointerFiles: {
+      a: "shilian.active-a.json",
+      b: "shilian.active-b.json",
+    },
+    legacyFilename: DATABASE_FILES.shilian,
+  },
 } as const satisfies Record<
   LocalDatabaseName,
   {
