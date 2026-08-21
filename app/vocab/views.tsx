@@ -9,6 +9,7 @@ import { getDueCards, recordStudySeconds } from "@/lib/vocab/store";
 import { scheduleReviewV2 } from "@/lib/vocab/srs";
 import type { ContentBlock, Lexeme, LibraryItem, Occurrence, ReviewCard, ReviewRating, SelectionTarget, TranscriptSegment, VocabSettings, VocabSnapshot, VocabView } from "@/lib/vocab/types";
 import { AnnotatedText, EmptyState, Metric, Toggle } from "./ui";
+import { VocabBackupFlow } from "./VocabBackupFlow";
 
 function caretOffset(element: HTMLElement, clientX: number, clientY: number) {
   const doc = document as Document & {
@@ -530,15 +531,14 @@ type SettingsViewProps = {
   persistenceSupported: boolean;
   onChange: (patch: Partial<VocabSettings>) => Promise<void>;
   onExport: () => Promise<string>;
-  onImport: (file: File) => Promise<string>;
+  onRestoreRefresh: () => Promise<void>;
   onPersist: () => Promise<boolean | null>;
   onTestAi: () => Promise<void>;
 };
 
-export function SettingsView({ settings, storage, persistenceSupported, onChange, onExport, onImport, onPersist, onTestAi }: SettingsViewProps) {
+export function SettingsView({ settings, storage, persistenceSupported, onChange, onExport, onRestoreRefresh, onPersist, onTestAi }: SettingsViewProps) {
   const [message,setMessage]=useState("");
   const [busy,setBusy]=useState(false);
-  const restore=useRef<HTMLInputElement>(null);
   const run=async(action:()=>Promise<string|void>,success:string)=>{setBusy(true);setMessage("");try{const result=await action();setMessage(result||success);}catch(error){setMessage(error instanceof Error?error.message:"操作失败");}finally{setBusy(false);}};
   return <div className="sc-page sc-settings-page">
     <header className="sc-page-title"><div><span className="sc-eyebrow">PREFERENCES & PRIVACY</span><h1>设置</h1><p>调整阅读体验，并掌握哪些内容可以离开设备。</p></div></header>
@@ -550,7 +550,7 @@ export function SettingsView({ settings, storage, persistenceSupported, onChange
       </section>
       <section id="ai"><header><h2>AI 与隐私</h2><p>选词后会先显示准确字段说明；只有再点“解释这个词”才会发送。</p></header><Toggle label="默认显示简体中文说明" copy="英文释义始终优先" value={settings.chinese_explanation} onChange={(value)=>void onChange({chinese_explanation:value})}/><Toggle label="本地锁" copy="阻止 URL、RSS、AI、转写与远程音频请求" value={settings.local_lock} onChange={(value)=>void onChange({local_lock:value})}/><div className="sc-endpoint"><span><i className={settings.local_lock?"locked":""}/><b>DeepSeek · OpenAI compatible</b><small>{settings.local_lock?"本地锁已开启":"由服务端安全配置"}</small></span><button disabled={busy||settings.local_lock} onClick={()=>void run(onTestAi,"检测到服务端 AI 配置；这次检查没有发送文章或词语内容。")}>检查配置</button></div></section>
       <section id="review-settings"><header><h2>复习节奏</h2><p>这里只控制每天首次加入复习的新词，不会隐藏旧卡。</p></header><div className="sc-setting-row"><label htmlFor="sc-daily-limit">每日新词<small>0 只暂停新词；已到期、学习中和重新学习的词不受影响</small></label><input id="sc-daily-limit" type="range" min="0" max="30" value={settings.daily_new_limit} aria-valuetext={settings.daily_new_limit === 0 ? "暂停加入新词" : `每天最多 ${settings.daily_new_limit} 个新词`} onChange={(event)=>void onChange({daily_new_limit:Number(event.target.value)})}/><b>{settings.daily_new_limit === 0 ? "暂停" : `${settings.daily_new_limit} 个`}</b></div></section>
-      <section id="data"><header><h2>数据与备份</h2><p>完整备份包含 SQLite 数据与实际保存在拾词里的本地音频。</p></header><div className={`sc-storage-fact ${storage?.persisted===true?"persisted":""}`}><span><i /><b>{storage?.persisted===true?"浏览器已授予持久化保护":!persistenceSupported?"当前浏览器未提供持久化保护接口":storage===null?"正在读取存储状态":storage.persisted===false?"仍可能被浏览器清理":"保护状态暂时未知"}</b><small>{storage?`当前占用 ${formatStorageBytes(storage.usage)} · 可用约 ${formatStorageBytes(storage.available)}`:"正在读取当前浏览器的容量信息"}</small></span>{persistenceSupported&&storage?.persisted!==true&&<button disabled={busy} onClick={()=>void run(async()=>{const result=await onPersist();return result===true?"已获得浏览器持久化保护。":result===false?"浏览器暂未授予持久化保护，请保持定期备份。":"保护请求已完成，但浏览器暂时无法复查状态。";},"")}>请求保护</button>}</div><div className="sc-data-actions"><button disabled={busy} onClick={()=>void run(onExport,"")}><i>↓</i><span><b>导出完整备份</b><small>内容、词语、复习与本地音频</small></span></button><button disabled={busy} onClick={()=>restore.current?.click()}><i>↑</i><span><b>恢复备份</b><small>先校验候选数据，再安全切换</small></span></button><input ref={restore} aria-label="选择拾词完整备份或旧版 SQLite" hidden type="file" accept=".vocab-backup,.sqlite,.sqlite3,.db" onChange={(event)=>{const file=event.target.files?.[0];if(file)void run(()=>onImport(file),"");event.currentTarget.value="";}}/></div><p className="sc-data-note">备份是未加密的私人文件，不含 AI 密钥。请把它保存在受信任的位置；旧版 SQLite 不包含本地音频。</p></section>
+      <section id="data"><header><h2>数据与备份</h2><p>完整备份包含 SQLite 数据与实际保存在拾词里的本地音频。</p></header><div className={`sc-storage-fact ${storage?.persisted===true?"persisted":""}`}><span><i /><b>{storage?.persisted===true?"浏览器已授予持久化保护":!persistenceSupported?"当前浏览器未提供持久化保护接口":storage===null?"正在读取存储状态":storage.persisted===false?"仍可能被浏览器清理":"保护状态暂时未知"}</b><small>{storage?`当前占用 ${formatStorageBytes(storage.usage)} · 可用约 ${formatStorageBytes(storage.available)}`:"正在读取当前浏览器的容量信息"}</small></span>{persistenceSupported&&storage?.persisted!==true&&<button disabled={busy} onClick={()=>void run(async()=>{const result=await onPersist();return result===true?"已获得浏览器持久化保护。":result===false?"浏览器暂未授予持久化保护，请保持定期备份。":"保护请求已完成，但浏览器暂时无法复查状态。";},"")}>请求保护</button>}</div><VocabBackupFlow controlsDisabled={busy} onExport={onExport} onRefreshActivated={onRestoreRefresh} onNotice={setMessage}/><p className="sc-data-note">备份是未加密的私人文件，不含 AI 密钥。请把它保存在受信任的位置；旧版拾词数据库不包含本地音频原件。</p></section>
       {message&&<div className="sc-settings-message" role="status">{message}</div>}
     </div></div>
   </div>;
