@@ -229,7 +229,20 @@ async function fixture(options = {}) {
       state.operations.push(["run", params[0]]);
       if (state.insertFailure === "before") {
         state.insertFailure = null;
+        state.queryFailuresRemaining += state.recoveryQueryFailures;
+        state.recoveryQueryFailures = 0;
         throw new Error("INSERT failed before commit");
+      }
+      if (state.insertFailure === "conflict") {
+        state.insertFailure = null;
+        const conflicting = [...params];
+        conflicting[7] = "由另一份材料占用";
+        conflicting[8] = null;
+        conflicting[9] = null;
+        conflicting[10] = null;
+        conflicting[11] = null;
+        executeRun(database, sql, conflicting);
+        throw new Error("INSERT collided with another material");
       }
       const result = executeRun(database, sql, params);
       if (state.insertFailure === "after") {
@@ -397,6 +410,31 @@ test("an OPFS failure performs no SQLite insert", async (t) => {
   assert.equal(selectMaterial(context.database, "material-stable-a"), null);
 });
 
+test("cleanup receipt issuance happens before INSERT and a signing failure cleans the stage", async (t) => {
+  const context = await fixture();
+  t.after(() => context.close());
+  const originalBtoa = globalThis.btoa;
+  globalThis.btoa = () => {
+    throw new Error("receipt encoding unavailable");
+  };
+  t.after(() => {
+    globalThis.btoa = originalBtoa;
+  });
+
+  await assert.rejects(
+    context.service.saveCareerMaterial(materialInput()),
+    (error) => {
+      assert.equal(error.code, "write_failed");
+      assert.equal(error.cleanupReceipt, undefined);
+      return true;
+    },
+  );
+  assert.equal(context.state.runCalls, 0);
+  assert.equal(context.state.deleteCalls, 1);
+  assert.equal(context.state.files.has(FILE_KEY_A), false);
+  assert.equal(selectMaterial(context.database, "material-stable-a"), null);
+});
+
 test("a definite pre-commit SQL failure cleans the staged file only after confirming absence", async (t) => {
   const context = await fixture();
   t.after(() => context.close());
@@ -430,6 +468,33 @@ test("a durable insert with a lost response is verified exactly and never delete
   assert.equal(context.state.deleteCalls, 0);
 });
 
+test("a post-stage conflict never strands an attachment without recovery", async (t) => {
+  const context = await fixture();
+  t.after(() => context.close());
+  context.state.insertFailure = "conflict";
+  let receipt;
+
+  await assert.rejects(
+    context.service.saveCareerMaterial(materialInput()),
+    (error) => {
+      assert.equal(error.code, "temporary_file_cleanup_failed");
+      assert.ok(error.cleanupReceipt);
+      receipt = error.cleanupReceipt;
+      return true;
+    },
+  );
+  assert.ok(receipt);
+  assert.equal(context.state.files.has(FILE_KEY_A), true);
+  assert.equal(context.state.deleteCalls, 0);
+  assert.equal(selectMaterial(context.database, "material-stable-a").notes, "由另一份材料占用");
+  assert.deepEqual(
+    await context.service.retryCareerMaterialSaveCleanup(receipt),
+    { outcome: "blocked", reason: "material_present", receipt },
+  );
+  assert.equal(context.state.files.has(FILE_KEY_A), true);
+  assert.equal(context.state.deleteCalls, 0);
+});
+
 test("durable insert plus failed verification stays uncertain and hides the file key", async (t) => {
   const context = await fixture();
   t.after(() => context.close());
@@ -442,7 +507,26 @@ test("durable insert plus failed verification stays uncertain and hides the file
   assert.equal(result.retryable, true);
   assert.equal("fileKey" in result, false);
   assert.equal(JSON.stringify(result).includes(FILE_KEY_A), false);
+  assert.ok(result.cleanupReceipt);
   assert.notEqual(selectMaterial(context.database, result.materialId), null);
+  assert.equal(context.state.files.has(FILE_KEY_A), true);
+  assert.equal(context.state.deleteCalls, 0);
+
+  assert.equal(
+    await context.service.inspectCareerMaterialSave(
+      result.materialId,
+      result.expectedSnapshot,
+    ),
+    "exact_saved",
+  );
+  assert.deepEqual(
+    await context.service.retryCareerMaterialSaveCleanup(result.cleanupReceipt),
+    {
+      outcome: "blocked",
+      reason: "material_present",
+      receipt: result.cleanupReceipt,
+    },
+  );
   assert.equal(context.state.files.has(FILE_KEY_A), true);
   assert.equal(context.state.deleteCalls, 0);
 });
@@ -465,6 +549,81 @@ test("retrying the exact uncertain payload is idempotent and performs no second 
   assert.equal(context.state.saveCalls, 1);
   assert.equal(context.state.runCalls, 1);
   assert.equal(context.database.selectValue("SELECT COUNT(*) FROM career_materials"), 1);
+});
+
+test("uncertain inspection of an existing row never invents a cleanup receipt", async (t) => {
+  const context = await fixture();
+  t.after(() => context.close());
+  const input = materialInput();
+  await context.service.saveCareerMaterial(input);
+  context.state.getFailuresRemaining = 1;
+
+  const uncertain = await context.service.saveCareerMaterial(input);
+  assert.equal(uncertain.outcome, "outcome_uncertain");
+  assert.equal(uncertain.cleanupReceipt, null);
+  assert.equal(context.state.saveCalls, 1);
+  assert.equal(context.state.runCalls, 1);
+  assert.equal(context.state.files.has(FILE_KEY_A), true);
+});
+
+test("an ambiguous absent insert cleans its original staged file before a save retry", async (t) => {
+  const context = await fixture();
+  t.after(() => context.close());
+  const input = materialInput();
+  context.state.insertFailure = "before";
+  context.state.recoveryQueryFailures = 1;
+
+  const uncertain = await context.service.saveCareerMaterial(input);
+  assert.equal(uncertain.outcome, "outcome_uncertain");
+  assert.ok(uncertain.cleanupReceipt);
+  assert.equal(JSON.stringify(uncertain).includes(FILE_KEY_A), false);
+  assert.equal(selectMaterial(context.database, input.materialId), null);
+  assert.equal(context.state.files.has(FILE_KEY_A), true);
+
+  const afterRefresh = materialSave.createCareerMaterialSaveService(context.runtime);
+  const restored = JSON.parse(JSON.stringify(uncertain));
+  assert.equal(
+    await afterRefresh.inspectCareerMaterialSave(
+      restored.materialId,
+      restored.expectedSnapshot,
+    ),
+    "absent",
+  );
+  assert.deepEqual(
+    await afterRefresh.inspectCareerMaterialSaveCleanup(restored.cleanupReceipt),
+    { state: "cleanup_ready", receipt: restored.cleanupReceipt },
+  );
+  assert.deepEqual(
+    await afterRefresh.retryCareerMaterialSaveCleanup(restored.cleanupReceipt),
+    { outcome: "cleaned" },
+  );
+  assert.equal(context.state.files.has(FILE_KEY_A), false);
+
+  const retried = await afterRefresh.saveCareerMaterial(input);
+  assert.equal(retried.outcome, "saved");
+  assert.equal(retried.fileKey, FILE_KEY_B);
+  assert.equal(context.state.files.size, 1);
+  assert.equal(context.state.files.has(FILE_KEY_B), true);
+});
+
+test("an uncertain cleanup receipt finishes a partial OPFS deletion after reload", async (t) => {
+  const context = await fixture();
+  t.after(() => context.close());
+  context.state.insertFailure = "before";
+  context.state.recoveryQueryFailures = 1;
+  const uncertain = await context.service.saveCareerMaterial(materialInput());
+  assert.equal(uncertain.outcome, "outcome_uncertain");
+  assert.ok(uncertain.cleanupReceipt);
+  context.state.fileReadErrorCodes.set(FILE_KEY_A, "FILE_BYTES_NOT_FOUND");
+
+  const afterRefresh = materialSave.createCareerMaterialSaveService(context.runtime);
+  const receipt = JSON.parse(JSON.stringify(uncertain.cleanupReceipt));
+  assert.deepEqual(
+    await afterRefresh.retryCareerMaterialSaveCleanup(receipt),
+    { outcome: "cleaned" },
+  );
+  assert.equal(context.state.fileReadErrorCodes.has(FILE_KEY_A), false);
+  assert.equal(context.state.files.has(FILE_KEY_A), false);
 });
 
 test("same id and semantic payload is idempotent after an ordinary success", async (t) => {

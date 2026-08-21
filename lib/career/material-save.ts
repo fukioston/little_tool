@@ -109,6 +109,11 @@ export type CareerMaterialSaveResult =
       materialId: string;
       /** Lets the UI perform a check-only retry without exposing file_key. */
       expectedSnapshot: CareerMaterialSaveExpectedSnapshot;
+      /**
+       * Present exactly when this attempt staged an attachment. Persist it
+       * until inspection proves the row exact or cleanup finishes.
+       */
+      cleanupReceipt: CareerMaterialSaveCleanupReceipt | null;
       retryable: true;
     }>;
 
@@ -936,13 +941,41 @@ function successfulResult(
 function uncertainResult(
   materialId: string,
   expectedSnapshot: CareerMaterialSaveExpectedSnapshot,
+  cleanupReceipt: CareerMaterialSaveCleanupReceipt | null = null,
 ): CareerMaterialSaveResult {
   return {
     outcome: "outcome_uncertain",
     materialId,
     expectedSnapshot,
+    cleanupReceipt,
     retryable: true,
   };
+}
+
+async function tryCleanupStagedFileInCurrentLock(
+  runtime: CareerMaterialSaveRuntime,
+  payload: CareerMaterialSaveCleanupPayload,
+): Promise<boolean> {
+  const safety = await inspectCleanupSafety(runtime, payload);
+  if (!safety?.safe) return false;
+  const file = await inspectStagedFile(runtime, payload);
+  if (file !== "exact" && file !== "parts_missing") return false;
+  let finalGeneration: CurrentCareerGeneration;
+  try {
+    finalGeneration = await runtime.currentGeneration();
+  } catch {
+    return false;
+  }
+  if (!validGeneration(finalGeneration) ||
+    !sameGeneration(finalGeneration, payload)) {
+    return false;
+  }
+  try {
+    await runtime.deleteFile(payload.stagedFile.key);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function cleanupDefiniteTemporaryFile(
@@ -1116,6 +1149,7 @@ export function createCareerMaterialSaveService(
 
       let metadata: LocalFileMetadata | null = null;
       let stagedGeneration: CurrentCareerGeneration | null = null;
+      let stagedCleanupReceipt: CareerMaterialSaveCleanupReceipt | null = null;
       let expected = snapshotWithoutAttachment(normalized);
       if (normalized.attachment) {
         try {
@@ -1152,6 +1186,36 @@ export function createCareerMaterialSaveService(
             snapshotForStagedFileCleanup(normalized, metadata),
           );
           throw error;
+        }
+        const cleanupPayload = canonicalCleanupPayload(
+          stagedGeneration,
+          normalized.materialId,
+          expected,
+          normalizeStagedFileMetadata(metadata),
+        );
+        try {
+          // Sign before INSERT: every later ambiguous write can return recovery.
+          stagedCleanupReceipt = await issueCleanupReceipt(
+            stagedGeneration,
+            normalized.materialId,
+            expected,
+            cleanupPayload.stagedFile,
+          );
+        } catch {
+          const cleaned = await tryCleanupStagedFileInCurrentLock(
+            runtime,
+            cleanupPayload,
+          );
+          if (!cleaned) {
+            throw new CareerMaterialSaveError(
+              "temporary_file_cleanup_failed",
+              "材料记录尚未开始写入，但暂存附件仍需手动核对浏览器存储。",
+            );
+          }
+          throw new CareerMaterialSaveError(
+            "write_failed",
+            "无法建立这次保存的恢复凭据；暂存附件已清理，材料记录没有写入。",
+          );
         }
       }
 
@@ -1215,12 +1279,34 @@ export function createCareerMaterialSaveService(
         );
       }
       if (inspection === "conflict") {
+        if (metadata && stagedGeneration && stagedCleanupReceipt) {
+          const cleaned = await tryCleanupStagedFileInCurrentLock(
+            runtime,
+            canonicalCleanupPayload(
+              stagedGeneration,
+              normalized.materialId,
+              expected,
+              normalizeStagedFileMetadata(metadata),
+            ),
+          );
+          if (!cleaned) {
+            throw new CareerMaterialSaveError(
+              "temporary_file_cleanup_failed",
+              "材料记录出现了另一份内容；暂存附件仍需核对，且没有删除现有材料。",
+              stagedCleanupReceipt,
+            );
+          }
+        }
         throw new CareerMaterialSaveError(
           "conflict",
           "这个材料标识已经对应另一份内容，没有覆盖原记录。",
         );
       }
-      return uncertainResult(normalized.materialId, expected);
+      return uncertainResult(
+        normalized.materialId,
+        expected,
+        stagedCleanupReceipt,
+      );
     });
   }
 
