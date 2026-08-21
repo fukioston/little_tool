@@ -41,10 +41,10 @@ export type LocalFileObjectUrl = Readonly<{
 }>;
 
 export type LocalStorageEstimate = Readonly<{
-  usage: number;
-  quota: number;
-  available: number;
-  persisted: boolean;
+  usage: number | null;
+  quota: number | null;
+  available: number | null;
+  persisted: boolean | null;
   usageDetails: Readonly<Record<string, number>>;
 }>;
 
@@ -700,16 +700,35 @@ export async function requestPersistentLocalStorage(): Promise<boolean> {
   return storage.persist();
 }
 
+export function supportsPersistentLocalStorage(): boolean {
+  return typeof requireBrowserStorage().persist === "function";
+}
+
 export async function estimateLocalStorage(): Promise<LocalStorageEstimate> {
   const storage = requireBrowserStorage();
-  const [estimate, persisted] = await Promise.all([
+  const [estimateResult, persistedResult] = await Promise.allSettled([
     storage.estimate(),
     typeof storage.persisted === "function"
       ? storage.persisted()
-      : Promise.resolve(false),
+      : Promise.resolve(null),
   ]);
-  const usage = estimate.usage ?? 0;
-  const quota = estimate.quota ?? 0;
+  if (estimateResult.status === "rejected" && persistedResult.status === "rejected") {
+    throw new LocalFileError(
+      "浏览器暂时没有返回容量或保护状态。",
+      "STORAGE_ESTIMATE_UNAVAILABLE",
+    );
+  }
+  const estimate = estimateResult.status === "fulfilled" ? estimateResult.value : {};
+  const persisted = persistedResult.status === "fulfilled" &&
+    typeof persistedResult.value === "boolean"
+    ? persistedResult.value
+    : null;
+  const usage = Number.isFinite(estimate.usage) && (estimate.usage as number) >= 0
+    ? estimate.usage as number
+    : null;
+  const quota = Number.isFinite(estimate.quota) && (estimate.quota as number) >= 0
+    ? estimate.quota as number
+    : null;
   const rawDetails = (estimate as StorageEstimate & {
     usageDetails?: Record<string, number>;
   }).usageDetails;
@@ -717,7 +736,7 @@ export async function estimateLocalStorage(): Promise<LocalStorageEstimate> {
   return {
     usage,
     quota,
-    available: Math.max(0, quota - usage),
+    available: usage === null || quota === null ? null : Math.max(0, quota - usage),
     persisted,
     usageDetails: rawDetails ? { ...rawDetails } : {},
   };

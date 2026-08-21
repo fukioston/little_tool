@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore, type FormEvent } from "react";
 import {
   EQUIPMENT_KIND_LABELS,
   FITNESS_EXERCISES,
@@ -68,6 +68,7 @@ import type {
 import {
   estimateLocalStorage,
   requestPersistentLocalStorage,
+  supportsPersistentLocalStorage,
   type LocalStorageEstimate,
 } from "@/lib/local-db/files";
 import {
@@ -80,6 +81,13 @@ import {
 } from "./forms";
 import { useFitnessDialog } from "./useFitnessDialog";
 import { EquipmentPhotos, FitnessDataControls } from "./data-panels";
+import {
+  formatFitnessStorageBytes,
+  resolveFitnessNavigationBehavior,
+  resolveFitnessPainDraftAfterRecord,
+  resolveScheduledFitnessStartRoute,
+  runFitnessPersistThenRefresh,
+} from "./fitness-ui-logic";
 
 const navigation: Array<{ id: FitnessView; label: string; glyph: string }> = [
   { id: "today", label: "今日", glyph: "今" },
@@ -88,6 +96,10 @@ const navigation: Array<{ id: FitnessView; label: string; glyph: string }> = [
   { id: "venues", label: "场地", glyph: "场" },
   { id: "history", label: "记录", glyph: "记" },
 ];
+
+const subscribeToOrigin = () => () => undefined;
+const readClientOrigin = () => window.location.origin;
+const readServerOrigin = () => "";
 
 const emptySnapshot: FitnessSnapshot = {
   profile: null,
@@ -280,34 +292,7 @@ type ScheduledStartChoice = Readonly<{
   event: FitnessCalendarEvent;
 }>;
 
-export function resolveFitnessNavigationBehavior(prefersReducedMotion: boolean): ScrollBehavior {
-  return prefersReducedMotion ? "auto" : "smooth";
-}
-
-export function resolveScheduledFitnessStartRoute(
-  currentVenueId: string | null,
-  plannedVenueId: string | null,
-): "missing-planned-venue" | "start-planned" | "choose-venue" {
-  if (!plannedVenueId) return "missing-planned-venue";
-  return currentVenueId === plannedVenueId ? "start-planned" : "choose-venue";
-}
-
-export function resolveFitnessPainDraftAfterRecord(current: string, persisted: boolean): string {
-  return persisted ? "" : current;
-}
-
-export async function runFitnessPersistThenRefresh<T>(
-  persist: () => Promise<T>,
-  refresh: () => Promise<void>,
-): Promise<Readonly<{ status: "refreshed" | "refresh-failed"; value: T }>> {
-  const value = await persist();
-  try {
-    await refresh();
-    return { status: "refreshed", value };
-  } catch {
-    return { status: "refresh-failed", value };
-  }
-}
+type FitnessStorageReadStatus = "loading" | "ready" | "error";
 
 export default function FitnessApp() {
   const [snapshot, setSnapshot] = useState<FitnessSnapshot>(emptySnapshot);
@@ -325,6 +310,14 @@ export default function FitnessApp() {
   const [toast, setToast] = useState("");
   const [error, setError] = useState("");
   const [storage, setStorage] = useState<LocalStorageEstimate | null>(null);
+  const [storageReadStatus, setStorageReadStatus] = useState<FitnessStorageReadStatus>("loading");
+  const [storageActionBusy, setStorageActionBusy] = useState(false);
+  const [storageActionMessage, setStorageActionMessage] = useState("");
+  const currentOrigin = useSyncExternalStore(
+    subscribeToOrigin,
+    readClientOrigin,
+    readServerOrigin,
+  );
   const [rescheduleEvent, setRescheduleEvent] = useState<FitnessCalendarEvent | null>(null);
   const [scheduledStartChoice, setScheduledStartChoice] = useState<ScheduledStartChoice | null>(null);
   const [scheduledStartBusy, setScheduledStartBusy] = useState(false);
@@ -340,6 +333,7 @@ export default function FitnessApp() {
   const scheduledStartMutationRef = useRef<symbol | null>(null);
   const scheduledStartSequence = useRef(0);
   const navigationFrame = useRef<number | null>(null);
+  const storageActionRef = useRef(false);
 
   const rememberScheduledStartChoice = useCallback((choice: ScheduledStartChoice | null) => {
     scheduledStartChoiceRef.current = choice;
@@ -369,6 +363,73 @@ export default function FitnessApp() {
       : next.venues.find((venue) => venue.is_default && venue.status === "active")?.id ?? next.venues.find((venue) => venue.status === "active")?.id ?? null);
   }, []);
 
+  const recheckStorage = useCallback(async () => {
+    if (storageActionRef.current) return;
+    storageActionRef.current = true;
+    setStorageActionBusy(true);
+    setStorageReadStatus("loading");
+    setStorageActionMessage("");
+    try {
+      const current = await estimateLocalStorage();
+      setStorage(current);
+      setStorageReadStatus("ready");
+      setStorageActionMessage("容量与保护状态已重新读取。");
+    } catch {
+      setStorage(null);
+      setStorageReadStatus("error");
+      setStorageActionMessage("这次没有读到容量与保护状态；本地资料没有因此改变。");
+    } finally {
+      storageActionRef.current = false;
+      setStorageActionBusy(false);
+    }
+  }, []);
+
+  const requestStorageProtection = useCallback(async () => {
+    if (storageActionRef.current) return;
+    storageActionRef.current = true;
+    setStorageActionBusy(true);
+    setStorageActionMessage("");
+    const hadReadableStatus = storageReadStatus === "ready" && storage !== null;
+    if (!supportsPersistentLocalStorage()) {
+      const message = "这个浏览器没有提供保护申请接口；现有资料和容量信息没有因此改变，请继续保留定期备份。";
+      setStorageActionMessage(message);
+      setToast(message);
+      storageActionRef.current = false;
+      setStorageActionBusy(false);
+      return;
+    }
+    try {
+      const granted = await requestPersistentLocalStorage();
+      try {
+        const current = await estimateLocalStorage();
+        setStorage(current);
+        setStorageReadStatus("ready");
+        const message = current.persisted === true
+          ? "浏览器已为这个地址降低自动清理风险。"
+          : current.persisted === false
+            ? "浏览器暂未授予额外保护；定期备份仍然可用。"
+            : granted
+              ? "浏览器已报告授予保护，但暂时没有返回复查状态；本地资料没有因此改变。"
+              : "浏览器没有报告授予额外保护；容量信息和本地资料没有因此改变。";
+        setStorageActionMessage(message);
+        setToast(message);
+      } catch {
+        if (!hadReadableStatus) setStorageReadStatus("error");
+        const message = "浏览器已处理保护申请，但容量与保护状态暂时没有重新读到；本地资料没有因此改变。";
+        setStorageActionMessage(message);
+        setToast(message);
+      }
+    } catch {
+      if (!hadReadableStatus) setStorageReadStatus("error");
+      const message = "浏览器没有完成这次保护申请；本地资料和原有容量信息没有因此改变。";
+      setStorageActionMessage(message);
+      setToast(message);
+    } finally {
+      storageActionRef.current = false;
+      setStorageActionBusy(false);
+    }
+  }, [storage, storageReadStatus]);
+
   useEffect(() => {
     let live = true;
     void (async () => {
@@ -385,8 +446,11 @@ export default function FitnessApp() {
             const current = await estimateLocalStorage();
             if (!live) return;
             setStorage(current);
+            setStorageReadStatus("ready");
           } catch {
-            // Storage details are informative and never gate local CRUD.
+            if (!live) return;
+            setStorage(null);
+            setStorageReadStatus("error");
           }
         })();
       } catch (reason) {
@@ -741,7 +805,7 @@ export default function FitnessApp() {
       {view === "history" && <HistoryView snapshot={snapshot} onOpen={(sessionId) => { setHistorySessionId(sessionId); setDialog("history-detail"); }} onStart={() => requestFitnessStart(null)} />}
       {view === "exercises" && <ExercisesView equipment={venueEquipment} equipmentLoads={snapshot.equipmentLoads} venue={venue} />}
       {view === "profile" && <ProfileView snapshot={snapshot} busy={busy} onProfile={() => setDialog("profile")} onConstraint={(entry) => { setEditingConstraint(entry); setDialog("constraint"); }} onToggleConstraint={(entry) => void run(async () => { await setFitnessConstraintActive(entry.id, !entry.active); }, entry.active ? "这条身体边界已暂时结束；记录仍保留" : "这条身体边界已重新启用；它只影响未来草稿和现场选项，不改写历史")} />}
-      {view === "settings" && <SettingsView snapshot={snapshot} storage={storage} onPersist={() => void run(async () => { await requestPersistentLocalStorage(); setStorage(await estimateLocalStorage()); }, "已重新请求浏览器保护；状态见下方")} onChange={(settings) => void run(async () => { await saveFitnessSettings(settings); }, "设置已保存在当前浏览器")} onRestored={refresh} />}
+      {view === "settings" && <SettingsView snapshot={snapshot} storage={storage} storageReadStatus={storageReadStatus} storageBusy={storageActionBusy} storageActionMessage={storageActionMessage} currentOrigin={currentOrigin} onPersist={requestStorageProtection} onRecheck={recheckStorage} onChange={(settings) => void run(async () => { await saveFitnessSettings(settings); }, "设置已保存在当前浏览器")} onRestored={refresh} />}
     </section>
 
     {!snapshot.venues.length && !firstRunDismissed && <FirstRun onStart={() => { setFirstRunDismissed(true); setDialog("venue"); }} onExercises={() => { setFirstRunDismissed(true); navigateToFitnessView("exercises"); }} />}
@@ -1028,11 +1092,35 @@ function ProfileView({ snapshot, busy, onProfile, onConstraint, onToggleConstrai
   </div>;
 }
 
-function SettingsView({ snapshot, storage, onPersist, onChange, onRestored }: { snapshot: FitnessSnapshot; storage: LocalStorageEstimate | null; onPersist: () => void; onChange: (settings: FitnessSnapshot["settings"]) => void; onRestored: () => Promise<void> }) {
+function SettingsView({ snapshot, storage, storageReadStatus, storageBusy, storageActionMessage, currentOrigin, onPersist, onRecheck, onChange, onRestored }: {
+  snapshot: FitnessSnapshot;
+  storage: LocalStorageEstimate | null;
+  storageReadStatus: FitnessStorageReadStatus;
+  storageBusy: boolean;
+  storageActionMessage: string;
+  currentOrigin: string;
+  onPersist: () => Promise<void>;
+  onRecheck: () => Promise<void>;
+  onChange: (settings: FitnessSnapshot["settings"]) => void;
+  onRestored: () => Promise<void>;
+}) {
   const settings = snapshot.settings;
   return <div className="sl-page"><header className="sl-page-title"><div><span>PRIVACY & DATA</span><h1>设置</h1><p>训练和身体资料留在当前浏览器；AI 只在你点击时收到最小草稿上下文。</p></div></header><div className="sl-settings">
     <section><header><h2>AI 与隐私</h2><p>没有 AI 时，器材、计划、日历与训练记录仍可使用。</p></header><SettingSwitch label="允许 AI 草稿" copy="只发送结构化器材、频次与能力数字；不发送用户填写的自由文本" checked={settings.ai_enabled} onChange={(value) => onChange({ ...settings, ai_enabled: value })}/><div className="sl-privacy-fact"><i/><span><b>DeepSeek Key 只在服务端</b><small>不会进入 SQLite、完整备份或浏览器资源</small></span></div></section>
-    <section><header><h2>当前浏览器</h2><p>OPFS 与 SQLite 都绑定当前 origin 和浏览器 profile。</p></header><div className={`sl-storage ${storage?.persisted ? "persisted" : ""}`}><i/><span><b>{storage?.persisted ? "已获浏览器持久化保护" : "仍可能被浏览器清理"}</b><small>{storage ? `当前使用约 ${Math.max(1, Math.round(storage.usage / 1024))} KB` : "正在读取存储状态"}</small></span>{!storage?.persisted && <button onClick={onPersist}>请求保护</button>}</div><p className="sl-data-note">持久化授权不是备份；清理站点数据仍可能删除当前浏览器资料。</p></section>
+    <section className="sl-local-space"><header><h2>这套本地空间</h2><p>当前完整地址与当前浏览器资料（profile）共同决定资料放在哪里。</p></header>
+      <div className="sl-origin-fact"><span>当前完整地址</span><code>{currentOrigin || "正在确认当前地址…"}</code><p>协议、主机名（hostname）或端口不同，就是另一套地址；更换浏览器资料（profile），也会打开另一套本地空间。</p></div>
+      <p className="sl-storage-scope">此地址站点数据合计（职迹、拾词、适练和缓存）</p>
+      {storageReadStatus === "ready" && storage ? <>
+        <dl className="sl-storage-metrics" aria-label="此地址站点数据容量">
+          <div><dt>已使用</dt><dd>{formatFitnessStorageBytes(storage.usage)}</dd></div>
+          <div><dt>浏览器估算上限</dt><dd>{formatFitnessStorageBytes(storage.quota)}</dd></div>
+          <div><dt>估算可用</dt><dd>{formatFitnessStorageBytes(storage.available)}</dd></div>
+        </dl>
+        <div className={`sl-storage ${storage.persisted === true ? "persisted" : ""}`}><i/><span><b>{storage.persisted === true ? "已降低浏览器自动清理风险" : storage.persisted === false ? "可以申请降低自动清理风险" : "保护状态暂时未知"}</b><small>{storage.persisted === null ? "容量仍可查看；同一完整地址里的三处空间没有因此改变。" : "同一完整地址里的职迹、拾词与适练共享这项浏览器保护。"}</small></span>{storage.persisted !== true && <button type="button" disabled={storageBusy} onClick={() => void onPersist()}>{storage.persisted === null ? "重新申请保护" : "申请降低清理风险"}</button>}</div>
+      </> : storageReadStatus === "error" ? <div className="sl-storage-unavailable"><span role="status"><b>暂时无法读取，不代表资料丢失</b><small>这里只是容量与保护状态没有读取成功。</small></span><button type="button" disabled={storageBusy} onClick={() => void onRecheck()}>重新检查</button></div> : <div className="sl-storage-loading" role="status">正在读取此地址的站点数据合计…</div>}
+      {storageActionMessage && <p className="sl-storage-action-status" role="status">{storageActionMessage}</p>}
+      <p className="sl-data-note">这项保护只降低浏览器自动清理风险，不是备份；手动清理站点数据仍会删除此地址的本地资料。</p>
+    </section>
     <section><header><h2>完整备份与恢复</h2><p>SQLite 与器材照片一起校验；失败时不会原位覆盖当前版本。</p></header><FitnessDataControls onRestored={onRestored}/></section>
   </div></div>;
 }

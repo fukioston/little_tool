@@ -5,12 +5,16 @@ import test from "node:test";
 import ts from "typescript";
 
 const sourceUrl = new URL("../app/fitness/FitnessApp.tsx", import.meta.url);
-const source = await readFile(sourceUrl, "utf8");
+const logicUrl = new URL("../app/fitness/fitness-ui-logic.ts", import.meta.url);
+const [source, logicSource] = await Promise.all([
+  readFile(sourceUrl, "utf8"),
+  readFile(logicUrl, "utf8"),
+]);
 
 async function loadPureFitnessUiHelpers() {
   const sourceFile = ts.createSourceFile(
-    sourceUrl.pathname,
-    source,
+    logicUrl.pathname,
+    logicSource,
     ts.ScriptTarget.ES2022,
     true,
     ts.ScriptKind.TSX,
