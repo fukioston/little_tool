@@ -144,6 +144,61 @@ export function isActiveConstraintScopeMissing(
   return active && movementPatternCount === 0 && exerciseCount === 0;
 }
 
+export type EquipmentIdentityDraft = Readonly<{
+  name: string;
+  quantity: string;
+  nameCustomized: boolean;
+  quantityCustomized: boolean;
+}>;
+
+export function suggestedEquipmentQuantity(kind: EquipmentKind): number {
+  return kind === "dumbbell" ? 2 : 1;
+}
+
+export function createEquipmentIdentityDraft(
+  equipment: Pick<FitnessEquipment, "name" | "quantity"> | null | undefined,
+  suggestedName: string,
+  suggestedQuantity: number,
+): EquipmentIdentityDraft {
+  if (equipment) {
+    return {
+      name: equipment.name,
+      quantity: String(equipment.quantity),
+      nameCustomized: true,
+      quantityCustomized: true,
+    };
+  }
+  return {
+    name: suggestedName,
+    quantity: String(suggestedQuantity),
+    nameCustomized: false,
+    quantityCustomized: false,
+  };
+}
+
+export function updateEquipmentIdentityDraft(
+  draft: EquipmentIdentityDraft,
+  field: "name" | "quantity",
+  value: string,
+): EquipmentIdentityDraft {
+  return field === "name"
+    ? { ...draft, name: value, nameCustomized: true }
+    : { ...draft, quantity: value, quantityCustomized: true };
+}
+
+export function applyEquipmentTemplateSuggestion(
+  draft: EquipmentIdentityDraft,
+  suggestedName: string,
+  suggestedQuantity: number,
+): EquipmentIdentityDraft {
+  return {
+    name: draft.nameCustomized ? draft.name : suggestedName,
+    quantity: draft.quantityCustomized ? draft.quantity : String(suggestedQuantity),
+    nameCustomized: draft.nameCustomized,
+    quantityCustomized: draft.quantityCustomized,
+  };
+}
+
 function useReportedFormBusy(onBusyChange?: (busy: boolean) => void) {
   const [busy, setBusy] = useState(false);
   const callback = useRef(onBusyChange);
@@ -293,6 +348,11 @@ export function EquipmentForm({
 }) {
   const initialTemplate = EQUIPMENT_TEMPLATES.find((entry) => entry.kind === equipment?.kind) ?? EQUIPMENT_TEMPLATES[0];
   const [templateKind, setTemplateKind] = useState<EquipmentKind>(initialTemplate.kind);
+  const [identityDraft, setIdentityDraft] = useState(() => createEquipmentIdentityDraft(
+    equipment,
+    initialTemplate.suggestedName,
+    suggestedEquipmentQuantity(initialTemplate.kind),
+  ));
   const { busy, beginBusy } = useReportedFormBusy(onBusyChange);
   const [error, setError] = useState("");
   const [loadError, setLoadError] = useState("");
@@ -352,13 +412,13 @@ export function EquipmentForm({
     setError("");
     void runReportedFormPersistence(beginBusy, () => onSave(input), setError, "器材没有保存");
   }}>
-    <fieldset className="sl-template-picker"><legend>器材类型</legend>{EQUIPMENT_TEMPLATES.map((entry) => <button type="button" aria-pressed={templateKind === entry.kind} className={templateKind === entry.kind ? "active" : ""} key={entry.kind} onClick={() => { clearLoadError(); setTemplateKind(entry.kind); }}><i>{entry.label.slice(0, 1)}</i><span>{entry.label}</span></button>)}</fieldset>
+    <fieldset className="sl-template-picker"><legend>器材类型</legend>{EQUIPMENT_TEMPLATES.map((entry) => <button type="button" aria-pressed={templateKind === entry.kind} className={templateKind === entry.kind ? "active" : ""} key={entry.kind} onClick={() => { clearLoadError(); setTemplateKind(entry.kind); setIdentityDraft((current) => applyEquipmentTemplateSuggestion(current, entry.suggestedName, suggestedEquipmentQuantity(entry.kind))); }}><i>{entry.label.slice(0, 1)}</i><span>{entry.label}</span></button>)}</fieldset>
     <p className="sl-form-hint">{templateKind === "bands"
       ? "轻 / 中 / 重和阻力范围都是相对信息，适练不会把它们伪装成公斤；请写进下方备注。只有包装明确标注单一阻力值时才录入数字档位。"
       : templateKind === "cable" || templateKind === "fixed_machine"
         ? "面板若只写 1 / 2 / 3 等无单位数字，它们不是公斤；请写进下方备注。只有面板明确标注重量单位时才录入数字档位。"
         : template.hint}</p>
-    <div className="sl-field-grid"><label><span>器材名称</span><input required name="name" defaultValue={equipment?.name ?? template.suggestedName} /></label><label><span>数量</span><input required name="quantity" type="number" min="1" max="1000" defaultValue={equipment?.quantity ?? 1} /></label></div>
+    <div className="sl-field-grid"><label><span>器材名称</span><input required name="name" value={identityDraft.name} onChange={(event) => setIdentityDraft((current) => updateEquipmentIdentityDraft(current, "name", event.target.value))} /></label><label><span>数量</span><input required name="quantity" type="number" min="1" max="1000" value={identityDraft.quantity} onChange={(event) => setIdentityDraft((current) => updateEquipmentIdentityDraft(current, "quantity", event.target.value))} /></label></div>
     <div className="sl-field-grid"><label><span>所在区域</span><input name="area" defaultValue={equipment?.area} placeholder="自由重量区" /></label><label><span>现在的状态</span><select name="status" defaultValue={equipment?.status ?? "available"}><option value="available">可用</option><option value="limited">部分可用</option><option value="maintenance">临时停用</option><option value="removed">这里已没有</option></select></label></div>
     {template.asksForDiscreteLoads && <label><span>{loadNeedsLiteralUnit ? `明确标有 ${unit} 的档位与数量` : `实际档位与数量（${unit}）`}</span><textarea ref={loadInput} name="loads" defaultValue={loadText} aria-invalid={loadError ? true : undefined} aria-describedby={loadError ? "sl-equipment-load-help sl-equipment-load-error" : "sl-equipment-load-help"} onChange={clearLoadError} placeholder={templateKind === "plates" ? "1.25×4, 2.5×4, 5×4, 10×2" : templateKind === "bands" ? `包装明确标有单一 ${unit} 值时，例如：5×1, 10×1` : "5×2, 7.5×2, 10×2"}/><small id="sl-equipment-load-help">{loadNeedsLiteralUnit ? `只填写器材明确标成 ${unit} 的数字；“轻 / 中 / 重”、阻力范围或无单位面板数字请留空，并写进备注。` : "写成“重量×实际数量”。不在这里的重量不会进入确定计划。"}</small></label>}
     {(templateKind === "barbell" || templateKind === "smith_machine") && <label><span>空杆 / 机器杆重（{unit}，未知可留空）</span><input name="barWeight" type="number" min="0" step="0.01" defaultValue={equipment?.bar_weight_grams ? Number((equipment.bar_weight_grams / (unit === "kg" ? 1_000 : 453.59237)).toFixed(2)) : ""} /></label>}

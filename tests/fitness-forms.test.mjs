@@ -18,12 +18,16 @@ async function loadPureFormHelpers() {
     ts.ScriptKind.TSX,
   );
   const wanted = new Set([
+    "applyEquipmentTemplateSuggestion",
     "clearOwnedFormError",
+    "createEquipmentIdentityDraft",
     "createFormBusyController",
     "isActiveConstraintScopeMissing",
     "parseEquipmentLoadText",
     "resolveVenueVerificationTimestamp",
     "runReportedFormPersistence",
+    "suggestedEquipmentQuantity",
+    "updateEquipmentIdentityDraft",
   ]);
   const helpers = sourceFile.statements
     .filter(
@@ -82,12 +86,16 @@ async function loadPureDialogHelpers() {
 }
 
 const {
+  applyEquipmentTemplateSuggestion,
   clearOwnedFormError,
+  createEquipmentIdentityDraft,
   createFormBusyController,
   isActiveConstraintScopeMissing,
   parseEquipmentLoadText,
   resolveVenueVerificationTimestamp,
   runReportedFormPersistence,
+  suggestedEquipmentQuantity,
+  updateEquipmentIdentityDraft,
 } = await loadPureFormHelpers();
 const { resolveFitnessDialogTabDestination } = await loadPureDialogHelpers();
 
@@ -224,6 +232,58 @@ test("equipment load parser preserves explicit truthful values and allows unknow
   assert.deepEqual(parseEquipmentLoadText("10x1", "lb", 2), [
     { load_grams: 4_536, quantity: 1, label: "10 lb", available: true },
   ]);
+});
+
+test("new equipment suggestions follow templates until each identity field is customized", () => {
+  assert.equal(suggestedEquipmentQuantity("dumbbell"), 2);
+  assert.equal(suggestedEquipmentQuantity("barbell"), 1);
+  assert.equal(suggestedEquipmentQuantity("plates"), 1);
+
+  const initial = createEquipmentIdentityDraft(null, "固定哑铃", 2);
+  assert.deepEqual(initial, {
+    name: "固定哑铃",
+    quantity: "2",
+    nameCustomized: false,
+    quantityCustomized: false,
+  });
+
+  const barbell = applyEquipmentTemplateSuggestion(initial, "奥杆", 1);
+  assert.equal(barbell.name, "奥杆");
+  assert.equal(barbell.quantity, "1");
+
+  const named = updateEquipmentIdentityDraft(barbell, "name", "训练区 A 杆");
+  const plates = applyEquipmentTemplateSuggestion(named, "杠铃片组", 1);
+  assert.equal(plates.name, "训练区 A 杆", "a manually edited name must not be replaced");
+  assert.equal(plates.quantity, "1", "the untouched quantity may still follow its template");
+
+  const counted = updateEquipmentIdentityDraft(plates, "quantity", "4");
+  const dumbbells = applyEquipmentTemplateSuggestion(counted, "固定哑铃", 2);
+  assert.equal(dumbbells.name, "训练区 A 杆");
+  assert.equal(dumbbells.quantity, "4", "a manually edited total must not be replaced");
+});
+
+test("editing existing equipment preserves identity and explicit load counts stay independent", () => {
+  const existing = createEquipmentIdentityDraft(
+    { name: "窗边哑铃", quantity: 7 },
+    "固定哑铃",
+    2,
+  );
+  assert.deepEqual(
+    applyEquipmentTemplateSuggestion(existing, "跑步机", 1),
+    existing,
+    "switching templates while editing must preserve the saved name and total exactly",
+  );
+
+  const newDumbbells = createEquipmentIdentityDraft(null, "固定哑铃", 2);
+  assert.equal(newDumbbells.quantity, "2");
+  assert.deepEqual(parseEquipmentLoadText("5×2", "kg", Number(newDumbbells.quantity)), [
+    { load_grams: 5_000, quantity: 2, label: "5 kg", available: true },
+  ]);
+  assert.equal(
+    newDumbbells.quantity,
+    "2",
+    "a load-row count is inventory detail and must not rewrite the equipment total",
+  );
 });
 
 test("equipment load parser rejects every malformed token instead of dropping it", () => {
@@ -370,4 +430,18 @@ test("custom validation identifies, describes, focuses, and clears the owning co
   assert.match(constraintSource, /setScopeError\(message\);[\s\S]*setError\(message\);[\s\S]*firstPattern\.current\?\.focus\(\);[\s\S]*return;/);
   assert.match(constraintSource, /onClick=\{\(\) => \{ clearScopeError\(\); setPatterns/);
   assert.doesNotMatch(source, /<form[^>]*noValidate/);
+});
+
+test("equipment identity inputs are controlled and template suggestions respect dirty state", () => {
+  const equipmentStart = source.indexOf("export function EquipmentForm");
+  const profileStart = source.indexOf("export function ProfileForm");
+  const equipmentSource = source.slice(equipmentStart, profileStart);
+
+  assert.match(equipmentSource, /const \[identityDraft, setIdentityDraft\] = useState\(\(\) => createEquipmentIdentityDraft\(/);
+  assert.match(equipmentSource, /suggestedEquipmentQuantity\(initialTemplate\.kind\)/);
+  assert.match(equipmentSource, /applyEquipmentTemplateSuggestion\(current, entry\.suggestedName, suggestedEquipmentQuantity\(entry\.kind\)\)/);
+  assert.match(equipmentSource, /name="name" value=\{identityDraft\.name\} onChange=\{\(event\) => setIdentityDraft\(\(current\) => updateEquipmentIdentityDraft\(current, "name", event\.target\.value\)\)\}/);
+  assert.match(equipmentSource, /name="quantity"[^>]*value=\{identityDraft\.quantity\} onChange=\{\(event\) => setIdentityDraft\(\(current\) => updateEquipmentIdentityDraft\(current, "quantity", event\.target\.value\)\)\}/);
+  assert.doesNotMatch(equipmentSource, /name="(?:name|quantity)"[^>]*defaultValue=/);
+  assert.doesNotMatch(equipmentSource, /setIdentityDraft[^\n]*(?:parsedLoads|loads\.length)/);
 });
