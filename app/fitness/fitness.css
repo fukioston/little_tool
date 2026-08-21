@@ -1990,6 +1990,22 @@
   transform: translateX(20px);
 }
 
+.sl-setting-row > button:disabled {
+  cursor: not-allowed;
+  opacity: 0.58;
+}
+
+.sl-settings-write-status {
+  margin: 12px 0 2px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: var(--sl-soft);
+  color: var(--sl-muted);
+  font-size: 12px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
 .sl-privacy-fact {
   display: flex;
   align-items: center;

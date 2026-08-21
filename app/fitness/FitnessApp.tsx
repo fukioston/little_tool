@@ -20,9 +20,11 @@ import {
   type FitnessPlannerContext,
 } from "@/lib/fitness/planner";
 import {
+  FitnessConfigMutationError,
   initializeFitnessDatabase,
+  loadFitnessSettingsExpectedState,
   loadFitnessSnapshot,
-  saveFitnessSettings,
+  prepareFitnessSettingsSave,
   prepareFitnessProgramVersionSchedule,
   prepareFitnessProgramWeekSchedule,
   prepareFitnessCalendarReschedule,
@@ -57,6 +59,7 @@ import {
   type FitnessLiveWriteReceipt,
   type FitnessLiveStructureWriteReceipt,
   type FitnessProgramVersionScheduleExpectation,
+  type FitnessSettingsWriteSnapshot,
   type PrepareFitnessLiveSessionStartInput,
   type SaveConstraintInput,
   type SaveEquipmentInput,
@@ -369,6 +372,10 @@ type EquipmentPhotoTarget = Readonly<{
 }>;
 
 type FitnessFileJournalView = FitnessFileOperationJournal & Readonly<{ loaded: boolean }>;
+type FitnessFactsReadBundle = Readonly<{
+  snapshot: FitnessSnapshot;
+  expected: FitnessSettingsWriteSnapshot;
+}>;
 
 const EMPTY_FILE_JOURNAL: FitnessFileJournalView = {
   loaded: false,
@@ -376,6 +383,45 @@ const EMPTY_FILE_JOURNAL: FitnessFileJournalView = {
   unreadable: [],
   unavailable: false,
 };
+
+function sameFitnessSettings(
+  left: FitnessSnapshot["settings"],
+  right: FitnessSnapshot["settings"],
+) {
+  return left.unit === right.unit &&
+    left.rest_timer_enabled === right.rest_timer_enabled &&
+    left.sound_enabled === right.sound_enabled &&
+    left.ai_enabled === right.ai_enabled;
+}
+
+function sameFitnessSettingsExpectedState(
+  left: FitnessSettingsWriteSnapshot,
+  right: FitnessSettingsWriteSnapshot,
+) {
+  return left.generationId === right.generationId &&
+    left.generationSequence === right.generationSequence &&
+    sameFitnessSettings(left.settings, right.settings) &&
+    left.rows.every((row, index) => {
+      const other = right.rows[index];
+      return row === null || other === null
+        ? row === other
+        : row.key === other.key && row.value === other.value && row.updated_at === other.updated_at;
+    });
+}
+
+async function loadFitnessFactsWithSettingsExpected(): Promise<FitnessFactsReadBundle> {
+  const expectedBefore = await loadFitnessSettingsExpectedState();
+  const facts = await loadFitnessSnapshot();
+  const expectedAfter = await loadFitnessSettingsExpectedState();
+  if (!sameFitnessSettingsExpectedState(expectedBefore, expectedAfter) ||
+      !sameFitnessSettings(facts.settings, expectedAfter.settings)) {
+    throw new Error("设置在读取期间发生了变化；这次没有拼接新旧页面资料。");
+  }
+  return {
+    snapshot: { ...facts, settings: expectedAfter.settings },
+    expected: expectedAfter,
+  };
+}
 
 function liveDraftFactsChanged(
   before: FitnessSnapshot,
@@ -400,6 +446,7 @@ function liveDraftFactsChanged(
 
 export default function FitnessApp() {
   const [snapshot, setSnapshot] = useState<FitnessSnapshot>(emptySnapshot);
+  const [settingsExpected, setSettingsExpected] = useState<FitnessSettingsWriteSnapshot | null>(null);
   const [ready, setReady] = useState(false);
   const [fatal, setFatal] = useState("");
   const [view, setView] = useState<FitnessView>("today");
@@ -453,8 +500,9 @@ export default function FitnessApp() {
   const [firstRunDismissed, setFirstRunDismissed] = useState(false);
   const dialogWasOpen = useRef(false);
   const snapshotRef = useRef(snapshot);
+  const settingsExpectedRef = useRef<FitnessSettingsWriteSnapshot | null>(null);
   const liveDraftGateRef = useRef<FitnessLiveDraftGate | null>(null);
-  const pendingLiveSnapshotRef = useRef<FitnessSnapshot | null>(null);
+  const pendingLiveSnapshotRef = useRef<FitnessFactsReadBundle | null>(null);
   const fitnessReadRequestRef = useRef(0);
   const submittedLiveDraftRef = useRef<
     | Readonly<{ kind: "set"; operationId: string; sessionId: string; exerciseId: string }>
@@ -469,6 +517,9 @@ export default function FitnessApp() {
   const scheduledStartChoiceRef = useRef<ScheduledStartChoice | null>(null);
   const scheduledStartSequence = useRef(0);
   const submittedConfigDialogRef = useRef<Readonly<{ operationId: string; dialog: DialogState }> | null>(null);
+  const settingsPrepareTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const submittedSettingsFocusRef = useRef<Readonly<{ operationId: string; trigger: HTMLButtonElement }> | null>(null);
+  const settingsFocusFrame = useRef<number | null>(null);
   const submittedPlanCalendarDialogRef = useRef<Readonly<{ operationId: string; dialog: DialogState }> | null>(null);
   const consumedPlanCalendarOperationRef = useRef<string | null>(null);
   const planCalendarRecoveryReturnDialog = useRef<DialogState>(null);
@@ -553,25 +604,28 @@ export default function FitnessApp() {
     });
   }, []);
 
-  const applyFitnessSnapshot = useCallback((next: FitnessSnapshot) => {
-    snapshotRef.current = next;
-    setSnapshot(next);
-    setVenueId((current) => current && next.venues.some((venue) => venue.id === current && venue.status === "active")
+  const applyFitnessSnapshot = useCallback((next: FitnessFactsReadBundle) => {
+    snapshotRef.current = next.snapshot;
+    settingsExpectedRef.current = next.expected;
+    setSnapshot(next.snapshot);
+    setSettingsExpected(next.expected);
+    setVenueId((current) => current && next.snapshot.venues.some((venue) => venue.id === current && venue.status === "active")
       ? current
-      : next.venues.find((venue) => venue.is_default && venue.status === "active")?.id ?? next.venues.find((venue) => venue.status === "active")?.id ?? null);
+      : next.snapshot.venues.find((venue) => venue.is_default && venue.status === "active")?.id ?? next.snapshot.venues.find((venue) => venue.status === "active")?.id ?? null);
     setSnapshotReadStatus("ready");
+    setReady(true);
   }, []);
 
   const readFitnessFacts = useCallback(async (): Promise<FitnessFactsRefreshOutcome> => {
     const requestId = ++fitnessReadRequestRef.current;
     try {
-      const next = await loadFitnessSnapshot();
+      const next = await loadFitnessFactsWithSettingsExpected();
       const gate = liveDraftGateRef.current;
-      const liveConflict = Boolean(gate?.dirty && liveDraftFactsChanged(snapshotRef.current, next, gate));
+      const liveConflict = Boolean(gate?.dirty && liveDraftFactsChanged(snapshotRef.current, next.snapshot, gate));
       const configDialogConflict = fitnessDirtyConfigDialogBlocksRouteChange(
         dialogDirtyRef.current,
         snapshotRef.current.sessions,
-        next.sessions,
+        next.snapshot.sessions,
       );
       const outcome = resolveFitnessFactsRead(
         requestId,
@@ -640,6 +694,12 @@ export default function FitnessApp() {
   }, []);
 
   const rememberPreparedConfigDialog = useCallback((receipt: FitnessConfigWriteReceipt) => {
+    if (receipt.kind === "settings-save") {
+      const trigger = settingsPrepareTriggerRef.current;
+      settingsPrepareTriggerRef.current = null;
+      if (trigger) submittedSettingsFocusRef.current = { operationId: receipt.operationId, trigger };
+      return;
+    }
     const current = activeDialog.current;
     if (dialogDirtyRef.current && (current === "venue" || current === "equipment" || current === "profile" || current === "constraint")) {
       submittedConfigDialogRef.current = { operationId: receipt.operationId, dialog: current };
@@ -656,13 +716,63 @@ export default function FitnessApp() {
     setConfigDialogSnapshotPending(false);
   }, []);
 
+  const settleConfigWriteFocus = useCallback((receipt: FitnessConfigWriteReceipt) => {
+    if (receipt.kind !== "settings-save") return;
+    const submitted = submittedSettingsFocusRef.current;
+    if (!submitted || submitted.operationId !== receipt.operationId) return;
+    submittedSettingsFocusRef.current = null;
+    if (activeDialog.current === "config-recovery") setDialog(null);
+    if (settingsFocusFrame.current !== null) window.cancelAnimationFrame(settingsFocusFrame.current);
+    settingsFocusFrame.current = window.requestAnimationFrame(() => {
+      settingsFocusFrame.current = window.requestAnimationFrame(() => {
+        settingsFocusFrame.current = null;
+        const trigger = submitted.trigger;
+        const target = trigger.isConnected && trigger.getClientRects().length > 0
+          ? trigger
+          : document.querySelector<HTMLElement>(".sl-settings-page .sl-page-title h1, .sl-page .sl-page-title h1");
+        if (!target?.isConnected || target.getClientRects().length === 0) return;
+        if (target.matches("h1")) target.tabIndex = -1;
+        target.focus({ preventScroll: true });
+      });
+    });
+  }, []);
+
   const configWrites = useFitnessConfigWriteFlow({
     refresh: refreshLiveWrite,
     onToast: setToast,
     onAttention: openConfigRecovery,
     onDurablePrepared: rememberPreparedConfigDialog,
     onDurableCommitted: consumeCommittedConfigDialog,
+    onDurableSettled: settleConfigWriteFocus,
   });
+
+  const saveFitnessSettingsSafely = useCallback(async (
+    next: FitnessSnapshot["settings"],
+    expected: FitnessSettingsWriteSnapshot,
+    trigger: HTMLButtonElement,
+  ) => {
+    if (snapshotReadStatus !== "ready" || configWrites.writeLocked ||
+        settingsExpectedRef.current !== expected || snapshotRef.current.settings !== expected.settings) {
+      setSnapshotReadStatus("stale");
+      setError("当前设置与安全读取凭据不再属于同一次读取；仍显示上次成功内容。请先只重新读取。");
+      return;
+    }
+    setError("");
+    settingsPrepareTriggerRef.current = trigger;
+    try {
+      await configWrites.start(
+        () => prepareFitnessSettingsSave(next, expected),
+        "设置已保存在当前完整网址与浏览器资料对应的本地空间",
+      );
+    } catch (reason) {
+      setSnapshotReadStatus("stale");
+      setError(reason instanceof FitnessConfigMutationError && reason.code === "changed"
+        ? "另一页已经更新了设置；这次没有写入。仍显示上次成功内容，请先只重新读取。"
+        : `${errorMessage(reason)} 这次没有确认安全收据是否完整保留；请先只重新读取并处理页面提醒。`);
+    } finally {
+      if (settingsPrepareTriggerRef.current === trigger) settingsPrepareTriggerRef.current = null;
+    }
+  }, [configWrites, snapshotReadStatus]);
 
   const openLiveRecovery = useCallback(() => {
     if (activeDialog.current === "history-detail") setHistoryLiveRecovery(true);
@@ -885,12 +995,8 @@ export default function FitnessApp() {
       try {
         await initializeFitnessDatabase();
         await initializeFitnessFiles();
-        const data = await loadFitnessSnapshot();
+        await readFitnessFacts();
         if (!live) return;
-        snapshotRef.current = data;
-        setSnapshot(data);
-        setVenueId(data.venues.find((venue) => venue.is_default && venue.status === "active")?.id ?? data.venues.find((venue) => venue.status === "active")?.id ?? null);
-        setReady(true);
         void (async () => {
           try {
             const current = await estimateLocalStorage();
@@ -907,8 +1013,11 @@ export default function FitnessApp() {
         if (live) setFatal(errorMessage(reason));
       }
     })();
-    return () => { live = false; };
-  }, []);
+    return () => {
+      live = false;
+      fitnessReadRequestRef.current += 1;
+    };
+  }, [readFitnessFacts]);
 
   useEffect(() => subscribeFitnessChanges(() => { void refresh().catch(() => undefined); }), [refresh]);
   useEffect(() => {
@@ -942,6 +1051,7 @@ export default function FitnessApp() {
   useEffect(() => () => {
     if (navigationFrame.current !== null) window.cancelAnimationFrame(navigationFrame.current);
     if (planCalendarFocusFrame.current !== null) window.cancelAnimationFrame(planCalendarFocusFrame.current);
+    if (settingsFocusFrame.current !== null) window.cancelAnimationFrame(settingsFocusFrame.current);
   }, []);
   useEffect(() => {
     activeDialog.current = dialog;
@@ -1154,25 +1264,6 @@ export default function FitnessApp() {
   const requestScheduledStartChoiceClose = useCallback(() => {
     if (!liveWrites.operationInProgress()) closeDialog();
   }, [closeDialog, liveWrites]);
-
-  const run = useCallback(async (operation: () => Promise<void>, success?: string) => {
-    setBusy(true); setError("");
-    try {
-      await operation();
-    } catch (reason) {
-      setError(errorMessage(reason));
-      setBusy(false);
-      return;
-    }
-    try {
-      await refresh();
-      if (success) setToast(success);
-    } catch {
-      setError("更改已经保存在本地，但当前页面没有重新读取成功。请刷新页面，不要重复提交。");
-    } finally {
-      setBusy(false);
-    }
-  }, [refresh]);
 
   const runConfigAction = useCallback(async (
     prepare: () => Promise<FitnessConfigWriteReceipt>,
@@ -1444,7 +1535,7 @@ export default function FitnessApp() {
       {view === "history" && <HistoryView snapshot={snapshot} startBusy={scheduledStartBusy} startLocked={liveWrites.writeLocked || planCalendarWrites.writeLocked} onOpen={(sessionId) => { setHistoryLiveRecovery(false); setHistorySessionId(sessionId); setDialog("history-detail"); }} onStart={() => requestFitnessStart(null)} />}
       {view === "exercises" && <ExercisesView equipment={venueEquipment} equipmentLoads={snapshot.equipmentLoads} venue={venue} />}
       {view === "profile" && <ProfileView snapshot={snapshot} busy={busy || configWrites.writeLocked} onProfile={() => { setEditingProfile(snapshot.profile); setDialog("profile"); }} onConstraint={(entry) => { setEditingConstraint(entry); setDialog("constraint"); }} onToggleConstraint={(entry) => void runConfigAction(() => prepareFitnessConstraintActive(entry, !entry.active), entry.active ? "这条身体边界已暂时结束；记录仍保留" : "这条身体边界已重新启用；它只影响未来草稿和现场选项，不改写历史")} />}
-      {view === "settings" && <SettingsView snapshot={snapshot} storage={storage} storageReadStatus={storageReadStatus} storageBusy={storageActionBusy} storageActionMessage={storageActionMessage} currentOrigin={currentOrigin} onPersist={requestStorageProtection} onRecheck={recheckStorage} onChange={(settings) => void run(async () => { await saveFitnessSettings(settings); }, "设置已保存在当前完整网址与浏览器资料对应的本地空间")} onRestored={refresh} />}
+      {view === "settings" && <SettingsView snapshot={snapshot} expected={settingsExpected} snapshotReadStatus={snapshotReadStatus} configWriteLocked={configWrites.writeLocked} configWriteBusy={configWrites.busy} storage={storage} storageReadStatus={storageReadStatus} storageBusy={storageActionBusy} storageActionMessage={storageActionMessage} currentOrigin={currentOrigin} onPersist={requestStorageProtection} onRecheck={recheckStorage} onChange={(settings, expected, trigger) => void saveFitnessSettingsSafely(settings, expected, trigger)} onRestored={refresh} />}
     </section>
 
     {!snapshot.venues.length && !firstRunDismissed && <FirstRun onStart={() => { setFirstRunDismissed(true); setEditingVenue(null); setDialog("venue"); }} onExercises={() => { setFirstRunDismissed(true); navigateToFitnessView("exercises"); }} />}
@@ -1843,8 +1934,12 @@ function ProfileView({ snapshot, busy, onProfile, onConstraint, onToggleConstrai
   </div>;
 }
 
-function SettingsView({ snapshot, storage, storageReadStatus, storageBusy, storageActionMessage, currentOrigin, onPersist, onRecheck, onChange, onRestored }: {
+function SettingsView({ snapshot, expected, snapshotReadStatus, configWriteLocked, configWriteBusy, storage, storageReadStatus, storageBusy, storageActionMessage, currentOrigin, onPersist, onRecheck, onChange, onRestored }: {
   snapshot: FitnessSnapshot;
+  expected: FitnessSettingsWriteSnapshot | null;
+  snapshotReadStatus: FitnessSnapshotReadStatus;
+  configWriteLocked: boolean;
+  configWriteBusy: boolean;
   storage: LocalStorageEstimate | null;
   storageReadStatus: FitnessStorageReadStatus;
   storageBusy: boolean;
@@ -1852,12 +1947,23 @@ function SettingsView({ snapshot, storage, storageReadStatus, storageBusy, stora
   currentOrigin: string;
   onPersist: () => Promise<void>;
   onRecheck: () => Promise<void>;
-  onChange: (settings: FitnessSnapshot["settings"]) => void;
+  onChange: (settings: FitnessSnapshot["settings"], expected: FitnessSettingsWriteSnapshot, trigger: HTMLButtonElement) => void;
   onRestored: () => Promise<void>;
 }) {
   const settings = snapshot.settings;
-  return <div className="sl-page"><header className="sl-page-title"><div><span>PRIVACY & DATA</span><h1>设置</h1><p>训练和身体资料留在当前完整网址与浏览器资料对应的本地空间；AI 只在你点击时收到最小草稿上下文。</p></div></header><div className="sl-settings">
-    <section><header><h2>AI 与隐私</h2><p>没有 AI 时，器材、计划、日历与训练记录仍可使用。</p></header><SettingSwitch label="允许 AI 草稿" copy="只发送结构化器材、频次与能力数字；不发送用户填写的自由文本" checked={settings.ai_enabled} onChange={(value) => onChange({ ...settings, ai_enabled: value })}/><div className="sl-privacy-fact"><i/><span><b>DeepSeek Key 只在服务端</b><small>不会进入 SQLite、完整备份或浏览器资源</small></span></div></section>
+  const settingsBound = expected !== null && settings === expected.settings;
+  const settingsWriteLocked = snapshotReadStatus !== "ready" || !settingsBound || configWriteLocked;
+  const settingsWriteStatus = configWriteBusy
+    ? "正在安全保存设置；结果确认前不会再次写入。"
+    : snapshotReadStatus !== "ready"
+      ? "当前显示上次成功读取的设置；只重新读取成功前，开关保持停用。"
+      : !settingsBound
+        ? "设置与安全读取凭据没有成对就绪；开关保持停用，没有据此写入。"
+        : configWriteLocked
+          ? "先处理页面上方的资料写入核对提醒；当前设置仍完整显示。"
+          : "";
+  return <div className="sl-page sl-settings-page"><header className="sl-page-title"><div><span>PRIVACY & DATA</span><h1>设置</h1><p>训练和身体资料留在当前完整网址与浏览器资料对应的本地空间；AI 只在你点击时收到最小草稿上下文。</p></div></header><div className="sl-settings">
+    <section className="sl-settings-write" aria-busy={configWriteBusy || undefined}><header><h2>AI 与隐私</h2><p>没有 AI 时，器材、计划、日历与训练记录仍可使用。</p></header><SettingSwitch label="允许 AI 草稿" copy="只发送结构化器材、频次与能力数字；不发送用户填写的自由文本" checked={settings.ai_enabled} disabled={settingsWriteLocked} describedBy={settingsWriteStatus ? "sl-settings-write-status" : undefined} onChange={(value, trigger) => { if (expected && settings === expected.settings) onChange({ ...settings, ai_enabled: value }, expected, trigger); }}/>{settingsWriteStatus && <p id="sl-settings-write-status" className="sl-settings-write-status" role="status">{settingsWriteStatus}</p>}<div className="sl-privacy-fact"><i/><span><b>DeepSeek Key 只在服务端</b><small>不会进入 SQLite、完整备份或浏览器资源</small></span></div></section>
     <section className="sl-local-space"><header><h2>这套本地空间</h2><p>当前完整地址与当前浏览器资料（profile）共同决定资料放在哪里。</p></header>
       <div className="sl-origin-fact"><span>当前完整地址</span><code>{currentOrigin || "正在确认当前地址…"}</code><p>协议、主机名（hostname）或端口不同，就是另一套地址；更换浏览器资料（profile），也会打开另一套本地空间。</p></div>
       <p className="sl-storage-scope">此地址站点数据合计（职迹、拾词、适练和缓存）</p>
@@ -1876,8 +1982,8 @@ function SettingsView({ snapshot, storage, storageReadStatus, storageBusy, stora
   </div></div>;
 }
 
-function SettingSwitch({ label, copy, checked, onChange }: { label: string; copy: string; checked: boolean; onChange: (checked: boolean) => void }) {
-  return <div className="sl-setting-row"><span><b>{label}</b><small>{copy}</small></span><button role="switch" aria-label={label} aria-checked={checked} className={checked ? "on" : ""} onClick={() => onChange(!checked)}><i/></button></div>;
+function SettingSwitch({ label, copy, checked, disabled, describedBy, onChange }: { label: string; copy: string; checked: boolean; disabled: boolean; describedBy?: string; onChange: (checked: boolean, trigger: HTMLButtonElement) => void }) {
+  return <div className="sl-setting-row"><span><b>{label}</b><small>{copy}</small></span><button type="button" role="switch" aria-label={label} aria-checked={checked} aria-describedby={describedBy} disabled={disabled} className={checked ? "on" : ""} onClick={(event) => onChange(!checked, event.currentTarget)}><i/></button></div>;
 }
 
 function PlanDraftPreview({ draft, expected, writeLocked, onSave }: { draft: FitnessPlanDraft; expected: FitnessProgramVersionScheduleExpectation; writeLocked: boolean; onSave: () => void }) {

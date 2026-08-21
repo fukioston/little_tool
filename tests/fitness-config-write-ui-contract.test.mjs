@@ -62,6 +62,31 @@ const { fitnessConfigReceiptDraftText } = await import(
   `data:text/javascript;base64,${Buffer.from(draftHelpersTranspiled.outputText).toString("base64")}`
 );
 
+const settingsReadHelpersSource = appSource.slice(
+  appSource.indexOf("function sameFitnessSettings("),
+  appSource.indexOf("function liveDraftFactsChanged"),
+);
+const settingsReadHelpersTranspiled = ts.transpileModule(`
+let loadFitnessSnapshot;
+let loadFitnessSettingsExpectedState;
+${settingsReadHelpersSource}
+function setFitnessSettingsReadLoaders(loadFacts, loadExpected) {
+  loadFitnessSnapshot = loadFacts;
+  loadFitnessSettingsExpectedState = loadExpected;
+}
+export { loadFitnessFactsWithSettingsExpected, sameFitnessSettingsExpectedState, setFitnessSettingsReadLoaders };`, {
+  fileName: "fitness-settings-read-bundle.ts",
+  reportDiagnostics: true,
+  compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
+});
+assert.deepEqual(
+  (settingsReadHelpersTranspiled.diagnostics ?? []).filter(({ category }) => category === ts.DiagnosticCategory.Error),
+  [],
+);
+const settingsRead = await import(
+  `data:text/javascript;base64,${Buffer.from(settingsReadHelpersTranspiled.outputText).toString("base64")}`
+);
+
 function receipt(operationId = "fitness-operation-ui-contract-a") {
   return { operationId };
 }
@@ -251,8 +276,9 @@ test("damaged peers remain visible and cannot hide valid config tickets", () => 
   assert.deepEqual(result.unreadable, [{ storageKey: damagedKey, raw: "{damaged" }]);
 });
 
-test("all eight config mutations use frozen safe prepare APIs and no legacy write call", () => {
+test("all nine config mutations use frozen safe prepare APIs and no legacy write call", () => {
   for (const name of [
+    "prepareFitnessSettingsSave",
     "prepareFitnessProfileSave",
     "prepareFitnessVenueSave",
     "prepareFitnessVenueArchive",
@@ -264,6 +290,7 @@ test("all eight config mutations use frozen safe prepare APIs and no legacy writ
   ]) assert.match(appSource, new RegExp(`\\b${name}\\b`));
 
   for (const name of [
+    "saveFitnessSettings",
     "saveFitnessProfile",
     "saveVenue",
     "archiveVenue",
@@ -273,7 +300,57 @@ test("all eight config mutations use frozen safe prepare APIs and no legacy writ
     "saveConstraint",
     "setFitnessConstraintActive",
   ]) assert.doesNotMatch(appSource, new RegExp(`\\b${name}\\b`));
-  assert.match(appSource, /saveFitnessSettings\(settings\)/, "settings is intentionally outside this slice");
+});
+
+test("settings facts use an executable E1-facts-E2 bundle and retain the exact second envelope", async () => {
+  const value = { unit: "kg", rest_timer_enabled: true, sound_enabled: false, ai_enabled: true };
+  const rows = [
+    { key: "unit", value: "kg", updated_at: 10 },
+    { key: "rest_timer_enabled", value: "true", updated_at: 10 },
+    { key: "sound_enabled", value: "false", updated_at: 10 },
+    { key: "ai_enabled", value: "true", updated_at: 10 },
+  ];
+  const first = { generationId: "generation-a", generationSequence: 4, rows: rows.map((row) => ({ ...row })), settings: { ...value } };
+  const second = { generationId: "generation-a", generationSequence: 4, rows: rows.map((row) => ({ ...row })), settings: { ...value } };
+  const trace = [];
+  let expectedRead = 0;
+  settingsRead.setFitnessSettingsReadLoaders(
+    async () => { trace.push("facts"); return { marker: "facts-a", settings: { ...value } }; },
+    async () => { trace.push(`expected-${expectedRead + 1}`); return [first, second][expectedRead++]; },
+  );
+  const bundle = await settingsRead.loadFitnessFactsWithSettingsExpected();
+  assert.deepEqual(trace, ["expected-1", "facts", "expected-2"]);
+  assert.strictEqual(bundle.expected, second);
+  assert.strictEqual(bundle.snapshot.settings, second.settings);
+  assert.equal(bundle.snapshot.marker, "facts-a");
+
+  const generationReplacement = { ...second, generationId: "generation-b", generationSequence: 1 };
+  let replacementRead = 0;
+  settingsRead.setFitnessSettingsReadLoaders(
+    async () => ({ settings: { ...value } }),
+    async () => [first, generationReplacement][replacementRead++],
+  );
+  await assert.rejects(() => settingsRead.loadFitnessFactsWithSettingsExpected(), /没有拼接新旧页面资料/);
+
+  const changedRows = { ...second, rows: second.rows.map((row, index) => index === 2 ? { ...row, updated_at: 11 } : row) };
+  let rowRead = 0;
+  settingsRead.setFitnessSettingsReadLoaders(
+    async () => ({ settings: { ...value } }),
+    async () => [first, changedRows][rowRead++],
+  );
+  await assert.rejects(() => settingsRead.loadFitnessFactsWithSettingsExpected(), /没有拼接新旧页面资料/);
+
+  let mismatchRead = 0;
+  settingsRead.setFitnessSettingsReadLoaders(
+    async () => ({ settings: { ...value, ai_enabled: false } }),
+    async () => [first, second][mismatchRead++],
+  );
+  await assert.rejects(() => settingsRead.loadFitnessFactsWithSettingsExpected(), /没有拼接新旧页面资料/);
+  settingsRead.setFitnessSettingsReadLoaders(
+    async () => { throw new Error("facts unavailable"); },
+    async () => first,
+  );
+  await assert.rejects(() => settingsRead.loadFitnessFactsWithSettingsExpected(), /facts unavailable/);
 });
 
 test("all nine durable receipts expose complete calm user content without technical guards", () => {
@@ -321,11 +398,13 @@ test("all nine durable receipts expose complete calm user content without techni
       version: 1,
       operationId: "fitness-operation-secret",
       generationId: "generation-secret",
+      generationSequence: 987654,
+      projectionSha256: "projection-secret",
       hash: "sha-secret",
       ...value,
     });
     for (const fact of requiredUserFacts[index]) assert.match(text, new RegExp(fact));
-    assert.doesNotMatch(text, /fitness-operation-secret|generation-secret|sha-secret/i);
+    assert.doesNotMatch(text, /fitness-operation-secret|generation-secret|987654|projection-secret|sha-secret/i);
     if (value.kind === "settings-save") assert.doesNotMatch(text, /updated_at|1787300000000|\brows\b/);
   });
 });
@@ -364,6 +443,109 @@ test("response loss is inspect-only, changed is refresh-only, and peer unreadabl
   );
   assert.match(listeners, /reloadJournal\(\)/);
   assert.doesNotMatch(listeners, /(inspect|commit)FitnessConfigWrite/);
+});
+
+test("only a newest complete settings bundle is applied, deferred, or later consumed as one unit", () => {
+  const loader = appSource.slice(
+    appSource.indexOf("async function loadFitnessFactsWithSettingsExpected"),
+    appSource.indexOf("function liveDraftFactsChanged"),
+  );
+  const firstExpected = loader.indexOf("const expectedBefore = await loadFitnessSettingsExpectedState()");
+  const facts = loader.indexOf("const facts = await loadFitnessSnapshot()");
+  const secondExpected = loader.indexOf("const expectedAfter = await loadFitnessSettingsExpectedState()", firstExpected + 1);
+  assert.ok(firstExpected >= 0 && firstExpected < facts && facts < secondExpected);
+  assert.match(loader, /sameFitnessSettingsExpectedState\(expectedBefore, expectedAfter\)/);
+  assert.match(loader, /sameFitnessSettings\(facts\.settings, expectedAfter\.settings\)/);
+  assert.match(loader, /snapshot: \{ \.\.\.facts, settings: expectedAfter\.settings \},\s*expected: expectedAfter/);
+
+  const apply = appSource.slice(
+    appSource.indexOf("const applyFitnessSnapshot = useCallback"),
+    appSource.indexOf("const readFitnessFacts = useCallback"),
+  );
+  assert.match(apply, /snapshotRef\.current = next\.snapshot/);
+  assert.match(apply, /settingsExpectedRef\.current = next\.expected/);
+  assert.match(apply, /setSnapshot\(next\.snapshot\)/);
+  assert.match(apply, /setSettingsExpected\(next\.expected\)/);
+
+  const read = appSource.slice(
+    appSource.indexOf("const readFitnessFacts = useCallback"),
+    appSource.indexOf("const refresh = useCallback"),
+  );
+  assert.ok(read.indexOf("const next = await loadFitnessFactsWithSettingsExpected()") < read.indexOf("resolveFitnessFactsRead("));
+  assert.ok(read.indexOf('if (outcome === "superseded") return outcome') < read.indexOf("applyFitnessSnapshot(next)"));
+  assert.match(read, /if \(outcome === "deferred"\) \{[\s\S]*?pendingLiveSnapshotRef\.current = next;[\s\S]*?return outcome/);
+  assert.match(appSource, /const pendingLiveSnapshotRef = useRef<FitnessFactsReadBundle \| null>/);
+  assert.equal((appSource.match(/if \(pending\) applyFitnessSnapshot\(pending\)/g) ?? []).length, 2);
+
+  const initial = appSource.slice(
+    appSource.indexOf("await initializeFitnessDatabase()"),
+    appSource.indexOf("useEffect(() => subscribeFitnessChanges"),
+  );
+  assert.match(initial, /await readFitnessFacts\(\)/);
+  assert.doesNotMatch(initial, /await loadFitnessSnapshot\(\)/);
+});
+
+test("settings switch submits its rendered envelope once and every unsafe pre-ticket outcome locks stale", () => {
+  const save = appSource.slice(
+    appSource.indexOf("const saveFitnessSettingsSafely"),
+    appSource.indexOf("const openLiveRecovery"),
+  );
+  assert.match(save, /settingsExpectedRef\.current !== expected \|\| snapshotRef\.current\.settings !== expected\.settings/);
+  assert.match(save, /configWrites\.start\([\s\S]*?prepareFitnessSettingsSave\(next, expected\)/);
+  assert.doesNotMatch(save, /loadFitnessSettingsExpectedState|loadFitnessSnapshot/);
+  assert.match(save, /reason instanceof FitnessConfigMutationError && reason\.code === "changed"/);
+  assert.match(save, /setSnapshotReadStatus\("stale"\)/);
+  assert.match(save, /没有确认安全收据是否完整保留/);
+
+  const view = appSource.slice(
+    appSource.indexOf("function SettingsView"),
+    appSource.indexOf("function PlanDraftPreview"),
+  );
+  assert.match(view, /const settingsBound = expected !== null && settings === expected\.settings/);
+  assert.match(view, /snapshotReadStatus !== "ready" \|\| !settingsBound \|\| configWriteLocked/);
+  assert.match(view, /role="switch"[\s\S]*?disabled=\{disabled\}/);
+  assert.match(view, /role="status">\{settingsWriteStatus\}/);
+  assert.match(appSource, /expected=\{settingsExpected\}[\s\S]*?configWriteLocked=\{configWrites\.writeLocked\}/);
+  assert.match(flowSource, /新的本地设置、偏好、场地、器材和身体边界改动先停用/);
+});
+
+test("settings response loss remains inspect-only and settles focus only after applied refresh and ticket removal", () => {
+  const inspect = flowSource.slice(
+    flowSource.indexOf("const inspect = useCallback"),
+    flowSource.indexOf("const continueExpected = useCallback"),
+  );
+  assert.match(inspect, /inspectFitnessConfigWrite/);
+  assert.doesNotMatch(inspect, /commitFitnessConfigWrite/);
+
+  const finish = flowSource.slice(
+    flowSource.indexOf("const finishCommitted"),
+    flowSource.indexOf("const commitEntry"),
+  );
+  assert.ok(finish.indexOf("await refresh()") < finish.indexOf("const removal = await removeCurrent(entry)"));
+  assert.ok(finish.indexOf("const removal = await removeCurrent(entry)") < finish.indexOf("onDurableSettled?.(entry.ticket.receipt)"));
+
+  const prepared = appSource.slice(
+    appSource.indexOf("const rememberPreparedConfigDialog"),
+    appSource.indexOf("const configWrites = useFitnessConfigWriteFlow"),
+  );
+  assert.match(prepared, /receipt\.kind === "settings-save"[\s\S]*?operationId: receipt\.operationId, trigger/);
+  const focus = appSource.slice(
+    appSource.indexOf("const settleConfigWriteFocus"),
+    appSource.indexOf("const configWrites = useFitnessConfigWriteFlow"),
+  );
+  assert.match(focus, /submitted\.operationId !== receipt\.operationId/);
+  assert.match(focus, /activeDialog\.current === "config-recovery"\) setDialog\(null\)/);
+  assert.equal((focus.match(/window\.requestAnimationFrame/g) ?? []).length, 2);
+  assert.match(focus, /trigger\.isConnected && trigger\.getClientRects\(\)\.length > 0/);
+  assert.match(appSource, /onDurableSettled: settleConfigWriteFocus/);
+
+  const start = flowSource.slice(
+    flowSource.indexOf("const start = useCallback"),
+    flowSource.indexOf("const open = useCallback"),
+  );
+  assert.match(start, /const recovered = reloadJournal\(\)/);
+  assert.match(start, /candidate\.ticket\.receipt\.operationId === preparedReceipt\?\.operationId/);
+  assert.match(start, /onDurablePrepared\?\.\(recoveredPrepared\.ticket\.receipt\)/);
 });
 
 test("focus and visibility only refresh facts, while changed receipts survive until explicit clearing", () => {
@@ -446,7 +628,7 @@ test("dirty close keeps the form mounted and restores deferred focus", () => {
   assert.match(keep, /target\?\.isConnected/);
   assert.match(keep, /\.sl-dialog :is\(\.sl-form, \.sl-draft, \.sl-calendar-not-performed\) :is\(input, select, textarea, button\)/);
   assert.match(appSource, /document\.addEventListener\("focusin", rememberFocus, true\)/);
-  assert.match(appSource, /fitnessDirtyConfigDialogBlocksRouteChange\([\s\S]*?dialogDirtyRef\.current[\s\S]*?snapshotRef\.current\.sessions[\s\S]*?next\.sessions/);
+  assert.match(appSource, /fitnessDirtyConfigDialogBlocksRouteChange\([\s\S]*?dialogDirtyRef\.current[\s\S]*?snapshotRef\.current\.sessions[\s\S]*?next\.snapshot\.sessions/);
   assert.match(appSource, /configDialogSnapshotPending && <ConfigDialogSnapshotNotice/);
   assert.match(appSource, /另一页已开始或结束训练[\s\S]*?当前表单和输入仍完整保留/);
   assert.match(appSource, /const discardDirtyDialog =[\s\S]*?if \(configDialogSnapshotPending\) applyPendingConfigDialogSnapshot\(\)/);
@@ -477,12 +659,16 @@ test("read failure preserves the rendered baseline and config recovery fits narr
     appSource.indexOf("const readFitnessFacts = useCallback"),
     appSource.indexOf("const openConfigRecovery = useCallback"),
   );
-  assert.match(refresh, /const next = await loadFitnessSnapshot\(\);[\s\S]*?applyFitnessSnapshot\(next\)/);
+  assert.match(refresh, /const next = await loadFitnessFactsWithSettingsExpected\(\);[\s\S]*?applyFitnessSnapshot\(next\)/);
   assert.doesNotMatch(refresh.slice(refresh.indexOf("catch (reason)"), refresh.indexOf("const refresh = useCallback")), /\bsetSnapshot\(/);
+  assert.match(refresh, /shouldMarkFitnessFactsReadStale[\s\S]*?setSnapshotReadStatus\("stale"\)/);
   assert.match(appSource, /loads=\{editingEquipmentExpected\?\.loads \?\? \[\]\}/);
   assert.match(appSource, /profile=\{editingProfile\}/);
   assert.match(appSource, /当前显示的是上次成功读取的资料/);
   assert.match(css, /\.shilian button \{\s*min-height: 44px/);
+  assert.match(css, /\.sl-setting-row > button \{[\s\S]*?min-height: 44px/);
+  assert.match(css, /\.sl-settings-write-status \{[\s\S]*?overflow-wrap: anywhere/);
+  assert.match(css, /@media \(max-width: 700px\) \{[\s\S]*?\.sl-settings,[\s\S]*?grid-template-columns: 1fr/);
   assert.match(css, /:focus-visible/);
   assert.match(css, /@media \(max-width: 370px\) \{[\s\S]*\.sl-config-recovery > footer[\s\S]*grid-template-columns: minmax\(0, 1fr\)/);
 });

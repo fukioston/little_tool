@@ -73,12 +73,14 @@ export function useFitnessConfigWriteFlow({
   onAttention,
   onDurablePrepared,
   onDurableCommitted,
+  onDurableSettled,
 }: {
   refresh: () => Promise<FitnessFactsRefreshOutcome>;
   onToast: (message: string) => void;
   onAttention: () => void;
   onDurablePrepared?: (receipt: FitnessConfigWriteReceipt) => void;
   onDurableCommitted?: (receipt: FitnessConfigWriteReceipt) => void;
+  onDurableSettled?: (receipt: FitnessConfigWriteReceipt) => void;
 }) {
   const [journal, setJournal] = useState<JournalView>(EMPTY_JOURNAL);
   const [flow, setFlow] = useState<FitnessConfigFlow>({ phase: "idle" });
@@ -234,6 +236,7 @@ export function useFitnessConfigWriteFlow({
       setFlow({ phase: "idle" });
       setStatus(success);
       onToast(success);
+      onDurableSettled?.(entry.ticket.receipt);
       return "fresh";
     } catch {
       showAttention({
@@ -245,7 +248,7 @@ export function useFitnessConfigWriteFlow({
     } finally {
       release(token);
     }
-  }, [onDurableCommitted, onToast, refresh, release, removeCurrent, reopenLatestAfterStale, showAttention]);
+  }, [onDurableCommitted, onDurableSettled, onToast, refresh, release, removeCurrent, reopenLatestAfterStale, showAttention]);
 
   const commitEntry = useCallback(async (
     entry: FitnessConfigWriteEntry,
@@ -331,6 +334,7 @@ export function useFitnessConfigWriteFlow({
     const token = claim("prepare");
     if (!token) return "attention";
     let entry: FitnessConfigWriteEntry | null = null;
+    let preparedReceipt: FitnessConfigWriteReceipt | null = null;
     try {
       const currentJournal = reloadJournal();
       if (currentJournal.unavailable) {
@@ -343,6 +347,7 @@ export function useFitnessConfigWriteFlow({
         throw new Error("先处理上一条资料写入核对线索；没有开始新的写入。");
       }
       const receipt = await prepare();
+      preparedReceipt = receipt;
       entry = await persistFitnessConfigWrite(createFitnessConfigWriteTicket(receipt));
       onDurablePrepared?.(receipt);
       reloadJournal();
@@ -355,6 +360,21 @@ export function useFitnessConfigWriteFlow({
           message: "这次写入结果需要核对。核对动作不会重复保存。",
         });
         setError(`${reasonMessage(reason)} 收据仍保留，请先只核对结果。`);
+        release(token);
+        return "attention";
+      }
+      const recovered = reloadJournal();
+      const recoveredPrepared = preparedReceipt
+        ? recovered.entries.find((candidate) => candidate.ticket.receipt.operationId === preparedReceipt?.operationId)
+        : null;
+      if (recoveredPrepared) {
+        onDurablePrepared?.(recoveredPrepared.ticket.receipt);
+        showAttention({
+          phase: "check",
+          entry: recoveredPrepared,
+          message: "安全收据可能已经保留；先只核对结果，不会重复写入。",
+        });
+        setError(`${reasonMessage(reason)} 请先按已保留的线索核对。`);
         release(token);
         return "attention";
       }
@@ -627,7 +647,7 @@ export function FitnessConfigWriteBanner({
       : journal.entries.length > 0
         ? `有 ${journal.entries.length} 条资料写入待核对`
         : "有无法验证的资料写入提醒"}</b><p>{journal.unavailable
-      ? "新的偏好、场地、器材和身体边界改动先停用；已有资料没有因此改变。"
+      ? "新的本地设置、偏好、场地、器材和身体边界改动先停用；已有资料没有因此改变。"
       : `这些线索属于当前完整网址与浏览器资料。${journal.unreadable.length ? `其中 ${journal.unreadable.length} 条无法验证；` : ""}打开后才会核对或继续。`}</p></div>
     <button type="button" onClick={onOpen}>{journal.entries.length ? "打开下一条" : "查看安全说明"}</button>
   </section>;
