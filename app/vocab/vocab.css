@@ -403,3 +403,18 @@
   .sc-review-footer{align-items:flex-start;flex-direction:column}
   .sc-review-complete{padding-top:12vh}
 }
+
+.sc-reminder-confirm{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap}
+.sc-reminder-confirm button{min-height:44px;padding:9px 13px!important;border:1px solid currentColor!important;border-radius:14px!important}
+.sc-reminder-confirm .danger{color:#b75849!important;background:#fff8f5!important}
+.sc-context-error .sc-reminder-confirm{margin-top:10px}
+.sc-toast-confirm{width:min(420px,calc(100vw - 34px));display:grid;gap:8px}
+.sc-toast-confirm>span{margin:0}
+.sc-toast-confirm>div{display:flex;justify-content:flex-end;gap:8px;flex-wrap:wrap}
+.sc-toast-confirm button{min-height:44px;border:1px solid #5d6157;background:none;color:#fff;border-radius:13px;padding:8px 12px}
+.sc-toast-confirm button.danger{color:#ffc5b9}
+
+@media(max-width:480px){
+  .sc-reminder-confirm,.sc-toast-confirm>div{display:grid;grid-template-columns:1fr;width:100%}
+  .sc-reminder-confirm button,.sc-toast-confirm button{width:100%}
+}

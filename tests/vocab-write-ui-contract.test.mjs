@@ -107,13 +107,16 @@ test("import UI synchronously gates writes and separates commit from refresh", a
     "const abandonConflict = async () =>",
     "const refreshOnly = async () =>",
   );
-  assert.match(abandonOnly, /window\.confirm/);
+  assert.doesNotMatch(abandonOnly, /window\.confirm/);
   assert.match(abandonOnly, /removeImportRecovery\(recovery\)/);
   assert.match(abandonOnly, /activateNextCheckpoint\(\)/);
   assert.doesNotMatch(
     abandonOnly,
     /saveArticle|savePodcast|saveVocabPodcastWithAudio|deleteOwned|cleanupVocab|inspectVocab/,
   );
+  assert.match(overlay, /const requestAbandonConflict = \(\) =>/);
+  assert.match(overlay, /confirmAbandon\?<footer className="sc-reminder-confirm"/);
+  assert.match(overlay, /ref=\{keepReminderButton\}[\s\S]*继续保留提醒/);
 });
 
 test("word UI uses one atomic receipt and recovery actions never replay save", async () => {
@@ -163,10 +166,34 @@ test("word UI uses one atomic receipt and recovery actions never replay save", a
     "const abandonConflictedWord = useCallback(async () =>",
     "const wordPrimaryAction = useCallback",
   );
-  assert.match(abandonOnly, /window\.confirm/);
+  assert.doesNotMatch(abandonOnly, /window\.confirm/);
   assert.match(abandonOnly, /removeOccurrenceRecovery\(receipt\)/);
   assert.match(abandonOnly, /activateNextOccurrenceRecovery\(\)/);
   assert.doesNotMatch(abandonOnly, /saveOccurrence|inspectVocabOccurrenceWrite/);
+  assert.match(app, /const requestAbandonConflictedWord = useCallback/);
+  assert.match(app, /data-word-reminder-keep[\s\S]*继续保留提醒/);
+  assert.match(app, /confirmReminderRemoval=\{wordAbandonConfirm\}/);
+  assert.doesNotMatch(app, /event\.key === "Escape"[\s\S]{0,160}setImportOpen\(false\)/);
+  assert.match(app, /data-word-recovery-primary/);
+});
+
+test("snapshot refreshes apply only the newest completed read", async () => {
+  const app = await source("app/vocab/VocabApp.tsx");
+  const sequencedRead = between(
+    app,
+    "const readAndApplySnapshot = useCallback(async () =>",
+    "const refresh = useCallback(async () =>",
+  );
+  assert.match(sequencedRead, /const request = \+\+snapshotReadRequestRef\.current/);
+  assert.match(
+    sequencedRead,
+    /if \(request !== snapshotReadRequestRef\.current\) \{\s*throw new VocabSnapshotSupersededError\(\);\s*\}\s*setSnapshot\(data\)/,
+  );
+  assert.match(app, /if \(!ready\) return;\s*return subscribeVocabChanges/);
+  assert.match(
+    app,
+    /onImported=\{async \(id\) => \{ const data = await readAndApplySnapshot\(\); setImportOpen\(false\)/,
+  );
 });
 
 test("recovery checkpoints contain identifiers and hashes, not imported prose", async () => {

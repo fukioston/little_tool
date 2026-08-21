@@ -29,17 +29,17 @@ import {
 import { Logo } from "./ui";
 import { useOverlayDialog } from "./useOverlayDialog";
 
-export function ContextPanel({ target, explanation, loading, error, showChinese, saveBusy, saveLabel, saveMessage, onChinese, onExplain, onSave, onClose }: { target: SelectionTarget; explanation: AiExplanation | null; loading: boolean; error: string; showChinese: boolean; saveBusy: boolean; saveLabel: string; saveMessage: string; onChinese: (value: boolean) => void | Promise<void>; onExplain: () => void; onSave: (note?: string) => void | Promise<void>; onClose: () => void }) {
+export function ContextPanel({ target, explanation, loading, error, showChinese, saveBusy, saveLabel, saveMessage, confirmReminderRemoval = false, onChinese, onExplain, onSave, onCancelReminderRemoval, onConfirmReminderRemoval, onClose }: { target: SelectionTarget; explanation: AiExplanation | null; loading: boolean; error: string; showChinese: boolean; saveBusy: boolean; saveLabel: string; saveMessage: string; confirmReminderRemoval?: boolean; onChinese: (value: boolean) => void | Promise<void>; onExplain: () => void; onSave: (note?: string) => void | Promise<void>; onCancelReminderRemoval?: () => void; onConfirmReminderRemoval?: () => void | Promise<void>; onClose: () => void }) {
   const [note, setNote] = useState("");
   const dialog = useOverlayDialog<HTMLElement>(true, onClose, "button[data-dialog-close]");
   const gloss = explanation?.sense?.glosses_en?.join(" · ") || explanation?.sense?.meaning_in_context_en;
   const pronunciation = explanation?.target?.ipa || explanation?.target?.pronunciation;
-  return <aside ref={dialog} className="sc-context-panel" role="dialog" aria-modal="true" aria-labelledby="sc-context-title" tabIndex={-1}><header><span id="sc-context-title">语境解释</span><button data-dialog-close disabled={saveBusy} onClick={onClose} aria-label="关闭语境解释">×</button></header><div className="sc-context-word"><div><h2>{explanation?.target?.canonical || target.surface}</h2><span>{pronunciation || "Selected in context"}</span></div><button className="sc-save-word" disabled={saveBusy} aria-busy={saveBusy} onClick={() => void onSave(note)}>{saveBusy ? "正在确认…" : saveLabel}</button></div>
+  return <aside ref={dialog} className="sc-context-panel" role="dialog" aria-modal="true" aria-labelledby="sc-context-title" tabIndex={-1}><header><span id="sc-context-title">语境解释</span><button data-dialog-close disabled={saveBusy} onClick={onClose} aria-label="关闭语境解释">×</button></header><div className="sc-context-word"><div><h2>{explanation?.target?.canonical || target.surface}</h2><span>{pronunciation || "Selected in context"}</span></div><button data-word-recovery-primary className="sc-save-word" disabled={saveBusy} aria-busy={saveBusy} onClick={() => void onSave(note)}>{saveBusy ? "正在确认…" : saveLabel}</button></div>
     {!explanation && !loading && !error && <div className="sc-context-preview"><span>IN THIS CONTEXT</span><p>“{target.sentence}”</p><small>{VOCAB_AI_DISCLOSURE_BY_ACTION.explain}</small><button style={{minHeight:44}} onClick={onExplain}>解释这个词</button></div>}
     {loading && <div className="sc-ai-loading" role="status" aria-live="polite"><i/><span>正在理解这个语境…</span><small>{VOCAB_AI_DISCLOSURE_BY_ACTION.explain}</small></div>}
     {error && <div className="sc-context-error" role="alert"><p>{error}</p><small>{VOCAB_AI_DISCLOSURE_BY_ACTION.explain}</small><button style={{minHeight:44}} onClick={onExplain}>重试解释</button></div>}
     {explanation && <div className="sc-explanation"><span className="sc-pos">{[...(explanation.sense?.parts_of_speech ?? []), explanation.cefr ?? ""].filter(Boolean).join(" · ") || explanation.target?.kind || "IN CONTEXT"}</span><h3>{gloss || "No English gloss returned"}</h3><p>{explanation.sense?.explanation_en || explanation.sense?.meaning_in_context_en}</p>{explanation.example?.sentence_en && <blockquote>{explanation.example.sentence_en}</blockquote>}<button className="sc-zh-toggle" disabled={saveBusy} onClick={() => void onChinese(!showChinese)}>{showChinese ? "隐藏简体中文" : "显示简体中文"}<span>{showChinese ? "−" : "+"}</span></button><small>{VOCAB_AI_DISCLOSURE_BY_ACTION.explain_chinese}</small>{showChinese && <div className="sc-zh-copy"><p>{explanation.sense?.explanation_zh || (loading ? "正在生成中文说明…" : "尚未返回中文说明。")}</p>{explanation.context_translation_zh && <small>{explanation.context_translation_zh}</small>}</div>}{explanation.collocations && explanation.collocations.length > 0 && <div className="sc-collocations">{explanation.collocations.map((entry) => <span key={entry}>{entry}</span>)}</div>}</div>}
-    {saveMessage && <div className="sc-context-error" role="status"><p>{saveMessage}</p></div>}
+    {saveMessage && <div className="sc-context-error" role="status"><p>{saveMessage}</p>{confirmReminderRemoval && <div className="sc-reminder-confirm"><button data-word-reminder-keep onClick={onCancelReminderRemoval}>继续保留提醒</button><button className="danger" onClick={() => void onConfirmReminderRemoval?.()}>只移除提醒</button></div>}</div>}
     <label className="sc-quick-note"><span>随手记</span><textarea value={note} disabled={saveBusy || saveLabel !== "＋ 收入词库"} onChange={(event) => setNote(event.target.value)} placeholder="为什么想记住它？"/></label><footer><span>Esc 关闭</span><span>E 解释</span><span>S 保存</span></footer></aside>;
 }
 
@@ -155,18 +155,27 @@ export function ImportWizard({ localLock, onClose, onImported }: { localLock: bo
   const [phase, setPhase] = useState<ImportPhase>("idle");
   const [error, setError] = useState("");
   const [committedId, setCommittedId] = useState<string | null>(null);
+  const [confirmAbandon, setConfirmAbandon] = useState(false);
   const [transcriptionConfigured, setTranscriptionConfigured] = useState<boolean | null>(null);
   const operation = useRef<AbortController | null>(null);
   const busyRef = useRef(false);
   const closed = useRef(false);
   const activeRecovery = useRef<ImportRecovery | null>(null);
+  const abandonOpener = useRef<HTMLElement | null>(null);
+  const keepReminderButton = useRef<HTMLButtonElement>(null);
 
   const close = useCallback(() => {
     if (busyRef.current) return;
+    if (confirmAbandon) {
+      setConfirmAbandon(false);
+      setError("恢复提醒会继续保留；没有写入、覆盖或删除任何内容。");
+      window.requestAnimationFrame(() => abandonOpener.current?.focus({ preventScroll: true }));
+      return;
+    }
     closed.current = true;
     operation.current?.abort();
     onClose();
-  }, [onClose]);
+  }, [confirmAbandon, onClose]);
   const dialog = useOverlayDialog<HTMLElement>(true, close, "button[data-dialog-close]");
 
   useEffect(() => {
@@ -200,6 +209,12 @@ export function ImportWizard({ localLock, onClose, onImported }: { localLock: bo
       operation.current?.abort();
     };
   }, []);
+
+  useEffect(() => {
+    if (!confirmAbandon) return;
+    const frame = window.requestAnimationFrame(() => keepReminderButton.current?.focus({ preventScroll: true }));
+    return () => window.cancelAnimationFrame(frame);
+  }, [confirmAbandon]);
 
   const begin = () => {
     if (busyRef.current) return false;
@@ -543,19 +558,24 @@ export function ImportWizard({ localLock, onClose, onImported }: { localLock: bo
     }
   };
 
+  const requestAbandonConflict = () => {
+    if (!recovery || busyRef.current) return;
+    abandonOpener.current = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null;
+    setConfirmAbandon(true);
+    setError(recovery.type === "podcast-audio"
+      ? "只结束这条提醒吗？数据库和本地音频都会原样保留。"
+      : "只结束这条提醒吗？数据库内容会原样保留。");
+  };
+
   const abandonConflict = async () => {
     if (!recovery || busyRef.current) return;
-    const audioWarning = recovery.type === "podcast-audio"
-      ? " 本地音频会原样保留，不会清理。"
-      : "";
-    const approved = window.confirm(
-      `只移除这条恢复提醒吗？这不会写入、覆盖或删除数据库内容。${audioWarning}`,
-    );
-    if (!approved) return;
     if (!removeImportRecovery(recovery)) {
       setError("提醒已发生变化或暂时无法访问，因此没有移除。可以稍后再次只读核对。");
       return;
     }
+    setConfirmAbandon(false);
     activeRecovery.current = null;
     setRecovery(null);
     if (!activateNextCheckpoint()) {
@@ -564,6 +584,9 @@ export function ImportWizard({ localLock, onClose, onImported }: { localLock: bo
         ? "只移除了这条恢复提醒；数据库和本地音频都保持原样。"
         : "只移除了这条恢复提醒；数据库内容保持原样。");
     }
+    window.requestAnimationFrame(() => {
+      document.querySelector<HTMLElement>(".sc-import-modal .sc-primary:not(:disabled), .sc-import-modal button[data-dialog-close]:not(:disabled)")?.focus({ preventScroll: true });
+    });
   };
 
   const refreshOnly = async () => {
@@ -593,7 +616,7 @@ export function ImportWizard({ localLock, onClose, onImported }: { localLock: bo
   const primaryAction = phase === "uncertain"
     ? inspectRecovery
     : phase === "conflict"
-      ? abandonConflict
+      ? requestAbandonConflict
     : phase === "recovery_absent"
       ? cleanupRecovery
       : phase === "refresh_failed"
@@ -605,7 +628,7 @@ export function ImportWizard({ localLock, onClose, onImported }: { localLock: bo
     {kind==="rss"&&!episodes.length&&<><label className="sc-field"><span>RSS 地址</span><input disabled={controlsLocked} value={url} onChange={(event)=>setUrl(event.target.value)} placeholder="https://example.com/feed.xml"/><small>先读取节目目录，再由你选择要保存的单集。</small></label><div className="sc-privacy-hint"><i>隐</i><p>只有 RSS 地址会发送到导入服务；单集不会自动下载。</p></div></>}
     {kind==="rss"&&episodes.length>0&&<div className="sc-episode-picker"><header><span>选择一集</span><small>显示全部 {episodes.length} 个结果</small></header>{episodes.map((episode,index)=><button key={`${episode.title}-${index}`} disabled={controlsLocked} onClick={()=>void importEpisode(episode)}><i>{String(index+1).padStart(2,"0")}</i><span><b>{episode.title}</b><small>{episode.source} · {episode.durationMs?`${Math.round(episode.durationMs/60000)} 分钟`:"时长未知"}</small></span><strong>导入 →</strong></button>)}</div>}
     {kind==="audio"&&<><FileDrop disabled={controlsLocked} file={audioFile} accept="audio/*,.mp3,.m4a,.wav,.ogg" label="音频文件" onFile={setAudioFile}/><FileDrop disabled={controlsLocked} file={transcriptFile} accept=".vtt,.srt,.lrc,.txt,text/vtt,text/plain" label="VTT、SRT、LRC 或纯文本字幕" onFile={(file)=>{setTranscriptFile(file);if(file)setTranscribe(false);}}/><label className="sc-field compact"><span>节目标题</span><input disabled={controlsLocked} value={title} onChange={(event)=>setTitle(event.target.value)} placeholder="Untitled podcast"/></label><label className="sc-check"><input aria-label="没有字幕时请求外部转写" type="checkbox" checked={transcribe} disabled={controlsLocked||Boolean(transcriptFile)||localLock||transcriptionConfigured!==true} onChange={(event)=>setTranscribe(event.target.checked)}/><span><b>没有字幕时，请求外部转写</b><small>{transcriptFile?"已选择字幕，不会上传音频转写。":localLock?"本地锁已开启，不会上传音频。":transcriptionConfigured===null?"正在检查是否配置了转写服务…":transcriptionConfigured?"只有音频会发送到已配置的转写端点。":"当前未配置转写服务；可以直接导入字幕文件。"}</small></span></label></>}
-    {error&&<div className="sc-import-error" role="alert">{error}</div>}{busy&&<div className="sc-import-progress" role="status" aria-live="polite"><i><em style={{width:stage===1?"58%":stage===2?"82%":stage===3?"94%":"22%"}}/></i><span>{phase==="refreshing"?"内容已保存，正在刷新页面…":stage===1?(kind==="audio"?"正在转写英文音频…":"正在读取远程内容…"):stage===2?"正在核对并写入本地资料库…":"正在准备…"}</span></div>}</div>{(!episodes.length||recoveryAction)&&<footer><button disabled={busy} onClick={close}>关闭</button><button className="sc-primary" disabled={busy} onClick={()=>void primaryAction()}>{primaryLabel}</button></footer>}</section></>;
+    {error&&<div className="sc-import-error" role={confirmAbandon?"status":"alert"}>{error}</div>}{busy&&<div className="sc-import-progress" role="status" aria-live="polite"><i><em style={{width:stage===1?"58%":stage===2?"82%":stage===3?"94%":"22%"}}/></i><span>{phase==="refreshing"?"内容已保存，正在刷新页面…":stage===1?(kind==="audio"?"正在转写英文音频…":"正在读取远程内容…"):stage===2?"正在核对并写入本地资料库…":"正在准备…"}</span></div>}</div>{(!episodes.length||recoveryAction)&&(confirmAbandon?<footer className="sc-reminder-confirm"><button ref={keepReminderButton} onClick={close}>继续保留提醒</button><button className="danger" onClick={()=>void abandonConflict()}>只移除提醒</button></footer>:<footer><button disabled={busy} onClick={close}>关闭</button><button className="sc-primary" disabled={busy} onClick={()=>void primaryAction()}>{primaryLabel}</button></footer>)}</section></>;
 }
 
 function FileDrop({file,accept,label,disabled=false,onFile}:{file:File|null;accept:string;label:string;disabled?:boolean;onFile:(file:File|null)=>void}){

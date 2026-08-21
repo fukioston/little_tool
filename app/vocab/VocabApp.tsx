@@ -51,6 +51,13 @@ const empty: VocabSnapshot = {
   settings: { chinese_explanation: false, font_scale: 1, line_height: 1.92, local_lock: false, auto_follow: true, daily_new_limit: 8 },
 };
 
+class VocabSnapshotSupersededError extends Error {
+  constructor() {
+    super("另一次较新的词库读取已经开始；等画面确认后再结束这次操作");
+    this.name = "VocabSnapshotSupersededError";
+  }
+}
+
 function selectionIdentity(target: SelectionTarget) {
   return [target.itemId, target.blockId ?? "", target.segmentId ?? "", target.startUtf16, target.endUtf16, target.surface, target.sentence].join("\u001f");
 }
@@ -155,6 +162,7 @@ export default function VocabApp() {
   const [wordSavePhase, setWordSavePhase] = useState<WordSavePhase>("idle");
   const [wordSaveBusy, setWordSaveBusy] = useState(false);
   const [wordSaveMessage, setWordSaveMessage] = useState("");
+  const [wordAbandonConfirm, setWordAbandonConfirm] = useState(false);
   const [occurrenceRecovery, setOccurrenceRecovery] = useState<VocabOccurrenceWriteReceipt | null>(null);
   const [committedOccurrence, setCommittedOccurrence] = useState<{ surface: string } | null>(null);
   const selectionRef = useRef<SelectionTarget | null>(null);
@@ -165,6 +173,8 @@ export default function VocabApp() {
   const pendingOccurrenceRef = useRef<PendingOccurrenceWrite | null>(null);
   const occurrenceRecoveryRef = useRef<VocabOccurrenceWriteReceipt | null>(null);
   const committedOccurrenceRef = useRef<{ surface: string } | null>(null);
+  const wordAbandonOpenerRef = useRef<HTMLElement | null>(null);
+  const snapshotReadRequestRef = useRef(0);
   const sidebarOpener = useRef<HTMLButtonElement>(null);
   const sidebarFocusFrame = useRef<number | null>(null);
   const focusSidebarOpenerAfterClose = useCallback(() => {
@@ -201,7 +211,19 @@ export default function VocabApp() {
     }
   }, []);
 
-  const refresh = useCallback(async () => setSnapshot(await loadVocabSnapshot()), []);
+  const readAndApplySnapshot = useCallback(async () => {
+    const request = ++snapshotReadRequestRef.current;
+    const data = await loadVocabSnapshot();
+    if (request !== snapshotReadRequestRef.current) {
+      throw new VocabSnapshotSupersededError();
+    }
+    setSnapshot(data);
+    return data;
+  }, []);
+
+  const refresh = useCallback(async () => {
+    await readAndApplySnapshot();
+  }, [readAndApplySnapshot]);
 
   const refreshStorageStatus = useCallback(async () => {
     const next = await estimateLocalStorage();
@@ -229,7 +251,9 @@ export default function VocabApp() {
     void (async () => {
       try {
         await initializeVocabDatabase();
+        const request = ++snapshotReadRequestRef.current;
         const data = await loadVocabSnapshot();
+        if (request !== snapshotReadRequestRef.current) return;
         if (!live) return;
         setSnapshot(data);
         setShowChinese(data.settings.chinese_explanation);
@@ -259,7 +283,10 @@ export default function VocabApp() {
     return () => { live = false; };
   }, []);
 
-  useEffect(() => subscribeVocabChanges(() => { void refresh().catch(() => undefined); }), [refresh]);
+  useEffect(() => {
+    if (!ready) return;
+    return subscribeVocabChanges(() => { void refresh().catch(() => undefined); });
+  }, [ready, refresh]);
 
   useEffect(() => {
     if (!toast) return;
@@ -294,6 +321,31 @@ export default function VocabApp() {
     }
     window.getSelection()?.removeAllRanges();
   }, [cancelAi]);
+
+  const cancelWordAbandon = useCallback(() => {
+    setWordAbandonConfirm(false);
+    setWordSaveMessage("恢复提醒会继续保留；词库和查询次数都没有改动。");
+    window.requestAnimationFrame(() => {
+      const opener = wordAbandonOpenerRef.current;
+      if (opener?.isConnected) opener.focus({ preventScroll: true });
+    });
+  }, []);
+
+  const requestCloseSelection = useCallback(() => {
+    if (wordAbandonConfirm) {
+      cancelWordAbandon();
+      return;
+    }
+    clearSelection();
+  }, [cancelWordAbandon, clearSelection, wordAbandonConfirm]);
+
+  useEffect(() => {
+    if (!wordAbandonConfirm) return;
+    const frame = window.requestAnimationFrame(() => {
+      document.querySelector<HTMLElement>("[data-word-reminder-keep]")?.focus({ preventScroll: true });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [wordAbandonConfirm]);
 
   useEffect(() => () => aiRequest.current?.controller.abort(), []);
 
@@ -575,18 +627,26 @@ export default function VocabApp() {
     }
   }, [activateNextOccurrenceRecovery, clearSelection, finishWordBusy, refresh]);
 
+  const requestAbandonConflictedWord = useCallback(() => {
+    if (wordSaveBusyRef.current) return;
+    wordAbandonOpenerRef.current = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null;
+    setWordAbandonConfirm(true);
+    setWordSaveMessage(
+      "只结束这条提醒吗？这不会改动词库、查询次数或任何已保存内容。",
+    );
+  }, []);
+
   const abandonConflictedWord = useCallback(async () => {
     if (wordSaveBusyRef.current) return;
     const receipt = occurrenceRecoveryRef.current ?? pendingOccurrenceRef.current?.receipt;
     if (!receipt) return;
-    const approved = window.confirm(
-      "只移除这条恢复提醒吗？这不会改动词库、查询次数或任何已保存内容；若数据库里已有冲突记录，也会原样保留。",
-    );
-    if (!approved) return;
     if (!removeOccurrenceRecovery(receipt)) {
       setWordSaveMessage("提醒已发生变化或暂时无法访问，因此没有移除。可以稍后再次只读核对。");
       return;
     }
+    setWordAbandonConfirm(false);
     occurrenceRecoveryRef.current = null;
     setOccurrenceRecovery(null);
     pendingOccurrenceRef.current = null;
@@ -594,14 +654,17 @@ export default function VocabApp() {
       setWordSavePhase("idle");
       setWordSaveMessage("只移除了这条恢复提醒；词库和查询次数都没有改动。");
     }
+    window.requestAnimationFrame(() => {
+      document.querySelector<HTMLElement>("[data-word-recovery-primary]:not(:disabled), .sc-menu:not(:disabled)")?.focus({ preventScroll: true });
+    });
   }, [activateNextOccurrenceRecovery]);
 
   const wordPrimaryAction = useCallback((note = "") => {
     if (wordSavePhase === "uncertain") return inspectPendingWord();
-    if (wordSavePhase === "conflict") return abandonConflictedWord();
+    if (wordSavePhase === "conflict") return requestAbandonConflictedWord();
     if (wordSavePhase === "refresh_failed") return refreshCommittedWord();
     return savePickedWord(note);
-  }, [abandonConflictedWord, inspectPendingWord, refreshCommittedWord, savePickedWord, wordSavePhase]);
+  }, [inspectPendingWord, refreshCommittedWord, requestAbandonConflictedWord, savePickedWord, wordSavePhase]);
 
   const changeSettings = useCallback(async (patch: Partial<VocabSettings>) => {
     const next = { ...snapshot.settings, ...patch };
@@ -648,11 +711,10 @@ export default function VocabApp() {
       if (event.key.toLowerCase() === "i") setImportOpen(true);
       if (event.key.toLowerCase() === "e" && selection) void askAi();
       if (event.key.toLowerCase() === "s" && selection) void wordPrimaryAction();
-      if (event.key === "Escape") { clearSelection(); setWordId(null); setImportOpen(false); setSearchOpen(false); }
     };
     window.addEventListener("keydown", shortcuts);
     return () => window.removeEventListener("keydown", shortcuts);
-  }, [askAi, clearSelection, selection, wordPrimaryAction]);
+  }, [askAi, selection, wordPrimaryAction]);
 
   if (fatal) return <main className="shici sc-fatal"><Logo /><section><span>数据库未能打开</span><h1>你的内容没有被改动。</h1><p>{fatal}</p><button onClick={() => window.location.reload()}>重新尝试</button></section></main>;
   if (!ready) return <Loader />;
@@ -681,11 +743,11 @@ export default function VocabApp() {
       </div>
     </section>
     <nav className="sc-mobile-tabs" aria-label="拾词页面">{navigation.slice(0, 4).map((item) => <button key={item.id} aria-current={view === item.id ? "page" : undefined} className={view === item.id ? "active" : ""} onClick={() => go(item.id)}><i>{item.glyph}</i><span>{item.label}</span></button>)}</nav>
-    {selection && <ContextPanel target={selection} explanation={explanation} loading={aiBusy} error={aiError} showChinese={showChinese} saveBusy={wordSaveBusy} saveLabel={wordSavePhase === "uncertain" ? "只读核对" : wordSavePhase === "conflict" ? "移除这条提醒" : wordSavePhase === "refresh_failed" ? "只刷新词库" : "＋ 收入词库"} saveMessage={wordSaveMessage} onChinese={async (value) => { setShowChinese(value); if (value && explanation && !explanation.sense?.explanation_zh) await addChinese(); }} onExplain={() => void askAi()} onSave={wordPrimaryAction} onClose={clearSelection} />}
+    {selection && <ContextPanel target={selection} explanation={explanation} loading={aiBusy} error={aiError} showChinese={showChinese} saveBusy={wordSaveBusy} saveLabel={wordSavePhase === "uncertain" ? "只读核对" : wordSavePhase === "conflict" ? "移除这条提醒" : wordSavePhase === "refresh_failed" ? "只刷新词库" : "＋ 收入词库"} saveMessage={wordSaveMessage} confirmReminderRemoval={wordAbandonConfirm} onChinese={async (value) => { setShowChinese(value); if (value && explanation && !explanation.sense?.explanation_zh) await addChinese(); }} onExplain={() => void askAi()} onSave={wordPrimaryAction} onCancelReminderRemoval={cancelWordAbandon} onConfirmReminderRemoval={abandonConflictedWord} onClose={requestCloseSelection} />}
     {wordId && <WordDetail key={wordId} word={snapshot.lexemes.find((word) => word.id === wordId) ?? null} occurrences={snapshot.occurrences.filter((item) => item.lexeme_id === wordId)} onClose={() => setWordId(null)} onNote={async (id, note) => { await saveLexemeNote(id, note); await refresh(); setToast("笔记已保存"); }} onStatus={async (id, status) => { await updateLexemeStatus(id, status); await refresh(); }} />}
-    {importOpen && <ImportWizard localLock={snapshot.settings.local_lock} onClose={() => setImportOpen(false)} onImported={async (id) => { const data = await loadVocabSnapshot(); setSnapshot(data); setImportOpen(false); const item = data.items.find((entry) => entry.id === id); if (item) openItem(item); setToast("内容已存入本地资料库"); }} />}
+    {importOpen && <ImportWizard localLock={snapshot.settings.local_lock} onClose={() => setImportOpen(false)} onImported={async (id) => { const data = await readAndApplySnapshot(); setImportOpen(false); const item = data.items.find((entry) => entry.id === id); if (item) openItem(item); setToast("内容已存入本地资料库"); }} />}
     {searchOpen && <SearchPalette snapshot={snapshot} onClose={() => setSearchOpen(false)} onOpenItem={openItem} onOpenWord={(id) => { setWordId(id); }} />}
-    {!selection && !toast && (occurrenceRecovery || (wordSavePhase === "refresh_failed" && committedOccurrence)) && <button className="sc-toast" disabled={wordSaveBusy} aria-label={wordSavePhase === "refresh_failed" ? "上次收词已保存，只刷新词库" : wordSavePhase === "conflict" ? "移除这条冲突提醒" : "只读核对上次收词结果"} onClick={() => void wordPrimaryAction()}><span>{wordSaveBusy ? "正在确认…" : wordSavePhase === "refresh_failed" ? "上次收词已保存" : wordSavePhase === "conflict" ? "发现冲突，不会改库" : "上次收词待核对"}</span>{wordSavePhase === "refresh_failed" ? "只刷新词库" : wordSavePhase === "conflict" ? "移除提醒" : "只读核对"}</button>}
+    {!selection && !toast && (occurrenceRecovery || (wordSavePhase === "refresh_failed" && committedOccurrence)) && (wordAbandonConfirm ? <div className="sc-toast sc-toast-confirm" role="group" aria-label="是否只移除这条恢复提醒"><span>词库内容会原样保留</span><div><button data-word-reminder-keep onClick={cancelWordAbandon}>继续保留提醒</button><button className="danger" onClick={() => void abandonConflictedWord()}>只移除提醒</button></div></div> : <button data-word-recovery-primary className="sc-toast" disabled={wordSaveBusy} aria-label={wordSavePhase === "refresh_failed" ? "上次收词已保存，只刷新词库" : wordSavePhase === "conflict" ? "移除这条冲突提醒" : "只读核对上次收词结果"} onClick={() => void wordPrimaryAction()}><span>{wordSaveBusy ? "正在确认…" : wordSavePhase === "refresh_failed" ? "上次收词已保存" : wordSavePhase === "conflict" ? "发现冲突，不会改库" : "上次收词待核对"}</span>{wordSavePhase === "refresh_failed" ? "只刷新词库" : wordSavePhase === "conflict" ? "移除提醒" : "只读核对"}</button>)}
     {toast && <div className="sc-toast" role="status"><span>✓</span>{toast}</div>}
     {mobile && sideOpen && <button className="sc-nav-scrim" onClick={closeMobileSidebar} aria-label="关闭导航" />}
   </main>;
