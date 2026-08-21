@@ -350,6 +350,163 @@ export type VocabItemStorageRuntime = Readonly<{
   broadcast(reason: string): void;
 }>;
 
+export type VocabStoredLexeme = Readonly<Pick<
+  Lexeme,
+  | "id"
+  | "headword"
+  | "normalized_key"
+  | "pronunciation"
+  | "gloss_en"
+  | "explanation_en"
+  | "explanation_zh"
+  | "status"
+  | "starred"
+  | "notes"
+  | "lookup_count"
+  | "created_at"
+  | "updated_at"
+>>;
+
+export type VocabStoredReviewCard = Readonly<Pick<
+  ReviewCard,
+  | "id"
+  | "lexeme_id"
+  | "state"
+  | "due_at"
+  | "interval_days"
+  | "ease"
+  | "reps"
+  | "lapses"
+  | "last_review_at"
+  | "algorithm_version"
+  | "suspended_from_state"
+  | "suspended_reason"
+  | "updated_at"
+>>;
+
+export type VocabLexemeExpectedEntry = Readonly<{
+  lexeme: VocabStoredLexeme;
+  reviewCard: VocabStoredReviewCard | null;
+}>;
+
+export type VocabLexemeExpectedSet = Readonly<{
+  generationId: string;
+  generationSequence: number;
+  entries: readonly VocabLexemeExpectedEntry[];
+}>;
+
+export type VocabLexemeExpectedState = Readonly<{
+  generationId: string;
+  generationSequence: number;
+  lexeme: VocabStoredLexeme;
+  reviewCard: VocabStoredReviewCard | null;
+}>;
+
+export type VocabLexemeWriteSnapshot = Readonly<{
+  generationId: string;
+  generationSequence: number;
+  lexeme: VocabStoredLexeme;
+}>;
+
+export type VocabLexemeStatusWriteSnapshot = VocabLexemeWriteSnapshot & Readonly<{
+  reviewCard: VocabStoredReviewCard | null;
+}>;
+
+type VocabLexemeReceiptBase<
+  Kind extends "note-save" | "star-set",
+> = Readonly<{
+  purpose: "vocab-lexeme-write";
+  version: 1;
+  kind: Kind;
+  operationId: string;
+  generationId: string;
+  generationSequence: number;
+  before: VocabLexemeWriteSnapshot;
+  after: VocabLexemeWriteSnapshot;
+  projectionSha256: string;
+}>;
+
+export type VocabLexemeNoteSaveReceipt =
+  VocabLexemeReceiptBase<"note-save">;
+export type VocabLexemeStarSetReceipt =
+  VocabLexemeReceiptBase<"star-set">;
+export type VocabLexemeStatusSetReceipt = Readonly<{
+  purpose: "vocab-lexeme-write";
+  version: 1;
+  kind: "status-set";
+  operationId: string;
+  generationId: string;
+  generationSequence: number;
+  before: VocabLexemeStatusWriteSnapshot;
+  after: VocabLexemeStatusWriteSnapshot;
+  projectionSha256: string;
+}>;
+
+export type VocabLexemeWriteReceipt =
+  | VocabLexemeNoteSaveReceipt
+  | VocabLexemeStarSetReceipt
+  | VocabLexemeStatusSetReceipt;
+
+export type VocabLexemeWriteInspection =
+  | "exact_saved"
+  | "expected"
+  | "changed"
+  | "still_unknown"
+  | "invalid_receipt";
+
+export type VocabLexemeWriteResult =
+  | Readonly<{
+      outcome: "saved" | "already_saved";
+      receipt: VocabLexemeWriteReceipt;
+      entityId: string;
+      updatedAt: number;
+    }>
+  | Readonly<{
+      outcome: "changed";
+      receipt: VocabLexemeWriteReceipt;
+      entityId: string;
+      retryable: false;
+    }>
+  | Readonly<{
+      outcome: "outcome_uncertain";
+      receipt: VocabLexemeWriteReceipt;
+      entityId: string;
+      retryable: true;
+    }>;
+
+export type VocabLexemeMutationErrorCode =
+  | "invalid_input"
+  | "invalid_receipt"
+  | "changed"
+  | "inspect_failed"
+  | "write_failed";
+
+export class VocabLexemeMutationError extends Error {
+  readonly name = "VocabLexemeMutationError";
+
+  constructor(
+    readonly code: VocabLexemeMutationErrorCode,
+    message: string,
+    readonly receipt?: VocabLexemeWriteReceipt,
+  ) {
+    super(message);
+  }
+}
+
+export type VocabLexemeStorageRuntime = Readonly<{
+  withReadLock?<Result>(operation: () => Promise<Result>): Promise<Result>;
+  withExclusiveLock<Result>(operation: () => Promise<Result>): Promise<Result>;
+  query<Result extends object>(
+    sql: string,
+    params?: SqlValue[],
+  ): Promise<VocabSettingsQueryResult<Result>>;
+  batch(statements: readonly Statement[]): Promise<unknown>;
+  currentGeneration(): Promise<Readonly<{ generationId: string; sequence: number }>>;
+  now(): number;
+  randomUUID(): string;
+  broadcast(reason: string): void;
+}>;
+
 export class VocabReviewConflictError extends Error {
   readonly code = "VOCAB_REVIEW_CONFLICT";
 
@@ -4683,6 +4840,1026 @@ export const inspectVocabItemWrite =
   defaultVocabItemStorageService.inspectVocabItemWrite;
 export const commitVocabItemWrite =
   defaultVocabItemStorageService.commitVocabItemWrite;
+
+const VOCAB_LEXEME_MAX_JSON_BYTES = 1_048_576;
+const VOCAB_LEXEME_OPERATION_ID_PATTERN =
+  /^vocab-lexeme-operation-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const VOCAB_LEXEME_CARD_ID_PATTERN =
+  /^card_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const VOCAB_LEXEME_STATUSES: readonly Lexeme["status"][] = [
+  "saved",
+  "learning",
+  "known",
+  "ignored",
+];
+const VOCAB_LEXEME_WRITE_KINDS = [
+  "note-save",
+  "status-set",
+  "star-set",
+] as const;
+const VOCAB_STORED_LEXEME_KEYS = [
+  "id",
+  "headword",
+  "normalized_key",
+  "pronunciation",
+  "gloss_en",
+  "explanation_en",
+  "explanation_zh",
+  "status",
+  "starred",
+  "notes",
+  "lookup_count",
+  "created_at",
+  "updated_at",
+] as const;
+const VOCAB_STORED_REVIEW_CARD_KEYS = [
+  "id",
+  "lexeme_id",
+  ...REVIEW_STATE_KEYS,
+] as const;
+
+type VocabLexemeJoinRow = VocabStoredLexeme & Readonly<{
+  card_id: string | null;
+  card_lexeme_id: string | null;
+  card_state: ReviewCard["state"] | null;
+  card_due_at: number | null;
+  card_interval_days: number | null;
+  card_ease: number | null;
+  card_reps: number | null;
+  card_lapses: number | null;
+  card_last_review_at: number | null;
+  card_algorithm_version: number | null;
+  card_suspended_from_state: ReviewCard["suspended_from_state"];
+  card_suspended_reason: string | null;
+  card_updated_at: number | null;
+}>;
+
+function vocabLexemeError(
+  code: VocabLexemeMutationErrorCode,
+  message: string,
+  receipt?: VocabLexemeWriteReceipt,
+): VocabLexemeMutationError {
+  return new VocabLexemeMutationError(code, message, receipt);
+}
+
+export function isVocabStoredLexeme(
+  value: unknown,
+): value is VocabStoredLexeme {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const lexeme = value as Partial<VocabStoredLexeme>;
+  return settingsExactObjectKeys(value, VOCAB_STORED_LEXEME_KEYS) &&
+    isSafeOpaqueReviewCardId(lexeme.id) &&
+    typeof lexeme.headword === "string" &&
+    typeof lexeme.normalized_key === "string" &&
+    typeof lexeme.pronunciation === "string" &&
+    typeof lexeme.gloss_en === "string" &&
+    typeof lexeme.explanation_en === "string" &&
+    typeof lexeme.explanation_zh === "string" &&
+    VOCAB_LEXEME_STATUSES.includes(lexeme.status as Lexeme["status"]) &&
+    (lexeme.starred === 0 || lexeme.starred === 1) &&
+    typeof lexeme.notes === "string" &&
+    settingsSafeInteger(lexeme.lookup_count) &&
+    settingsSafeInteger(lexeme.created_at) &&
+    settingsSafeInteger(lexeme.updated_at);
+}
+
+export function isVocabStoredReviewCard(
+  value: unknown,
+): value is VocabStoredReviewCard {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const card = value as Partial<VocabStoredReviewCard>;
+  if (
+    !settingsExactObjectKeys(value, VOCAB_STORED_REVIEW_CARD_KEYS) ||
+    !isSafeOpaqueReviewCardId(card.id) ||
+    !isSafeOpaqueReviewCardId(card.lexeme_id)
+  ) return false;
+  return isReviewStateProjection(Object.fromEntries(
+    REVIEW_STATE_KEYS.map((key) => [key, card[key]]),
+  ));
+}
+
+function isVocabLexemeExpectedEntry(
+  value: unknown,
+): value is VocabLexemeExpectedEntry {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const entry = value as Partial<VocabLexemeExpectedEntry>;
+  return settingsExactObjectKeys(value, ["lexeme", "reviewCard"]) &&
+    isVocabStoredLexeme(entry.lexeme) &&
+    (entry.reviewCard === null || isVocabStoredReviewCard(entry.reviewCard)) &&
+    (entry.reviewCard === null || entry.reviewCard.lexeme_id === entry.lexeme.id);
+}
+
+export function isVocabLexemeExpectedSet(
+  value: unknown,
+): value is VocabLexemeExpectedSet {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const set = value as Partial<VocabLexemeExpectedSet>;
+  if (
+    !settingsExactObjectKeys(value, [
+      "generationId", "generationSequence", "entries",
+    ]) ||
+    typeof set.generationId !== "string" ||
+    !VOCAB_SETTINGS_GENERATION_ID_PATTERN.test(set.generationId) ||
+    !settingsSafeInteger(set.generationSequence) ||
+    !Array.isArray(set.entries) ||
+    !set.entries.every(isVocabLexemeExpectedEntry)
+  ) return false;
+  return set.entries.every((entry, index) =>
+    index === 0 || set.entries![index - 1].lexeme.id < entry.lexeme.id
+  );
+}
+
+export function isVocabLexemeExpectedState(
+  value: unknown,
+): value is VocabLexemeExpectedState {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const state = value as Partial<VocabLexemeExpectedState>;
+  return settingsExactObjectKeys(value, [
+    "generationId", "generationSequence", "lexeme", "reviewCard",
+  ]) &&
+    typeof state.generationId === "string" &&
+    VOCAB_SETTINGS_GENERATION_ID_PATTERN.test(state.generationId) &&
+    settingsSafeInteger(state.generationSequence) &&
+    isVocabStoredLexeme(state.lexeme) &&
+    (state.reviewCard === null || isVocabStoredReviewCard(state.reviewCard)) &&
+    (state.reviewCard === null || state.reviewCard.lexeme_id === state.lexeme.id);
+}
+
+function isVocabLexemeWriteSnapshot(
+  value: unknown,
+): value is VocabLexemeWriteSnapshot {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const snapshot = value as Partial<VocabLexemeWriteSnapshot>;
+  return settingsExactObjectKeys(value, [
+    "generationId", "generationSequence", "lexeme",
+  ]) &&
+    typeof snapshot.generationId === "string" &&
+    VOCAB_SETTINGS_GENERATION_ID_PATTERN.test(snapshot.generationId) &&
+    settingsSafeInteger(snapshot.generationSequence) &&
+    isVocabStoredLexeme(snapshot.lexeme);
+}
+
+function isVocabLexemeStatusWriteSnapshot(
+  value: unknown,
+): value is VocabLexemeStatusWriteSnapshot {
+  return isVocabLexemeExpectedState(value);
+}
+
+function sameVocabLexemeExcept(
+  before: VocabStoredLexeme,
+  after: VocabStoredLexeme,
+  changed: "notes" | "starred" | "status",
+): boolean {
+  return VOCAB_STORED_LEXEME_KEYS.every((key) =>
+    key === changed || key === "updated_at" || before[key] === after[key]
+  ) && after.updated_at > before.updated_at;
+}
+
+function sameVocabLexemeGeneration(
+  before: VocabLexemeWriteSnapshot,
+  after: VocabLexemeWriteSnapshot,
+): boolean {
+  return before.generationId === after.generationId &&
+    before.generationSequence === after.generationSequence &&
+    before.lexeme.id === after.lexeme.id;
+}
+
+function reconciledStoredCard(
+  before: VocabStoredReviewCard,
+  lexeme: VocabStoredLexeme,
+  heartbeat: boolean,
+): VocabStoredReviewCard {
+  const suspension = reconcileReviewSuspension(
+    before,
+    lexeme.status,
+    hasUsefulEnglishExplanation(lexeme.gloss_en, lexeme.explanation_en),
+  );
+  if (
+    suspension.state === before.state &&
+    suspension.suspended_from_state === before.suspended_from_state &&
+    suspension.suspended_reason === before.suspended_reason
+  ) {
+    return heartbeat
+      ? {
+          ...before,
+          updated_at: Math.max(lexeme.updated_at, before.updated_at + 1),
+        }
+      : { ...before };
+  }
+  return {
+    ...before,
+    ...suspension,
+    updated_at: Math.max(lexeme.updated_at, before.updated_at + 1),
+  };
+}
+
+function newStoredReviewCard(
+  cardId: string,
+  lexeme: VocabStoredLexeme,
+): VocabStoredReviewCard {
+  const suspension = reconcileReviewSuspension({
+    state: "new",
+    suspended_from_state: null,
+    suspended_reason: null,
+  }, lexeme.status, hasUsefulEnglishExplanation(
+    lexeme.gloss_en,
+    lexeme.explanation_en,
+  ));
+  return {
+    id: cardId,
+    lexeme_id: lexeme.id,
+    ...suspension,
+    due_at: lexeme.updated_at,
+    interval_days: 0,
+    ease: 2.5,
+    reps: 0,
+    lapses: 0,
+    last_review_at: null,
+    algorithm_version: 2,
+    updated_at: lexeme.updated_at,
+  };
+}
+
+function isVocabLexemeStatusCardTransition(
+  beforeLexeme: VocabStoredLexeme,
+  before: VocabStoredReviewCard | null,
+  after: VocabStoredReviewCard | null,
+  afterLexeme: VocabStoredLexeme,
+): boolean {
+  if (after === null) return false;
+  if (before === null) {
+    return VOCAB_LEXEME_CARD_ID_PATTERN.test(after.id) &&
+      sameSettingsProjection(after, newStoredReviewCard(after.id, afterLexeme));
+  }
+  return sameSettingsProjection(after, reconciledStoredCard(
+    before,
+    afterLexeme,
+    beforeLexeme.status !== afterLexeme.status,
+  ));
+}
+
+function isVocabLexemeWriteTransition(
+  kind: VocabLexemeWriteReceipt["kind"],
+  beforeValue: unknown,
+  afterValue: unknown,
+): boolean {
+  if (kind === "status-set") {
+    if (
+      !isVocabLexemeStatusWriteSnapshot(beforeValue) ||
+      !isVocabLexemeStatusWriteSnapshot(afterValue)
+    ) return false;
+    return sameVocabLexemeGeneration(beforeValue, afterValue) &&
+      sameVocabLexemeExcept(beforeValue.lexeme, afterValue.lexeme, "status") &&
+      isVocabLexemeStatusCardTransition(
+        beforeValue.lexeme,
+        beforeValue.reviewCard,
+        afterValue.reviewCard,
+        afterValue.lexeme,
+      );
+  }
+  if (
+    !isVocabLexemeWriteSnapshot(beforeValue) ||
+    !isVocabLexemeWriteSnapshot(afterValue) ||
+    !sameVocabLexemeGeneration(beforeValue, afterValue)
+  ) return false;
+  return kind === "note-save"
+    ? sameVocabLexemeExcept(beforeValue.lexeme, afterValue.lexeme, "notes")
+    : sameVocabLexemeExcept(beforeValue.lexeme, afterValue.lexeme, "starred");
+}
+
+function isVocabLexemeWriteReceiptUnchecked(
+  value: unknown,
+): value is VocabLexemeWriteReceipt {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const receipt = value as Partial<VocabLexemeWriteReceipt>;
+  if (
+    !settingsExactObjectKeys(value, [
+      "purpose", "version", "kind", "operationId", "generationId",
+      "generationSequence", "before", "after", "projectionSha256",
+    ]) ||
+    receipt.purpose !== "vocab-lexeme-write" || receipt.version !== 1 ||
+    !VOCAB_LEXEME_WRITE_KINDS.includes(
+      receipt.kind as VocabLexemeWriteReceipt["kind"],
+    ) ||
+    typeof receipt.operationId !== "string" ||
+    !VOCAB_LEXEME_OPERATION_ID_PATTERN.test(receipt.operationId) ||
+    typeof receipt.generationId !== "string" ||
+    !VOCAB_SETTINGS_GENERATION_ID_PATTERN.test(receipt.generationId) ||
+    !settingsSafeInteger(receipt.generationSequence) ||
+    typeof receipt.projectionSha256 !== "string" ||
+    !RECEIPT_HASH_PATTERN.test(receipt.projectionSha256) ||
+    !isVocabLexemeWriteTransition(
+      receipt.kind as VocabLexemeWriteReceipt["kind"],
+      receipt.before,
+      receipt.after,
+    )
+  ) return false;
+  const before = receipt.before as VocabLexemeWriteSnapshot;
+  const after = receipt.after as VocabLexemeWriteSnapshot;
+  return receipt.generationId === before.generationId &&
+    receipt.generationSequence === before.generationSequence &&
+    receipt.generationId === after.generationId &&
+    receipt.generationSequence === after.generationSequence &&
+    new TextEncoder().encode(JSON.stringify(value)).byteLength <=
+      VOCAB_LEXEME_MAX_JSON_BYTES;
+}
+
+export function isVocabLexemeWriteReceipt(
+  value: unknown,
+): value is VocabLexemeWriteReceipt {
+  try {
+    return settingsJsonSafe(value) && isVocabLexemeWriteReceiptUnchecked(value);
+  } catch {
+    return false;
+  }
+}
+
+async function sealVocabLexemeReceipt<Receipt extends VocabLexemeWriteReceipt>(
+  draft: Omit<Receipt, "projectionSha256">,
+): Promise<Receipt> {
+  const projectionSha256 = await settingsSha256Hex(settingsCanonicalJson(draft));
+  const receipt = { ...draft, projectionSha256 } as Receipt;
+  if (!isVocabLexemeWriteReceipt(receipt)) {
+    throw vocabLexemeError("invalid_input", "无法生成有效的词条写入回执。");
+  }
+  return receipt;
+}
+
+async function vocabLexemeReceiptHashIsValid(
+  receipt: VocabLexemeWriteReceipt,
+): Promise<boolean> {
+  const { projectionSha256, ...projection } = receipt;
+  return projectionSha256 ===
+    await settingsSha256Hex(settingsCanonicalJson(projection));
+}
+
+function cloneVocabLexemeChecked<Result>(
+  value: unknown,
+  guard: (candidate: unknown) => candidate is Result,
+  label: string,
+): Result {
+  let snapshot: unknown;
+  try {
+    snapshot = settingsSnapshotInput(value);
+  } catch {
+    throw vocabLexemeError(
+      "invalid_input",
+      `${label}必须是安全、有限的 JSON 数据。`,
+    );
+  }
+  if (!guard(snapshot)) {
+    throw vocabLexemeError("invalid_input", `${label}格式不正确。`);
+  }
+  return snapshot;
+}
+
+async function readVocabLexemeGeneration(
+  runtime: VocabLexemeStorageRuntime,
+): Promise<Readonly<{ generationId: string; generationSequence: number }>> {
+  const current = await runtime.currentGeneration();
+  if (
+    !current || typeof current.generationId !== "string" ||
+    !VOCAB_SETTINGS_GENERATION_ID_PATTERN.test(current.generationId) ||
+    !settingsSafeInteger(current.sequence)
+  ) throw new Error("无法确认当前拾词数据库世代。");
+  return {
+    generationId: current.generationId,
+    generationSequence: current.sequence,
+  };
+}
+
+function storedLexemeFromJoin(row: VocabLexemeJoinRow): VocabStoredLexeme {
+  return {
+    id: row.id,
+    headword: row.headword,
+    normalized_key: row.normalized_key,
+    pronunciation: row.pronunciation,
+    gloss_en: row.gloss_en,
+    explanation_en: row.explanation_en,
+    explanation_zh: row.explanation_zh,
+    status: row.status,
+    starred: row.starred,
+    notes: row.notes,
+    lookup_count: row.lookup_count,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  };
+}
+
+function storedCardFromJoin(
+  row: VocabLexemeJoinRow,
+): VocabStoredReviewCard | null {
+  if (row.card_id === null) return null;
+  return {
+    id: row.card_id,
+    lexeme_id: row.card_lexeme_id as string,
+    state: row.card_state as ReviewCard["state"],
+    due_at: row.card_due_at as number,
+    interval_days: row.card_interval_days as number,
+    ease: row.card_ease as number,
+    reps: row.card_reps as number,
+    lapses: row.card_lapses as number,
+    last_review_at: row.card_last_review_at,
+    algorithm_version: row.card_algorithm_version as number,
+    suspended_from_state: row.card_suspended_from_state,
+    suspended_reason: row.card_suspended_reason,
+    updated_at: row.card_updated_at as number,
+  };
+}
+
+async function readVocabLexemeEntries(
+  runtime: VocabLexemeStorageRuntime,
+  lexemeId?: string,
+): Promise<readonly VocabLexemeExpectedEntry[]> {
+  const rows = (await runtime.query<VocabLexemeJoinRow>(
+    `SELECT l.id,l.headword,l.normalized_key,l.pronunciation,l.gloss_en,
+      l.explanation_en,l.explanation_zh,l.status,l.starred,l.notes,
+      l.lookup_count,l.created_at,l.updated_at,c.id AS card_id,
+      c.lexeme_id AS card_lexeme_id,c.state AS card_state,
+      c.due_at AS card_due_at,c.interval_days AS card_interval_days,
+      c.ease AS card_ease,c.reps AS card_reps,c.lapses AS card_lapses,
+      c.last_review_at AS card_last_review_at,
+      c.algorithm_version AS card_algorithm_version,
+      c.suspended_from_state AS card_suspended_from_state,
+      c.suspended_reason AS card_suspended_reason,
+      c.updated_at AS card_updated_at
+      FROM vocab_lexemes l
+      LEFT JOIN vocab_review_cards c ON c.lexeme_id=l.id
+      ${lexemeId === undefined ? "" : "WHERE l.id=?"}
+      ORDER BY l.id`,
+    lexemeId === undefined ? [] : [lexemeId],
+  )).rows;
+  const entries: VocabLexemeExpectedEntry[] = [];
+  for (const row of rows) {
+    const entry = {
+      lexeme: storedLexemeFromJoin(row),
+      reviewCard: storedCardFromJoin(row),
+    };
+    if (
+      !isVocabLexemeExpectedEntry(entry) ||
+      (entries.length > 0 &&
+        entries[entries.length - 1].lexeme.id >= entry.lexeme.id)
+    ) throw new Error("词条或复习卡存储行不符合 canonical 格式。");
+    entries.push(entry);
+  }
+  return entries;
+}
+
+async function readVocabStoredLexeme(
+  runtime: VocabLexemeStorageRuntime,
+  lexemeId: string,
+): Promise<VocabStoredLexeme | null> {
+  const rows = (await runtime.query<VocabStoredLexeme>(
+    `SELECT id,headword,normalized_key,pronunciation,gloss_en,explanation_en,
+      explanation_zh,status,starred,notes,lookup_count,created_at,updated_at
+      FROM vocab_lexemes WHERE id=? ORDER BY id LIMIT 2`,
+    [lexemeId],
+  )).rows;
+  if (rows.length === 0) return null;
+  if (rows.length !== 1 || !isVocabStoredLexeme(rows[0])) {
+    throw new Error("词条存储行不符合 canonical 格式。");
+  }
+  return { ...rows[0] };
+}
+
+function nextVocabLexemeTimestamp(latest: number, now: number): number {
+  if (!settingsSafeInteger(now)) {
+    throw vocabLexemeError("invalid_input", "设备时间不在可接受范围。");
+  }
+  const timestamp = Math.max(now, latest + 1);
+  if (!settingsSafeInteger(timestamp)) {
+    throw vocabLexemeError("invalid_input", "词条版本时间超出可接受范围。");
+  }
+  return timestamp;
+}
+
+function generatedVocabLexemeOperationId(
+  runtime: VocabLexemeStorageRuntime,
+): string {
+  const id = `vocab-lexeme-operation-${runtime.randomUUID()}`;
+  if (!VOCAB_LEXEME_OPERATION_ID_PATTERN.test(id)) {
+    throw vocabLexemeError("invalid_input", "无法生成可靠的词条操作标识。");
+  }
+  return id;
+}
+
+function generatedVocabLexemeCardId(runtime: VocabLexemeStorageRuntime): string {
+  const id = `card_${runtime.randomUUID()}`;
+  if (!VOCAB_LEXEME_CARD_ID_PATTERN.test(id)) {
+    throw vocabLexemeError("invalid_input", "无法生成可靠的复习卡标识。");
+  }
+  return id;
+}
+
+function withRequiredVocabLexemeWriteLock<Result>(
+  operation: () => Promise<Result>,
+): Promise<Result> {
+  const locks = typeof navigator === "undefined"
+    ? null
+    : (navigator as Navigator & { locks?: unknown }).locks ?? null;
+  if (!locks) {
+    throw new Error(
+      "当前浏览器不支持安全的跨标签页写入锁，请使用最新版 Chrome、Edge 或 Safari。",
+    );
+  }
+  return withVocabWriteLock(operation);
+}
+
+function safeVocabLexemeBroadcast(
+  runtime: VocabLexemeStorageRuntime,
+  reason: string,
+): void {
+  try {
+    runtime.broadcast(reason);
+  } catch {
+    // A refresh hint is advisory and cannot reverse a durable commit.
+  }
+}
+
+function vocabLexemeBroadcastReason(
+  kind: VocabLexemeWriteReceipt["kind"],
+): string {
+  switch (kind) {
+    case "note-save": return "lexeme-note-saved";
+    case "status-set": return "lexeme-status-changed";
+    case "star-set": return "lexeme-star-changed";
+  }
+}
+
+function vocabLexemeRowPredicate(
+  lexeme: VocabStoredLexeme,
+): Readonly<{ sql: string; params: SqlValue[] }> {
+  return {
+    sql: `EXISTS(SELECT 1 FROM vocab_lexemes WHERE id IS ? AND headword IS ?
+      AND normalized_key IS ? AND pronunciation IS ? AND gloss_en IS ?
+      AND explanation_en IS ? AND explanation_zh IS ? AND status IS ?
+      AND starred IS ? AND notes IS ? AND lookup_count IS ?
+      AND created_at IS ? AND updated_at IS ?)`,
+    params: VOCAB_STORED_LEXEME_KEYS.map((key) => lexeme[key]),
+  };
+}
+
+function vocabReviewCardRowPredicate(
+  card: VocabStoredReviewCard,
+): Readonly<{ sql: string; params: SqlValue[] }> {
+  return {
+    sql: `EXISTS(SELECT 1 FROM vocab_review_cards WHERE id IS ?
+      AND lexeme_id IS ? AND state IS ? AND due_at IS ?
+      AND interval_days IS ? AND ease IS ? AND reps IS ? AND lapses IS ?
+      AND last_review_at IS ? AND algorithm_version IS ?
+      AND suspended_from_state IS ? AND suspended_reason IS ?
+      AND updated_at IS ?)`,
+    params: VOCAB_STORED_REVIEW_CARD_KEYS.map((key) => card[key]),
+  };
+}
+
+function vocabLexemeReceiptStatements(
+  receipt: VocabLexemeWriteReceipt,
+): Statement[] {
+  const lexemePredicate = vocabLexemeRowPredicate(receipt.before.lexeme);
+  let relatedPredicate = "1";
+  let relatedParams: SqlValue[] = [];
+  if (receipt.kind === "status-set") {
+    if (receipt.before.reviewCard) {
+      const card = vocabReviewCardRowPredicate(receipt.before.reviewCard);
+      relatedPredicate = card.sql;
+      relatedParams = card.params;
+    } else {
+      const cardId = receipt.after.reviewCard!.id;
+      relatedPredicate = `NOT EXISTS(
+          SELECT 1 FROM vocab_review_cards WHERE lexeme_id=?
+        ) AND NOT EXISTS(
+          SELECT 1 FROM vocab_review_cards WHERE id=?
+        )`;
+      relatedParams = [receipt.before.lexeme.id, cardId];
+    }
+  }
+  const statements: Statement[] = [{
+    sql: `INSERT INTO vocab_lexemes(
+        id,headword,normalized_key,created_at,updated_at
+      ) SELECT '__vocab_lexeme_cas_abort__',NULL,
+        '__vocab_lexeme_cas_abort__',0,0
+      WHERE NOT ((${lexemePredicate.sql}) AND (${relatedPredicate}))`,
+    params: [...lexemePredicate.params, ...relatedParams],
+  }];
+  switch (receipt.kind) {
+    case "note-save":
+      statements.push({
+        sql: "UPDATE vocab_lexemes SET notes=?,updated_at=? WHERE id=?",
+        params: [
+          receipt.after.lexeme.notes,
+          receipt.after.lexeme.updated_at,
+          receipt.after.lexeme.id,
+        ],
+      });
+      break;
+    case "star-set":
+      statements.push({
+        sql: "UPDATE vocab_lexemes SET starred=?,updated_at=? WHERE id=?",
+        params: [
+          receipt.after.lexeme.starred,
+          receipt.after.lexeme.updated_at,
+          receipt.after.lexeme.id,
+        ],
+      });
+      break;
+    case "status-set": {
+      statements.push({
+        sql: "UPDATE vocab_lexemes SET status=?,updated_at=? WHERE id=?",
+        params: [
+          receipt.after.lexeme.status,
+          receipt.after.lexeme.updated_at,
+          receipt.after.lexeme.id,
+        ],
+      });
+      const afterCard = receipt.after.reviewCard!;
+      if (receipt.before.reviewCard === null) {
+        statements.push({
+          sql: `INSERT INTO vocab_review_cards(
+            id,lexeme_id,state,due_at,interval_days,ease,reps,lapses,
+            last_review_at,algorithm_version,suspended_from_state,
+            suspended_reason,updated_at
+          ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+          params: VOCAB_STORED_REVIEW_CARD_KEYS.map((key) => afterCard[key]),
+        });
+      } else if (!sameSettingsProjection(receipt.before.reviewCard, afterCard)) {
+        statements.push({
+          sql: `UPDATE vocab_review_cards SET state=?,suspended_from_state=?,
+            suspended_reason=?,updated_at=? WHERE id=?`,
+          params: [
+            afterCard.state,
+            afterCard.suspended_from_state,
+            afterCard.suspended_reason,
+            afterCard.updated_at,
+            afterCard.id,
+          ],
+        });
+      }
+      break;
+    }
+  }
+  return statements;
+}
+
+export function createVocabLexemeStorageService(
+  runtime: VocabLexemeStorageRuntime = {
+    withReadLock: (operation) => withVocabReadLock(operation),
+    withExclusiveLock: withRequiredVocabLexemeWriteLock,
+    query: async <Result extends object>(sql: string, params?: SqlValue[]) => ({
+      rows: await rawQuery<Result>(sql, params),
+    }),
+    batch: (statements) => localDb.batch(DB, statements, { transaction: true }),
+    currentGeneration: () => localDb.currentGeneration(DB),
+    now: () => Date.now(),
+    randomUUID: () => crypto.randomUUID(),
+    broadcast: broadcastVocabChange,
+  },
+) {
+  async function readLocked<Result>(operation: () => Promise<Result>): Promise<Result> {
+    try {
+      return await (runtime.withReadLock
+        ? runtime.withReadLock(operation)
+        : runtime.withExclusiveLock(operation));
+    } catch (error) {
+      if (error instanceof VocabLexemeMutationError) throw error;
+      throw vocabLexemeError("inspect_failed", "暂时无法读取最新词条；没有开始写入。");
+    }
+  }
+
+  async function prepareLocked<Result>(
+    operation: () => Promise<Result>,
+  ): Promise<Result> {
+    try {
+      return await runtime.withExclusiveLock(operation);
+    } catch (error) {
+      if (error instanceof VocabLexemeMutationError) throw error;
+      throw vocabLexemeError("inspect_failed", "暂时无法核对最新词条；没有开始写入。");
+    }
+  }
+
+  async function loadExpectedStates(): Promise<VocabLexemeExpectedSet> {
+    return readLocked(async () => {
+      const generation = await readVocabLexemeGeneration(runtime);
+      const set: VocabLexemeExpectedSet = {
+        ...generation,
+        entries: await readVocabLexemeEntries(runtime),
+      };
+      if (!isVocabLexemeExpectedSet(set)) {
+        throw new Error("无法构造可信的词条集合读取快照。");
+      }
+      return set;
+    });
+  }
+
+  async function loadExpectedState(
+    lexemeIdValue: string,
+  ): Promise<VocabLexemeExpectedState> {
+    const lexemeId = cloneVocabLexemeChecked(
+      lexemeIdValue,
+      isSafeOpaqueReviewCardId,
+      "词条标识",
+    );
+    return readLocked(async () => {
+      const generation = await readVocabLexemeGeneration(runtime);
+      const entries = await readVocabLexemeEntries(runtime, lexemeId);
+      if (entries.length !== 1) {
+        throw vocabLexemeError("changed", "这个词条已经不存在；没有开始写入。");
+      }
+      return { ...generation, ...entries[0] };
+    });
+  }
+
+  async function currentLexemeSnapshot(
+    expected: VocabLexemeExpectedState,
+  ): Promise<Readonly<{
+    generation: Readonly<{ generationId: string; generationSequence: number }>;
+    lexeme: VocabStoredLexeme;
+  }>> {
+    const generation = await readVocabLexemeGeneration(runtime);
+    if (
+      expected.generationId !== generation.generationId ||
+      expected.generationSequence !== generation.generationSequence
+    ) throw vocabLexemeError("changed", "词条所在数据库已经更换；没有准备写入。");
+    const lexeme = await readVocabStoredLexeme(runtime, expected.lexeme.id);
+    if (!lexeme || !sameSettingsProjection(lexeme, expected.lexeme)) {
+      throw vocabLexemeError("changed", "这个词条已在别处变化；没有准备写入。");
+    }
+    return { generation, lexeme };
+  }
+
+  async function prepareSimple<Receipt extends
+    VocabLexemeNoteSaveReceipt | VocabLexemeStarSetReceipt>(
+    kind: Receipt["kind"],
+    nextValue: string | boolean,
+    expectedValue: VocabLexemeExpectedState,
+  ): Promise<Receipt> {
+    const expected = cloneVocabLexemeChecked(
+      expectedValue,
+      isVocabLexemeExpectedState,
+      "词条读取快照",
+    );
+    if (kind === "note-save" && typeof nextValue !== "string") {
+      throw vocabLexemeError("invalid_input", "词条笔记必须是文本。");
+    }
+    if (kind === "star-set" && typeof nextValue !== "boolean") {
+      throw vocabLexemeError("invalid_input", "词条星标必须是布尔值。");
+    }
+    return prepareLocked(async () => {
+      const { generation, lexeme } = await currentLexemeSnapshot(expected);
+      const updatedAt = nextVocabLexemeTimestamp(lexeme.updated_at, runtime.now());
+      const before: VocabLexemeWriteSnapshot = { ...generation, lexeme };
+      const after: VocabLexemeWriteSnapshot = {
+        ...generation,
+        lexeme: {
+          ...lexeme,
+          ...(kind === "note-save"
+            ? { notes: nextValue as string }
+            : { starred: (nextValue as boolean) ? 1 : 0 }),
+          updated_at: updatedAt,
+        },
+      };
+      return sealVocabLexemeReceipt<Receipt>({
+        purpose: "vocab-lexeme-write",
+        version: 1,
+        kind,
+        operationId: generatedVocabLexemeOperationId(runtime),
+        ...generation,
+        before,
+        after,
+      } as Omit<Receipt, "projectionSha256">);
+    });
+  }
+
+  async function prepareStatus(
+    statusValue: Lexeme["status"],
+    expectedValue: VocabLexemeExpectedState,
+  ): Promise<VocabLexemeStatusSetReceipt> {
+    const expected = cloneVocabLexemeChecked(
+      expectedValue,
+      isVocabLexemeExpectedState,
+      "词条读取快照",
+    );
+    if (!VOCAB_LEXEME_STATUSES.includes(statusValue)) {
+      throw vocabLexemeError("invalid_input", "词条状态不受支持。");
+    }
+    return prepareLocked(async () => {
+      const generation = await readVocabLexemeGeneration(runtime);
+      if (
+        expected.generationId !== generation.generationId ||
+        expected.generationSequence !== generation.generationSequence
+      ) throw vocabLexemeError("changed", "词条所在数据库已经更换；没有准备写入。");
+      const entries = await readVocabLexemeEntries(runtime, expected.lexeme.id);
+      if (entries.length !== 1) {
+        throw vocabLexemeError("changed", "这个词条已经不存在；没有准备写入。");
+      }
+      const current: VocabLexemeExpectedState = { ...generation, ...entries[0] };
+      if (!sameSettingsProjection(current, expected)) {
+        throw vocabLexemeError("changed", "词条或复习卡已在别处变化；没有准备写入。");
+      }
+      const updatedAt = nextVocabLexemeTimestamp(
+        current.lexeme.updated_at,
+        runtime.now(),
+      );
+      const afterLexeme: VocabStoredLexeme = {
+        ...current.lexeme,
+        status: statusValue,
+        updated_at: updatedAt,
+      };
+      let afterCard: VocabStoredReviewCard;
+      if (current.reviewCard) {
+        afterCard = reconciledStoredCard(
+          current.reviewCard,
+          afterLexeme,
+          current.lexeme.status !== afterLexeme.status,
+        );
+      } else {
+        const cardId = generatedVocabLexemeCardId(runtime);
+        const occupied = (await runtime.query<{ id: string }>(
+          "SELECT id FROM vocab_review_cards WHERE id=? LIMIT 2",
+          [cardId],
+        )).rows;
+        if (occupied.length !== 0) {
+          throw vocabLexemeError("changed", "新的复习卡标识已被占用；没有准备写入。");
+        }
+        afterCard = newStoredReviewCard(cardId, afterLexeme);
+      }
+      const before: VocabLexemeStatusWriteSnapshot = {
+        ...generation,
+        lexeme: current.lexeme,
+        reviewCard: current.reviewCard,
+      };
+      const after: VocabLexemeStatusWriteSnapshot = {
+        ...generation,
+        lexeme: afterLexeme,
+        reviewCard: afterCard,
+      };
+      return sealVocabLexemeReceipt<VocabLexemeStatusSetReceipt>({
+        purpose: "vocab-lexeme-write",
+        version: 1,
+        kind: "status-set",
+        operationId: generatedVocabLexemeOperationId(runtime),
+        ...generation,
+        before,
+        after,
+      });
+    });
+  }
+
+  async function receiptStateUnlocked(
+    receipt: VocabLexemeWriteReceipt,
+  ): Promise<Exclude<
+    VocabLexemeWriteInspection,
+    "still_unknown" | "invalid_receipt"
+  >> {
+    const generation = await readVocabLexemeGeneration(runtime);
+    if (
+      generation.generationId !== receipt.generationId ||
+      generation.generationSequence !== receipt.generationSequence
+    ) return "changed";
+    if (receipt.kind === "status-set") {
+      const entries = await readVocabLexemeEntries(
+        runtime,
+        receipt.before.lexeme.id,
+      );
+      if (entries.length !== 1) return "changed";
+      const current: VocabLexemeStatusWriteSnapshot = {
+        ...generation,
+        ...entries[0],
+      };
+      if (sameSettingsProjection(current, receipt.after)) return "exact_saved";
+      if (!sameSettingsProjection(current, receipt.before)) return "changed";
+      if (receipt.before.reviewCard === null) {
+        const occupied = (await runtime.query<{ id: string; lexeme_id: string }>(
+          "SELECT id,lexeme_id FROM vocab_review_cards WHERE id=? LIMIT 2",
+          [receipt.after.reviewCard!.id],
+        )).rows;
+        if (occupied.length !== 0) return "changed";
+      }
+      return "expected";
+    }
+    const lexeme = await readVocabStoredLexeme(runtime, receipt.before.lexeme.id);
+    if (!lexeme) return "changed";
+    const current: VocabLexemeWriteSnapshot = { ...generation, lexeme };
+    if (sameSettingsProjection(current, receipt.after)) return "exact_saved";
+    return sameSettingsProjection(current, receipt.before) ? "expected" : "changed";
+  }
+
+  async function inspectWrite(value: unknown): Promise<VocabLexemeWriteInspection> {
+    let receipt: VocabLexemeWriteReceipt;
+    try {
+      const stable = settingsSnapshotInput(value);
+      if (!isVocabLexemeWriteReceipt(stable)) return "invalid_receipt";
+      receipt = stable;
+      if (!await vocabLexemeReceiptHashIsValid(receipt)) return "invalid_receipt";
+    } catch {
+      return "invalid_receipt";
+    }
+    try {
+      return await runtime.withExclusiveLock(() => receiptStateUnlocked(receipt));
+    } catch {
+      return "still_unknown";
+    }
+  }
+
+  async function commitWrite(value: unknown): Promise<VocabLexemeWriteResult> {
+    let receipt: VocabLexemeWriteReceipt;
+    try {
+      const stable = settingsSnapshotInput(value);
+      if (!isVocabLexemeWriteReceipt(stable)) {
+        throw vocabLexemeError("invalid_receipt", "词条写入回执无效；没有改动资料。");
+      }
+      receipt = stable;
+      if (!await vocabLexemeReceiptHashIsValid(receipt)) {
+        throw vocabLexemeError("invalid_receipt", "词条写入回执无法验证；没有改动资料。");
+      }
+    } catch (error) {
+      if (
+        error instanceof VocabLexemeMutationError &&
+        error.code === "invalid_receipt"
+      ) throw error;
+      throw vocabLexemeError("invalid_receipt", "词条写入回执无法验证；没有改动资料。");
+    }
+    const entityId = receipt.after.lexeme.id;
+    const updatedAt = receipt.after.lexeme.updated_at;
+    try {
+      return await runtime.withExclusiveLock(async () => {
+        const before = await receiptStateUnlocked(receipt);
+        if (before === "exact_saved") {
+          safeVocabLexemeBroadcast(
+            runtime,
+            vocabLexemeBroadcastReason(receipt.kind),
+          );
+          return { outcome: "already_saved", receipt, entityId, updatedAt };
+        }
+        if (before === "changed") {
+          return { outcome: "changed", receipt, entityId, retryable: false };
+        }
+        try {
+          await runtime.batch(vocabLexemeReceiptStatements(receipt));
+        } catch {
+          // The transaction may have committed even though its response was lost.
+        }
+        const after = await receiptStateUnlocked(receipt);
+        if (after === "exact_saved") {
+          safeVocabLexemeBroadcast(
+            runtime,
+            vocabLexemeBroadcastReason(receipt.kind),
+          );
+          return { outcome: "saved", receipt, entityId, updatedAt };
+        }
+        if (after === "expected") {
+          throw vocabLexemeError(
+            "write_failed",
+            "这次词条修改确定没有写入；保留原回执后可以重试。",
+            receipt,
+          );
+        }
+        return { outcome: "changed", receipt, entityId, retryable: false };
+      });
+    } catch (error) {
+      if (error instanceof VocabLexemeMutationError) throw error;
+      return {
+        outcome: "outcome_uncertain",
+        receipt,
+        entityId,
+        retryable: true,
+      };
+    }
+  }
+
+  return {
+    loadVocabLexemeExpectedStates: loadExpectedStates,
+    loadVocabLexemeExpectedState: loadExpectedState,
+    prepareVocabLexemeNoteSave: (
+      note: string,
+      expected: VocabLexemeExpectedState,
+    ) => prepareSimple<VocabLexemeNoteSaveReceipt>("note-save", note, expected),
+    prepareVocabLexemeStarSet: (
+      starred: boolean,
+      expected: VocabLexemeExpectedState,
+    ) => prepareSimple<VocabLexemeStarSetReceipt>("star-set", starred, expected),
+    prepareVocabLexemeStatusSet: prepareStatus,
+    inspectVocabLexemeWrite: inspectWrite,
+    commitVocabLexemeWrite: commitWrite,
+  } as const;
+}
+
+const defaultVocabLexemeStorageService = createVocabLexemeStorageService();
+
+export const loadVocabLexemeExpectedStates =
+  defaultVocabLexemeStorageService.loadVocabLexemeExpectedStates;
+export const loadVocabLexemeExpectedState =
+  defaultVocabLexemeStorageService.loadVocabLexemeExpectedState;
+export const prepareVocabLexemeNoteSave =
+  defaultVocabLexemeStorageService.prepareVocabLexemeNoteSave;
+export const prepareVocabLexemeStarSet =
+  defaultVocabLexemeStorageService.prepareVocabLexemeStarSet;
+export const prepareVocabLexemeStatusSet =
+  defaultVocabLexemeStorageService.prepareVocabLexemeStatusSet;
+export const inspectVocabLexemeWrite =
+  defaultVocabLexemeStorageService.inspectVocabLexemeWrite;
+export const commitVocabLexemeWrite =
+  defaultVocabLexemeStorageService.commitVocabLexemeWrite;
 
 export async function saveSettings(settings: VocabSettings): Promise<void> {
   await withWrite("settings-saved", async () => {
