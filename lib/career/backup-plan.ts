@@ -2,82 +2,37 @@ import type {
   DatabaseSchemaRequirements,
   SqlStatement,
 } from "../local-db/types";
+import {
+  ZHIJI_APPLICATION_ID,
+  ZHIJI_SCHEMA_LINEAGES,
+  ZHIJI_SCHEMA_OBJECT_SQL_VARIANTS,
+  ZHIJI_TABLE_COLUMNS,
+  ZHIJI_TABLES,
+  ZHIJI_USER_VERSION,
+  ZHIJI_V1_SCHEMA_STATEMENTS,
+  ZHIJI_V1_TABLE_COLUMNS,
+  ZHIJI_V1_TABLES,
+  ZHIJI_V1_MIGRATION_NAME,
+  ZHIJI_V2_MIGRATION_NAME,
+  ZHIJI_V2_SCHEMA_MIGRATION_STATEMENTS,
+  ZHIJI_V3_MIGRATION_NAME,
+  ZHIJI_V3_SCHEMA_MIGRATION_STATEMENTS,
+} from "../schemas/zhiji";
 
-export const CAREER_APPLICATION_ID = 0x5a484a49;
-export const CAREER_USER_VERSION = 2;
+export const CAREER_APPLICATION_ID = ZHIJI_APPLICATION_ID;
+export const CAREER_USER_VERSION = ZHIJI_USER_VERSION;
+export const CAREER_V2_SCHEMA_OBJECT_COUNT = Object.keys(
+  ZHIJI_SCHEMA_OBJECT_SQL_VARIANTS[2],
+).length;
 
-const CAREER_V1_REQUIRED_TABLES = [
-  {
-    name: "career_stages",
-    columns: ["id", "name", "color", "position", "is_terminal", "hidden"],
-  },
-  {
-    name: "career_jobs",
-    columns: [
-      "id", "company", "role", "location", "source", "source_url",
-      "stage_id", "priority", "salary", "work_mode", "description",
-      "applied_at", "deadline", "contact_name", "note", "tags",
-      "created_at", "updated_at", "archived", "position",
-    ],
-  },
-  {
-    name: "career_tasks",
-    columns: [
-      "id", "job_id", "title", "due_at", "kind", "priority", "status",
-      "created_at",
-    ],
-  },
-  {
-    name: "career_interviews",
-    columns: [
-      "id", "job_id", "round_name", "interview_type", "scheduled_at",
-      "duration", "interviewer", "meeting_url", "status", "summary",
-      "raw_notes", "questions_json", "reflection", "created_at", "updated_at",
-    ],
-  },
-  {
-    name: "career_contacts",
-    columns: [
-      "id", "company", "name", "role", "channel", "email", "phone",
-      "last_contact_at", "next_follow_up", "notes", "created_at",
-    ],
-  },
-  {
-    name: "career_materials",
-    columns: [
-      "id", "name", "kind", "version", "updated_at", "linked_job_id",
-      "status", "notes", "file_key", "file_name", "mime_type", "byte_size",
-    ],
-  },
-  {
-    name: "career_activity",
-    columns: ["id", "job_id", "type", "detail", "created_at"],
-  },
-  { name: "career_settings", columns: ["key", "value"] },
-] as const;
-
-const CAREER_V2_REQUIRED_TABLES = [
-  ...CAREER_V1_REQUIRED_TABLES.map((table) => {
-    if (table.name === "career_tasks") {
-      return { ...table, columns: [...table.columns, "contact_id"] };
-    }
-    if (table.name === "career_contacts") {
-      return { ...table, columns: [...table.columns, "updated_at", "archived"] };
-    }
-    return table;
-  }),
-  {
-    name: "career_contact_jobs",
-    columns: ["contact_id", "job_id", "created_at"],
-  },
-  {
-    name: "career_contact_interactions",
-    columns: [
-      "id", "contact_id", "job_id", "interaction_type", "direction",
-      "channel", "summary", "notes", "occurred_at", "created_at",
-    ],
-  },
-] as const;
+const CAREER_V1_REQUIRED_TABLES = ZHIJI_V1_TABLES.map((name) => ({
+  name,
+  columns: ZHIJI_V1_TABLE_COLUMNS[name],
+}));
+const CAREER_V3_REQUIRED_TABLES = ZHIJI_TABLES.map((name) => ({
+  name,
+  columns: ZHIJI_TABLE_COLUMNS[name],
+}));
 
 export const CAREER_SCHEMA_REQUIREMENTS = {
   applicationId: CAREER_APPLICATION_ID,
@@ -87,7 +42,7 @@ export const CAREER_SCHEMA_REQUIREMENTS = {
   sourceMinimumUserVersion: 0,
   sourceMaximumUserVersion: CAREER_USER_VERSION,
   sourceRequiredTables: CAREER_V1_REQUIRED_TABLES,
-  requiredTables: CAREER_V2_REQUIRED_TABLES,
+  requiredTables: CAREER_V3_REQUIRED_TABLES,
   allowedViews: [],
   allowedTriggers: [],
 } as const satisfies DatabaseSchemaRequirements;
@@ -229,7 +184,12 @@ function canonicalIdentityStatements(): SqlStatement[] {
   ];
 }
 
-function careerV2MigrationStatements(sourceUserVersion: number): SqlStatement[] {
+type CareerSchemaVersion = 0 | 1 | 2 | 3;
+const SCHEMA_GUARD_TABLE = "temp.__career_restore_schema_guard";
+
+function assertSourceVersion(
+  sourceUserVersion: number,
+): asserts sourceUserVersion is CareerSchemaVersion {
   if (
     !Number.isSafeInteger(sourceUserVersion) ||
     sourceUserVersion < 0 ||
@@ -237,58 +197,287 @@ function careerV2MigrationStatements(sourceUserVersion: number): SqlStatement[] 
   ) {
     throw new TypeError("Unsupported Career restore source user_version.");
   }
-  if (sourceUserVersion === CAREER_USER_VERSION) return [];
+}
+
+function compactSql(value: string): string {
+  return value.replace(/\s+/g, "");
+}
+
+function compactSqlExpression(column: string): string {
+  return `replace(replace(replace(replace(${column},' ',''),char(10),''),char(13),''),char(9),'')`;
+}
+
+function schemaObjects(version: CareerSchemaVersion) {
+  return Object.entries(ZHIJI_SCHEMA_OBJECT_SQL_VARIANTS[version]).map(
+    ([name, sqlVariants]) => ({
+      name,
+      type: /^CREATE\s+(?:UNIQUE\s+)?TABLE\b/i.test(sqlVariants[0])
+        ? "table" as const
+        : "index" as const,
+      sqlVariants,
+    }),
+  );
+}
+
+/**
+ * Verify the complete known DDL, not merely familiar table names. Whitespace is
+ * ignored because SQLite rewrites spacing around ALTER TABLE additions. The
+ * two v2/v3 lineages are accepted only as coherent pairs, never mixed.
+ */
+export function createCareerSchemaGuardStatements(
+  sourceUserVersion: number,
+): SqlStatement[] {
+  assertSourceVersion(sourceUserVersion);
+  const version = sourceUserVersion;
+  const objects = schemaObjects(version);
+  const expectedObjectRows = objects.map(() => "(?, ?)").join(", ");
+  const allowedApplicationIds = version === 0
+    ? [0, CAREER_APPLICATION_ID]
+    : [CAREER_APPLICATION_ID];
+  const applicationIdPlaceholders = allowedApplicationIds.map(() => "?").join(",");
+  const statements: SqlStatement[] = [
+    {
+      sql: `CREATE TEMP TABLE __career_restore_schema_guard (
+        value INTEGER NOT NULL CHECK (value = 1)
+      )`,
+    },
+    {
+      sql: `INSERT INTO ${SCHEMA_GUARD_TABLE}(value)
+        SELECT CASE WHEN
+          (SELECT application_id FROM pragma_application_id)
+            IN (${applicationIdPlaceholders})
+          AND (SELECT user_version FROM pragma_user_version) = ?
+        THEN 1 ELSE 0 END`,
+      params: [...allowedApplicationIds, version],
+    },
+    {
+      sql: `WITH expected(type,name) AS (VALUES ${expectedObjectRows}),
+        actual AS (
+          SELECT type,name FROM sqlite_schema
+          WHERE type IN ('table','index','view','trigger')
+            AND name NOT LIKE 'sqlite_%'
+        )
+        INSERT INTO ${SCHEMA_GUARD_TABLE}(value)
+        SELECT CASE WHEN
+          (SELECT COUNT(*) FROM actual) = ?
+          AND NOT EXISTS (
+            SELECT 1 FROM actual
+            WHERE NOT EXISTS (
+              SELECT 1 FROM expected
+              WHERE expected.type = actual.type AND expected.name = actual.name
+            )
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM expected
+            WHERE NOT EXISTS (
+              SELECT 1 FROM actual
+              WHERE actual.type = expected.type AND actual.name = expected.name
+            )
+          )
+        THEN 1 ELSE 0 END`,
+      params: [
+        ...objects.flatMap(({ type, name }) => [type, name]),
+        objects.length,
+      ],
+    },
+    ...objects.map(({ name, type, sqlVariants }) => ({
+      sql: `INSERT INTO ${SCHEMA_GUARD_TABLE}(value)
+        SELECT CASE WHEN EXISTS (
+          SELECT 1 FROM sqlite_schema
+          WHERE type = ? AND name = ?
+            AND ${compactSqlExpression("sql")} IN (
+              ${sqlVariants.map(() => "?").join(",")}
+            )
+        ) THEN 1 ELSE 0 END`,
+      params: [type, name, ...sqlVariants.map(compactSql)],
+    })),
+  ];
+
+  if (version === 2 || version === 3) {
+    const lineages = ZHIJI_SCHEMA_LINEAGES[version];
+    statements.push({
+      sql: `WITH expected(contacts_sql,tasks_sql) AS (
+          ${lineages.map(() => "SELECT ?,?").join(" UNION ALL ")}
+        )
+        INSERT INTO ${SCHEMA_GUARD_TABLE}(value)
+        SELECT CASE WHEN EXISTS (
+          SELECT 1 FROM expected
+          WHERE contacts_sql = (
+            SELECT ${compactSqlExpression("sql")} FROM sqlite_schema
+            WHERE type='table' AND name='career_contacts'
+          )
+          AND tasks_sql = (
+            SELECT ${compactSqlExpression("sql")} FROM sqlite_schema
+            WHERE type='table' AND name='career_tasks'
+          )
+        ) THEN 1 ELSE 0 END`,
+      params: lineages.flatMap(({ contactsSql, tasksSql }) => [
+        compactSql(contactsSql),
+        compactSql(tasksSql),
+      ]),
+    });
+  }
+
+  const taskStatuses = version === 3
+    ? ["todo", "done", "canceled"]
+    : ["todo", "done", "canceled", "cancelled"];
+  const interviewStatuses = version === 3
+    ? ["scheduled", "completed", "canceled"]
+    : ["scheduled", "completed", "canceled", "cancelled"];
+  statements.push({
+    sql: `INSERT INTO ${SCHEMA_GUARD_TABLE}(value)
+      SELECT CASE WHEN
+        NOT EXISTS (
+          SELECT 1 FROM career_tasks
+          WHERE status NOT IN (${taskStatuses.map(() => "?").join(",")})
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM career_interviews
+          WHERE status NOT IN (${interviewStatuses.map(() => "?").join(",")})
+        )
+      THEN 1 ELSE 0 END`,
+    params: [...taskStatuses, ...interviewStatuses],
+  });
+
+  if (version === 3) {
+    const expectedLedger = [
+      { version: 1, name: ZHIJI_V1_MIGRATION_NAME },
+      { version: 2, name: ZHIJI_V2_MIGRATION_NAME },
+      { version: 3, name: ZHIJI_V3_MIGRATION_NAME },
+    ];
+    statements.push({
+      sql: `INSERT INTO ${SCHEMA_GUARD_TABLE}(value)
+        SELECT CASE WHEN
+          (SELECT COUNT(*) FROM career_schema_migrations) = ?
+          AND NOT EXISTS (
+            SELECT 1 FROM career_schema_migrations AS actual
+            WHERE actual.applied_at IS NULL OR actual.applied_at = ''
+              OR NOT EXISTS (
+                SELECT 1 FROM (
+                  ${expectedLedger.map(() => "SELECT ? AS version,? AS name").join(" UNION ALL ")}
+                ) AS expected
+                WHERE expected.version = actual.version
+                  AND expected.name = actual.name
+              )
+          )
+        THEN 1 ELSE 0 END`,
+      params: [
+        expectedLedger.length,
+        ...expectedLedger.flatMap(({ version: ledgerVersion, name }) => [
+          ledgerVersion,
+          name,
+        ]),
+      ],
+    });
+  }
+
+  statements.push(
+    {
+      sql: `INSERT INTO ${SCHEMA_GUARD_TABLE}(value)
+        SELECT CASE WHEN (
+          SELECT integrity_check FROM pragma_integrity_check LIMIT 1
+        ) = 'ok' THEN 1 ELSE 0 END`,
+    },
+    {
+      sql: `INSERT INTO ${SCHEMA_GUARD_TABLE}(value)
+        SELECT CASE WHEN NOT EXISTS (
+          SELECT 1 FROM pragma_foreign_key_check
+        ) THEN 1 ELSE 0 END`,
+    },
+    { sql: `DROP TABLE ${SCHEMA_GUARD_TABLE}` },
+  );
+  return statements;
+}
+
+function migrationStatements(sourceUserVersion: CareerSchemaVersion): SqlStatement[] {
+  const statements: SqlStatement[] = [];
+  if (sourceUserVersion < 2) {
+    statements.push(
+      ...ZHIJI_V2_SCHEMA_MIGRATION_STATEMENTS,
+      { sql: `PRAGMA application_id = ${CAREER_APPLICATION_ID}` },
+      { sql: "PRAGMA user_version = 2" },
+      ...createCareerSchemaGuardStatements(2),
+    );
+  }
+  if (sourceUserVersion < 3) {
+    statements.push(...ZHIJI_V3_SCHEMA_MIGRATION_STATEMENTS);
+  }
+  statements.push(
+    ...canonicalIdentityStatements(),
+    ...createCareerSchemaGuardStatements(3),
+    { sql: "PRAGMA optimize" },
+  );
+  return statements;
+}
+
+export function createFreshCareerSchemaStatements(): SqlStatement[] {
   return [
-    { sql: "ALTER TABLE career_contacts ADD COLUMN updated_at TEXT" },
+    ...ZHIJI_V1_SCHEMA_STATEMENTS,
+    ...ZHIJI_V2_SCHEMA_MIGRATION_STATEMENTS,
+    ...ZHIJI_V3_SCHEMA_MIGRATION_STATEMENTS,
+    ...canonicalIdentityStatements(),
+    ...createCareerSchemaGuardStatements(3),
+    { sql: "PRAGMA optimize" },
+  ];
+}
+
+export function createCareerRuntimeUpgradeStatements(
+  sourceUserVersion: number,
+): SqlStatement[] {
+  assertSourceVersion(sourceUserVersion);
+  return [
+    ...createCareerSchemaGuardStatements(sourceUserVersion),
+    ...migrationStatements(sourceUserVersion),
+  ];
+}
+
+/**
+ * Recover only three proven runtime interruptions around the historical v2
+ * rollout: v1/migrated-v2, v0/direct-v2, and the development-only
+ * v3/migrated-v2 state. Backup restore deliberately never calls this plan,
+ * because an external file must match the version it declares.
+ */
+export function createInterruptedCareerV2RuntimeRecoveryStatements(
+  currentApplicationId: number,
+  currentUserVersion: number,
+): SqlStatement[] {
+  const migratedLineage =
+    currentApplicationId === CAREER_APPLICATION_ID &&
+    (currentUserVersion === 1 || currentUserVersion === 3);
+  const directLineage =
+    currentApplicationId === 0 && currentUserVersion === 0;
+  if (!migratedLineage && !directLineage) {
+    throw new TypeError("Unsupported interrupted Career runtime identity.");
+  }
+  const lineage = ZHIJI_SCHEMA_LINEAGES[2][directLineage ? 1 : 0];
+  return [
     {
-      sql: "ALTER TABLE career_contacts ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
-    },
-    {
-      sql: "ALTER TABLE career_tasks ADD COLUMN contact_id TEXT REFERENCES career_contacts(id) ON DELETE SET NULL",
-    },
-    {
-      sql: `UPDATE career_contacts
-        SET updated_at = created_at
-        WHERE updated_at IS NULL OR updated_at = ''`,
-    },
-    {
-      sql: `CREATE TABLE career_contact_jobs (
-        contact_id TEXT NOT NULL REFERENCES career_contacts(id) ON DELETE CASCADE,
-        job_id TEXT NOT NULL REFERENCES career_jobs(id) ON DELETE CASCADE,
-        created_at TEXT NOT NULL,
-        PRIMARY KEY (contact_id, job_id)
+      sql: `CREATE TEMP TABLE __career_interrupted_v2_guard (
+        value INTEGER NOT NULL CHECK (value = 1)
       )`,
     },
     {
-      sql: `CREATE TABLE career_contact_interactions (
-        id TEXT PRIMARY KEY,
-        contact_id TEXT NOT NULL REFERENCES career_contacts(id) ON DELETE CASCADE,
-        job_id TEXT REFERENCES career_jobs(id) ON DELETE SET NULL,
-        interaction_type TEXT NOT NULL DEFAULT 'message',
-        direction TEXT NOT NULL DEFAULT 'outbound'
-          CHECK (direction IN ('outbound', 'inbound', 'mutual')),
-        channel TEXT NOT NULL DEFAULT '',
-        summary TEXT NOT NULL,
-        notes TEXT NOT NULL DEFAULT '',
-        occurred_at TEXT NOT NULL,
-        created_at TEXT NOT NULL
-      )`,
+      sql: `INSERT INTO temp.__career_interrupted_v2_guard(value)
+        SELECT CASE WHEN
+          (SELECT application_id FROM pragma_application_id) = ?
+          AND (SELECT user_version FROM pragma_user_version) = ?
+          AND (SELECT ${compactSqlExpression("sql")} FROM sqlite_schema
+            WHERE type='table' AND name='career_contacts') = ?
+          AND (SELECT ${compactSqlExpression("sql")} FROM sqlite_schema
+            WHERE type='table' AND name='career_tasks') = ?
+        THEN 1 ELSE 0 END`,
+      params: [
+        currentApplicationId,
+        currentUserVersion,
+        compactSql(lineage.contactsSql),
+        compactSql(lineage.tasksSql),
+      ],
     },
-    {
-      sql: "CREATE INDEX idx_career_contacts_archived_name ON career_contacts(archived, name)",
-    },
-    {
-      sql: "CREATE INDEX idx_career_tasks_contact_due ON career_tasks(contact_id, status, due_at)",
-    },
-    {
-      sql: "CREATE INDEX idx_career_contact_jobs_job ON career_contact_jobs(job_id, contact_id)",
-    },
-    {
-      sql: "CREATE INDEX idx_career_contact_interactions_contact_date ON career_contact_interactions(contact_id, occurred_at DESC)",
-    },
-    {
-      sql: "CREATE INDEX idx_career_contact_interactions_job_date ON career_contact_interactions(job_id, occurred_at DESC)",
-    },
+    { sql: "DROP TABLE temp.__career_interrupted_v2_guard" },
+    { sql: `PRAGMA application_id = ${CAREER_APPLICATION_ID}` },
+    { sql: "PRAGMA user_version = 2" },
+    ...createCareerSchemaGuardStatements(2),
+    ...migrationStatements(2),
   ];
 }
 
@@ -305,7 +494,7 @@ export function createCompleteCareerRestoreStatements(
   const staged = mappings.map((mapping) => mapping.staged);
 
   return [
-    ...careerV2MigrationStatements(sourceUserVersion),
+    ...createCareerSchemaGuardStatements(sourceUserVersion),
     {
       sql: `CREATE TEMP TABLE __career_restore_guard (
         value INTEGER NOT NULL CHECK (value = 1)
@@ -326,7 +515,7 @@ export function createCompleteCareerRestoreStatements(
     })),
     materialGuardStatement(staged),
     { sql: `DROP TABLE ${GUARD_TABLE}` },
-    ...canonicalIdentityStatements(),
+    ...migrationStatements(sourceUserVersion as CareerSchemaVersion),
   ];
 }
 
@@ -338,12 +527,13 @@ export function createCompleteCareerRestoreStatements(
 export function createLegacyCareerRestoreStatements(
   sourceUserVersion = CAREER_USER_VERSION,
 ): SqlStatement[] {
+  assertSourceVersion(sourceUserVersion);
   return [
-    ...careerV2MigrationStatements(sourceUserVersion),
+    ...createCareerSchemaGuardStatements(sourceUserVersion),
     {
       sql: `UPDATE career_materials
         SET file_key = NULL, file_name = NULL, mime_type = NULL, byte_size = NULL`,
     },
-    ...canonicalIdentityStatements(),
+    ...migrationStatements(sourceUserVersion),
   ];
 }

@@ -60,21 +60,26 @@ for (const contract of [
     filename: "zhiji.sqlite3",
     minimumTables: 12,
     seedTable: "career_stages",
-    minimumSeedRows: 6,
+    minimumSeedRows: 9,
     emptyTables: [
-      "app_meta",
-      "career_profiles",
-      "companies",
-      "job_applications",
-      "application_events",
       "career_tasks",
-      "interviews",
-      "contacts",
-      "contact_interactions",
-      "career_documents",
-      "application_documents",
-      "career_notes",
+      "career_jobs",
+      "career_interviews",
+      "career_contacts",
+      "career_contact_jobs",
+      "career_contact_interactions",
+      "career_materials",
+      "career_activity",
+      "career_lifecycle_events",
     ],
+    migrationLedger: {
+      table: "career_schema_migrations",
+      rows: [
+        { version: 1, name: "initial-career-runtime" },
+        { version: 2, name: "contact-history" },
+        { version: 3, name: "reversible-lifecycle" },
+      ],
+    },
   },
   {
     path: "lib/schemas/shici.ts",
@@ -85,6 +90,7 @@ for (const contract of [
     seedTable: "vocabulary_entries",
     minimumSeedRows: 6,
     emptyTables: [],
+    migrationLedger: null,
   },
   {
     path: "lib/schemas/shilian.ts",
@@ -95,6 +101,7 @@ for (const contract of [
     seedTable: null,
     minimumSeedRows: 0,
     emptyTables: [],
+    migrationLedger: null,
   },
 ]) {
   test(`${contract.name} reference schema and seed policy are idempotent`, async () => {
@@ -131,6 +138,14 @@ for (const contract of [
             Number(database.selectValue(`SELECT COUNT(*) FROM ${table}`)),
             0,
             `${contract.name}.${table} must not contain inferred personal data`,
+          );
+        }
+        if (contract.migrationLedger) {
+          assert.deepEqual(
+            database.selectObjects(
+              `SELECT version,name FROM ${contract.migrationLedger.table} ORDER BY version`,
+            ).map((row) => ({ ...row })),
+            contract.migrationLedger.rows,
           );
         }
       } else {

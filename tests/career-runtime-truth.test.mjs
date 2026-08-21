@@ -47,7 +47,7 @@ function executeRun(database, sql, params = []) {
   };
 }
 
-function adapterFor(database) {
+function adapterFor(database, { failOnSql = null } = {}) {
   return {
     async init() {
       return {
@@ -67,9 +67,12 @@ function adapterFor(database) {
       return executeRun(database, sql, params);
     },
     async batch(_name, statements, options = {}) {
-      const operation = () => statements.map(({ sql, params = [] }) =>
-        executeRun(database, sql, params)
-      );
+      const operation = () => statements.map(({ sql, params = [] }) => {
+        if (failOnSql && sql.includes(failOnSql)) {
+          throw new Error(`injected storage failure at ${failOnSql}`);
+        }
+        return executeRun(database, sql, params);
+      });
       const results = options.transaction === false
         ? operation()
         : database.transaction("IMMEDIATE", operation);
@@ -108,6 +111,15 @@ globalThis.__careerLocalDbProxy = {
   },
 };
 
+const schemaJavaScript = await transpile("lib/schemas/zhiji.ts");
+const schemaModuleUrl = moduleUrl(schemaJavaScript);
+const careerSchema = await import(schemaModuleUrl);
+let backupPlanJavaScript = await transpile("lib/career/backup-plan.ts");
+backupPlanJavaScript = backupPlanJavaScript.replaceAll(
+  '"../schemas/zhiji"',
+  `"${schemaModuleUrl}"`,
+);
+const backupPlanModuleUrl = moduleUrl(backupPlanJavaScript);
 const [lockJavaScript, rawDatabaseJavaScript] = await Promise.all([
   transpile("lib/career/lock.ts"),
   transpile("lib/career/db.ts"),
@@ -117,9 +129,7 @@ const dependencyUrls = {
     "export const localDb = globalThis.__careerLocalDbProxy;",
   ),
   "./lock": moduleUrl(lockJavaScript),
-  "./backup-plan": moduleUrl(
-    "export const CAREER_APPLICATION_ID=0x5a484a49; export const CAREER_USER_VERSION=2;",
-  ),
+  "./backup-plan": backupPlanModuleUrl,
 };
 let databaseJavaScript = rawDatabaseJavaScript;
 for (const [specifier, url] of Object.entries(dependencyUrls)) {
@@ -136,6 +146,58 @@ async function databaseFixture() {
   return database;
 }
 
+function legacyDatabaseFixture(version, adapterOptions = {}) {
+  assert.ok(version === 1 || version === 2);
+  const database = new sqlite3.oo1.DB(":memory:", "c");
+  database.exec("PRAGMA foreign_keys=ON");
+  database.transaction("IMMEDIATE", () => {
+    for (const statement of careerSchema.ZHIJI_V1_SCHEMA_STATEMENTS) {
+      executeRun(database, statement.sql, statement.params ?? []);
+    }
+    if (version === 2) {
+      for (const statement of careerSchema.ZHIJI_V2_SCHEMA_MIGRATION_STATEMENTS) {
+        executeRun(database, statement.sql, statement.params ?? []);
+      }
+    }
+    for (const statement of careerDb.CAREER_STRUCTURAL_STAGE_STATEMENTS) {
+      executeRun(database, statement.sql, statement.params ?? []);
+    }
+    database.exec(`PRAGMA application_id=${careerSchema.ZHIJI_APPLICATION_ID}`);
+    database.exec(`PRAGMA user_version=${version}`);
+  });
+  globalThis.__careerLocalDbAdapter = adapterFor(database, adapterOptions);
+  return database;
+}
+
+function directVersionTwoDatabaseFixture({
+  applicationId = careerSchema.ZHIJI_APPLICATION_ID,
+  userVersion = 2,
+} = {}) {
+  const database = new sqlite3.oo1.DB(":memory:", "c");
+  database.exec("PRAGMA foreign_keys=ON");
+  const objectSql = Object.entries(
+    careerSchema.ZHIJI_SCHEMA_OBJECT_SQL_VARIANTS[2],
+  ).map(([name, variants]) => ({
+    name,
+    sql: name === "career_contacts" || name === "career_tasks"
+      ? variants[1]
+      : variants[0],
+  }));
+  database.transaction("IMMEDIATE", () => {
+    for (const { sql } of objectSql.filter(({ sql }) =>
+      /^CREATE\s+TABLE\b/i.test(sql))) database.exec(sql);
+    for (const { sql } of objectSql.filter(({ sql }) =>
+      /^CREATE\s+INDEX\b/i.test(sql))) database.exec(sql);
+    for (const statement of careerDb.CAREER_STRUCTURAL_STAGE_STATEMENTS) {
+      executeRun(database, statement.sql, statement.params ?? []);
+    }
+    database.exec(`PRAGMA application_id=${applicationId}`);
+    database.exec(`PRAGMA user_version=${userVersion}`);
+  });
+  globalThis.__careerLocalDbAdapter = adapterFor(database);
+  return database;
+}
+
 function generatedId(prefix, number) {
   return `${prefix}_00000000-0000-4000-8000-${String(number).padStart(12, "0")}`;
 }
@@ -149,7 +211,7 @@ function hasColumn(database, table, column) {
     .some((candidate) => candidate.name === column);
 }
 
-function installUntouchedLegacyDemo(database) {
+function installUntouchedLegacyDemo(database, sourceUserVersion = 3) {
   const now = "2026-08-21T06:15:32.456Z";
   const jobs = {
     Linear: generatedId("job", 1),
@@ -261,7 +323,10 @@ function installUntouchedLegacyDemo(database) {
   ));
   insert(database, "INSERT INTO career_settings(key,value) VALUES ('seed_version','1')", []);
   insert(database, "INSERT INTO career_settings(key,value) VALUES ('weekly_goal','8')", []);
-  database.exec("PRAGMA user_version=1");
+  if (hasColumn(database, "career_tasks", "updated_at")) {
+    database.exec("UPDATE career_tasks SET updated_at=created_at");
+  }
+  database.exec(`PRAGMA user_version=${sourceUserVersion}`);
   return { jobs, contactIds, materialIds };
 }
 
@@ -274,6 +339,7 @@ const businessTables = [
   "career_contact_interactions",
   "career_materials",
   "career_activity",
+  "career_lifecycle_events",
 ];
 
 function count(database, table) {
@@ -284,45 +350,17 @@ function assertIntegrity(database) {
   assert.equal(database.selectValue("PRAGMA integrity_check"), "ok");
   assert.deepEqual(database.selectObjects("PRAGMA foreign_key_check"), []);
   assert.equal(Number(database.selectValue("PRAGMA application_id")), 0x5a484a49);
-  assert.equal(Number(database.selectValue("PRAGMA user_version")), 2);
-}
-
-function downgradeEmptyContactsToV1(database) {
-  database.exec("PRAGMA foreign_keys=OFF");
-  try {
-    database.exec(`
-      DROP TABLE career_contact_interactions;
-      DROP TABLE career_contact_jobs;
-      DROP TABLE career_tasks;
-      DROP TABLE career_contacts;
-
-      CREATE TABLE career_contacts (
-        id TEXT PRIMARY KEY,
-        company TEXT NOT NULL DEFAULT '',
-        name TEXT NOT NULL,
-        role TEXT NOT NULL DEFAULT '',
-        channel TEXT NOT NULL DEFAULT '',
-        email TEXT NOT NULL DEFAULT '',
-        phone TEXT NOT NULL DEFAULT '',
-        last_contact_at TEXT,
-        next_follow_up TEXT,
-        notes TEXT NOT NULL DEFAULT '',
-        created_at TEXT NOT NULL
-      );
-      CREATE TABLE career_tasks (
-        id TEXT PRIMARY KEY,
-        job_id TEXT REFERENCES career_jobs(id) ON DELETE SET NULL,
-        title TEXT NOT NULL,
-        due_at TEXT,
-        kind TEXT NOT NULL DEFAULT '跟进',
-        priority INTEGER NOT NULL DEFAULT 1,
-        status TEXT NOT NULL DEFAULT 'todo',
-        created_at TEXT NOT NULL
-      );
-    `);
-  } finally {
-    database.exec("PRAGMA foreign_keys=ON");
-  }
+  assert.equal(Number(database.selectValue("PRAGMA user_version")), 3);
+  assert.deepEqual(
+    database.selectObjects(
+      "SELECT version,name FROM career_schema_migrations ORDER BY version",
+    ).map((row) => ({ ...row })),
+    [
+      { version: 1, name: "initial-career-runtime" },
+      { version: 2, name: "contact-history" },
+      { version: 3, name: "reversible-lifecycle" },
+    ],
+  );
 }
 
 test("fresh Career runtime contains workflow structure and no invented life history", async () => {
@@ -362,11 +400,10 @@ test("an untouched legacy demo is removed atomically and only once", async () =>
   }
 });
 
-test("an untouched v1 demo migrates to the contact v2 schema before cleanup", async () => {
-  const database = await databaseFixture();
+test("an untouched v1 demo migrates atomically to canonical v3 before cleanup", async () => {
+  const database = legacyDatabaseFixture(1);
   try {
-    downgradeEmptyContactsToV1(database);
-    installUntouchedLegacyDemo(database);
+    installUntouchedLegacyDemo(database, 1);
     await careerDb.initializeCareerDb();
 
     assert.equal(hasColumn(database, "career_contacts", "updated_at"), true);
@@ -378,10 +415,323 @@ test("an untouched v1 demo migrates to the contact v2 schema before cleanup", as
       ),
       "table",
     );
+    assert.equal(hasColumn(database, "career_jobs", "archived_at"), true);
+    assert.equal(hasColumn(database, "career_tasks", "canceled_at"), true);
+    assert.equal(
+      database.selectValue(
+        "SELECT type FROM sqlite_schema WHERE name='career_lifecycle_events'",
+      ),
+      "table",
+    );
     for (const table of businessTables) assert.equal(count(database, table), 0, table);
     assert.equal(count(database, "career_stages"), 9);
     assert.equal(await careerDb.getCareerLegacyDemoResolution(), "cleaned");
     assertIntegrity(database);
+  } finally {
+    database.close();
+  }
+});
+
+test("v2 runtime migration preserves facts and backfills canonical v3 history", async () => {
+  const database = legacyDatabaseFixture(2);
+  try {
+    const createdAt = "2026-08-20T01:00:00.000Z";
+    const updatedAt = "2026-08-21T01:00:00.000Z";
+    const terminalJob = generatedId("job", 81);
+    const archivedJob = generatedId("job", 82);
+    for (const [jobId, company, stageId, archived] of [
+      [terminalJob, "Terminal fact", "stage_rejected", 0],
+      [archivedJob, "Archived fact", "stage_applied", 1],
+    ]) {
+      insert(database, `INSERT INTO career_jobs
+        (id,company,role,stage_id,created_at,updated_at,archived)
+        VALUES (?,?,?,?,?,?,?)`, [
+        jobId, company, "Role", stageId, createdAt, updatedAt, archived,
+      ]);
+    }
+    insert(database, `INSERT INTO career_tasks
+      (id,job_id,title,status,created_at) VALUES (?,?,?,'todo',?)`, [
+      generatedId("task", 81), terminalJob, "Preserved task", createdAt,
+    ]);
+    insert(database, `INSERT INTO career_interviews
+      (id,job_id,round_name,status,created_at,updated_at)
+      VALUES (?,?,?,'completed',?,?)`, [
+      generatedId("interview", 81), terminalJob, "Preserved interview",
+      createdAt, updatedAt,
+    ]);
+
+    await careerDb.initializeCareerDb();
+
+    assert.equal(count(database, "career_jobs"), 2);
+    assert.equal(count(database, "career_tasks"), 1);
+    assert.equal(count(database, "career_interviews"), 1);
+    assert.deepEqual(
+      database.selectObjects(`SELECT company,archived_at,ended_at
+        FROM career_jobs ORDER BY company`).map((row) => ({ ...row })),
+      [
+        { company: "Archived fact", archived_at: updatedAt, ended_at: null },
+        { company: "Terminal fact", archived_at: null, ended_at: updatedAt },
+      ],
+    );
+    assert.equal(
+      database.selectValue("SELECT updated_at FROM career_tasks"),
+      createdAt,
+    );
+    assert.equal(count(database, "career_lifecycle_events"), 0);
+    assertIntegrity(database);
+  } finally {
+    database.close();
+  }
+});
+
+test("v2 migration normalizes only the known cancelled status alias", async () => {
+  const database = legacyDatabaseFixture(2);
+  try {
+    const now = "2026-08-21T01:00:00.000Z";
+    const jobId = generatedId("job", 86);
+    insert(database, `INSERT INTO career_jobs
+      (id,company,role,stage_id,created_at,updated_at)
+      VALUES (?,?,?,?,?,?)`, [
+      jobId, "Alias fact", "Role", "stage_applied", now, now,
+    ]);
+    insert(database, `INSERT INTO career_tasks
+      (id,job_id,title,status,created_at) VALUES (?,?,?,?,?)`, [
+      generatedId("task", 86), jobId, "Alias task", "cancelled", now,
+    ]);
+    insert(database, `INSERT INTO career_interviews
+      (id,job_id,round_name,status,created_at,updated_at)
+      VALUES (?,?,?,?,?,?)`, [
+      generatedId("interview", 86), jobId, "Alias interview", "cancelled", now, now,
+    ]);
+
+    await careerDb.initializeCareerDb();
+
+    assert.equal(database.selectValue("SELECT status FROM career_tasks"), "canceled");
+    assert.equal(
+      database.selectValue("SELECT status FROM career_interviews"),
+      "canceled",
+    );
+    assertIntegrity(database);
+  } finally {
+    database.close();
+  }
+});
+
+for (const entity of ["task", "interview"]) {
+  test(`v2 migration rejects an unknown ${entity} status without changing facts`, async () => {
+    const database = legacyDatabaseFixture(2);
+    try {
+      const now = "2026-08-21T01:00:00.000Z";
+      const jobId = generatedId("job", entity === "task" ? 87 : 88);
+      insert(database, `INSERT INTO career_jobs
+        (id,company,role,stage_id,created_at,updated_at)
+        VALUES (?,?,?,?,?,?)`, [
+        jobId, "Unknown status fact", "Role", "stage_applied", now, now,
+      ]);
+      if (entity === "task") {
+        insert(database, `INSERT INTO career_tasks
+          (id,job_id,title,status,created_at) VALUES (?,?,?,?,?)`, [
+          generatedId("task", 87), jobId, "Unknown task", "mystery", now,
+        ]);
+      } else {
+        insert(database, `INSERT INTO career_interviews
+          (id,job_id,round_name,status,created_at,updated_at)
+          VALUES (?,?,?,?,?,?)`, [
+          generatedId("interview", 88), jobId, "Unknown interview", "mystery",
+          now, now,
+        ]);
+      }
+
+      await assert.rejects(careerDb.initializeCareerDb(), /本次没有改动它/);
+
+      assert.equal(Number(database.selectValue("PRAGMA user_version")), 2);
+      assert.equal(
+        database.selectValue(`SELECT status FROM career_${entity === "task" ? "tasks" : "interviews"}`),
+        "mystery",
+      );
+      assert.equal(hasColumn(database, "career_jobs", "archived_at"), false);
+      assert.equal(database.selectValue("PRAGMA integrity_check"), "ok");
+    } finally {
+      database.close();
+    }
+  });
+}
+
+test("the historical direct-v2 lineage upgrades to and reopens as exact direct-v3", async () => {
+  const database = directVersionTwoDatabaseFixture();
+  try {
+    const now = "2026-08-21T01:00:00.000Z";
+    const jobId = generatedId("job", 83);
+    const contactId = generatedId("contact", 83);
+    insert(database, `INSERT INTO career_jobs
+      (id,company,role,stage_id,created_at,updated_at)
+      VALUES (?,?,?,?,?,?)`, [
+      jobId, "Direct lineage fact", "Role", "stage_applied", now, now,
+    ]);
+    insert(database, `INSERT INTO career_contacts
+      (id,name,created_at,updated_at) VALUES (?,?,?,?)`, [
+      contactId, "Direct contact", now, now,
+    ]);
+    insert(database, `INSERT INTO career_tasks
+      (id,job_id,contact_id,title,status,created_at)
+      VALUES (?,?,?,?,?,?)`, [
+      generatedId("task", 83), jobId, contactId, "Direct task", "todo", now,
+    ]);
+
+    await careerDb.initializeCareerDb();
+    assert.equal(count(database, "career_jobs"), 1);
+    assert.equal(count(database, "career_contacts"), 1);
+    assert.equal(count(database, "career_tasks"), 1);
+    assert.equal(database.selectValue("SELECT updated_at FROM career_tasks"), now);
+    assertIntegrity(database);
+
+    await careerDb.initializeCareerDb();
+    assert.equal(count(database, "career_jobs"), 1);
+    assertIntegrity(database);
+  } finally {
+    database.close();
+  }
+});
+
+test("runtime repairs historical user_version 1 after the full migrated-v2 DDL landed", async () => {
+  const database = legacyDatabaseFixture(2);
+  try {
+    const now = "2026-08-21T01:00:00.000Z";
+    insert(database, `INSERT INTO career_jobs
+      (id,company,role,stage_id,note,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?)`, [
+      generatedId("job", 89), "Interrupted v1 fact", "Role", "stage_applied",
+      "must survive", now, now,
+    ]);
+    database.exec("PRAGMA user_version=1");
+
+    await careerDb.initializeCareerDb();
+
+    assert.equal(database.selectValue("SELECT note FROM career_jobs"), "must survive");
+    assertIntegrity(database);
+  } finally {
+    database.close();
+  }
+});
+
+test("runtime adopts only the pre-identity v0 exact direct-v2 lineage", async () => {
+  const database = directVersionTwoDatabaseFixture({
+    applicationId: 0,
+    userVersion: 0,
+  });
+  try {
+    const now = "2026-08-21T01:00:00.000Z";
+    insert(database, `INSERT INTO career_jobs
+      (id,company,role,stage_id,note,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?)`, [
+      generatedId("job", 90), "Interrupted v0 fact", "Role", "stage_applied",
+      "must survive", now, now,
+    ]);
+
+    await careerDb.initializeCareerDb();
+
+    assert.equal(database.selectValue("SELECT note FROM career_jobs"), "must survive");
+    assertIntegrity(database);
+  } finally {
+    database.close();
+  }
+});
+
+test("runtime narrowly repairs the known v3-identity with exact migrated-v2 DDL", async () => {
+  const database = legacyDatabaseFixture(2);
+  try {
+    const now = "2026-08-21T01:00:00.000Z";
+    insert(database, `INSERT INTO career_jobs
+      (id,company,role,stage_id,note,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?)`, [
+      generatedId("job", 84), "Interrupted v3 fact", "Role", "stage_applied",
+      "must survive", now, now,
+    ]);
+    database.exec("PRAGMA user_version=3");
+
+    await careerDb.initializeCareerDb();
+
+    assert.equal(count(database, "career_jobs"), 1);
+    assert.equal(
+      database.selectValue("SELECT note FROM career_jobs"),
+      "must survive",
+    );
+    assert.equal(hasColumn(database, "career_jobs", "archived_at"), true);
+    assert.equal(
+      database.selectValue(
+        "SELECT type FROM sqlite_schema WHERE name='career_lifecycle_events'",
+      ),
+      "table",
+    );
+    assertIntegrity(database);
+  } finally {
+    database.close();
+  }
+});
+
+test("interrupted-v3 repair rolls identity, DDL, and facts back on migration failure", async () => {
+  const database = legacyDatabaseFixture(2, {
+    failOnSql: "ALTER TABLE career_tasks ADD COLUMN canceled_at",
+  });
+  try {
+    const now = "2026-08-21T01:00:00.000Z";
+    insert(database, `INSERT INTO career_jobs
+      (id,company,role,stage_id,created_at,updated_at)
+      VALUES (?,?,?,?,?,?)`, [
+      generatedId("job", 85), "Interrupted rollback fact", "Role",
+      "stage_applied", now, now,
+    ]);
+    database.exec("PRAGMA user_version=3");
+
+    await assert.rejects(
+      careerDb.initializeCareerDb(),
+      /本次没有改动它/,
+    );
+
+    assert.equal(Number(database.selectValue("PRAGMA user_version")), 3);
+    assert.equal(count(database, "career_jobs"), 1);
+    assert.equal(hasColumn(database, "career_jobs", "archived_at"), false);
+    assert.equal(
+      database.selectValue(
+        "SELECT type FROM sqlite_schema WHERE name='career_schema_migrations'",
+      ),
+      undefined,
+    );
+    assert.equal(database.selectValue("PRAGMA integrity_check"), "ok");
+  } finally {
+    database.close();
+  }
+});
+
+test("a mid-v2-to-v3 storage failure rolls every schema and fact change back", async () => {
+  const database = legacyDatabaseFixture(2, {
+    failOnSql: "ALTER TABLE career_tasks ADD COLUMN canceled_at",
+  });
+  try {
+    const now = "2026-08-21T01:00:00.000Z";
+    insert(database, `INSERT INTO career_jobs
+      (id,company,role,stage_id,created_at,updated_at)
+      VALUES (?,?,?,?,?,?)`, [
+      generatedId("job", 91), "Rollback fact", "Role", "stage_applied", now, now,
+    ]);
+
+    await assert.rejects(
+      careerDb.initializeCareerDb(),
+      /本次没有改动它/,
+    );
+
+    assert.equal(Number(database.selectValue("PRAGMA user_version")), 2);
+    assert.equal(count(database, "career_jobs"), 1);
+    assert.equal(hasColumn(database, "career_jobs", "archived_at"), false);
+    assert.equal(hasColumn(database, "career_tasks", "updated_at"), false);
+    assert.equal(
+      database.selectValue(
+        "SELECT type FROM sqlite_schema WHERE name='career_schema_migrations'",
+      ),
+      undefined,
+    );
+    assert.equal(database.selectValue("PRAGMA integrity_check"), "ok");
+    assert.deepEqual(database.selectObjects("PRAGMA foreign_key_check"), []);
   } finally {
     database.close();
   }
@@ -428,6 +778,29 @@ for (const scenario of [
     },
     expectedJobs: 6,
   },
+  {
+    name: "one real lifecycle event",
+    mutate(database, fixture) {
+      insert(database, `INSERT INTO career_lifecycle_events
+        (id,job_id,entity_type,entity_id,action,reason,created_at)
+        VALUES (?,?,?,?,?,?,?)`, [
+        generatedId("lifecycle", 1), fixture.jobs.Arc, "job", fixture.jobs.Arc,
+        "note_lifecycle_fact", "真实生命周期事实", "2026-08-21T07:00:00.000Z",
+      ]);
+    },
+    expectedJobs: 6,
+    expectedLifecycleEvents: 1,
+  },
+  {
+    name: "one lifecycle operation marker",
+    mutate(database) {
+      database.exec(`UPDATE career_tasks
+        SET lifecycle_operation_id='operation_user_fact'
+        WHERE title='准备 Arc 技术二面：性能与动效'`);
+    },
+    expectedJobs: 6,
+    expectedTaskOperationMarker: "operation_user_fact",
+  },
 ]) {
   test(`legacy cleanup preserves everything and flags review after ${scenario.name}`, async () => {
     const database = await databaseFixture();
@@ -440,6 +813,18 @@ for (const scenario of [
       assert.equal(count(database, "career_contacts"), 3);
       assert.equal(count(database, "career_materials"), 3);
       assert.equal(count(database, "career_activity"), 3);
+      assert.equal(
+        count(database, "career_lifecycle_events"),
+        scenario.expectedLifecycleEvents ?? 0,
+      );
+      if (scenario.expectedTaskOperationMarker) {
+        assert.equal(
+          database.selectValue(`SELECT lifecycle_operation_id
+            FROM career_tasks
+            WHERE title='准备 Arc 技术二面：性能与动效'`),
+          scenario.expectedTaskOperationMarker,
+        );
+      }
       assert.equal(await careerDb.getCareerLegacyDemoResolution(), "review-needed");
 
       await careerDb.initializeCareerDb();
@@ -475,11 +860,85 @@ test("pre-existing user data without the legacy marker is never treated as demo 
   }
 });
 
+test("loadCareerData hides archived-job dependents without erasing terminal history", async () => {
+  const database = await databaseFixture();
+  try {
+    const now = "2026-08-21T06:15:32.456Z";
+    const jobs = {
+      active: generatedId("job", 201),
+      terminal: generatedId("job", 202),
+      archived: generatedId("job", 203),
+    };
+    for (const [jobId, company, stageId, archived] of [
+      [jobs.active, "Active", "stage_applied", 0],
+      [jobs.terminal, "Terminal", "stage_rejected", 0],
+      [jobs.archived, "Archived", "stage_interview", 1],
+    ]) {
+      insert(database, `INSERT INTO career_jobs
+        (id,company,role,stage_id,created_at,updated_at,archived,archived_at)
+        VALUES (?,?,?,?,?,?,?,?)`, [
+        jobId, company, "Role", stageId, now, now, archived,
+        archived ? now : null,
+      ]);
+    }
+
+    for (const [number, jobId, title] of [
+      [201, jobs.active, "active task"],
+      [202, jobs.terminal, "terminal task"],
+      [203, jobs.archived, "archived task"],
+      [204, null, "unlinked task"],
+    ]) {
+      insert(database, `INSERT INTO career_tasks
+        (id,job_id,title,status,created_at,updated_at)
+        VALUES (?,?,?,'todo',?,?)`, [generatedId("task", number), jobId, title, now, now]);
+    }
+
+    for (const [number, jobId, roundName] of [
+      [201, jobs.active, "active interview"],
+      [202, jobs.terminal, "terminal interview"],
+      [203, jobs.archived, "archived interview"],
+    ]) {
+      insert(database, `INSERT INTO career_interviews
+        (id,job_id,round_name,status,created_at,updated_at)
+        VALUES (?,?,?,'scheduled',?,?)`, [
+        generatedId("interview", number), jobId, roundName, now, now,
+      ]);
+    }
+
+    for (const [number, jobId, detail] of [
+      [201, jobs.active, "active activity"],
+      [202, jobs.terminal, "terminal activity"],
+      [203, jobs.archived, "archived activity"],
+      [204, null, "unlinked activity"],
+    ]) {
+      insert(database, `INSERT INTO career_activity
+        (id,job_id,type,detail,created_at) VALUES (?,?,'test',?,?)`, [
+        generatedId("activity", number), jobId, detail, now,
+      ]);
+    }
+
+    const data = await careerDb.loadCareerData();
+    assert.deepEqual(data.jobs.map(({ company }) => company).sort(), ["Active", "Terminal"]);
+    assert.deepEqual(data.tasks.map(({ title }) => title).sort(), [
+      "active task", "terminal task", "unlinked task",
+    ]);
+    assert.deepEqual(data.interviews.map(({ round_name }) => round_name).sort(), [
+      "active interview", "terminal interview",
+    ]);
+    assert.deepEqual(data.activities.map(({ detail }) => detail).sort(), [
+      "active activity", "terminal activity", "unlinked activity",
+    ]);
+    assertIntegrity(database);
+  } finally {
+    database.close();
+  }
+});
+
 test("legacy resolution is lock-scoped, transactional, and never deletes OPFS", async () => {
   const source = await readFile(new URL("lib/career/db.ts", projectRoot), "utf8");
   assert.match(
     source,
-    /withCareerWriteLock\(async \(lockContext\) =>[\s\S]*runCareerBatch\(CAREER_LEGACY_DEMO_RESOLUTION_STATEMENTS, lockContext\)/,
+    /withCareerWriteLock\(async \(lockContext\) =>[\s\S]*\.\.\.CAREER_LEGACY_DEMO_RESOLUTION_STATEMENTS[\s\S]*lockContext/,
   );
   assert.match(source, /CREATE TEMP TABLE IF NOT EXISTS __career_legacy_demo_guard/);
   assert.match(source, /CAREER_LEGACY_DEMO_RESOLUTION_SETTING/);

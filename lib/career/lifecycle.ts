@@ -5,6 +5,7 @@ import {
   withCareerWriteLock,
   type CareerLockContext,
 } from "./lock";
+import { ZHIJI_V3_SCHEMA_MIGRATION_STATEMENTS } from "../schemas/zhiji";
 import type { Interview, Job, Task } from "./types";
 
 const DB = "career" as const;
@@ -48,75 +49,27 @@ export type CareerTaskCancellationReason =
   | "changed_plan"
   | "other";
 
+export type CareerTaskRestoreOptions = Readonly<{
+  /** Omit to retain an existing safe date; pass null to restore without one. */
+  dueAt?: string | null;
+  now?: string;
+  operationId?: string;
+}>;
+
+export type CareerInterviewRestoreOptions = Readonly<{
+  /** Omit to retain an existing future schedule. */
+  scheduledAt?: string;
+  now?: string;
+  operationId?: string;
+}>;
+
 /**
  * Additive v3 migration. A current row carries the exact lifecycle operation
  * that paused it; the immutable ledger retains every earlier decision. This
  * lets a later restore touch only rows paused by the matching job operation.
  */
-export const CAREER_LIFECYCLE_V3_MIGRATION_STATEMENTS: readonly SqlStatement[] = [
-  { sql: "ALTER TABLE career_jobs ADD COLUMN archived_at TEXT" },
-  { sql: "ALTER TABLE career_jobs ADD COLUMN ended_at TEXT" },
-  { sql: "ALTER TABLE career_jobs ADD COLUMN archived_operation_id TEXT" },
-  { sql: "ALTER TABLE career_jobs ADD COLUMN ended_operation_id TEXT" },
-  { sql: "ALTER TABLE career_tasks ADD COLUMN updated_at TEXT" },
-  { sql: "ALTER TABLE career_tasks ADD COLUMN canceled_at TEXT" },
-  { sql: "ALTER TABLE career_tasks ADD COLUMN cancellation_reason TEXT" },
-  { sql: "ALTER TABLE career_tasks ADD COLUMN lifecycle_previous_status TEXT" },
-  { sql: "ALTER TABLE career_tasks ADD COLUMN lifecycle_operation_id TEXT" },
-  { sql: "ALTER TABLE career_interviews ADD COLUMN canceled_at TEXT" },
-  { sql: "ALTER TABLE career_interviews ADD COLUMN cancellation_reason TEXT" },
-  { sql: "ALTER TABLE career_interviews ADD COLUMN lifecycle_previous_status TEXT" },
-  { sql: "ALTER TABLE career_interviews ADD COLUMN lifecycle_operation_id TEXT" },
-  {
-    sql: `CREATE TABLE career_lifecycle_events (
-      id TEXT PRIMARY KEY,
-      job_id TEXT REFERENCES career_jobs(id) ON DELETE SET NULL,
-      entity_type TEXT NOT NULL CHECK (entity_type IN ('job','task','interview')),
-      entity_id TEXT NOT NULL,
-      action TEXT NOT NULL,
-      previous_status TEXT,
-      next_status TEXT,
-      previous_due_at TEXT,
-      next_due_at TEXT,
-      reason TEXT NOT NULL DEFAULT '',
-      created_at TEXT NOT NULL
-    )`,
-  },
-  {
-    sql: `UPDATE career_tasks
-      SET updated_at = created_at
-      WHERE updated_at IS NULL OR updated_at = ''`,
-  },
-  {
-    sql: `UPDATE career_jobs
-      SET archived_at = updated_at
-      WHERE archived = 1 AND archived_at IS NULL`,
-  },
-  {
-    sql: `UPDATE career_jobs
-      SET ended_at = updated_at
-      WHERE ended_at IS NULL AND EXISTS (
-        SELECT 1 FROM career_stages
-        WHERE career_stages.id = career_jobs.stage_id
-          AND career_stages.is_terminal = 1
-      )`,
-  },
-  {
-    sql: "CREATE INDEX idx_career_jobs_lifecycle ON career_jobs(archived, ended_at, updated_at)",
-  },
-  {
-    sql: "CREATE INDEX idx_career_tasks_job_lifecycle ON career_tasks(job_id, status, lifecycle_operation_id, due_at)",
-  },
-  {
-    sql: "CREATE INDEX idx_career_interviews_job_lifecycle ON career_interviews(job_id, status, lifecycle_operation_id, scheduled_at)",
-  },
-  {
-    sql: "CREATE INDEX idx_career_lifecycle_events_job_date ON career_lifecycle_events(job_id, created_at DESC)",
-  },
-  {
-    sql: "CREATE INDEX idx_career_lifecycle_events_entity_date ON career_lifecycle_events(entity_type, entity_id, created_at DESC)",
-  },
-];
+export const CAREER_LIFECYCLE_V3_MIGRATION_STATEMENTS:
+readonly SqlStatement[] = ZHIJI_V3_SCHEMA_MIGRATION_STATEMENTS;
 
 function uid(prefix: string): string {
   return `${prefix}_${crypto.randomUUID()}`;
@@ -160,6 +113,80 @@ function normalizedOptions<Action extends string>(
       : requireTimestamp(options.now, "操作时间"),
     operationId: options.operationId === undefined
       ? uid("lifecycle")
+      : requireId(options.operationId, "操作 ID"),
+  };
+}
+
+function normalizedTaskRestoreOptions(
+  optionsOrNow: CareerTaskRestoreOptions | string | undefined,
+  legacyOperationId: string,
+): Readonly<{
+  replaceDueAt: boolean;
+  dueAt: string | null;
+  now: string;
+  operationId: string;
+}> {
+  if (typeof optionsOrNow === "string" || optionsOrNow === undefined) {
+    return {
+      replaceDueAt: false,
+      dueAt: null,
+      now: optionsOrNow === undefined
+        ? new Date().toISOString()
+        : requireTimestamp(optionsOrNow, "操作时间"),
+      operationId: requireId(legacyOperationId, "操作 ID"),
+    };
+  }
+  if (!optionsOrNow || typeof optionsOrNow !== "object") {
+    throw new TypeError("恢复待办参数无效");
+  }
+  const replaceDueAt = Object.prototype.hasOwnProperty.call(
+    optionsOrNow,
+    "dueAt",
+  );
+  if (replaceDueAt && optionsOrNow.dueAt === undefined) {
+    throw new TypeError("新的待办时间必须是有效时间或 null");
+  }
+  return {
+    replaceDueAt,
+    dueAt: optionsOrNow.dueAt === null || optionsOrNow.dueAt === undefined
+      ? null
+      : requireTimestamp(optionsOrNow.dueAt, "新的待办时间"),
+    now: optionsOrNow.now === undefined
+      ? new Date().toISOString()
+      : requireTimestamp(optionsOrNow.now, "操作时间"),
+    operationId: optionsOrNow.operationId === undefined
+      ? requireId(legacyOperationId, "操作 ID")
+      : requireId(optionsOrNow.operationId, "操作 ID"),
+  };
+}
+
+function normalizedInterviewRestoreOptions(
+  options: CareerInterviewRestoreOptions | undefined,
+  generatedOperationId: string,
+): Readonly<{
+  replaceScheduledAt: boolean;
+  scheduledAt: string | null;
+  now: string;
+  operationId: string;
+}> {
+  if (options !== undefined && (!options || typeof options !== "object")) {
+    throw new TypeError("恢复面试参数无效");
+  }
+  const replaceScheduledAt = options !== undefined &&
+    Object.prototype.hasOwnProperty.call(options, "scheduledAt");
+  if (replaceScheduledAt && options?.scheduledAt === undefined) {
+    throw new TypeError("新的面试时间必须是有效时间");
+  }
+  return {
+    replaceScheduledAt,
+    scheduledAt: options?.scheduledAt === undefined
+      ? null
+      : requireTimestamp(options.scheduledAt, "新的面试时间"),
+    now: options?.now === undefined
+      ? new Date().toISOString()
+      : requireTimestamp(options.now, "操作时间"),
+    operationId: options?.operationId === undefined
+      ? requireId(generatedOperationId, "操作 ID")
       : requireId(options.operationId, "操作 ID"),
   };
 }
@@ -296,6 +323,9 @@ function restoreJobDependents(
   restoreOperationId: string,
   now: string,
 ): SqlStatement[] {
+  const pauseAction = reason === "job_archived"
+    ? "auto_pause_job_archived"
+    : "auto_pause_job_ended";
   return [
     {
       sql: `INSERT INTO career_lifecycle_events(
@@ -313,6 +343,23 @@ function restoreJobDependents(
           )
           AND lifecycle_previous_status = 'todo'
           AND updated_at = canceled_at
+          AND due_at IS NOT NULL
+          AND due_at > ?
+          AND EXISTS (
+            SELECT 1 FROM career_lifecycle_events AS pause_event
+            WHERE pause_event.id = career_tasks.lifecycle_operation_id
+                || '_task_' || career_tasks.id
+              AND pause_event.job_id IS career_tasks.job_id
+              AND pause_event.entity_type = 'task'
+              AND pause_event.entity_id = career_tasks.id
+              AND pause_event.action = ?
+              AND pause_event.previous_status = career_tasks.lifecycle_previous_status
+              AND pause_event.next_status = career_tasks.status
+              AND pause_event.previous_due_at IS career_tasks.due_at
+              AND pause_event.next_due_at IS career_tasks.due_at
+              AND pause_event.reason = ?
+              AND pause_event.created_at = career_tasks.canceled_at
+          )
           AND EXISTS (
             SELECT 1
             FROM career_jobs AS active_job
@@ -329,6 +376,9 @@ function restoreJobDependents(
         jobId,
         reason,
         jobId,
+        now,
+        pauseAction,
+        reason,
       ],
     },
     {
@@ -347,6 +397,23 @@ function restoreJobDependents(
           )
           AND lifecycle_previous_status = 'todo'
           AND updated_at = canceled_at
+          AND due_at IS NOT NULL
+          AND due_at > ?
+          AND EXISTS (
+            SELECT 1 FROM career_lifecycle_events AS pause_event
+            WHERE pause_event.id = career_tasks.lifecycle_operation_id
+                || '_task_' || career_tasks.id
+              AND pause_event.job_id IS career_tasks.job_id
+              AND pause_event.entity_type = 'task'
+              AND pause_event.entity_id = career_tasks.id
+              AND pause_event.action = ?
+              AND pause_event.previous_status = career_tasks.lifecycle_previous_status
+              AND pause_event.next_status = career_tasks.status
+              AND pause_event.previous_due_at IS career_tasks.due_at
+              AND pause_event.next_due_at IS career_tasks.due_at
+              AND pause_event.reason = ?
+              AND pause_event.created_at = career_tasks.canceled_at
+          )
           AND EXISTS (
             SELECT 1
             FROM career_jobs AS active_job
@@ -356,7 +423,7 @@ function restoreJobDependents(
               AND active_job.archived = 0
               AND active_stage.is_terminal = 0
           )`,
-      params: [now, jobId, reason, jobId],
+      params: [now, jobId, reason, jobId, now, pauseAction, reason],
     },
     {
       sql: `INSERT INTO career_lifecycle_events(
@@ -374,6 +441,23 @@ function restoreJobDependents(
           )
           AND lifecycle_previous_status = 'scheduled'
           AND updated_at = canceled_at
+          AND scheduled_at IS NOT NULL
+          AND scheduled_at > ?
+          AND EXISTS (
+            SELECT 1 FROM career_lifecycle_events AS pause_event
+            WHERE pause_event.id = career_interviews.lifecycle_operation_id
+                || '_interview_' || career_interviews.id
+              AND pause_event.job_id IS career_interviews.job_id
+              AND pause_event.entity_type = 'interview'
+              AND pause_event.entity_id = career_interviews.id
+              AND pause_event.action = ?
+              AND pause_event.previous_status = career_interviews.lifecycle_previous_status
+              AND pause_event.next_status = career_interviews.status
+              AND pause_event.previous_due_at IS career_interviews.scheduled_at
+              AND pause_event.next_due_at IS career_interviews.scheduled_at
+              AND pause_event.reason = ?
+              AND pause_event.created_at = career_interviews.canceled_at
+          )
           AND EXISTS (
             SELECT 1
             FROM career_jobs AS active_job
@@ -390,6 +474,9 @@ function restoreJobDependents(
         jobId,
         reason,
         jobId,
+        now,
+        pauseAction,
+        reason,
       ],
     },
     {
@@ -408,6 +495,23 @@ function restoreJobDependents(
           )
           AND lifecycle_previous_status = 'scheduled'
           AND updated_at = canceled_at
+          AND scheduled_at IS NOT NULL
+          AND scheduled_at > ?
+          AND EXISTS (
+            SELECT 1 FROM career_lifecycle_events AS pause_event
+            WHERE pause_event.id = career_interviews.lifecycle_operation_id
+                || '_interview_' || career_interviews.id
+              AND pause_event.job_id IS career_interviews.job_id
+              AND pause_event.entity_type = 'interview'
+              AND pause_event.entity_id = career_interviews.id
+              AND pause_event.action = ?
+              AND pause_event.previous_status = career_interviews.lifecycle_previous_status
+              AND pause_event.next_status = career_interviews.status
+              AND pause_event.previous_due_at IS career_interviews.scheduled_at
+              AND pause_event.next_due_at IS career_interviews.scheduled_at
+              AND pause_event.reason = ?
+              AND pause_event.created_at = career_interviews.canceled_at
+          )
           AND EXISTS (
             SELECT 1
             FROM career_jobs AS active_job
@@ -417,7 +521,7 @@ function restoreJobDependents(
               AND active_job.archived = 0
               AND active_stage.is_terminal = 0
           )`,
-      params: [now, jobId, reason, jobId],
+      params: [now, jobId, reason, jobId, now, pauseAction, reason],
     },
   ];
 }
@@ -448,7 +552,7 @@ export function planArchiveCareerJob(
       sql: `UPDATE career_jobs
         SET archived = 1,
             archived_at = ?,
-            archived_operation_id = ?,
+            archived_operation_id = COALESCE(?, archived_operation_id),
             updated_at = ?
         WHERE id = ? AND archived = 0`,
       params: [
@@ -510,13 +614,6 @@ export function planRestoreCareerJob(
         now,
       )
       : []),
-    {
-      sql: `UPDATE career_jobs
-        SET archived_operation_id = CASE
-          WHEN ? = 'restore-paused' THEN NULL ELSE archived_operation_id END
-        WHERE id = ?`,
-      params: [relatedAction, jobId],
-    },
     dropGuardStatement(operationId),
   ];
 }
@@ -601,7 +698,8 @@ export function planTransitionCareerJobStage(
                   WHERE previous_stage.id = career_jobs.stage_id
                     AND previous_stage.is_terminal = 0
                 )
-                THEN CASE WHEN ? = 'pause' THEN ? ELSE NULL END
+                THEN CASE
+                  WHEN ? = 'pause' THEN ? ELSE ended_operation_id END
               ELSE ended_operation_id
             END,
             updated_at = ?
@@ -621,22 +719,22 @@ export function planTransitionCareerJobStage(
       ? suspendJobDependents(jobId, "job_ended", operationId, now)
       : []),
     ...(!ending && relatedAction === "restore-paused"
-      ? restoreJobDependents(
-        jobId,
-        "job_ended",
-        "ended_operation_id",
-        operationId,
-        now,
-      )
-      : []),
-    ...(!ending
-      ? [{
-        sql: `UPDATE career_jobs
-          SET ended_operation_id = CASE
-            WHEN ? = 'restore-paused' THEN NULL ELSE ended_operation_id END
-          WHERE id = ?`,
-        params: [relatedAction, jobId],
-      } satisfies SqlStatement]
+      ? [
+          ...restoreJobDependents(
+            jobId,
+            "job_ended",
+            "ended_operation_id",
+            operationId,
+            now,
+          ),
+          ...restoreJobDependents(
+            jobId,
+            "job_archived",
+            "archived_operation_id",
+            operationId,
+            now,
+          ),
+        ]
       : []),
     dropGuardStatement(operationId),
   ];
@@ -731,14 +829,16 @@ export function planCancelCareerTask(
 
 export function planRestoreCareerTask(
   taskIdInput: string,
-  nowInput?: string,
+  optionsOrNow?: CareerTaskRestoreOptions | string,
   operationIdInput = uid("lifecycle"),
 ): SqlStatement[] {
   const taskId = requireId(taskIdInput, "待办 ID");
-  const operationId = requireId(operationIdInput, "操作 ID");
-  const now = nowInput === undefined
-    ? new Date().toISOString()
-    : requireTimestamp(nowInput, "操作时间");
+  const {
+    replaceDueAt,
+    dueAt,
+    now,
+    operationId,
+  } = normalizedTaskRestoreOptions(optionsOrNow, operationIdInput);
   return [
     ...guardStatements(
       operationId,
@@ -749,8 +849,19 @@ export function planRestoreCareerTask(
         WHERE task.id = ?
           AND task.status = 'canceled'
           AND (task.job_id IS NULL
-            OR (job.archived = 0 AND stage.is_terminal = 0))) = 1`,
-      [taskId],
+            OR (job.archived = 0 AND stage.is_terminal = 0))
+          AND (
+            CASE WHEN ? = 1 THEN ? ELSE task.due_at END IS NULL
+            OR CASE WHEN ? = 1 THEN ? ELSE task.due_at END > ?
+          )) = 1`,
+      [
+        taskId,
+        replaceDueAt ? 1 : 0,
+        dueAt,
+        replaceDueAt ? 1 : 0,
+        dueAt,
+        now,
+      ],
     ),
     {
       sql: `INSERT INTO career_lifecycle_events(
@@ -760,20 +871,99 @@ export function planRestoreCareerTask(
         SELECT ?,job_id,'task',id,
           CASE WHEN lifecycle_operation_id IS NULL THEN 'restore_task'
             ELSE 'restore_paused_task' END,
-          status,'todo',due_at,due_at,cancellation_reason,?
+          status,'todo',due_at,
+          CASE WHEN ? = 1 THEN ? ELSE due_at END,
+          COALESCE(cancellation_reason,''),?
         FROM career_tasks WHERE id = ? AND status = 'canceled'`,
-      params: [operationId, now, taskId],
+      params: [operationId, replaceDueAt ? 1 : 0, dueAt, now, taskId],
     },
     {
       sql: `UPDATE career_tasks
         SET status = 'todo',
+            due_at = CASE WHEN ? = 1 THEN ? ELSE due_at END,
             canceled_at = NULL,
             cancellation_reason = NULL,
             lifecycle_previous_status = NULL,
             lifecycle_operation_id = NULL,
             updated_at = ?
         WHERE id = ? AND status = 'canceled'`,
-      params: [now, taskId],
+      params: [replaceDueAt ? 1 : 0, dueAt, now, taskId],
+    },
+    dropGuardStatement(operationId),
+  ];
+}
+
+export function planRestoreCareerInterview(
+  interviewIdInput: string,
+  options?: CareerInterviewRestoreOptions,
+  operationIdInput = uid("lifecycle"),
+): SqlStatement[] {
+  const interviewId = requireId(interviewIdInput, "面试 ID");
+  const {
+    replaceScheduledAt,
+    scheduledAt,
+    now,
+    operationId,
+  } = normalizedInterviewRestoreOptions(options, operationIdInput);
+  return [
+    ...guardStatements(
+      operationId,
+      `(SELECT COUNT(*)
+        FROM career_interviews AS interview
+        JOIN career_jobs AS job ON job.id = interview.job_id
+        JOIN career_stages AS stage ON stage.id = job.stage_id
+        WHERE interview.id = ?
+          AND interview.status = 'canceled'
+          AND job.archived = 0
+          AND stage.is_terminal = 0
+          AND CASE WHEN ? = 1 THEN ? ELSE interview.scheduled_at END IS NOT NULL
+          AND CASE WHEN ? = 1 THEN ? ELSE interview.scheduled_at END > ?
+      ) = 1`,
+      [
+        interviewId,
+        replaceScheduledAt ? 1 : 0,
+        scheduledAt,
+        replaceScheduledAt ? 1 : 0,
+        scheduledAt,
+        now,
+      ],
+    ),
+    {
+      sql: `INSERT INTO career_lifecycle_events(
+          id,job_id,entity_type,entity_id,action,previous_status,next_status,
+          previous_due_at,next_due_at,reason,created_at
+        )
+        SELECT ?,job_id,'interview',id,
+          CASE WHEN lifecycle_operation_id IS NULL THEN 'restore_interview'
+            ELSE 'restore_paused_interview' END,
+          status,'scheduled',scheduled_at,
+          CASE WHEN ? = 1 THEN ? ELSE scheduled_at END,
+          COALESCE(cancellation_reason,''),?
+        FROM career_interviews WHERE id = ? AND status = 'canceled'`,
+      params: [
+        operationId,
+        replaceScheduledAt ? 1 : 0,
+        scheduledAt,
+        now,
+        interviewId,
+      ],
+    },
+    {
+      sql: `UPDATE career_interviews
+        SET status = 'scheduled',
+            scheduled_at = CASE WHEN ? = 1 THEN ? ELSE scheduled_at END,
+            canceled_at = NULL,
+            cancellation_reason = NULL,
+            lifecycle_previous_status = NULL,
+            lifecycle_operation_id = NULL,
+            updated_at = ?
+        WHERE id = ? AND status = 'canceled'`,
+      params: [
+        replaceScheduledAt ? 1 : 0,
+        scheduledAt,
+        now,
+        interviewId,
+      ],
     },
     dropGuardStatement(operationId),
   ];
@@ -827,8 +1017,18 @@ export async function cancelCareerTask(
   await executeLifecyclePlan(planCancelCareerTask(taskId, reason, now));
 }
 
-export async function restoreCareerTask(taskId: string, now?: string): Promise<void> {
-  await executeLifecyclePlan(planRestoreCareerTask(taskId, now));
+export async function restoreCareerTask(
+  taskId: string,
+  optionsOrNow?: CareerTaskRestoreOptions | string,
+): Promise<void> {
+  await executeLifecyclePlan(planRestoreCareerTask(taskId, optionsOrNow));
+}
+
+export async function restoreCareerInterview(
+  interviewId: string,
+  options?: CareerInterviewRestoreOptions,
+): Promise<void> {
+  await executeLifecyclePlan(planRestoreCareerInterview(interviewId, options));
 }
 
 function unwrapRows<T>(result: unknown): T[] {

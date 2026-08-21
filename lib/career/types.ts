@@ -39,7 +39,13 @@ export type Job = {
   updated_at: string;
   archived: number;
   position: number;
+  archived_at: string | null;
+  ended_at: string | null;
+  archived_operation_id: string | null;
+  ended_operation_id: string | null;
 };
+
+export type CareerTaskStatus = "todo" | "done" | "canceled";
 
 export type Task = {
   id: string;
@@ -49,8 +55,13 @@ export type Task = {
   due_at: string | null;
   kind: string;
   priority: number;
-  status: "todo" | "done";
+  status: CareerTaskStatus;
   created_at: string;
+  updated_at: string | null;
+  canceled_at: string | null;
+  cancellation_reason: string | null;
+  lifecycle_previous_status: "todo" | null;
+  lifecycle_operation_id: string | null;
 };
 
 export type InterviewQuestion = {
@@ -58,6 +69,8 @@ export type InterviewQuestion = {
   answer: string;
   note: string;
 };
+
+export type CareerInterviewStatus = "scheduled" | "completed" | "canceled";
 
 export type Interview = {
   id: string;
@@ -68,13 +81,17 @@ export type Interview = {
   duration: number;
   interviewer: string;
   meeting_url: string;
-  status: string;
+  status: CareerInterviewStatus;
   summary: string;
   raw_notes: string;
   questions_json: string;
   reflection: string;
   created_at: string;
   updated_at: string;
+  canceled_at: string | null;
+  cancellation_reason: string | null;
+  lifecycle_previous_status: "scheduled" | null;
+  lifecycle_operation_id: string | null;
 };
 
 export type Contact = {

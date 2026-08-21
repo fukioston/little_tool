@@ -73,7 +73,11 @@ function adapterFor(database, state) {
 globalThis.__careerLifecycleAdapter = null;
 globalThis.__careerLifecycleLocks = { reads: 0, writes: 0 };
 
-const rawLifecycleJavaScript = await transpile("lib/career/lifecycle.ts");
+const [schemaJavaScript, rawLifecycleJavaScript] = await Promise.all([
+  transpile("lib/schemas/zhiji.ts"),
+  transpile("lib/career/lifecycle.ts"),
+]);
+const schemaUrl = moduleUrl(schemaJavaScript);
 const clientUrl = moduleUrl(`
   export const localDb = {
     query(...args) { return globalThis.__careerLifecycleAdapter.query(...args); },
@@ -92,15 +96,19 @@ const lockUrl = moduleUrl(`
 `);
 const lifecycleJavaScript = rawLifecycleJavaScript
   .replaceAll('"@/lib/local-db/client"', `"${clientUrl}"`)
-  .replaceAll('"./lock"', `"${lockUrl}"`);
+  .replaceAll('"./lock"', `"${lockUrl}"`)
+  .replaceAll('"../schemas/zhiji"', `"${schemaUrl}"`);
 const lifecycle = await import(moduleUrl(lifecycleJavaScript));
 
 const NOW = "2026-08-21T08:00:00.000Z";
+const RESTORE_BEFORE = "2026-08-21T12:00:00.000Z";
 const PAST = "2026-08-20T08:00:00.000Z";
 const FUTURE = "2026-08-22T08:00:00.000Z";
 const LATER = "2026-08-23T08:00:00.000Z";
+const FAR_FUTURE = "2026-08-24T08:00:00.000Z";
+const EDITED_AT = "2026-08-22T12:00:00.000Z";
 
-async function fixture() {
+async function fixture(beforeV3Migration) {
   const sqlite3 = await sqlite3InitModule();
   const database = new sqlite3.oo1.DB(":memory:", "c");
   database.exec("PRAGMA foreign_keys=ON");
@@ -164,6 +172,7 @@ async function fixture() {
       updated_at TEXT NOT NULL
     );
   `);
+  beforeV3Migration?.(database);
   database.transaction("IMMEDIATE", () => {
     for (const { sql, params = [] } of lifecycle.CAREER_LIFECYCLE_V3_MIGRATION_STATEMENTS) {
       executeRun(database, sql, params);
@@ -274,11 +283,13 @@ test("archive pause hides future pressure, preserves history, and restores only 
     addJob(database, "job-b");
     addTask(database, "future-untouched", "job-a", FUTURE);
     addTask(database, "future-edited", "job-a", FUTURE);
+    addTask(database, "future-silent-edit", "job-a", FUTURE);
     addTask(database, "past", "job-a", PAST);
     addTask(database, "undated", "job-a", null);
     addTask(database, "done", "job-a", FUTURE, "done");
     addTask(database, "other", "job-b", FUTURE);
     addInterview(database, "future-interview", "job-a", FUTURE);
+    addInterview(database, "future-interview-silent-edit", "job-a", FUTURE);
     addInterview(database, "past-interview", "job-a", PAST);
     addInterview(database, "completed-interview", "job-a", FUTURE, "completed");
     addInterview(database, "canceled-interview", "job-a", FUTURE, "canceled");
@@ -296,6 +307,7 @@ test("archive pause hides future pressure, preserves history, and restores only 
       [
         { id: "done", status: "done", due_at: FUTURE, lifecycle_operation_id: null },
         { id: "future-edited", status: "canceled", due_at: FUTURE, lifecycle_operation_id: "archive-a" },
+        { id: "future-silent-edit", status: "canceled", due_at: FUTURE, lifecycle_operation_id: "archive-a" },
         { id: "future-untouched", status: "canceled", due_at: FUTURE, lifecycle_operation_id: "archive-a" },
         { id: "other", status: "todo", due_at: FUTURE, lifecycle_operation_id: null },
         { id: "past", status: "todo", due_at: PAST, lifecycle_operation_id: null },
@@ -309,6 +321,7 @@ test("archive pause hides future pressure, preserves history, and restores only 
         { id: "canceled-interview", status: "canceled", lifecycle_operation_id: null },
         { id: "completed-interview", status: "completed", lifecycle_operation_id: null },
         { id: "future-interview", status: "canceled", lifecycle_operation_id: "archive-a" },
+        { id: "future-interview-silent-edit", status: "canceled", lifecycle_operation_id: "archive-a" },
         { id: "other-interview", status: "scheduled", lifecycle_operation_id: null },
         { id: "past-interview", status: "scheduled", lifecycle_operation_id: null },
       ],
@@ -320,17 +333,27 @@ test("archive pause hides future pressure, preserves history, and restores only 
     assert.deepEqual(active.interviews.map(({ id }) => id), ["other-interview"]);
     const archived = await lifecycle.loadCareerLifecycleScope("archived");
     assert.deepEqual(archived.jobs.map(({ id }) => id), ["job-a"]);
-    assert.equal(archived.tasks.length, 5);
-    assert.equal(archived.interviews.length, 4);
+    assert.equal(archived.tasks.length, 6);
+    assert.equal(archived.interviews.length, 5);
 
     executeRun(
       database,
       "UPDATE career_tasks SET due_at=?,updated_at=? WHERE id='future-edited'",
       [LATER, LATER],
     );
+    executeRun(
+      database,
+      "UPDATE career_tasks SET due_at=? WHERE id='future-silent-edit'",
+      [LATER],
+    );
+    executeRun(
+      database,
+      "UPDATE career_interviews SET scheduled_at=? WHERE id='future-interview-silent-edit'",
+      [LATER],
+    );
     await lifecycle.restoreCareerJob("job-a", {
       relatedAction: "restore-paused",
-      now: LATER,
+      now: RESTORE_BEFORE,
       operationId: "restore-a",
     });
 
@@ -339,19 +362,23 @@ test("archive pause hides future pressure, preserves history, and restores only 
         FROM career_tasks WHERE id LIKE 'future-%' ORDER BY id`),
       [
         { id: "future-edited", status: "canceled", due_at: LATER, lifecycle_operation_id: "archive-a" },
+        { id: "future-silent-edit", status: "canceled", due_at: LATER, lifecycle_operation_id: "archive-a" },
         { id: "future-untouched", status: "todo", due_at: FUTURE, lifecycle_operation_id: null },
       ],
     );
     assert.deepEqual(
       objects(database, `SELECT id,status,lifecycle_operation_id
-        FROM career_interviews WHERE id='future-interview'`),
-      [{ id: "future-interview", status: "scheduled", lifecycle_operation_id: null }],
+        FROM career_interviews WHERE id LIKE 'future-interview%' ORDER BY id`),
+      [
+        { id: "future-interview", status: "scheduled", lifecycle_operation_id: null },
+        { id: "future-interview-silent-edit", status: "canceled", lifecycle_operation_id: "archive-a" },
+      ],
     );
     assert.equal(
       Number(database.selectValue(
         "SELECT COUNT(*) FROM career_lifecycle_events WHERE job_id='job-a'",
       )),
-      7,
+      9,
     );
     assert.equal(state.batches, 2);
     assert.deepEqual(state.transactional, [true, true]);
@@ -442,7 +469,7 @@ test("terminal pause and reopen respect keep-paused versus restore-paused", asyn
 
     await lifecycle.transitionCareerJobStage("job-rejected", "active", {
       relatedAction: "keep-paused",
-      now: LATER,
+      now: RESTORE_BEFORE,
       operationId: "reopen-keep",
     });
     assert.equal(
@@ -450,7 +477,7 @@ test("terminal pause and reopen respect keep-paused versus restore-paused", asyn
       "canceled",
     );
 
-    await lifecycle.restoreCareerTask("rejected-task", LATER);
+    await lifecycle.restoreCareerTask("rejected-task", RESTORE_BEFORE);
     assert.equal(
       database.selectValue("SELECT status FROM career_tasks WHERE id='rejected-task'"),
       "todo",
@@ -464,7 +491,7 @@ test("terminal pause and reopen respect keep-paused versus restore-paused", asyn
     });
     await lifecycle.transitionCareerJobStage("job-rejected", "active", {
       relatedAction: "restore-paused",
-      now: LATER,
+      now: RESTORE_BEFORE,
       operationId: "reopen-restore",
     });
     assert.equal(
@@ -484,7 +511,168 @@ test("terminal pause and reopen respect keep-paused versus restore-paused", asyn
       database.selectValue(
         "SELECT ended_operation_id FROM career_jobs WHERE id='job-rejected'",
       ),
-      null,
+      "end-two",
+    );
+  } finally {
+    database.close();
+  }
+});
+
+test("reopen restores eligible ended and archived pauses in one transaction", async () => {
+  const { database } = await fixture();
+  try {
+    addJob(database, "job-combined-restore");
+    for (const [id, dueAt] of [
+      ["ended-future", FAR_FUTURE],
+      ["ended-elapsed", FUTURE],
+      ["ended-edited", FAR_FUTURE],
+    ]) addTask(database, id, "job-combined-restore", dueAt);
+    for (const [id, scheduledAt] of [
+      ["ended-interview-future", FAR_FUTURE],
+      ["ended-interview-elapsed", FUTURE],
+      ["ended-interview-edited", FAR_FUTURE],
+    ]) addInterview(database, id, "job-combined-restore", scheduledAt);
+
+    await lifecycle.transitionCareerJobStage("job-combined-restore", "rejected", {
+      relatedAction: "pause",
+      now: NOW,
+      operationId: "end-combined",
+    });
+    await lifecycle.transitionCareerJobStage("job-combined-restore", "active", {
+      relatedAction: "keep-paused",
+      now: RESTORE_BEFORE,
+      operationId: "reopen-ended-keep",
+    });
+
+    for (const [id, dueAt] of [
+      ["archived-future", FAR_FUTURE],
+      ["archived-elapsed", FUTURE],
+      ["archived-edited", FAR_FUTURE],
+    ]) addTask(database, id, "job-combined-restore", dueAt);
+    for (const [id, scheduledAt] of [
+      ["archived-interview-future", FAR_FUTURE],
+      ["archived-interview-elapsed", FUTURE],
+      ["archived-interview-edited", FAR_FUTURE],
+    ]) addInterview(database, id, "job-combined-restore", scheduledAt);
+
+    await lifecycle.transitionCareerJobStage("job-combined-restore", "rejected", {
+      relatedAction: "keep",
+      now: RESTORE_BEFORE,
+      operationId: "end-again-keep",
+    });
+    await lifecycle.archiveCareerJob("job-combined-restore", {
+      relatedAction: "pause",
+      now: RESTORE_BEFORE,
+      operationId: "archive-combined",
+    });
+    await lifecycle.restoreCareerJob("job-combined-restore", {
+      relatedAction: "keep-paused",
+      now: RESTORE_BEFORE,
+      operationId: "restore-archive-keep",
+    });
+
+    database.exec(`UPDATE career_tasks SET title=title || ' edited',updated_at='${EDITED_AT}'
+      WHERE id IN ('ended-edited','archived-edited')`);
+    database.exec(`UPDATE career_interviews SET summary='edited',updated_at='${EDITED_AT}'
+      WHERE id IN ('ended-interview-edited','archived-interview-edited')`);
+
+    await lifecycle.transitionCareerJobStage("job-combined-restore", "active", {
+      relatedAction: "restore-paused",
+      now: LATER,
+      operationId: "reopen-combined-restore",
+    });
+
+    assert.deepEqual(
+      objects(database, `SELECT id,status,cancellation_reason,lifecycle_operation_id
+        FROM career_tasks ORDER BY id`),
+      [
+        { id: "archived-edited", status: "canceled", cancellation_reason: "job_archived", lifecycle_operation_id: "archive-combined" },
+        { id: "archived-elapsed", status: "canceled", cancellation_reason: "job_archived", lifecycle_operation_id: "archive-combined" },
+        { id: "archived-future", status: "todo", cancellation_reason: null, lifecycle_operation_id: null },
+        { id: "ended-edited", status: "canceled", cancellation_reason: "job_ended", lifecycle_operation_id: "end-combined" },
+        { id: "ended-elapsed", status: "canceled", cancellation_reason: "job_ended", lifecycle_operation_id: "end-combined" },
+        { id: "ended-future", status: "todo", cancellation_reason: null, lifecycle_operation_id: null },
+      ],
+    );
+    assert.deepEqual(
+      objects(database, `SELECT id,status,cancellation_reason,lifecycle_operation_id
+        FROM career_interviews ORDER BY id`),
+      [
+        { id: "archived-interview-edited", status: "canceled", cancellation_reason: "job_archived", lifecycle_operation_id: "archive-combined" },
+        { id: "archived-interview-elapsed", status: "canceled", cancellation_reason: "job_archived", lifecycle_operation_id: "archive-combined" },
+        { id: "archived-interview-future", status: "scheduled", cancellation_reason: null, lifecycle_operation_id: null },
+        { id: "ended-interview-edited", status: "canceled", cancellation_reason: "job_ended", lifecycle_operation_id: "end-combined" },
+        { id: "ended-interview-elapsed", status: "canceled", cancellation_reason: "job_ended", lifecycle_operation_id: "end-combined" },
+        { id: "ended-interview-future", status: "scheduled", cancellation_reason: null, lifecycle_operation_id: null },
+      ],
+    );
+    assert.deepEqual(
+      objects(database, `SELECT stage_id,archived,ended_operation_id,archived_operation_id
+        FROM career_jobs WHERE id='job-combined-restore'`),
+      [{
+        stage_id: "active",
+        archived: 0,
+        ended_operation_id: "end-combined",
+        archived_operation_id: "archive-combined",
+      }],
+    );
+    assert.equal(
+      Number(database.selectValue(`SELECT COUNT(*) FROM career_lifecycle_events
+        WHERE action='auto_restore_job_active'
+          AND entity_id LIKE '%future'`)),
+      4,
+    );
+  } finally {
+    database.close();
+  }
+});
+
+test("bulk restore never turns elapsed schedules back into fresh pressure", async () => {
+  const { database } = await fixture();
+  try {
+    addJob(database, "job-elapsed");
+    addTask(database, "elapsed-task", "job-elapsed", FUTURE);
+    addInterview(database, "elapsed-interview", "job-elapsed", FUTURE);
+
+    await lifecycle.archiveCareerJob("job-elapsed", {
+      relatedAction: "pause",
+      now: NOW,
+      operationId: "archive-elapsed",
+    });
+    await lifecycle.restoreCareerJob("job-elapsed", {
+      relatedAction: "restore-paused",
+      now: LATER,
+      operationId: "restore-after-time-passed",
+    });
+
+    assert.deepEqual(
+      objects(database, `SELECT status,canceled_at,lifecycle_operation_id
+        FROM career_tasks WHERE id='elapsed-task'`),
+      [{
+        status: "canceled",
+        canceled_at: NOW,
+        lifecycle_operation_id: "archive-elapsed",
+      }],
+    );
+    assert.deepEqual(
+      objects(database, `SELECT status,canceled_at,lifecycle_operation_id
+        FROM career_interviews WHERE id='elapsed-interview'`),
+      [{
+        status: "canceled",
+        canceled_at: NOW,
+        lifecycle_operation_id: "archive-elapsed",
+      }],
+    );
+    assert.equal(
+      database.selectValue(
+        "SELECT archived_operation_id FROM career_jobs WHERE id='job-elapsed'",
+      ),
+      "archive-elapsed",
+    );
+    assert.equal(
+      Number(database.selectValue(`SELECT COUNT(*) FROM career_lifecycle_events
+        WHERE action='auto_restore_job_active'`)),
+      0,
     );
   } finally {
     database.close();
@@ -587,6 +775,332 @@ test("task reschedule, remove-date, cancel, and restore retain an audit trail", 
         { action: "unschedule_task", previous_due_at: LATER, next_due_at: null, reason: "user" },
         { action: "cancel_task", previous_due_at: null, next_due_at: null, reason: "no_longer_needed" },
         { action: "restore_task", previous_due_at: null, next_due_at: null, reason: "no_longer_needed" },
+      ],
+    );
+  } finally {
+    database.close();
+  }
+});
+
+test("elapsed canceled tasks restore atomically only without a date or to the future", async () => {
+  const { database } = await fixture();
+  try {
+    addTask(database, "restore-unscheduled", null, PAST);
+    addTask(database, "restore-rescheduled", null, PAST);
+    await lifecycle.cancelCareerTask("restore-unscheduled", "changed_plan", NOW);
+    await lifecycle.cancelCareerTask("restore-rescheduled", "changed_plan", NOW);
+
+    await assert.rejects(
+      lifecycle.restoreCareerTask("restore-unscheduled", RESTORE_BEFORE),
+      /constraint/i,
+      "the compatible signature must not revive an elapsed due date unchanged",
+    );
+    await lifecycle.restoreCareerTask("restore-unscheduled", {
+      dueAt: null,
+      now: RESTORE_BEFORE,
+      operationId: "restore-without-date",
+    });
+    await lifecycle.restoreCareerTask("restore-rescheduled", {
+      dueAt: FAR_FUTURE,
+      now: LATER,
+      operationId: "restore-with-future-date",
+    });
+
+    assert.deepEqual(
+      objects(database, `SELECT id,status,due_at,canceled_at,cancellation_reason
+        FROM career_tasks ORDER BY id`),
+      [
+        { id: "restore-rescheduled", status: "todo", due_at: FAR_FUTURE, canceled_at: null, cancellation_reason: null },
+        { id: "restore-unscheduled", status: "todo", due_at: null, canceled_at: null, cancellation_reason: null },
+      ],
+    );
+    assert.deepEqual(
+      objects(database, `SELECT entity_id,action,previous_due_at,next_due_at
+        FROM career_lifecycle_events
+        WHERE action='restore_task' ORDER BY entity_id`),
+      [
+        { entity_id: "restore-rescheduled", action: "restore_task", previous_due_at: PAST, next_due_at: FAR_FUTURE },
+        { entity_id: "restore-unscheduled", action: "restore_task", previous_due_at: PAST, next_due_at: null },
+      ],
+    );
+  } finally {
+    database.close();
+  }
+});
+
+test("an invalid past restore date rolls the entire task plan back", async () => {
+  const { database } = await fixture();
+  try {
+    addTask(database, "restore-invalid-past", null, PAST);
+    await lifecycle.cancelCareerTask("restore-invalid-past", "changed_plan", NOW);
+    const before = objects(database, `SELECT status,due_at,canceled_at,
+      cancellation_reason,lifecycle_operation_id FROM career_tasks
+      WHERE id='restore-invalid-past'`);
+    const beforeEvents = Number(database.selectValue(
+      "SELECT COUNT(*) FROM career_lifecycle_events",
+    ));
+
+    await assert.rejects(
+      lifecycle.restoreCareerTask("restore-invalid-past", {
+        dueAt: FUTURE,
+        now: LATER,
+        operationId: "restore-invalid-date",
+      }),
+      /constraint/i,
+    );
+
+    assert.deepEqual(
+      objects(database, `SELECT status,due_at,canceled_at,
+        cancellation_reason,lifecycle_operation_id FROM career_tasks
+        WHERE id='restore-invalid-past'`),
+      before,
+    );
+    assert.equal(
+      Number(database.selectValue("SELECT COUNT(*) FROM career_lifecycle_events")),
+      beforeEvents,
+    );
+    assert.equal(
+      Number(database.selectValue(`SELECT COUNT(*) FROM sqlite_temp_schema
+        WHERE name LIKE '__career_lifecycle_guard_%'`)),
+      0,
+    );
+  } finally {
+    database.close();
+  }
+});
+
+test("canceled interviews restore atomically only with a future schedule", async () => {
+  const { database } = await fixture();
+  try {
+    addJob(database, "job-interview-restore");
+    addInterview(
+      database,
+      "paused-future-interview",
+      "job-interview-restore",
+      FUTURE,
+    );
+    addInterview(
+      database,
+      "elapsed-interview",
+      "job-interview-restore",
+      PAST,
+      "canceled",
+    );
+    executeRun(
+      database,
+      `UPDATE career_interviews
+        SET canceled_at=?,cancellation_reason='changed_plan',updated_at=?
+        WHERE id='elapsed-interview'`,
+      [NOW, NOW],
+    );
+
+    await lifecycle.archiveCareerJob("job-interview-restore", {
+      relatedAction: "pause",
+      now: NOW,
+      operationId: "pause-interview-restore",
+    });
+    await lifecycle.restoreCareerJob("job-interview-restore", {
+      relatedAction: "keep-paused",
+      now: RESTORE_BEFORE,
+      operationId: "keep-interview-paused",
+    });
+
+    await assert.rejects(
+      lifecycle.restoreCareerInterview("elapsed-interview", {
+        now: RESTORE_BEFORE,
+        operationId: "reject-elapsed-interview",
+      }),
+      /constraint/i,
+      "an elapsed interview cannot be revived at its stale time",
+    );
+    await lifecycle.restoreCareerInterview("elapsed-interview", {
+      scheduledAt: FAR_FUTURE,
+      now: LATER,
+      operationId: "reschedule-and-restore-interview",
+    });
+    await lifecycle.restoreCareerInterview("paused-future-interview", {
+      now: RESTORE_BEFORE,
+      operationId: "restore-paused-interview",
+    });
+
+    assert.deepEqual(
+      objects(database, `SELECT id,status,scheduled_at,canceled_at,
+        cancellation_reason,lifecycle_previous_status,lifecycle_operation_id
+        FROM career_interviews ORDER BY id`),
+      [
+        {
+          id: "elapsed-interview",
+          status: "scheduled",
+          scheduled_at: FAR_FUTURE,
+          canceled_at: null,
+          cancellation_reason: null,
+          lifecycle_previous_status: null,
+          lifecycle_operation_id: null,
+        },
+        {
+          id: "paused-future-interview",
+          status: "scheduled",
+          scheduled_at: FUTURE,
+          canceled_at: null,
+          cancellation_reason: null,
+          lifecycle_previous_status: null,
+          lifecycle_operation_id: null,
+        },
+      ],
+    );
+    assert.deepEqual(
+      objects(database, `SELECT entity_id,action,previous_due_at,next_due_at,reason
+        FROM career_lifecycle_events
+        WHERE action IN ('restore_interview','restore_paused_interview')
+        ORDER BY entity_id`),
+      [
+        {
+          entity_id: "elapsed-interview",
+          action: "restore_interview",
+          previous_due_at: PAST,
+          next_due_at: FAR_FUTURE,
+          reason: "changed_plan",
+        },
+        {
+          entity_id: "paused-future-interview",
+          action: "restore_paused_interview",
+          previous_due_at: FUTURE,
+          next_due_at: FUTURE,
+          reason: "job_archived",
+        },
+      ],
+    );
+  } finally {
+    database.close();
+  }
+});
+
+test("interview restore rejects past replacements and inactive jobs without partial writes", async () => {
+  const { database } = await fixture();
+  try {
+    addJob(database, "job-invalid-interview");
+    addJob(database, "job-terminal-interview", "rejected");
+    addJob(database, "job-archived-interview");
+    addInterview(database, "invalid-past-interview", "job-invalid-interview", PAST, "canceled");
+    addInterview(database, "terminal-interview", "job-terminal-interview", FUTURE, "canceled");
+    addInterview(database, "archived-interview", "job-archived-interview", FUTURE, "canceled");
+    database.exec(`UPDATE career_interviews
+      SET canceled_at='${NOW}',cancellation_reason='changed_plan',updated_at='${NOW}'
+      WHERE status='canceled'`);
+    database.exec(`UPDATE career_jobs SET archived=1,archived_at='${NOW}'
+      WHERE id='job-archived-interview'`);
+    const before = objects(database, `SELECT id,status,scheduled_at,canceled_at,
+      cancellation_reason,lifecycle_operation_id
+      FROM career_interviews ORDER BY id`);
+    const beforeEvents = Number(database.selectValue(
+      "SELECT COUNT(*) FROM career_lifecycle_events",
+    ));
+
+    for (const [id, options] of [
+      ["invalid-past-interview", {
+        scheduledAt: FUTURE,
+        now: LATER,
+        operationId: "invalid-past-replacement",
+      }],
+      ["terminal-interview", {
+        scheduledAt: FAR_FUTURE,
+        now: RESTORE_BEFORE,
+        operationId: "invalid-terminal-interview",
+      }],
+      ["archived-interview", {
+        scheduledAt: FAR_FUTURE,
+        now: RESTORE_BEFORE,
+        operationId: "invalid-archived-interview",
+      }],
+    ]) {
+      await assert.rejects(
+        lifecycle.restoreCareerInterview(id, options),
+        /constraint/i,
+      );
+    }
+
+    assert.deepEqual(
+      objects(database, `SELECT id,status,scheduled_at,canceled_at,
+        cancellation_reason,lifecycle_operation_id
+        FROM career_interviews ORDER BY id`),
+      before,
+    );
+    assert.equal(
+      Number(database.selectValue("SELECT COUNT(*) FROM career_lifecycle_events")),
+      beforeEvents,
+    );
+    assert.equal(
+      Number(database.selectValue(`SELECT COUNT(*) FROM sqlite_temp_schema
+        WHERE name LIKE '__career_lifecycle_guard_%'`)),
+      0,
+    );
+  } finally {
+    database.close();
+  }
+});
+
+test("migrated canceled rows without a recorded reason remain recoverable", async () => {
+  const { database } = await fixture((legacyDatabase) => {
+    executeRun(
+      legacyDatabase,
+      `INSERT INTO career_stages(id,name,color,position,is_terminal,hidden)
+        VALUES('legacy-active','Legacy active','#777777',99,0,0)`,
+    );
+    executeRun(
+      legacyDatabase,
+      `INSERT INTO career_jobs(
+        id,company,role,stage_id,created_at,updated_at,archived,position
+      ) VALUES('legacy-job','Legacy','Role','legacy-active',?,?,0,0)`,
+      [PAST, PAST],
+    );
+    executeRun(
+      legacyDatabase,
+      `INSERT INTO career_tasks(
+        id,job_id,title,due_at,status,created_at
+      ) VALUES('legacy-task','legacy-job','Legacy task',?,'cancelled',?)`,
+      [FUTURE, PAST],
+    );
+    executeRun(
+      legacyDatabase,
+      `INSERT INTO career_interviews(
+        id,job_id,round_name,scheduled_at,status,created_at,updated_at
+      ) VALUES('legacy-interview','legacy-job','Legacy round',?,'canceled',?,?)`,
+      [FUTURE, PAST, PAST],
+    );
+  });
+  try {
+    assert.deepEqual(
+      objects(database, `SELECT id,status,cancellation_reason
+        FROM career_tasks WHERE id='legacy-task'`),
+      [{ id: "legacy-task", status: "canceled", cancellation_reason: null }],
+    );
+    await lifecycle.restoreCareerTask("legacy-task", {
+      now: RESTORE_BEFORE,
+      operationId: "restore-legacy-task",
+    });
+    await lifecycle.restoreCareerInterview("legacy-interview", {
+      now: RESTORE_BEFORE,
+      operationId: "restore-legacy-interview",
+    });
+
+    assert.equal(
+      database.selectValue("SELECT status FROM career_tasks WHERE id='legacy-task'"),
+      "todo",
+    );
+    assert.equal(
+      database.selectValue(
+        "SELECT status FROM career_interviews WHERE id='legacy-interview'",
+      ),
+      "scheduled",
+    );
+    assert.deepEqual(
+      objects(database, `SELECT entity_type,action,reason
+        FROM career_lifecycle_events
+        WHERE entity_id IN ('legacy-task','legacy-interview')
+        ORDER BY entity_type`),
+      [
+        { entity_type: "interview", action: "restore_interview", reason: "" },
+        { entity_type: "task", action: "restore_task", reason: "" },
       ],
     );
   } finally {

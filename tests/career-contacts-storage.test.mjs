@@ -7,63 +7,43 @@ import ts from "typescript";
 
 const projectRoot = new URL("../", import.meta.url);
 
-function stringValue(expression) {
-  if (
-    ts.isStringLiteral(expression) ||
-    ts.isNoSubstitutionTemplateLiteral(expression)
-  ) {
-    return expression.text;
-  }
-  return null;
+async function loadStandaloneTypeScriptModule(relativePath) {
+  const source = await readFile(new URL(relativePath, projectRoot), "utf8");
+  const { outputText, diagnostics = [] } = ts.transpileModule(source, {
+    fileName: relativePath,
+    reportDiagnostics: true,
+    compilerOptions: {
+      module: ts.ModuleKind.ESNext,
+      target: ts.ScriptTarget.ES2022,
+      verbatimModuleSyntax: true,
+    },
+  });
+  assert.deepEqual(
+    diagnostics.filter(
+      ({ category }) => category === ts.DiagnosticCategory.Error,
+    ),
+    [],
+  );
+  const encoded = Buffer.from(outputText).toString("base64");
+  return import(`data:text/javascript;base64,${encoded}`);
 }
 
-function arraySql(source, variableName) {
-  const file = ts.createSourceFile(
-    "db.ts",
-    source,
-    ts.ScriptTarget.ESNext,
-    true,
-    ts.ScriptKind.TS,
-  );
-  let values = null;
-  function visit(node) {
-    if (
-      ts.isVariableDeclaration(node) &&
-      ts.isIdentifier(node.name) &&
-      node.name.text === variableName &&
-      node.initializer &&
-      ts.isArrayLiteralExpression(node.initializer)
-    ) {
-      values = node.initializer.elements.flatMap((element) => {
-        if (!ts.isObjectLiteralExpression(element)) return [];
-        const property = element.properties.find(
-          (candidate) =>
-            ts.isPropertyAssignment(candidate) &&
-            ((ts.isIdentifier(candidate.name) && candidate.name.text === "sql") ||
-              (ts.isStringLiteral(candidate.name) && candidate.name.text === "sql")),
-        );
-        if (!property || !ts.isPropertyAssignment(property)) return [];
-        const value = stringValue(property.initializer);
-        return value === null ? [] : [value];
-      });
-    }
-    ts.forEachChild(node, visit);
-  }
-  visit(file);
-  assert.ok(values, `missing ${variableName}`);
-  return values;
-}
-
-test("fresh runtime schema exposes v2 contact relationships without synthetic history", async () => {
-  const source = await readFile(
-    new URL("lib/career/db.ts", projectRoot),
-    "utf8",
-  );
+test("fresh runtime schema exposes v3 contact relationships without synthetic history", async () => {
+  const [source, schema] = await Promise.all([
+    readFile(new URL("lib/career/db.ts", projectRoot), "utf8"),
+    loadStandaloneTypeScriptModule("lib/schemas/zhiji.ts"),
+  ]);
   const sqlite3 = await sqlite3InitModule();
   const database = new sqlite3.oo1.DB(":memory:", "c");
   try {
     database.exec("PRAGMA foreign_keys=ON");
-    for (const sql of arraySql(source, "schemaStatements")) database.exec(sql);
+    database.transaction("IMMEDIATE", () => {
+      for (const { sql } of [
+        ...schema.ZHIJI_V1_SCHEMA_STATEMENTS,
+        ...schema.ZHIJI_V2_SCHEMA_MIGRATION_STATEMENTS,
+        ...schema.ZHIJI_V3_SCHEMA_MIGRATION_STATEMENTS,
+      ]) database.exec(sql);
+    });
 
     const contactColumns = new Set(
       database.selectObjects("PRAGMA table_info(career_contacts)")
@@ -76,6 +56,7 @@ test("fresh runtime schema exposes v2 contact relationships without synthetic hi
     assert.equal(contactColumns.has("updated_at"), true);
     assert.equal(contactColumns.has("archived"), true);
     assert.equal(taskColumns.has("contact_id"), true);
+    assert.equal(taskColumns.has("canceled_at"), true);
     assert.equal(
       database.selectValue(
         "SELECT type FROM sqlite_schema WHERE name='career_contact_jobs'",
@@ -93,6 +74,9 @@ test("fresh runtime schema exposes v2 contact relationships without synthetic hi
     )), 0);
     assert.equal(Number(database.selectValue(
       "SELECT COUNT(*) FROM career_contact_interactions",
+    )), 0);
+    assert.equal(Number(database.selectValue(
+      "SELECT COUNT(*) FROM career_lifecycle_events",
     )), 0);
     assert.deepEqual(database.selectObjects("PRAGMA foreign_key_check"), []);
   } finally {

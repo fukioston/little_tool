@@ -8,6 +8,10 @@ import {
 import {
   CAREER_APPLICATION_ID,
   CAREER_USER_VERSION,
+  CAREER_V2_SCHEMA_OBJECT_COUNT,
+  createCareerRuntimeUpgradeStatements,
+  createFreshCareerSchemaStatements,
+  createInterruptedCareerV2RuntimeRecoveryStatements,
 } from "./backup-plan";
 import type {
   Activity,
@@ -66,153 +70,6 @@ export async function runCareerBatch(
   assertExclusiveContext(context);
   return withCareerWriteLock(() => localDb.batch(DB, statements), context);
 }
-
-const schemaStatements: SqlStatement[] = [
-  {
-    sql: `CREATE TABLE IF NOT EXISTS career_stages (
-      id TEXT PRIMARY KEY,
-      name TEXT NOT NULL,
-      color TEXT NOT NULL,
-      position INTEGER NOT NULL,
-      is_terminal INTEGER NOT NULL DEFAULT 0,
-      hidden INTEGER NOT NULL DEFAULT 0
-    )`,
-  },
-  {
-    sql: `CREATE TABLE IF NOT EXISTS career_jobs (
-      id TEXT PRIMARY KEY,
-      company TEXT NOT NULL,
-      role TEXT NOT NULL,
-      location TEXT NOT NULL DEFAULT '',
-      source TEXT NOT NULL DEFAULT '手动记录',
-      source_url TEXT NOT NULL DEFAULT '',
-      stage_id TEXT NOT NULL REFERENCES career_stages(id),
-      priority INTEGER NOT NULL DEFAULT 1,
-      salary TEXT NOT NULL DEFAULT '',
-      work_mode TEXT NOT NULL DEFAULT '',
-      description TEXT NOT NULL DEFAULT '',
-      applied_at TEXT,
-      deadline TEXT,
-      contact_name TEXT NOT NULL DEFAULT '',
-      note TEXT NOT NULL DEFAULT '',
-      tags TEXT NOT NULL DEFAULT '',
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL,
-      archived INTEGER NOT NULL DEFAULT 0,
-      position INTEGER NOT NULL DEFAULT 0
-    )`,
-  },
-  {
-    sql: `CREATE TABLE IF NOT EXISTS career_tasks (
-      id TEXT PRIMARY KEY,
-      job_id TEXT REFERENCES career_jobs(id) ON DELETE SET NULL,
-      contact_id TEXT REFERENCES career_contacts(id) ON DELETE SET NULL,
-      title TEXT NOT NULL,
-      due_at TEXT,
-      kind TEXT NOT NULL DEFAULT '跟进',
-      priority INTEGER NOT NULL DEFAULT 1,
-      status TEXT NOT NULL DEFAULT 'todo',
-      created_at TEXT NOT NULL
-    )`,
-  },
-  {
-    sql: `CREATE TABLE IF NOT EXISTS career_interviews (
-      id TEXT PRIMARY KEY,
-      job_id TEXT NOT NULL REFERENCES career_jobs(id) ON DELETE CASCADE,
-      round_name TEXT NOT NULL,
-      interview_type TEXT NOT NULL DEFAULT '视频面试',
-      scheduled_at TEXT,
-      duration INTEGER NOT NULL DEFAULT 45,
-      interviewer TEXT NOT NULL DEFAULT '',
-      meeting_url TEXT NOT NULL DEFAULT '',
-      status TEXT NOT NULL DEFAULT 'scheduled',
-      summary TEXT NOT NULL DEFAULT '',
-      raw_notes TEXT NOT NULL DEFAULT '',
-      questions_json TEXT NOT NULL DEFAULT '[]',
-      reflection TEXT NOT NULL DEFAULT '',
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    )`,
-  },
-  {
-    sql: `CREATE TABLE IF NOT EXISTS career_contacts (
-      id TEXT PRIMARY KEY,
-      company TEXT NOT NULL DEFAULT '',
-      name TEXT NOT NULL,
-      role TEXT NOT NULL DEFAULT '',
-      channel TEXT NOT NULL DEFAULT '',
-      email TEXT NOT NULL DEFAULT '',
-      phone TEXT NOT NULL DEFAULT '',
-      last_contact_at TEXT,
-      next_follow_up TEXT,
-      notes TEXT NOT NULL DEFAULT '',
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL,
-      archived INTEGER NOT NULL DEFAULT 0
-    )`,
-  },
-  {
-    sql: `CREATE TABLE IF NOT EXISTS career_contact_jobs (
-      contact_id TEXT NOT NULL REFERENCES career_contacts(id) ON DELETE CASCADE,
-      job_id TEXT NOT NULL REFERENCES career_jobs(id) ON DELETE CASCADE,
-      created_at TEXT NOT NULL,
-      PRIMARY KEY (contact_id, job_id)
-    )`,
-  },
-  {
-    sql: `CREATE TABLE IF NOT EXISTS career_contact_interactions (
-      id TEXT PRIMARY KEY,
-      contact_id TEXT NOT NULL REFERENCES career_contacts(id) ON DELETE CASCADE,
-      job_id TEXT REFERENCES career_jobs(id) ON DELETE SET NULL,
-      interaction_type TEXT NOT NULL DEFAULT 'message',
-      direction TEXT NOT NULL DEFAULT 'outbound'
-        CHECK (direction IN ('outbound', 'inbound', 'mutual')),
-      channel TEXT NOT NULL DEFAULT '',
-      summary TEXT NOT NULL,
-      notes TEXT NOT NULL DEFAULT '',
-      occurred_at TEXT NOT NULL,
-      created_at TEXT NOT NULL
-    )`,
-  },
-  {
-    sql: `CREATE TABLE IF NOT EXISTS career_materials (
-      id TEXT PRIMARY KEY,
-      name TEXT NOT NULL,
-      kind TEXT NOT NULL DEFAULT '简历',
-      version TEXT NOT NULL DEFAULT 'v1.0',
-      updated_at TEXT NOT NULL,
-      linked_job_id TEXT REFERENCES career_jobs(id) ON DELETE SET NULL,
-      status TEXT NOT NULL DEFAULT 'ready',
-      notes TEXT NOT NULL DEFAULT ''
-    )`,
-  },
-  {
-    sql: `CREATE TABLE IF NOT EXISTS career_activity (
-      id TEXT PRIMARY KEY,
-      job_id TEXT REFERENCES career_jobs(id) ON DELETE SET NULL,
-      type TEXT NOT NULL,
-      detail TEXT NOT NULL,
-      created_at TEXT NOT NULL
-    )`,
-  },
-  {
-    sql: `CREATE TABLE IF NOT EXISTS career_settings (
-      key TEXT PRIMARY KEY,
-      value TEXT NOT NULL
-    )`,
-  },
-  { sql: "CREATE INDEX IF NOT EXISTS idx_career_jobs_stage ON career_jobs(stage_id, archived, position)" },
-  { sql: "CREATE INDEX IF NOT EXISTS idx_career_tasks_due ON career_tasks(status, due_at)" },
-  { sql: "CREATE INDEX IF NOT EXISTS idx_career_interviews_date ON career_interviews(scheduled_at)" },
-];
-
-const contactIndexes: SqlStatement[] = [
-  { sql: "CREATE INDEX IF NOT EXISTS idx_career_contacts_archived_name ON career_contacts(archived, name)" },
-  { sql: "CREATE INDEX IF NOT EXISTS idx_career_tasks_contact_due ON career_tasks(contact_id, status, due_at)" },
-  { sql: "CREATE INDEX IF NOT EXISTS idx_career_contact_jobs_job ON career_contact_jobs(job_id, contact_id)" },
-  { sql: "CREATE INDEX IF NOT EXISTS idx_career_contact_interactions_contact_date ON career_contact_interactions(contact_id, occurred_at DESC)" },
-  { sql: "CREATE INDEX IF NOT EXISTS idx_career_contact_interactions_job_date ON career_contact_interactions(job_id, occurred_at DESC)" },
-];
 
 export const CAREER_LEGACY_DEMO_RESOLUTION_SETTING =
   "legacy_demo_v1_resolution";
@@ -369,6 +226,10 @@ export const CAREER_LEGACY_DEMO_RESOLUTION_STATEMENTS: readonly SqlStatement[] =
             OR actual.created_at IS NOT (SELECT created_at FROM reference)
             OR actual.archived IS NOT expected.archived
             OR actual.position IS NOT expected.position
+            OR actual.archived_at IS NOT NULL
+            OR actual.ended_at IS NOT NULL
+            OR actual.archived_operation_id IS NOT NULL
+            OR actual.ended_operation_id IS NOT NULL
         )
         AND (SELECT COUNT(*) FROM career_tasks) = 4
         AND (SELECT COUNT(DISTINCT title) FROM career_tasks) = 4
@@ -385,6 +246,11 @@ export const CAREER_LEGACY_DEMO_RESOLUTION_STATEMENTS: readonly SqlStatement[] =
             OR actual.priority IS NOT expected.priority
             OR actual.status IS NOT expected.status
             OR actual.created_at IS NOT (SELECT created_at FROM reference)
+            OR actual.updated_at IS NOT actual.created_at
+            OR actual.canceled_at IS NOT NULL
+            OR actual.cancellation_reason IS NOT NULL
+            OR actual.lifecycle_previous_status IS NOT NULL
+            OR actual.lifecycle_operation_id IS NOT NULL
         )
         AND (SELECT COUNT(*) FROM career_interviews) = 2
         AND (SELECT COUNT(DISTINCT round_name) FROM career_interviews) = 2
@@ -407,6 +273,10 @@ export const CAREER_LEGACY_DEMO_RESOLUTION_STATEMENTS: readonly SqlStatement[] =
             OR actual.reflection IS NOT expected.reflection
             OR actual.created_at IS NOT (SELECT created_at FROM reference)
             OR actual.updated_at IS NOT (SELECT created_at FROM reference)
+            OR actual.canceled_at IS NOT NULL
+            OR actual.cancellation_reason IS NOT NULL
+            OR actual.lifecycle_previous_status IS NOT NULL
+            OR actual.lifecycle_operation_id IS NOT NULL
         )
         AND (SELECT COUNT(*) FROM career_contacts) = 3
         AND (SELECT COUNT(DISTINCT name) FROM career_contacts) = 3
@@ -429,6 +299,7 @@ export const CAREER_LEGACY_DEMO_RESOLUTION_STATEMENTS: readonly SqlStatement[] =
         )
         AND (SELECT COUNT(*) FROM career_contact_jobs) = 0
         AND (SELECT COUNT(*) FROM career_contact_interactions) = 0
+        AND (SELECT COUNT(*) FROM career_lifecycle_events) = 0
         AND (SELECT COUNT(*) FROM career_materials) = 3
         AND (SELECT COUNT(DISTINCT name) FROM career_materials) = 3
         AND NOT EXISTS (
@@ -542,61 +413,48 @@ export async function initializeCareerDb(context?: CareerLockContext) {
       throw new Error("这份职迹数据库来自更新版本，请升级应用后再打开。");
     }
 
-    await runCareerBatch(schemaStatements, lockContext);
-    const materialColumns = await query<{ name: string }>(
-      "PRAGMA table_info(career_materials)",
+    const schemaObjectCount = await query<{ count: number }>(
+      `SELECT COUNT(*) AS count FROM sqlite_schema
+        WHERE type IN ('table','index','view','trigger')
+          AND name NOT LIKE 'sqlite_%'`,
       [],
       lockContext,
     );
-    const existingMaterialColumns = new Set(materialColumns.map((column) => column.name));
-    const materialMigrations = [
-      ["file_key", "TEXT"],
-      ["file_name", "TEXT"],
-      ["mime_type", "TEXT"],
-      ["byte_size", "INTEGER"],
-    ] as const;
-    const missingMaterialColumns = materialMigrations
-      .filter(([column]) => !existingMaterialColumns.has(column))
-      .map(([column, type]) => ({
-        sql: `ALTER TABLE career_materials ADD COLUMN ${column} ${type}`,
-      }));
-    if (missingMaterialColumns.length > 0) {
-      await runCareerBatch(missingMaterialColumns, lockContext);
-    }
+    const isEmpty = Number(schemaObjectCount[0]?.count ?? 0) === 0;
+    const hasExactV2ObjectCount =
+      Number(schemaObjectCount[0]?.count ?? 0) === CAREER_V2_SCHEMA_OBJECT_COUNT;
+    const isKnownInterruptedV2 = hasExactV2ObjectCount && (
+      (currentApplicationId === CAREER_APPLICATION_ID &&
+        (currentUserVersion === 1 || currentUserVersion === CAREER_USER_VERSION)) ||
+      (currentApplicationId === 0 && currentUserVersion === 0)
+    );
+    try {
+      if (isEmpty) {
+        if (currentApplicationId !== 0 || currentUserVersion !== 0) {
+          throw new Error("空数据库带有不一致的版本标识");
+        }
+        await runCareerBatch([
+          ...createFreshCareerSchemaStatements(),
+          ...CAREER_STRUCTURAL_STAGE_STATEMENTS,
+        ], lockContext);
+        return;
+      }
 
-    const [contactColumns, taskColumns] = await Promise.all([
-      query<{ name: string }>("PRAGMA table_info(career_contacts)", [], lockContext),
-      query<{ name: string }>("PRAGMA table_info(career_tasks)", [], lockContext),
-    ]);
-    const existingContactColumns = new Set(contactColumns.map((column) => column.name));
-    const existingTaskColumns = new Set(taskColumns.map((column) => column.name));
-    const contactMigrations: SqlStatement[] = [];
-    if (!existingContactColumns.has("updated_at")) {
-      contactMigrations.push({ sql: "ALTER TABLE career_contacts ADD COLUMN updated_at TEXT" });
+      await runCareerBatch([
+        ...(isKnownInterruptedV2
+          ? createInterruptedCareerV2RuntimeRecoveryStatements(
+            currentApplicationId,
+            currentUserVersion,
+          )
+          : createCareerRuntimeUpgradeStatements(currentUserVersion)),
+        ...CAREER_LEGACY_DEMO_RESOLUTION_STATEMENTS,
+      ], lockContext);
+    } catch (error) {
+      throw new Error(
+        "职迹本地数据结构不完整或并非受支持的版本；为保护原记录，本次没有改动它。",
+        { cause: error },
+      );
     }
-    if (!existingContactColumns.has("archived")) {
-      contactMigrations.push({
-        sql: "ALTER TABLE career_contacts ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
-      });
-    }
-    if (!existingTaskColumns.has("contact_id")) {
-      contactMigrations.push({
-        sql: "ALTER TABLE career_tasks ADD COLUMN contact_id TEXT REFERENCES career_contacts(id) ON DELETE SET NULL",
-      });
-    }
-    if (contactMigrations.length > 0) {
-      await runCareerBatch(contactMigrations, lockContext);
-    }
-    await runCareerBatch([
-      {
-        sql: `UPDATE career_contacts
-          SET updated_at = created_at
-          WHERE updated_at IS NULL OR updated_at = ''`,
-      },
-      ...contactIndexes,
-    ], lockContext);
-
-    await runCareerBatch(CAREER_LEGACY_DEMO_RESOLUTION_STATEMENTS, lockContext);
 
     const count = await query<{ count: number }>(
       "SELECT COUNT(*) AS count FROM career_stages",
@@ -606,11 +464,6 @@ export async function initializeCareerDb(context?: CareerLockContext) {
     if (Number(count[0]?.count ?? 0) === 0) {
       await runCareerBatch(CAREER_STRUCTURAL_STAGE_STATEMENTS, lockContext);
     }
-
-    await runCareerBatch([
-      { sql: `PRAGMA application_id = ${CAREER_APPLICATION_ID}` },
-      { sql: `PRAGMA user_version = ${CAREER_USER_VERSION}` },
-    ], lockContext);
   }, context);
 }
 
@@ -633,11 +486,26 @@ export async function loadCareerData(context?: CareerLockContext): Promise<Caree
     const [stages, jobs, tasks, interviews, contacts, materials, activities] = await Promise.all([
       query<Stage>("SELECT * FROM career_stages ORDER BY position", [], lockContext),
       query<Job>("SELECT * FROM career_jobs WHERE archived = 0 ORDER BY position, updated_at DESC", [], lockContext),
-      query<Task>("SELECT * FROM career_tasks ORDER BY status, due_at", [], lockContext),
-      query<Interview>("SELECT * FROM career_interviews ORDER BY scheduled_at", [], lockContext),
+      query<Task>(`SELECT task.* FROM career_tasks AS task
+        WHERE task.job_id IS NULL OR EXISTS (
+          SELECT 1 FROM career_jobs AS job
+          WHERE job.id = task.job_id AND job.archived = 0
+        )
+        ORDER BY task.status,task.due_at`, [], lockContext),
+      query<Interview>(`SELECT interview.* FROM career_interviews AS interview
+        WHERE EXISTS (
+          SELECT 1 FROM career_jobs AS job
+          WHERE job.id = interview.job_id AND job.archived = 0
+        )
+        ORDER BY interview.scheduled_at`, [], lockContext),
       query<Contact>("SELECT * FROM career_contacts WHERE archived = 0 ORDER BY next_follow_up, name", [], lockContext),
       query<Material>("SELECT * FROM career_materials ORDER BY updated_at DESC", [], lockContext),
-      query<Activity>("SELECT * FROM career_activity ORDER BY created_at DESC LIMIT 40", [], lockContext),
+      query<Activity>(`SELECT activity.* FROM career_activity AS activity
+        WHERE activity.job_id IS NULL OR EXISTS (
+          SELECT 1 FROM career_jobs AS job
+          WHERE job.id = activity.job_id AND job.archived = 0
+        )
+        ORDER BY activity.created_at DESC LIMIT 40`, [], lockContext),
     ]);
     return { stages, jobs, tasks, interviews, contacts, materials, activities };
   }, context);
