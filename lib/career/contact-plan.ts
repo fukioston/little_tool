@@ -19,6 +19,13 @@ export type PlannedContactUpdate = Readonly<{
   fields: Readonly<Record<string, string>>;
   updatedAt: string;
   jobIds?: readonly string[];
+  expected?: PlannedContactExpectedState;
+}>;
+
+export type PlannedContactExpectedState = Readonly<{
+  updatedAt: string;
+  archived: boolean;
+  jobIds: readonly string[];
 }>;
 
 export type PlannedContactInteraction = Readonly<{
@@ -33,6 +40,8 @@ export type PlannedContactInteraction = Readonly<{
   occurredAt: string;
   createdAt: string;
   associatedJobIds: readonly string[];
+  contactUpdatedAt?: string;
+  expectedContact?: PlannedContactExpectedState;
   followUp: Readonly<{
     id: string;
     title: string;
@@ -52,6 +61,8 @@ export type PlannedContactTask = Readonly<{
   priority: number;
   jobId: string | null;
   createdAt: string;
+  contactUpdatedAt?: string;
+  expectedContact?: PlannedContactExpectedState;
 }>;
 
 const GUARD_TABLE = "temp.__career_contact_write_guard";
@@ -65,7 +76,27 @@ const PROFILE_COLUMNS = new Set([
   "notes",
 ]);
 
-function contactGuard(contactId: string, activeOnly: boolean): SqlStatement[] {
+function contactGuard(
+  contactId: string,
+  activeOnly: boolean,
+  expected?: PlannedContactExpectedState,
+): SqlStatement[] {
+  const expectedJobIds = expected ? [...new Set(expected.jobIds)].sort() : [];
+  const expectedClauses = expected
+    ? [
+        "AND contact.updated_at = ?",
+        "AND contact.archived = ?",
+        `AND (SELECT COUNT(*) FROM career_contact_jobs AS expected_links
+          WHERE expected_links.contact_id = contact.id) = ?`,
+        ...(expectedJobIds.length > 0
+          ? [`AND NOT EXISTS (
+              SELECT 1 FROM career_contact_jobs AS unexpected_link
+              WHERE unexpected_link.contact_id = contact.id
+                AND unexpected_link.job_id NOT IN (${expectedJobIds.map(() => "?").join(",")})
+            )`]
+          : []),
+      ]
+    : [];
   return [
     {
       sql: `CREATE TEMP TABLE __career_contact_write_guard (
@@ -75,10 +106,21 @@ function contactGuard(contactId: string, activeOnly: boolean): SqlStatement[] {
     {
       sql: `INSERT INTO ${GUARD_TABLE}(value)
         SELECT CASE WHEN EXISTS (
-          SELECT 1 FROM career_contacts
-          WHERE id = ?${activeOnly ? " AND archived = 0" : ""}
+          SELECT 1 FROM career_contacts AS contact
+          WHERE contact.id = ?${activeOnly ? " AND contact.archived = 0" : ""}
+          ${expectedClauses.join("\n          ")}
         ) THEN 1 ELSE 0 END`,
-      params: [contactId],
+      params: [
+        contactId,
+        ...(expected
+          ? [
+              expected.updatedAt,
+              expected.archived ? 1 : 0,
+              expectedJobIds.length,
+              ...expectedJobIds,
+            ]
+          : []),
+      ],
     },
   ];
 }
@@ -135,7 +177,7 @@ export function createCareerContactUpdateStatements(
     }
   }
   const statements: SqlStatement[] = [
-    ...contactGuard(update.contactId, false),
+    ...contactGuard(update.contactId, false, update.expected),
     {
       sql: `UPDATE career_contacts SET ${[
         ...fields.map(([column]) => `${column} = ?`),
@@ -144,7 +186,7 @@ export function createCareerContactUpdateStatements(
       params: [...fields.map(([, value]) => value), update.updatedAt, update.contactId],
     },
   ];
-  if (update.jobIds) {
+  if (update.jobIds !== undefined) {
     statements.push(
       {
         sql: "DELETE FROM career_contact_jobs WHERE contact_id = ?",
@@ -160,9 +202,12 @@ export function createCareerContactUpdateStatements(
 export function createCareerContactInteractionStatements(
   interaction: PlannedContactInteraction,
 ): SqlStatement[] {
-  const nextFollowUp = interaction.followUp?.dueAt ?? null;
   return [
-    ...contactGuard(interaction.contactId, true),
+    ...contactGuard(
+      interaction.contactId,
+      true,
+      interaction.expectedContact,
+    ),
     {
       sql: `INSERT INTO career_contact_interactions
         (id, contact_id, job_id, interaction_type, direction, channel,
@@ -189,8 +234,9 @@ export function createCareerContactInteractionStatements(
     ...(interaction.followUp
       ? [{
           sql: `INSERT INTO career_tasks
-            (id, job_id, contact_id, title, due_at, kind, priority, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'todo', ?)`,
+            (id, job_id, contact_id, title, due_at, kind, priority, status,
+              created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'todo', ?, ?)`,
           params: [
             interaction.followUp.id,
             interaction.followUp.jobId,
@@ -200,24 +246,14 @@ export function createCareerContactInteractionStatements(
             interaction.followUp.kind,
             interaction.followUp.priority,
             interaction.createdAt,
+            interaction.createdAt,
           ],
         } satisfies SqlStatement]
       : []),
     {
-      sql: `UPDATE career_contacts
-        SET last_contact_at = CASE
-            WHEN last_contact_at IS NULL OR last_contact_at < ? THEN ?
-            ELSE last_contact_at
-          END,
-          next_follow_up = CASE WHEN ? IS NULL THEN next_follow_up ELSE ? END,
-          updated_at = ?
-        WHERE id = ?`,
+      sql: "UPDATE career_contacts SET updated_at = ? WHERE id = ?",
       params: [
-        interaction.occurredAt,
-        interaction.occurredAt,
-        nextFollowUp,
-        nextFollowUp,
-        interaction.createdAt,
+        interaction.contactUpdatedAt ?? interaction.createdAt,
         interaction.contactId,
       ],
     },
@@ -229,11 +265,12 @@ export function createCareerContactTaskStatements(
   task: PlannedContactTask,
 ): SqlStatement[] {
   return [
-    ...contactGuard(task.contactId, true),
+    ...contactGuard(task.contactId, true, task.expectedContact),
     {
       sql: `INSERT INTO career_tasks
-        (id, job_id, contact_id, title, due_at, kind, priority, status, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'todo', ?)`,
+        (id, job_id, contact_id, title, due_at, kind, priority, status,
+          created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'todo', ?, ?)`,
       params: [
         task.id,
         task.jobId,
@@ -243,21 +280,15 @@ export function createCareerContactTaskStatements(
         task.kind,
         task.priority,
         task.createdAt,
+        task.createdAt,
       ],
     },
     ...(task.jobId
       ? associationStatements(task.contactId, [task.jobId], task.createdAt)
       : []),
     {
-      sql: `UPDATE career_contacts
-        SET next_follow_up = CASE
-            WHEN ? IS NULL THEN next_follow_up
-            WHEN next_follow_up IS NULL OR next_follow_up > ? THEN ?
-            ELSE next_follow_up
-          END,
-          updated_at = ?
-        WHERE id = ?`,
-      params: [task.dueAt, task.dueAt, task.dueAt, task.createdAt, task.contactId],
+      sql: "UPDATE career_contacts SET updated_at = ? WHERE id = ?",
+      params: [task.contactUpdatedAt ?? task.createdAt, task.contactId],
     },
     dropGuard(),
   ];
@@ -267,9 +298,10 @@ export function createCareerContactArchiveStatements(
   contactId: string,
   archived: boolean,
   updatedAt: string,
+  expected?: PlannedContactExpectedState,
 ): SqlStatement[] {
   return [
-    ...contactGuard(contactId, false),
+    ...contactGuard(contactId, false, expected),
     {
       sql: "UPDATE career_contacts SET archived = ?, updated_at = ? WHERE id = ?",
       params: [archived ? 1 : 0, updatedAt, contactId],

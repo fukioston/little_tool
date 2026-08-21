@@ -85,7 +85,8 @@ function database() {
       kind TEXT NOT NULL,
       priority INTEGER NOT NULL,
       status TEXT NOT NULL,
-      created_at TEXT NOT NULL
+      created_at TEXT NOT NULL,
+      updated_at TEXT
     );
     INSERT INTO career_jobs VALUES
       ('job-a', 'Arc', '2026-01-01T00:00:00.000Z', 0),
@@ -213,10 +214,11 @@ test("recording a real interaction can link jobs and create one follow-up task",
       }],
     );
     assert.deepEqual(
-      rows(db, "SELECT last_contact_at,next_follow_up FROM career_contacts"),
+      rows(db, "SELECT last_contact_at,next_follow_up,updated_at FROM career_contacts"),
       [{
-        last_contact_at: "2026-08-21T03:00:00.000Z",
-        next_follow_up: "2026-08-22T03:00:00.000Z",
+        last_contact_at: null,
+        next_follow_up: null,
+        updated_at: "2026-08-21T03:05:00.000Z",
       }],
     );
     assert.equal(Number(db.selectValue("SELECT COUNT(*) FROM career_contact_jobs")), 1);
@@ -253,6 +255,10 @@ test("standalone follow-up and archive plans preserve relationship history", () 
     assert.equal(Number(db.selectValue("SELECT archived FROM career_contacts")), 0);
     assert.equal(Number(db.selectValue("SELECT COUNT(*) FROM career_tasks")), 1);
     assert.equal(Number(db.selectValue("SELECT COUNT(*) FROM career_contact_jobs")), 1);
+    assert.deepEqual(
+      rows(db, "SELECT last_contact_at,next_follow_up FROM career_contacts"),
+      [{ last_contact_at: null, next_follow_up: null }],
+    );
   } finally {
     db.close();
   }
