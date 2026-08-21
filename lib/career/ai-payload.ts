@@ -16,6 +16,13 @@ export const CAREER_AI_PAYLOAD_LIMITS = Object.freeze({
   roundName: 240,
   interviewer: 240,
   durationMinutes: 1_440,
+  interviewSummary: 4_000,
+  interviewRawNotes: 24_000,
+  interviewReflection: 12_000,
+  interviewQuestions: 24,
+  interviewQuestion: 600,
+  interviewAnswer: 1_500,
+  interviewQuestionNote: 600,
 } as const);
 
 const requirementsJobFields = Object.freeze([
@@ -37,6 +44,24 @@ const interviewPrepInterviewFields = Object.freeze([
   Object.freeze({ key: "interviewer", label: "面试官", kind: "single-line", maxLength: CAREER_AI_PAYLOAD_LIMITS.interviewer }),
 ] as const satisfies readonly CareerAiFieldSpec[]);
 
+const structureInterviewJobFields = Object.freeze([
+  Object.freeze({ key: "company", label: "公司", kind: "single-line", maxLength: CAREER_AI_PAYLOAD_LIMITS.company }),
+  Object.freeze({ key: "role", label: "职位", kind: "single-line", maxLength: CAREER_AI_PAYLOAD_LIMITS.role }),
+] as const satisfies readonly CareerAiFieldSpec[]);
+
+const structureInterviewFields = Object.freeze([
+  Object.freeze({ key: "round_name", label: "面试轮次", kind: "single-line", maxLength: CAREER_AI_PAYLOAD_LIMITS.roundName }),
+  Object.freeze({ key: "summary", label: "一句话总结", kind: "single-line", maxLength: CAREER_AI_PAYLOAD_LIMITS.interviewSummary }),
+  Object.freeze({ key: "raw_notes", label: "原始速记", kind: "multiline", maxLength: CAREER_AI_PAYLOAD_LIMITS.interviewRawNotes }),
+  Object.freeze({ key: "reflection", label: "复盘与下一步", kind: "multiline", maxLength: CAREER_AI_PAYLOAD_LIMITS.interviewReflection }),
+] as const satisfies readonly CareerAiFieldSpec[]);
+
+const structureInterviewQuestionFields = Object.freeze([
+  Object.freeze({ key: "question", label: "问题", kind: "single-line", maxLength: CAREER_AI_PAYLOAD_LIMITS.interviewQuestion }),
+  Object.freeze({ key: "answer", label: "回答", kind: "multiline", maxLength: CAREER_AI_PAYLOAD_LIMITS.interviewAnswer }),
+  Object.freeze({ key: "note", label: "问题备注", kind: "single-line", maxLength: CAREER_AI_PAYLOAD_LIMITS.interviewQuestionNote }),
+] as const satisfies readonly CareerAiFieldSpec[]);
+
 function fieldLabels(fields: readonly CareerAiFieldSpec[]) {
   return Object.freeze(fields.map((field) => field.label));
 }
@@ -48,6 +73,14 @@ export const CAREER_REQUIREMENTS_SHARED_FIELDS = fieldLabels(requirementsJobFiel
 export const CAREER_INTERVIEW_PREP_SHARED_FIELDS = fieldLabels([
   ...interviewPrepJobFields,
   ...interviewPrepInterviewFields,
+]);
+
+/** Human-readable disclosure text derived from the exact interview-structure whitelist. */
+export const CAREER_STRUCTURE_INTERVIEW_SHARED_FIELDS = fieldLabels([
+  ...structureInterviewJobFields,
+  ...structureInterviewFields.slice(0, 3),
+  ...structureInterviewQuestionFields,
+  structureInterviewFields[3],
 ]);
 
 export type CareerRequirementsPayload = Readonly<{
@@ -74,6 +107,24 @@ export type CareerInterviewPrepPayload = Readonly<{
   }>;
 }>;
 
+export type CareerStructureInterviewPayload = Readonly<{
+  job: Readonly<{
+    company: string;
+    role: string;
+  }>;
+  interview: Readonly<{
+    round_name: string;
+    summary: string;
+    raw_notes: string;
+    questions: readonly Readonly<{
+      question: string;
+      answer: string;
+      note: string;
+    }>[];
+    reflection: string;
+  }>;
+}>;
+
 export class CareerAiPayloadValidationError extends TypeError {
   readonly code = "CAREER_AI_PAYLOAD_REQUIRED_FIELDS";
   readonly missingFields: readonly string[];
@@ -83,6 +134,15 @@ export class CareerAiPayloadValidationError extends TypeError {
     super(`Career AI payload is missing required fields: ${stableFields.join(", ")}`);
     this.name = "CareerAiPayloadValidationError";
     this.missingFields = stableFields;
+  }
+}
+
+export class CareerAiActionNotAllowedError extends TypeError {
+  readonly code = "CAREER_AI_ACTION_NOT_ALLOWED";
+
+  constructor() {
+    super("This Career AI action is not available at this privacy boundary.");
+    this.name = "CareerAiActionNotAllowedError";
   }
 }
 
@@ -105,6 +165,27 @@ function takeCodePoints(value: string, maximum: number): string {
   return Array.from(value).slice(0, maximum).join("");
 }
 
+function toWellFormedText(value: string): string {
+  let result = "";
+  for (let index = 0; index < value.length; index += 1) {
+    const current = value.charCodeAt(index);
+    if (current >= 0xd800 && current <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        result += value[index] + value[index + 1];
+        index += 1;
+      } else {
+        result += "\ufffd";
+      }
+    } else if (current >= 0xdc00 && current <= 0xdfff) {
+      result += "\ufffd";
+    } else {
+      result += value[index];
+    }
+  }
+  return result;
+}
+
 function removeUnsafeControls(value: string): string {
   let result = "";
   for (const character of value) {
@@ -112,10 +193,12 @@ function removeUnsafeControls(value: string): string {
     const disallowedControl = codePoint <= 8 ||
       (codePoint >= 11 && codePoint <= 12) ||
       (codePoint >= 14 && codePoint <= 31) ||
-      codePoint === 127;
-    const bidiOverride = (codePoint >= 0x202a && codePoint <= 0x202e) ||
+      (codePoint >= 127 && codePoint <= 159);
+    const bidiOverride = codePoint === 0x061c ||
+      (codePoint >= 0x200e && codePoint <= 0x200f) ||
+      (codePoint >= 0x202a && codePoint <= 0x202e) ||
       (codePoint >= 0x2066 && codePoint <= 0x2069);
-    if (!disallowedControl && !bidiOverride) result += character;
+    if (!disallowedControl && !bidiOverride && codePoint !== 0xfeff) result += character;
   }
   return result;
 }
@@ -123,7 +206,10 @@ function removeUnsafeControls(value: string): string {
 function normalizeText(value: unknown, maximum: number, multiline: boolean): string {
   if (typeof value !== "string") return "";
   const withoutUnsafeControls = removeUnsafeControls(
-    value.normalize("NFC").replace(/\r\n?/g, "\n"),
+    toWellFormedText(value)
+      .normalize("NFC")
+      .replace(/\r\n?/g, "\n")
+      .replace(/[\u2028\u2029]/g, "\n"),
   );
   const normalized = multiline
     ? withoutUnsafeControls
@@ -214,6 +300,64 @@ export function buildCareerInterviewPrepPayload(
   return Object.freeze({ job: selectedJob, interview: selectedInterview });
 }
 
+function selectStructureInterviewQuestions(value: unknown): CareerStructureInterviewPayload["interview"]["questions"] {
+  let questions: readonly unknown[];
+  try {
+    if (!Array.isArray(value)) return Object.freeze([]);
+    questions = value;
+  } catch {
+    return Object.freeze([]);
+  }
+
+  const selectedQuestions: Array<CareerStructureInterviewPayload["interview"]["questions"][number]> = [];
+  let count = 0;
+  try {
+    count = Math.min(questions.length, CAREER_AI_PAYLOAD_LIMITS.interviewQuestions);
+  } catch {
+    return Object.freeze([]);
+  }
+  for (let index = 0; index < count; index += 1) {
+    let question: unknown;
+    try {
+      question = questions[index];
+    } catch {
+      question = undefined;
+    }
+    const selected = selectFields(question, structureInterviewQuestionFields);
+    selectedQuestions.push(selected as CareerStructureInterviewPayload["interview"]["questions"][number]);
+  }
+  return Object.freeze(selectedQuestions);
+}
+
+export function buildCareerStructureInterviewPayload(
+  job: unknown,
+  interview: unknown,
+): CareerStructureInterviewPayload {
+  const interviewSource = record(interview);
+  const selectedJobFields = selectFields(job, structureInterviewJobFields);
+  const selectedInterviewFields = selectFields(interview, structureInterviewFields);
+  const missing = [
+    ...missingNonEmptyText(selectedJobFields, [
+      { key: "company", path: "job.company" },
+      { key: "role", path: "job.role" },
+    ]),
+    ...missingNonEmptyText(selectedInterviewFields, [
+      { key: "round_name", path: "interview.round_name" },
+    ]),
+  ];
+  if (missing.length > 0) throw new CareerAiPayloadValidationError(missing);
+
+  const selectedJob = selectedJobFields as CareerStructureInterviewPayload["job"];
+  const selectedInterview = Object.freeze({
+    round_name: selectedInterviewFields.round_name as string,
+    summary: selectedInterviewFields.summary as string,
+    raw_notes: selectedInterviewFields.raw_notes as string,
+    questions: selectStructureInterviewQuestions(read(interviewSource, "questions")),
+    reflection: selectedInterviewFields.reflection as string,
+  });
+  return Object.freeze({ job: selectedJob, interview: selectedInterview });
+}
+
 function normalizeCareerAiAction(action: string): string {
   return action
     .trim()
@@ -224,9 +368,12 @@ function normalizeCareerAiAction(action: string): string {
 /**
  * Rebuild privacy-sensitive AI inputs at the server boundary. Callers are
  * intentionally treated as untrusted even when the UI already used a builder.
- * Actions whose contracts have not yet been narrowed retain their payload.
+ * Actions whose contracts have not been narrowed are rejected before prompting.
  */
-export function sanitizeCareerAiRequestPayload(action: string, payload: unknown): unknown {
+export function sanitizeCareerAiRequestPayload(
+  action: string,
+  payload: unknown,
+): CareerRequirementsPayload | CareerInterviewPrepPayload | CareerStructureInterviewPayload {
   const normalizedAction = normalizeCareerAiAction(action);
   if (normalizedAction === "fit_analysis") {
     return buildCareerRequirementsPayload(read(record(payload), "job"));
@@ -237,5 +384,11 @@ export function sanitizeCareerAiRequestPayload(action: string, payload: unknown)
       read(record(payload), "interview"),
     );
   }
-  return payload;
+  if (normalizedAction === "structure_interview") {
+    return buildCareerStructureInterviewPayload(
+      read(record(payload), "job"),
+      read(record(payload), "interview"),
+    );
+  }
+  throw new CareerAiActionNotAllowedError();
 }

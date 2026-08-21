@@ -36,6 +36,14 @@ function payload(value: unknown): string {
   return JSON.stringify(value, null, 2).slice(0, 80_000);
 }
 
+function contractedCareerPayload(value: unknown): string {
+  const serialized = JSON.stringify(value, null, 2);
+  if (serialized.length > 240_000) {
+    throw new Error("Career AI payload exceeds its bounded contract");
+  }
+  return serialized;
+}
+
 function fitnessPayload(value: unknown): string {
   const serialized = JSON.stringify(value);
   if (serialized.length > 160_000) throw new Error("Fitness AI payload exceeds its bounded contract");
@@ -43,7 +51,7 @@ function fitnessPayload(value: unknown): string {
 }
 
 export function careerPrompt(action: string, input: unknown): PromptBundle {
-  const normalized = action.replace(/[A-Z]/g, (value) => `_${value.toLowerCase()}`).replace(/-/g, "_");
+  const normalized = action.trim().replace(/[A-Z]/g, (value) => `_${value.toLowerCase()}`).replace(/-/g, "_");
   const tasks: Record<string, string> = {
     parse_job: `从职位链接、分享文字或 JD 中提取结构化职位信息。薪资 min/max 必须换算成完整货币单位数字（例如 30K 写成 30000），无法确认币种或周期时保留 null。返回：
 {"company_name":string|null,"title":string|null,"location":string|null,"work_mode":"onsite"|"hybrid"|"remote"|null,"employment_type":"full_time"|"part_time"|"contract"|"internship"|null,"salary":{"min":number|null,"max":number|null,"currency":string|null,"period":"hour"|"day"|"month"|"year"|null,"months":number|null,"raw":string|null},"source":"linkedin"|"boss"|"other"|null,"responsibilities":string[],"must_have":string[],"nice_to_have":string[],"keywords":string[],"deadline":string|null,"summary":string,"field_confidence":object,"warnings":string[]}`,
@@ -53,20 +61,12 @@ export function careerPrompt(action: string, input: unknown): PromptBundle {
 {"role_summary":string,"round_focus":string[],"questions":[{"category":string,"question":string,"why_likely":string,"answer_framework":string[],"difficulty":"easy"|"medium"|"hard"}],"study_plan":[{"topic":string,"priority":"high"|"medium"|"low","minutes":number,"done_definition":string}],"questions_to_ask_interviewer":string[],"red_flags_to_clarify":string[],"opening_pitch":string,"warnings":string[]}`,
     structure_interview: `把面试速记整理为结构化面经草稿，但保留不确定性。返回：
 {"summary":string,"process":string,"questions":[{"category":string,"question":string,"my_answer":string|null,"interviewer_follow_up":string|null,"better_answer":string|null,"confidence":number}],"feedback_received":string[],"strengths":string[],"improvements":string[],"next_steps":string[],"uncertain_items":string[],"warnings":string[]}`,
-    improve_answer: `改进一段面试回答，不添加用户没有提供的经历。返回：
-{"diagnosis":string,"strengths":string[],"issues":string[],"improved_answer":string,"answer_structure":[{"part":string,"purpose":string}],"follow_up_questions":string[],"claims_to_verify":string[],"warnings":string[]}`,
-    follow_up_email: `基于面试和联系人信息生成一封自然、克制、不过度热情的跟进邮件。返回：
-{"subject":string,"body":string,"tone":string,"alternate_subjects":string[],"claims_to_verify":string[],"warnings":string[]}`,
-    tailor_material: `在不虚构经历的前提下，给出简历或求职信的逐项修改草稿。返回：
-{"document_type":"resume"|"cover_letter","summary_draft":string,"changes":[{"section":string,"before":string,"after":string,"reason":string,"risk_flags":string[]}],"unsupported_claims_removed":string[],"keywords_used":string[],"warnings":string[]}`,
-    weekly_review: `根据已计算的求职数据做克制、可行动的复盘，不重新发明指标。返回：
-{"headline":string,"wins":string[],"bottlenecks":[{"label":string,"evidence":string,"impact":string}],"next_week_actions":[{"title":string,"why":string,"target":string}],"experiments":string[],"encouragement":string,"warnings":string[]}`,
   };
-  const instruction = tasks[normalized];
-  if (!instruction) throw new Error(`Unsupported career AI action: ${action}`);
+  const instruction = Object.hasOwn(tasks, normalized) ? tasks[normalized] : undefined;
+  if (typeof instruction !== "string") throw new Error(`Unsupported career AI action: ${action}`);
   return {
     system: CAREER_SYSTEM,
-    user: `${instruction}\n\n以下是用户提供的数据：\n${payload(input)}`,
+    user: `${instruction}\n\n以下是用户提供的数据：\n${normalized === "parse_job" ? payload(input) : contractedCareerPayload(input)}`,
     promptVersion: `career-${normalized}-1.0.0`,
   };
 }

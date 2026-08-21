@@ -177,11 +177,6 @@ export type Notice = {
 };
 
 export type AiAction =
-  | "parse_job"
   | "fit_analysis"
   | "interview_prep"
-  | "structure_interview"
-  | "improve_answer"
-  | "follow_up_email"
-  | "tailor_material"
-  | "weekly_review";
+  | "structure_interview";

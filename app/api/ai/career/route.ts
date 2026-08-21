@@ -1,4 +1,5 @@
 import {
+  CareerAiActionNotAllowedError,
   CareerAiPayloadValidationError,
   sanitizeCareerAiRequestPayload,
 } from "@/lib/career/ai-payload";
@@ -18,10 +19,17 @@ export async function POST(request: Request) {
     const result = await runDeepSeekJson(careerPrompt(body.action, safePayload));
     return jsonResponse({ ok: true, ...result });
   } catch (error) {
+    if (error instanceof CareerAiActionNotAllowedError) {
+      return errorResponse(new HttpError(
+        400,
+        "这个 AI 功能尚未开放。",
+        "CAREER_AI_ACTION_NOT_ALLOWED",
+      ));
+    }
     if (error instanceof CareerAiPayloadValidationError) {
       return errorResponse(new HttpError(
         400,
-        "AI 所需的职位信息不完整，请补全后再试。",
+        "AI 所需的信息不完整，请补全后再试。",
         "CAREER_AI_INPUT_INCOMPLETE",
       ));
     }

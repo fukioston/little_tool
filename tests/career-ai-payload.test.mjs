@@ -35,6 +35,8 @@ const payloadModuleUrl = dataModule(
 );
 const payloads = await import(payloadModuleUrl);
 const PRIVATE_TOKENS = [
+  "PRIVATE_JOB_ID",
+  "PRIVATE_INTERVIEW_ID",
   "PRIVATE_NOTE",
   "PRIVATE_CONTACT",
   "PRIVATE_SOURCE_URL",
@@ -48,6 +50,24 @@ const PRIVATE_TOKENS = [
   "PRIVATE_STATUS",
   "PRIVATE_CREATED_AT",
   "PRIVATE_UPDATED_AT",
+  "PRIVATE_LIFECYCLE",
+  "PRIVATE_EXTRA",
+];
+
+const STRUCTURE_LOCAL_ONLY_TOKENS = [
+  "PRIVATE_JOB_ID",
+  "PRIVATE_INTERVIEW_ID",
+  "PRIVATE_NOTE",
+  "PRIVATE_CONTACT",
+  "PRIVATE_SOURCE_URL",
+  "PRIVATE_SALARY",
+  "PRIVATE_TAGS",
+  "PRIVATE_MEETING_URL",
+  "PRIVATE_STATUS",
+  "PRIVATE_CREATED_AT",
+  "PRIVATE_UPDATED_AT",
+  "PRIVATE_LIFECYCLE",
+  "PRIVATE_EXTRA",
 ];
 
 function sensitiveJob(overrides = {}) {
@@ -65,6 +85,8 @@ function sensitiveJob(overrides = {}) {
     tags: "PRIVATE_TAGS",
     created_at: "PRIVATE_CREATED_AT",
     updated_at: "PRIVATE_UPDATED_AT",
+    lifecycle_metadata: "PRIVATE_LIFECYCLE",
+    extra: "PRIVATE_EXTRA",
     ...overrides,
   };
 }
@@ -84,14 +106,46 @@ function sensitiveInterview(overrides = {}) {
     status: "PRIVATE_STATUS",
     created_at: "PRIVATE_CREATED_AT",
     updated_at: "PRIVATE_UPDATED_AT",
+    lifecycle_metadata: "PRIVATE_LIFECYCLE",
+    extra: "PRIVATE_EXTRA",
     ...overrides,
   };
 }
 
 function assertNoPrivateTokens(value) {
+  assertNoTokens(value, PRIVATE_TOKENS);
+}
+
+function assertNoTokens(value, tokens) {
   const serialized = JSON.stringify(value);
-  for (const token of PRIVATE_TOKENS) {
+  for (const token of tokens) {
     assert.equal(serialized.includes(token), false, `${token} must stay local`);
+  }
+}
+
+function assertNoUnsafeControls(value) {
+  if (typeof value === "string") {
+    for (const character of value) {
+      const codePoint = character.codePointAt(0);
+      const unsafe = codePoint <= 8 ||
+        (codePoint >= 11 && codePoint <= 12) ||
+        (codePoint >= 14 && codePoint <= 31) ||
+        (codePoint >= 127 && codePoint <= 159) ||
+        codePoint === 0x061c ||
+        (codePoint >= 0x200e && codePoint <= 0x200f) ||
+        (codePoint >= 0x202a && codePoint <= 0x202e) ||
+        (codePoint >= 0x2066 && codePoint <= 0x2069) ||
+        codePoint === 0xfeff;
+      assert.equal(unsafe, false, `unsafe code point U+${codePoint.toString(16)} crossed the AI boundary`);
+    }
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) assertNoUnsafeControls(item);
+    return;
+  }
+  if (value && typeof value === "object") {
+    for (const item of Object.values(value)) assertNoUnsafeControls(item);
   }
 }
 
@@ -143,6 +197,119 @@ test("interview-prep payload excludes every private note and unused lifecycle fi
   assertNoPrivateTokens(result);
 });
 
+test("interview-structure payload contains only current form content and minimal job identity", () => {
+  const result = payloads.buildCareerStructureInterviewPayload(
+    sensitiveJob(),
+    sensitiveInterview({
+      summary: "  Technical\nconversation  ",
+      raw_notes: "Asked about systems.\r\n\r\n\r\nI explained queues.",
+      questions: [
+        {
+          id: "PRIVATE_EXTRA",
+          question: " Why this role?\n ",
+          answer: "I value useful tools.\r\nThe team fits.",
+          note: " Recruiter\tseemed positive ",
+          interviewer_follow_up: "PRIVATE_EXTRA",
+        },
+      ],
+      reflection: "  Explain tradeoffs earlier.\n\nKeep the example. ",
+    }),
+  );
+
+  assert.deepEqual(result, {
+    job: { company: "Arc Labs", role: "Product Engineer" },
+    interview: {
+      round_name: "Technical Interview",
+      summary: "Technical conversation",
+      raw_notes: "Asked about systems.\n\nI explained queues.",
+      questions: [{
+        question: "Why this role?",
+        answer: "I value useful tools.\nThe team fits.",
+        note: "Recruiter seemed positive",
+      }],
+      reflection: "Explain tradeoffs earlier.\n\nKeep the example.",
+    },
+  });
+  assert.deepEqual(Object.keys(result), ["job", "interview"]);
+  assert.deepEqual(Object.keys(result.job), ["company", "role"]);
+  assert.deepEqual(Object.keys(result.interview), [
+    "round_name", "summary", "raw_notes", "questions", "reflection",
+  ]);
+  assert.deepEqual(Object.keys(result.interview.questions[0]), ["question", "answer", "note"]);
+  assertNoTokens(result, STRUCTURE_LOCAL_ONLY_TOKENS);
+});
+
+test("interview-structure output is deeply immutable and never mutates frozen form input", () => {
+  const questions = Object.freeze([
+    Object.freeze({ question: "A", answer: "B", note: "C", extra: "PRIVATE_EXTRA" }),
+  ]);
+  const job = Object.freeze(sensitiveJob());
+  const interview = Object.freeze(sensitiveInterview({ questions }));
+  const jobBefore = structuredClone(job);
+  const interviewBefore = structuredClone(interview);
+  const result = payloads.buildCareerStructureInterviewPayload(job, interview);
+
+  assert.deepEqual(job, jobBefore);
+  assert.deepEqual(interview, interviewBefore);
+  assert.equal(Object.isFrozen(result), true);
+  assert.equal(Object.isFrozen(result.job), true);
+  assert.equal(Object.isFrozen(result.interview), true);
+  assert.equal(Object.isFrozen(result.interview.questions), true);
+  assert.equal(Object.isFrozen(result.interview.questions[0]), true);
+  assert.throws(() => result.interview.questions.push({ question: "x", answer: "", note: "" }), TypeError);
+  assert.throws(() => { result.interview.questions[0].answer = "changed"; }, TypeError);
+});
+
+test("interview-structure bounds arrays and text by Unicode code point and strips unsafe controls", () => {
+  const questions = Array.from(
+    { length: payloads.CAREER_AI_PAYLOAD_LIMITS.interviewQuestions + 5 },
+    (_, index) => ({
+      question: `${"🧭".repeat(payloads.CAREER_AI_PAYLOAD_LIMITS.interviewQuestion + 5)}\0\u202e${index}`,
+      answer: `line one\u0085\r\nline two${"🌱".repeat(payloads.CAREER_AI_PAYLOAD_LIMITS.interviewAnswer)}`,
+      note: "note\u2066 hidden",
+      extra: "PRIVATE_EXTRA",
+    }),
+  );
+  const result = payloads.buildCareerStructureInterviewPayload(
+    sensitiveJob(),
+    sensitiveInterview({
+      summary: `\ud800${"🧠".repeat(payloads.CAREER_AI_PAYLOAD_LIMITS.interviewSummary + 3)}`,
+      raw_notes: "alpha\u2028beta\u0001",
+      questions,
+      reflection: "left\ufeffright\u200f",
+    }),
+  );
+
+  assert.equal(result.interview.questions.length, payloads.CAREER_AI_PAYLOAD_LIMITS.interviewQuestions);
+  assert.equal(Array.from(result.interview.summary).length, payloads.CAREER_AI_PAYLOAD_LIMITS.interviewSummary);
+  assert.equal(result.interview.summary.startsWith("�🧠"), true);
+  assert.equal(Array.from(result.interview.questions[0].question).length, payloads.CAREER_AI_PAYLOAD_LIMITS.interviewQuestion);
+  assert.equal(result.interview.questions[0].question.endsWith("🧭"), true);
+  assert.equal(result.interview.raw_notes, "alpha\nbeta");
+  assert.equal(result.interview.reflection, "leftright");
+  assertNoUnsafeControls(result);
+  assertNoTokens(result, STRUCTURE_LOCAL_ONLY_TOKENS);
+});
+
+test("interview-structure handles malformed optional form fields deterministically", () => {
+  const result = payloads.buildCareerStructureInterviewPayload(
+    { company: "Arc", role: "Engineer", note: "PRIVATE_NOTE" },
+    {
+      round_name: "Screen",
+      summary: 42,
+      raw_notes: { text: "PRIVATE_RAW_NOTES" },
+      questions: "PRIVATE_QUESTIONS",
+      reflection: ["PRIVATE_REFLECTION"],
+      extra: "PRIVATE_EXTRA",
+    },
+  );
+  assert.deepEqual(result, {
+    job: { company: "Arc", role: "Engineer" },
+    interview: { round_name: "Screen", summary: "", raw_notes: "", questions: [], reflection: "" },
+  });
+  assertNoPrivateTokens(result);
+});
+
 test("builders never mutate even deeply frozen inputs", () => {
   const job = Object.freeze(sensitiveJob());
   const interview = Object.freeze(sensitiveInterview());
@@ -151,6 +318,10 @@ test("builders never mutate even deeply frozen inputs", () => {
 
   payloads.buildCareerRequirementsPayload(job);
   payloads.buildCareerInterviewPrepPayload(job, interview);
+  payloads.buildCareerStructureInterviewPayload(job, Object.freeze({
+    ...interview,
+    questions: Object.freeze([]),
+  }));
 
   assert.deepEqual(job, jobBefore);
   assert.deepEqual(interview, interviewBefore);
@@ -165,6 +336,17 @@ test("missing or badly typed required facts fail with a stable validation error"
       assert.equal(error.code, "CAREER_AI_PAYLOAD_REQUIRED_FIELDS");
       assert.deepEqual(error.missingFields, ["job.company", "job.role", "job.description"]);
       assert.equal(Object.isFrozen(error.missingFields), true);
+      return true;
+    },
+  );
+  assert.throws(
+    () => payloads.buildCareerStructureInterviewPayload(
+      { company: "", role: null },
+      { round_name: false },
+    ),
+    (error) => {
+      assert.equal(error.code, "CAREER_AI_PAYLOAD_REQUIRED_FIELDS");
+      assert.deepEqual(error.missingFields, ["job.company", "job.role", "interview.round_name"]);
       return true;
     },
   );
@@ -257,12 +439,16 @@ test("UI disclosure lists are exact, readable, and immutable", () => {
   assert.deepEqual(payloads.CAREER_INTERVIEW_PREP_SHARED_FIELDS, [
     "公司", "职位", "职位描述", "地点", "工作方式", "面试轮次", "计划时间", "预计时长", "面试官",
   ]);
+  assert.deepEqual(payloads.CAREER_STRUCTURE_INTERVIEW_SHARED_FIELDS, [
+    "公司", "职位", "面试轮次", "一句话总结", "原始速记", "问题", "回答", "问题备注", "复盘与下一步",
+  ]);
   assert.equal(Object.isFrozen(payloads.CAREER_REQUIREMENTS_SHARED_FIELDS), true);
   assert.equal(Object.isFrozen(payloads.CAREER_INTERVIEW_PREP_SHARED_FIELDS), true);
+  assert.equal(Object.isFrozen(payloads.CAREER_STRUCTURE_INTERVIEW_SHARED_FIELDS), true);
   assert.throws(() => payloads.CAREER_REQUIREMENTS_SHARED_FIELDS.push("私人备注"), TypeError);
 });
 
-test("server sanitizer rebuilds both protected actions from untrusted nested payloads", () => {
+test("server sanitizer rebuilds every protected action from untrusted nested payloads", () => {
   for (const action of ["fit_analysis", "fitAnalysis", " fit-analysis "]) {
     const result = payloads.sanitizeCareerAiRequestPayload(action, {
       job: sensitiveJob(),
@@ -285,9 +471,25 @@ test("server sanitizer rebuilds both protected actions from untrusted nested pay
     assert.deepEqual(Object.keys(result.interview), ["round_name", "scheduled_at", "duration", "interviewer"]);
     assertNoPrivateTokens(result);
   }
+
+  for (const action of ["structure_interview", "structureInterview", " structure-interview "]) {
+    const result = payloads.sanitizeCareerAiRequestPayload(action, {
+      job: sensitiveJob(),
+      interview: sensitiveInterview({
+        summary: "Allowed summary",
+        raw_notes: "Allowed notes",
+        questions: [{ question: "Allowed question", answer: "Allowed answer", note: "Allowed note", extra: "PRIVATE_EXTRA" }],
+        reflection: "Allowed reflection",
+      }),
+      top_level_secret: "PRIVATE_EXTRA",
+    });
+    assert.deepEqual(Object.keys(result.job), ["company", "role"]);
+    assert.deepEqual(Object.keys(result.interview), ["round_name", "summary", "raw_notes", "questions", "reflection"]);
+    assertNoTokens(result, STRUCTURE_LOCAL_ONLY_TOKENS);
+  }
 });
 
-test("server sanitizer rejects incomplete protected actions but preserves other action contracts", () => {
+test("server sanitizer rejects incomplete protected actions and every action without a strict contract", () => {
   assert.throws(
     () => payloads.sanitizeCareerAiRequestPayload("fitAnalysis", {
       job: { company: "Arc", role: "Engineer", description: "  " },
@@ -304,14 +506,25 @@ test("server sanitizer rejects incomplete protected actions but preserves other 
       error.missingFields.join(",") === "job.role,interview.round_name",
   );
 
-  const existingContract = Object.freeze({
-    raw_notes: "PRIVATE_RAW_NOTES",
-    questions_json: "PRIVATE_QUESTIONS",
-  });
-  assert.strictEqual(
-    payloads.sanitizeCareerAiRequestPayload("structure_interview", existingContract),
-    existingContract,
-  );
+  for (const action of [
+    "parse_job",
+    "tailor_material",
+    "improveAnswer",
+    "follow-up-email",
+    "weekly_review",
+    "__proto__",
+    "unknown",
+  ]) {
+    assert.throws(
+      () => payloads.sanitizeCareerAiRequestPayload(action, {
+        raw_notes: "PRIVATE_RAW_NOTES",
+        extra: "PRIVATE_EXTRA",
+      }),
+      (error) => error instanceof payloads.CareerAiActionNotAllowedError &&
+        error.code === "CAREER_AI_ACTION_NOT_ALLOWED" &&
+        !error.message.includes(action),
+    );
+  }
 });
 
 async function loadCareerAiRoute() {
@@ -339,7 +552,7 @@ async function loadCareerAiRoute() {
   return import(dataModule(routeOutput, "app/api/ai/career/route.ts"));
 }
 
-test("Career AI route sanitizes before prompting and maps missing facts to a safe 400", async () => {
+test("Career AI route sanitizes every allowed action before prompting and maps missing facts to a safe 400", async () => {
   const route = await loadCareerAiRoute();
   globalThis.__careerAiPromptCalls = [];
   globalThis.__careerAiDeepSeekCalls = [];
@@ -358,6 +571,36 @@ test("Career AI route sanitizes before prompting and maps missing facts to a saf
 
   globalThis.__careerAiPromptCalls = [];
   globalThis.__careerAiDeepSeekCalls = [];
+  const structured = await route.POST(new Request("http://localhost/api/ai/career", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      action: " structure-interview ",
+      payload: {
+        job: sensitiveJob(),
+        interview: sensitiveInterview({
+          summary: "Allowed summary",
+          raw_notes: "Allowed notes",
+          questions: [{
+            question: "Allowed question",
+            answer: "Allowed answer",
+            note: "Allowed note",
+            extra: "PRIVATE_EXTRA",
+          }],
+          reflection: "Allowed reflection",
+        }),
+        extra: "PRIVATE_EXTRA",
+      },
+    }),
+  }));
+  assert.equal(structured.status, 200);
+  assert.equal(globalThis.__careerAiPromptCalls.length, 1);
+  assert.equal(globalThis.__careerAiDeepSeekCalls.length, 1);
+  assert.equal(globalThis.__careerAiPromptCalls[0].action, " structure-interview ");
+  assertNoTokens(globalThis.__careerAiPromptCalls[0].payload, STRUCTURE_LOCAL_ONLY_TOKENS);
+
+  globalThis.__careerAiPromptCalls = [];
+  globalThis.__careerAiDeepSeekCalls = [];
   const rejected = await route.POST(new Request("http://localhost/api/ai/career", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -369,11 +612,101 @@ test("Career AI route sanitizes before prompting and maps missing facts to a saf
   assert.equal(rejected.status, 400);
   assert.deepEqual(await rejected.json(), {
     ok: false,
-    error: "AI 所需的职位信息不完整，请补全后再试。",
+    error: "AI 所需的信息不完整，请补全后再试。",
     code: "CAREER_AI_INPUT_INCOMPLETE",
   });
   assert.equal(globalThis.__careerAiPromptCalls.length, 0);
   assert.equal(globalThis.__careerAiDeepSeekCalls.length, 0);
+});
+
+test("Career AI route returns a safe 400 for unopened actions without prompting or calling DeepSeek", async () => {
+  const route = await loadCareerAiRoute();
+  globalThis.__careerAiPromptCalls = [];
+  globalThis.__careerAiDeepSeekCalls = [];
+
+  for (const action of [
+    "parse_job",
+    "tailor_material",
+    "improve_answer",
+    "follow_up_email",
+    "weekly_review",
+    "__proto__",
+    "unknown",
+  ]) {
+    const response = await route.POST(new Request("http://localhost/api/ai/career", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        action,
+        payload: { raw_notes: "PRIVATE_RAW_NOTES", extra: "PRIVATE_EXTRA" },
+      }),
+    }));
+    assert.equal(response.status, 400);
+    assert.deepEqual(await response.json(), {
+      ok: false,
+      error: "这个 AI 功能尚未开放。",
+      code: "CAREER_AI_ACTION_NOT_ALLOWED",
+    });
+  }
+
+  assert.equal(globalThis.__careerAiPromptCalls.length, 0);
+  assert.equal(globalThis.__careerAiDeepSeekCalls.length, 0);
+});
+
+test("real Career prompt receives only the sanitized interview-structure contract", async () => {
+  const promptsUrl = dataModule(
+    await transpileStandaloneTypeScript("lib/server/prompts.ts"),
+    "lib/server/prompts.ts",
+  );
+  const prompts = await import(promptsUrl);
+  const safePayload = payloads.sanitizeCareerAiRequestPayload("structure_interview", {
+    job: sensitiveJob(),
+    interview: sensitiveInterview({
+      summary: "Allowed summary",
+      raw_notes: "Allowed raw notes",
+      questions: [{
+        question: "Allowed question",
+        answer: "Allowed answer",
+        note: "Allowed note",
+        extra: "PRIVATE_EXTRA",
+      }],
+      reflection: "Allowed reflection",
+    }),
+    extra: "PRIVATE_EXTRA",
+  });
+  const prompt = prompts.careerPrompt("structure_interview", safePayload);
+
+  assertNoTokens(prompt, STRUCTURE_LOCAL_ONLY_TOKENS);
+  assert.match(prompt.user, /Allowed raw notes/);
+  assert.match(prompt.user, /Allowed question/);
+  assert.doesNotMatch(prompt.user, /PRIVATE_EXTRA|PRIVATE_NOTE|PRIVATE_MEETING_URL|PRIVATE_STATUS/);
+});
+
+test("real Career prompt keeps the complete bounded interview form instead of slicing its tail", async () => {
+  const promptsUrl = dataModule(
+    await transpileStandaloneTypeScript("lib/server/prompts.ts"),
+    "lib/server/prompts.ts",
+  );
+  const prompts = await import(promptsUrl);
+  const questionCount = payloads.CAREER_AI_PAYLOAD_LIMITS.interviewQuestions;
+  const safePayload = payloads.buildCareerStructureInterviewPayload(
+    { company: "Arc", role: "Engineer" },
+    {
+      round_name: "Technical",
+      summary: "S".repeat(payloads.CAREER_AI_PAYLOAD_LIMITS.interviewSummary),
+      raw_notes: "R".repeat(payloads.CAREER_AI_PAYLOAD_LIMITS.interviewRawNotes),
+      questions: Array.from({ length: questionCount }, (_, index) => ({
+        question: `Q${index}`.padEnd(payloads.CAREER_AI_PAYLOAD_LIMITS.interviewQuestion, "Q"),
+        answer: `A${index}`.padEnd(payloads.CAREER_AI_PAYLOAD_LIMITS.interviewAnswer, "A"),
+        note: `N${index}`.padEnd(payloads.CAREER_AI_PAYLOAD_LIMITS.interviewQuestionNote, "N"),
+      })),
+      reflection: `${"F".repeat(payloads.CAREER_AI_PAYLOAD_LIMITS.interviewReflection - "ALLOWED_REFLECTION_END".length)}ALLOWED_REFLECTION_END`,
+    },
+  );
+  const prompt = prompts.careerPrompt("structure_interview", safePayload);
+
+  assert.match(prompt.user, /ALLOWED_REFLECTION_END/);
+  assert.equal(prompt.user.includes(`Q${questionCount - 1}`), true);
 });
 
 test("Career AI route source contract requires the sanitizer before careerPrompt", async () => {
@@ -385,5 +718,6 @@ test("Career AI route source contract requires the sanitizer before careerPrompt
   assert.equal(sanitizeAt < promptAt, true);
   assert.doesNotMatch(source, /careerPrompt\(body\.action,\s*body\.payload/);
   assert.match(source, /error instanceof CareerAiPayloadValidationError/);
+  assert.match(source, /error instanceof CareerAiActionNotAllowedError/);
   assert.match(source, /new HttpError\(\s*400,/);
 });
