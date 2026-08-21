@@ -303,6 +303,8 @@ test("every dirty interview close path offers an explicit local-only choice", ()
   assert.match(drawerSource, /保存本机草稿并关闭/);
   assert.match(drawerSource, /放弃修改/);
   assert.match(drawerSource, /不进入 SQLite 或导出备份/);
+  assert.match(drawerSource, /当前完整网址与浏览器资料对应的站点存储/);
+  assert.doesNotMatch(drawerSource, /当前设备与此浏览器/);
   assert.match(drawerSource, /setBaseline\(currentSnapshot\)/);
   assert.match(drawerSource, /localStorage\.removeItem\(interviewDraftKey\(interview\.id\)\)/);
   assert.match(source, /\["scheduled", "completed", "canceled"\]\.includes\(snapshot\.status\)/);
