@@ -2803,6 +2803,1746 @@ export const inspectFitnessConfigWrite =
 export const commitFitnessConfigWrite =
   defaultFitnessConfigStorageService.commitFitnessConfigWrite;
 
+export type FitnessLiveSetSnapshot = Readonly<{
+  id: string;
+  session_exercise_id: string;
+  set_index: number;
+  set_kind: FitnessSet["set_kind"];
+  load_grams: number | null;
+  reps: number | null;
+  duration_seconds: number | null;
+  rir: number | null;
+  rpe: number | null;
+  completed: boolean;
+  pain_note: string;
+  completed_at: number | null;
+  client_mutation_id: string;
+  created_at: number;
+  updated_at: number;
+}>;
+
+export type FitnessLiveExerciseExpectation = Readonly<{
+  session: FitnessSession;
+  exercise: FitnessSessionExercise;
+  sets: readonly FitnessSet[];
+  nextSetIndex: number;
+}>;
+
+export type FitnessLiveSessionExpectation = Readonly<{
+  session: FitnessSession;
+  exercises: readonly FitnessSessionExercise[];
+  sets: readonly FitnessSet[];
+  cardioEntries: readonly FitnessCardioEntry[];
+  event: FitnessCalendarEvent | null;
+  capabilities: readonly FitnessCapability[];
+}>;
+
+export type FitnessLiveExerciseProjection = Readonly<{
+  session: FitnessSession;
+  exercise: FitnessSessionExercise;
+  sets: readonly FitnessLiveSetSnapshot[];
+}>;
+
+export type FitnessLiveSessionProjection = Readonly<{
+  session: FitnessSession | null;
+  exercises: readonly FitnessSessionExercise[];
+  sets: readonly FitnessLiveSetSnapshot[];
+  cardioEntries: readonly FitnessCardioEntry[];
+  event: FitnessCalendarEvent | null;
+  capabilities: readonly FitnessCapability[];
+}>;
+
+type FitnessLiveReceiptBase<Kind extends string> = Readonly<{
+  purpose: "fitness-live-write";
+  version: 1;
+  operationId: string;
+  generationId: string;
+  generationSequence: number;
+  preparedAt: number;
+  kind: Kind;
+  projectionSha256: string;
+}>;
+
+export type FitnessSetRecordReceipt = FitnessLiveReceiptBase<"set-record"> & Readonly<{
+  before: FitnessLiveExerciseProjection;
+  after: FitnessLiveExerciseProjection;
+}>;
+
+export type FitnessSetUndoReceipt = FitnessLiveReceiptBase<"set-undo"> & Readonly<{
+  before: FitnessLiveExerciseProjection;
+  after: FitnessLiveExerciseProjection;
+}>;
+
+export type FitnessSessionFinishReceipt = FitnessLiveReceiptBase<"session-finish"> & Readonly<{
+  before: FitnessLiveSessionProjection & Readonly<{ session: FitnessSession }>;
+  after: FitnessLiveSessionProjection & Readonly<{ session: FitnessSession }>;
+}>;
+
+export type FitnessEmptySessionCancelReceipt = FitnessLiveReceiptBase<"session-cancel"> & Readonly<{
+  before: FitnessLiveSessionProjection & Readonly<{ session: FitnessSession }>;
+  after: FitnessLiveSessionProjection & Readonly<{ session: null }>;
+}>;
+
+export type FitnessLiveWriteReceipt =
+  | FitnessSetRecordReceipt
+  | FitnessSetUndoReceipt
+  | FitnessSessionFinishReceipt
+  | FitnessEmptySessionCancelReceipt;
+
+export type FitnessLiveWriteInspection =
+  | "exact_saved"
+  | "expected"
+  | "changed"
+  | "still_unknown"
+  | "invalid_receipt";
+
+export type FitnessLiveWriteResult =
+  | Readonly<{
+      outcome: "saved" | "already_saved";
+      receipt: FitnessLiveWriteReceipt;
+      entityId: string;
+      updatedAt: number;
+    }>
+  | Readonly<{
+      outcome: "changed";
+      receipt: FitnessLiveWriteReceipt;
+      entityId: string;
+      retryable: false;
+    }>
+  | Readonly<{
+      outcome: "outcome_uncertain";
+      receipt: FitnessLiveWriteReceipt;
+      entityId: string;
+      retryable: true;
+    }>;
+
+export type FitnessLiveMutationErrorCode =
+  | "invalid_input"
+  | "invalid_receipt"
+  | "changed"
+  | "inspect_failed"
+  | "write_failed";
+
+export class FitnessLiveMutationError extends Error {
+  readonly name = "FitnessLiveMutationError";
+
+  constructor(
+    readonly code: FitnessLiveMutationErrorCode,
+    message: string,
+    readonly receipt?: FitnessLiveWriteReceipt,
+  ) {
+    super(message);
+  }
+}
+
+export type FitnessLiveStorageRuntime = FitnessConfigStorageRuntime;
+
+const LIVE_OPERATION_ID_PATTERN =
+  /^fitness-live-operation-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const LIVE_SET_ID_PATTERN =
+  /^set-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const LIVE_MUTATION_ID_PATTERN =
+  /^fitness-live-mutation-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const LIVE_UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const LIVE_MAX_ATOMIC_ROWS = 500;
+const LIVE_MAX_RECEIPT_JSON_UNITS = 1_000_000;
+const LIVE_MAX_EXPECTATION_JSON_UNITS = 500_000;
+
+function jsonWithinUnits(value: unknown, maximum: number): boolean {
+  try {
+    const encoded = JSON.stringify(value);
+    return typeof encoded === "string" && encoded.length <= maximum;
+  } catch {
+    return false;
+  }
+}
+
+function liveError(
+  code: FitnessLiveMutationErrorCode,
+  message: string,
+  receipt?: FitnessLiveWriteReceipt,
+): FitnessLiveMutationError {
+  return new FitnessLiveMutationError(code, message, receipt);
+}
+
+function snapshotLiveInput<Input>(value: Input): Input {
+  try {
+    return JSON.parse(JSON.stringify(value)) as Input;
+  } catch {
+    throw liveError("invalid_input", "训练写入内容不能安全复制。");
+  }
+}
+
+function compareLiveId(left: string, right: string): number {
+  return left === right ? 0 : left < right ? -1 : 1;
+}
+
+function sortedByIndexAndId<Value extends { set_index: number; id: string }>(
+  rows: readonly Value[],
+): Value[] {
+  return [...rows].sort((left, right) =>
+    left.set_index - right.set_index || compareLiveId(left.id, right.id)
+  );
+}
+
+function sortedExercises(rows: readonly FitnessSessionExercise[]): FitnessSessionExercise[] {
+  return [...rows].sort((left, right) =>
+    left.order_index - right.order_index || compareLiveId(left.id, right.id)
+  );
+}
+
+function sortedCardio(rows: readonly FitnessCardioEntry[]): FitnessCardioEntry[] {
+  return [...rows].sort((left, right) => left.created_at - right.created_at ||
+    compareLiveId(left.id, right.id));
+}
+
+function sortedCapabilities(rows: readonly FitnessCapability[]): FitnessCapability[] {
+  return [...rows].sort((left, right) => left.recorded_at - right.recorded_at ||
+    compareLiveId(left.id, right.id));
+}
+
+function publicLiveSet(row: FitnessLiveSetSnapshot): FitnessSet {
+  return {
+    id: row.id,
+    session_exercise_id: row.session_exercise_id,
+    set_index: row.set_index,
+    set_kind: row.set_kind,
+    load_grams: row.load_grams,
+    reps: row.reps,
+    duration_seconds: row.duration_seconds,
+    rir: row.rir,
+    rpe: row.rpe,
+    completed: row.completed,
+    pain_note: row.pain_note,
+    completed_at: row.completed_at,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  };
+}
+
+export function fitnessLiveExerciseExpectationFromSnapshot(
+  snapshot: FitnessSnapshot,
+  sessionExerciseId: string,
+): FitnessLiveExerciseExpectation {
+  const exercise = snapshot.sessionExercises.find(({ id }) => id === sessionExerciseId);
+  if (!exercise) throw liveError("invalid_input", "当前动作不在这份训练画面里。");
+  const session = snapshot.sessions.find(({ id }) => id === exercise.session_id);
+  if (!session) throw liveError("invalid_input", "当前训练不在这份训练画面里。");
+  const sets = sortedByIndexAndId(snapshot.sets.filter(
+    ({ session_exercise_id }) => session_exercise_id === exercise.id,
+  ));
+  const nextSetIndex = sets.reduce(
+    (maximum, set) => Math.max(maximum, set.set_index + 1),
+    0,
+  );
+  return snapshotLiveInput({ session, exercise, sets, nextSetIndex });
+}
+
+export function fitnessLiveSessionExpectationFromSnapshot(
+  snapshot: FitnessSnapshot,
+  sessionId: string,
+): FitnessLiveSessionExpectation {
+  const session = snapshot.sessions.find(({ id }) => id === sessionId);
+  if (!session) throw liveError("invalid_input", "当前训练不在这份训练画面里。");
+  const exercises = sortedExercises(snapshot.sessionExercises.filter(
+    ({ session_id }) => session_id === session.id,
+  ));
+  const exerciseIds = new Set(exercises.map(({ id }) => id));
+  const sets = sortedByIndexAndId(snapshot.sets.filter(
+    ({ session_exercise_id }) => exerciseIds.has(session_exercise_id),
+  ));
+  const setIds = new Set(sets.map(({ id }) => id));
+  const cardioEntries = sortedCardio(snapshot.cardioEntries.filter(
+    ({ session_id }) => session_id === session.id,
+  ));
+  const event = session.event_id === null
+    ? null
+    : snapshot.events.find(({ id }) => id === session.event_id) ?? null;
+  const capabilities = sortedCapabilities(snapshot.capabilities.filter(({ source_set_id }) =>
+    source_set_id !== null && setIds.has(source_set_id)
+  ));
+  return snapshotLiveInput({ session, exercises, sets, cardioEntries, event, capabilities });
+}
+
+function liveInteger(value: unknown, minimum: number, maximum: number): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) &&
+    value >= minimum && value <= maximum;
+}
+
+function liveNullableInteger(
+  value: unknown,
+  minimum: number,
+  maximum: number,
+): value is number | null {
+  return value === null || liveInteger(value, minimum, maximum);
+}
+
+function isFitnessLiveSession(value: unknown): value is FitnessSession {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const row = value as Partial<FitnessSession>;
+  return exactObjectKeys(value, [
+    "id", "event_id", "venue_id", "program_day_id", "started_at", "ended_at",
+    "status", "available_minutes", "energy_note", "soreness_note", "reflection",
+    "created_at", "updated_at",
+  ]) && safeOpaqueId(row.id) && (row.event_id === null || safeOpaqueId(row.event_id)) &&
+    safeOpaqueId(row.venue_id) &&
+    (row.program_day_id === null || safeOpaqueId(row.program_day_id)) &&
+    safeTimestamp(row.started_at) && liveNullableInteger(row.ended_at, 0, Number.MAX_SAFE_INTEGER) &&
+    (row.ended_at === null || row.ended_at >= row.started_at) &&
+    ["active", "completed", "ended_early"].includes(String(row.status)) &&
+    (row.available_minutes === null || liveInteger(row.available_minutes, 1, 1_440)) &&
+    ["", "lower", "usual", "higher"].includes(String(row.energy_note)) &&
+    safeString(row.soreness_note, 20_000) && safeString(row.reflection, 20_000) &&
+    safeTimestamp(row.created_at) && safeTimestamp(row.updated_at) &&
+    row.updated_at >= row.created_at;
+}
+
+function isFitnessLiveExercise(value: unknown): value is FitnessSessionExercise {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const row = value as Partial<FitnessSessionExercise>;
+  return exactObjectKeys(value, [
+    "id", "session_id", "exercise_id", "equipment_id", "planned_item_id",
+    "order_index", "status", "substituted_for_exercise_id", "substitution_reason",
+    "equipment_snapshot", "note", "created_at", "updated_at",
+  ]) && safeOpaqueId(row.id) && safeOpaqueId(row.session_id) &&
+    safeOpaqueId(row.exercise_id) &&
+    (row.equipment_id === null || safeOpaqueId(row.equipment_id)) &&
+    (row.planned_item_id === null || safeOpaqueId(row.planned_item_id)) &&
+    liveInteger(row.order_index, 0, 100_000) &&
+    ["pending", "active", "completed", "skipped", "substituted"].includes(String(row.status)) &&
+    (row.substituted_for_exercise_id === null || safeOpaqueId(row.substituted_for_exercise_id)) &&
+    safeString(row.substitution_reason, 10_000) && safeString(row.equipment_snapshot, 100_000) &&
+    safeString(row.note, 10_000) && safeTimestamp(row.created_at) && safeTimestamp(row.updated_at) &&
+    row.updated_at >= row.created_at;
+}
+
+function isFitnessLiveSet(
+  value: unknown,
+  includeMutationId: boolean,
+): value is FitnessLiveSetSnapshot {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const row = value as Partial<FitnessLiveSetSnapshot>;
+  const keys = [
+    "id", "session_exercise_id", "set_index", "set_kind", "load_grams", "reps",
+    "duration_seconds", "rir", "rpe", "completed", "pain_note", "completed_at",
+    ...(includeMutationId ? ["client_mutation_id"] : []), "created_at", "updated_at",
+  ];
+  return exactObjectKeys(value, keys) && safeOpaqueId(row.id) &&
+    safeOpaqueId(row.session_exercise_id) && liveInteger(row.set_index, 0, 100_000) &&
+    ["warmup", "work", "drop", "amrap"].includes(String(row.set_kind)) &&
+    liveNullableInteger(row.load_grams, 0, 10_000_000) &&
+    liveNullableInteger(row.reps, 0, 10_000) &&
+    liveNullableInteger(row.duration_seconds, 0, 86_400) &&
+    liveNullableInteger(row.rir, 0, 5) && liveNullableInteger(row.rpe, 1, 10) &&
+    (row.reps !== null || row.duration_seconds !== null) &&
+    typeof row.completed === "boolean" && safeString(row.pain_note, 10_000) &&
+    liveNullableInteger(row.completed_at, 0, Number.MAX_SAFE_INTEGER) &&
+    (!includeMutationId || (
+      typeof row.client_mutation_id === "string" && row.client_mutation_id.length >= 1 &&
+      row.client_mutation_id.length <= 160 && row.client_mutation_id === row.client_mutation_id.trim()
+    )) && safeTimestamp(row.created_at) && safeTimestamp(row.updated_at) &&
+    row.updated_at >= row.created_at;
+}
+
+function isFitnessLiveCardio(value: unknown): value is FitnessCardioEntry {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const row = value as Partial<FitnessCardioEntry>;
+  return exactObjectKeys(value, [
+    "id", "session_id", "equipment_id", "mode", "duration_seconds", "distance_meters",
+    "resistance", "average_heart_rate", "effort", "note", "created_at",
+  ]) && safeOpaqueId(row.id) && safeOpaqueId(row.session_id) &&
+    (row.equipment_id === null || safeOpaqueId(row.equipment_id)) &&
+    safeString(row.mode, 10_000) && liveInteger(row.duration_seconds, 1, 86_400) &&
+    liveNullableInteger(row.distance_meters, 0, Number.MAX_SAFE_INTEGER) &&
+    safeString(row.resistance, 10_000) &&
+    liveNullableInteger(row.average_heart_rate, 20, 260) &&
+    ["", "easy", "moderate", "hard"].includes(String(row.effort)) &&
+    safeString(row.note, 10_000) && safeTimestamp(row.created_at);
+}
+
+function isFitnessLiveEvent(value: unknown): value is FitnessCalendarEvent {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const row = value as Partial<FitnessCalendarEvent>;
+  return exactObjectKeys(value, [
+    "id", "program_day_id", "venue_id", "title", "kind", "starts_at",
+    "occurrence_key", "planned_minutes", "status", "rescheduled_from_id", "note",
+    "created_at", "updated_at",
+  ]) && safeOpaqueId(row.id) &&
+    (row.program_day_id === null || safeOpaqueId(row.program_day_id)) &&
+    (row.venue_id === null || safeOpaqueId(row.venue_id)) && safeString(row.title, 10_000) &&
+    ["resistance", "cardio", "rest", "note"].includes(String(row.kind)) &&
+    safeTimestamp(row.starts_at) &&
+    (row.occurrence_key === null || safeString(row.occurrence_key, 100)) &&
+    liveInteger(row.planned_minutes, 0, 1_440) &&
+    ["planned", "in_progress", "completed", "not_performed", "cancelled"].includes(String(row.status)) &&
+    (row.rescheduled_from_id === null || safeOpaqueId(row.rescheduled_from_id)) &&
+    safeString(row.note, 10_000) && safeTimestamp(row.created_at) && safeTimestamp(row.updated_at) &&
+    row.updated_at >= row.created_at;
+}
+
+function isFitnessLiveCapability(value: unknown): value is FitnessCapability {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const row = value as Partial<FitnessCapability>;
+  return exactObjectKeys(value, [
+    "id", "exercise_id", "equipment_id", "source_set_id", "load_grams", "reps",
+    "rir", "rpe", "confidence", "recorded_at", "created_at",
+  ]) && safeOpaqueId(row.id) && safeOpaqueId(row.exercise_id) &&
+    (row.equipment_id === null || safeOpaqueId(row.equipment_id)) &&
+    (row.source_set_id === null || safeOpaqueId(row.source_set_id)) &&
+    liveNullableInteger(row.load_grams, 0, 10_000_000) &&
+    liveNullableInteger(row.reps, 0, 10_000) && liveNullableInteger(row.rir, 0, 5) &&
+    liveNullableInteger(row.rpe, 1, 10) &&
+    (row.confidence === "observed" || row.confidence === "user_entered") &&
+    safeTimestamp(row.recorded_at) && safeTimestamp(row.created_at);
+}
+
+function uniqueIds(rows: readonly { id: string }[]): boolean {
+  return new Set(rows.map(({ id }) => id)).size === rows.length;
+}
+
+function isSortedProjection<Value>(
+  rows: readonly Value[],
+  sorter: (values: readonly Value[]) => readonly Value[],
+): boolean {
+  return sameProjection(rows, sorter(rows));
+}
+
+function isLiveExerciseProjection(value: unknown): value is FitnessLiveExerciseProjection {
+  if (!value || typeof value !== "object" || Array.isArray(value) ||
+      !exactObjectKeys(value, ["session", "exercise", "sets"])) return false;
+  const projection = value as Partial<FitnessLiveExerciseProjection>;
+  return isFitnessLiveSession(projection.session) && isFitnessLiveExercise(projection.exercise) &&
+    projection.exercise.session_id === projection.session.id &&
+    Array.isArray(projection.sets) && projection.sets.length <= LIVE_MAX_ATOMIC_ROWS &&
+    projection.sets.every((set) => isFitnessLiveSet(set, true) &&
+      set.session_exercise_id === projection.exercise?.id) &&
+    uniqueIds(projection.sets) &&
+    new Set(projection.sets.map(({ set_index }) => set_index)).size === projection.sets.length &&
+    new Set(projection.sets.map(({ client_mutation_id }) => client_mutation_id)).size ===
+      projection.sets.length && isSortedProjection(projection.sets, sortedByIndexAndId);
+}
+
+function isLiveSessionProjection(value: unknown): value is FitnessLiveSessionProjection {
+  if (!value || typeof value !== "object" || Array.isArray(value) || !exactObjectKeys(value, [
+    "session", "exercises", "sets", "cardioEntries", "event", "capabilities",
+  ])) return false;
+  const projection = value as Partial<FitnessLiveSessionProjection>;
+  if (!(projection.session === null || isFitnessLiveSession(projection.session)) ||
+      !Array.isArray(projection.exercises) || !Array.isArray(projection.sets) ||
+      !Array.isArray(projection.cardioEntries) || !Array.isArray(projection.capabilities) ||
+      !(projection.event === null || isFitnessLiveEvent(projection.event))) return false;
+  const total = projection.exercises.length + projection.sets.length +
+    projection.cardioEntries.length + projection.capabilities.length;
+  if (total > LIVE_MAX_ATOMIC_ROWS || !uniqueIds(projection.exercises) ||
+      !uniqueIds(projection.sets) || !uniqueIds(projection.cardioEntries) ||
+      !uniqueIds(projection.capabilities) ||
+      !projection.exercises.every(isFitnessLiveExercise) ||
+      !projection.sets.every((set) => isFitnessLiveSet(set, true)) ||
+      !projection.cardioEntries.every(isFitnessLiveCardio) ||
+      !projection.capabilities.every(isFitnessLiveCapability) ||
+      !isSortedProjection(projection.exercises, sortedExercises) ||
+      !isSortedProjection(projection.sets, sortedByIndexAndId) ||
+      !isSortedProjection(projection.cardioEntries, sortedCardio) ||
+      !isSortedProjection(projection.capabilities, sortedCapabilities)) return false;
+  if (projection.session === null) {
+    return projection.exercises.length === 0 && projection.sets.length === 0 &&
+      projection.cardioEntries.length === 0 && projection.capabilities.length === 0;
+  }
+  const exerciseIds = new Set(projection.exercises.map(({ id }) => id));
+  const setIds = new Set(projection.sets.map(({ id }) => id));
+  return projection.exercises.every(({ session_id }) => session_id === projection.session?.id) &&
+    projection.sets.every(({ session_exercise_id }) => exerciseIds.has(session_exercise_id)) &&
+    projection.cardioEntries.every(({ session_id }) => session_id === projection.session?.id) &&
+    projection.capabilities.every(({ source_set_id }) =>
+      source_set_id !== null && setIds.has(source_set_id)) &&
+    (projection.session.event_id === null
+      ? projection.event === null
+      : projection.event?.id === projection.session.event_id);
+}
+
+function isLiveExerciseExpectation(value: unknown): value is FitnessLiveExerciseExpectation {
+  if (!value || typeof value !== "object" || Array.isArray(value) ||
+      !jsonWithinUnits(value, LIVE_MAX_EXPECTATION_JSON_UNITS) ||
+      !exactObjectKeys(value, ["session", "exercise", "sets", "nextSetIndex"])) return false;
+  const expected = value as Partial<FitnessLiveExerciseExpectation>;
+  if (!isFitnessLiveSession(expected.session) || !isFitnessLiveExercise(expected.exercise) ||
+      expected.exercise.session_id !== expected.session.id || !Array.isArray(expected.sets) ||
+      expected.sets.length > LIVE_MAX_ATOMIC_ROWS ||
+      !expected.sets.every((set) => isFitnessLiveSet(set, false) &&
+        set.session_exercise_id === expected.exercise?.id) || !uniqueIds(expected.sets) ||
+      new Set(expected.sets.map(({ set_index }) => set_index)).size !== expected.sets.length ||
+      !isSortedProjection(expected.sets, sortedByIndexAndId) ||
+      !liveInteger(expected.nextSetIndex, 0, 100_000)) return false;
+  const actualNext = expected.sets.reduce(
+    (maximum, set) => Math.max(maximum, set.set_index + 1),
+    0,
+  );
+  return expected.nextSetIndex === actualNext;
+}
+
+function isLiveSessionExpectation(value: unknown): value is FitnessLiveSessionExpectation {
+  if (!value || typeof value !== "object" || Array.isArray(value) ||
+      !jsonWithinUnits(value, LIVE_MAX_EXPECTATION_JSON_UNITS) || !exactObjectKeys(value, [
+    "session", "exercises", "sets", "cardioEntries", "event", "capabilities",
+  ])) return false;
+  const expected = value as Partial<FitnessLiveSessionExpectation>;
+  if (!isFitnessLiveSession(expected.session) || !Array.isArray(expected.exercises) ||
+      !Array.isArray(expected.sets) || !Array.isArray(expected.cardioEntries) ||
+      !Array.isArray(expected.capabilities) ||
+      !(expected.event === null || isFitnessLiveEvent(expected.event))) return false;
+  const total = expected.exercises.length + expected.sets.length +
+    expected.cardioEntries.length + expected.capabilities.length;
+  if (total > LIVE_MAX_ATOMIC_ROWS || !uniqueIds(expected.exercises) ||
+      !uniqueIds(expected.sets) || !uniqueIds(expected.cardioEntries) ||
+      !uniqueIds(expected.capabilities) ||
+      !expected.exercises.every((exercise) => isFitnessLiveExercise(exercise) &&
+        exercise.session_id === expected.session?.id) ||
+      !expected.sets.every((set) => isFitnessLiveSet(set, false)) ||
+      !expected.cardioEntries.every((entry) => isFitnessLiveCardio(entry) &&
+        entry.session_id === expected.session?.id) ||
+      !expected.capabilities.every(isFitnessLiveCapability) ||
+      !isSortedProjection(expected.exercises, sortedExercises) ||
+      !isSortedProjection(expected.sets, sortedByIndexAndId) ||
+      !isSortedProjection(expected.cardioEntries, sortedCardio) ||
+      !isSortedProjection(expected.capabilities, sortedCapabilities)) return false;
+  const exerciseIds = new Set(expected.exercises.map(({ id }) => id));
+  const setIds = new Set(expected.sets.map(({ id }) => id));
+  return expected.sets.every(({ session_exercise_id }) => exerciseIds.has(session_exercise_id)) &&
+    expected.capabilities.every(({ source_set_id }) =>
+      source_set_id !== null && setIds.has(source_set_id)) &&
+    (expected.session.event_id === null
+      ? expected.event === null
+      : expected.event?.id === expected.session.event_id);
+}
+
+function sameLiveExerciseCore(
+  before: FitnessLiveExerciseProjection,
+  after: FitnessLiveExerciseProjection,
+  preparedAt: number,
+): boolean {
+  return sameProjection(after.session, { ...before.session, updated_at: preparedAt }) &&
+    sameProjection(after.exercise, {
+      ...before.exercise,
+      status: "active",
+      updated_at: preparedAt,
+    });
+}
+
+function exerciseProjectionVersions(projection: FitnessLiveExerciseProjection): number[] {
+  return [
+    projection.session.created_at,
+    projection.session.started_at,
+    projection.session.updated_at,
+    projection.exercise.created_at,
+    projection.exercise.updated_at,
+    ...projection.sets.flatMap(({ created_at, updated_at, completed_at }) =>
+      completed_at === null ? [created_at, updated_at] : [created_at, updated_at, completed_at]
+    ),
+  ];
+}
+
+function sessionProjectionVersions(
+  projection: FitnessLiveSessionProjection & Readonly<{ session: FitnessSession }>,
+): number[] {
+  return [
+    projection.session.created_at,
+    projection.session.started_at,
+    projection.session.updated_at,
+    ...projection.exercises.flatMap(({ created_at, updated_at }) => [created_at, updated_at]),
+    ...projection.sets.flatMap(({ created_at, updated_at, completed_at }) =>
+      completed_at === null ? [created_at, updated_at] : [created_at, updated_at, completed_at]
+    ),
+    ...projection.cardioEntries.map(({ created_at }) => created_at),
+    ...projection.capabilities.flatMap(({ created_at, recorded_at }) => [created_at, recorded_at]),
+    ...(projection.event === null
+      ? []
+      : [projection.event.created_at, projection.event.updated_at]),
+  ];
+}
+
+function strictlyAfterEvery(value: number, versions: readonly number[]): boolean {
+  return versions.every((version) => value > version);
+}
+
+function isRecordTransition(receipt: FitnessSetRecordReceipt): boolean {
+  const { before, after, preparedAt } = receipt;
+  if (!isLiveExerciseProjection(before) || !isLiveExerciseProjection(after) ||
+      before.session.status !== "active" || !sameLiveExerciseCore(before, after, preparedAt) ||
+      !strictlyAfterEvery(preparedAt, exerciseProjectionVersions(before)) ||
+      after.sets.length !== before.sets.length + 1) return false;
+  const beforeById = new Map(before.sets.map((set) => [set.id, set]));
+  const added = after.sets.filter(({ id }) => !beforeById.has(id));
+  if (added.length !== 1 || !before.sets.every((set) =>
+    sameProjection(after.sets.find(({ id }) => id === set.id), set)
+  )) return false;
+  const set = added[0]!;
+  return LIVE_SET_ID_PATTERN.test(set.id) &&
+    LIVE_MUTATION_ID_PATTERN.test(set.client_mutation_id) && set.completed &&
+    set.created_at === preparedAt && set.updated_at === preparedAt &&
+    set.completed_at === preparedAt &&
+    !before.sets.some(({ set_index }) => set_index === set.set_index) &&
+    !before.sets.some(({ client_mutation_id }) =>
+      client_mutation_id === set.client_mutation_id);
+}
+
+function isUndoTransition(receipt: FitnessSetUndoReceipt): boolean {
+  const { before, after, preparedAt } = receipt;
+  if (!isLiveExerciseProjection(before) || !isLiveExerciseProjection(after) ||
+      before.session.status !== "active" || !sameLiveExerciseCore(before, after, preparedAt) ||
+      !strictlyAfterEvery(preparedAt, exerciseProjectionVersions(before)) ||
+      after.sets.length !== before.sets.length - 1) return false;
+  const afterById = new Map(after.sets.map((set) => [set.id, set]));
+  const removed = before.sets.filter(({ id }) => !afterById.has(id));
+  return removed.length === 1 && after.sets.every((set) =>
+    sameProjection(before.sets.find(({ id }) => id === set.id), set)
+  );
+}
+
+function transformedFinishedExercise(
+  exercise: FitnessSessionExercise,
+  sets: readonly FitnessLiveSetSnapshot[],
+  preparedAt: number,
+): FitnessSessionExercise {
+  if (!["pending", "active", "substituted"].includes(exercise.status)) return exercise;
+  return {
+    ...exercise,
+    status: sets.some((set) =>
+      set.session_exercise_id === exercise.id && set.completed
+    ) ? "completed" : "skipped",
+    updated_at: preparedAt,
+  };
+}
+
+function isFinishTransition(receipt: FitnessSessionFinishReceipt): boolean {
+  const { before, after, preparedAt } = receipt;
+  if (!isLiveSessionProjection(before) || !isLiveSessionProjection(after) ||
+      before.session === null || after.session === null || before.session.status !== "active" ||
+      !["completed", "ended_early"].includes(after.session.status) ||
+      after.session.ended_at !== preparedAt || after.session.updated_at !== preparedAt ||
+      !strictlyAfterEvery(preparedAt, sessionProjectionVersions(before)) ||
+      !sameProjection(after.session, {
+        ...before.session,
+        status: after.session.status,
+        ended_at: preparedAt,
+        reflection: after.session.reflection,
+        updated_at: preparedAt,
+      }) || !sameProjection(after.sets, before.sets) ||
+      !sameProjection(after.cardioEntries, before.cardioEntries) ||
+      !sameProjection(after.exercises, sortedExercises(before.exercises.map((exercise) =>
+        transformedFinishedExercise(exercise, before.sets, preparedAt)
+      )))) return false;
+  if (before.event === null) {
+    if (after.event !== null) return false;
+  } else if (
+    before.event.status !== "in_progress" || after.event === null ||
+    preparedAt <= before.event.updated_at ||
+    !sameProjection(after.event, {
+      ...before.event,
+      status: "completed",
+      updated_at: preparedAt,
+    })
+  ) return false;
+
+  const beforeBySource = new Map(before.capabilities.map((capability) =>
+    [capability.source_set_id, capability]
+  ));
+  const expected = [...before.capabilities];
+  const exercises = new Map(before.exercises.map((exercise) => [exercise.id, exercise]));
+  for (const set of before.sets) {
+    if (!set.completed || set.set_kind !== "work" || set.pain_note !== "" ||
+        set.completed_at === null || (set.reps === null && set.load_grams === null) ||
+        beforeBySource.has(set.id)) continue;
+    const exercise = exercises.get(set.session_exercise_id);
+    const capability = after.capabilities.find(({ source_set_id }) => source_set_id === set.id);
+    if (!exercise || !capability || !LIVE_UUID_PATTERN.test(capability.id) ||
+        !sameProjection(capability, {
+          id: capability.id,
+          exercise_id: exercise.exercise_id,
+          equipment_id: exercise.equipment_id,
+          source_set_id: set.id,
+          load_grams: set.load_grams,
+          reps: set.reps,
+          rir: set.rir,
+          rpe: set.rpe,
+          confidence: "observed",
+          recorded_at: set.completed_at,
+          created_at: preparedAt,
+        })) return false;
+    expected.push(capability);
+  }
+  return sameProjection(after.capabilities, sortedCapabilities(expected));
+}
+
+function isCancelTransition(receipt: FitnessEmptySessionCancelReceipt): boolean {
+  const { before, after, preparedAt } = receipt;
+  if (!isLiveSessionProjection(before) || !isLiveSessionProjection(after) ||
+      before.session === null || after.session !== null || before.session.status !== "active" ||
+      before.sets.length !== 0 || before.cardioEntries.length !== 0 ||
+      before.capabilities.length !== 0 ||
+      !strictlyAfterEvery(preparedAt, sessionProjectionVersions(before)) ||
+      after.exercises.length !== 0 ||
+      after.sets.length !== 0 || after.cardioEntries.length !== 0 ||
+      after.capabilities.length !== 0) return false;
+  if (before.event === null) return after.event === null;
+  return before.event.status === "in_progress" && after.event !== null &&
+    preparedAt > before.event.updated_at && sameProjection(after.event, {
+      ...before.event,
+      status: "planned",
+      updated_at: preparedAt,
+    });
+}
+
+function hasValidLiveReceiptBase(
+  value: object,
+  kind: FitnessLiveWriteReceipt["kind"],
+): boolean {
+  const receipt = value as Partial<FitnessLiveWriteReceipt>;
+  return exactObjectKeys(value, [
+    "purpose", "version", "operationId", "generationId", "generationSequence",
+    "preparedAt", "kind", "projectionSha256", "before", "after",
+  ]) && receipt.purpose === "fitness-live-write" && receipt.version === 1 &&
+    receipt.kind === kind && typeof receipt.operationId === "string" &&
+    LIVE_OPERATION_ID_PATTERN.test(receipt.operationId) &&
+    typeof receipt.generationId === "string" &&
+    CONFIG_GENERATION_ID_PATTERN.test(receipt.generationId) &&
+    liveInteger(receipt.generationSequence, 0, Number.MAX_SAFE_INTEGER) &&
+    liveInteger(receipt.preparedAt, 0, Number.MAX_SAFE_INTEGER) &&
+    typeof receipt.projectionSha256 === "string" &&
+    CONFIG_HASH_PATTERN.test(receipt.projectionSha256);
+}
+
+function isFitnessLiveWriteReceiptUnchecked(value: unknown): value is FitnessLiveWriteReceipt {
+  if (!value || typeof value !== "object" || Array.isArray(value) ||
+      !jsonWithinUnits(value, LIVE_MAX_RECEIPT_JSON_UNITS)) return false;
+  const receipt = value as Partial<FitnessLiveWriteReceipt>;
+  switch (receipt.kind) {
+    case "set-record":
+      return hasValidLiveReceiptBase(value, receipt.kind) &&
+        isRecordTransition(receipt as FitnessSetRecordReceipt);
+    case "set-undo":
+      return hasValidLiveReceiptBase(value, receipt.kind) &&
+        isUndoTransition(receipt as FitnessSetUndoReceipt);
+    case "session-finish":
+      return hasValidLiveReceiptBase(value, receipt.kind) &&
+        isFinishTransition(receipt as FitnessSessionFinishReceipt);
+    case "session-cancel":
+      return hasValidLiveReceiptBase(value, receipt.kind) &&
+        isCancelTransition(receipt as FitnessEmptySessionCancelReceipt);
+    default:
+      return false;
+  }
+}
+
+export function isFitnessLiveWriteReceipt(value: unknown): value is FitnessLiveWriteReceipt {
+  try {
+    return isFitnessLiveWriteReceiptUnchecked(value);
+  } catch {
+    return false;
+  }
+}
+
+async function sealLiveReceipt<Receipt extends FitnessLiveWriteReceipt>(
+  draft: Omit<Receipt, "projectionSha256">,
+): Promise<Receipt> {
+  const projectionSha256 = await sha256Hex(canonicalJson(draft));
+  return { ...draft, projectionSha256 } as Receipt;
+}
+
+async function liveReceiptHashIsValid(receipt: FitnessLiveWriteReceipt): Promise<boolean> {
+  const { projectionSha256, ...projection } = receipt;
+  return projectionSha256 === await sha256Hex(canonicalJson(projection));
+}
+
+function mapLiveSet(row: Row): FitnessLiveSetSnapshot {
+  return {
+    id: String(row.id),
+    session_exercise_id: String(row.session_exercise_id),
+    set_index: Number(row.set_index),
+    set_kind: String(row.set_kind) as FitnessSet["set_kind"],
+    load_grams: row.load_grams === null ? null : Number(row.load_grams),
+    reps: row.reps === null ? null : Number(row.reps),
+    duration_seconds: row.duration_seconds === null ? null : Number(row.duration_seconds),
+    rir: row.rir === null ? null : Number(row.rir),
+    rpe: row.rpe === null ? null : Number(row.rpe),
+    completed: asBoolean(row.completed),
+    pain_note: String(row.pain_note),
+    completed_at: row.completed_at === null ? null : Number(row.completed_at),
+    client_mutation_id: String(row.client_mutation_id),
+    created_at: Number(row.created_at),
+    updated_at: Number(row.updated_at),
+  };
+}
+
+async function liveRows<Result extends object>(
+  runtime: FitnessLiveStorageRuntime,
+  sql: string,
+  params: SqlParams = [],
+): Promise<readonly Result[]> {
+  return (await runtime.query<Result>(sql, params)).rows;
+}
+
+async function readLiveSession(
+  runtime: FitnessLiveStorageRuntime,
+  id: string,
+): Promise<FitnessSession | null> {
+  return (await liveRows<FitnessSession>(
+    runtime,
+    "SELECT * FROM fitness_sessions WHERE id=? LIMIT 1",
+    [id],
+  ))[0] ?? null;
+}
+
+async function readLiveExercise(
+  runtime: FitnessLiveStorageRuntime,
+  id: string,
+): Promise<FitnessSessionExercise | null> {
+  return (await liveRows<FitnessSessionExercise>(
+    runtime,
+    "SELECT * FROM fitness_session_exercises WHERE id=? LIMIT 1",
+    [id],
+  ))[0] ?? null;
+}
+
+async function readLiveSetsForExercise(
+  runtime: FitnessLiveStorageRuntime,
+  exerciseId: string,
+): Promise<readonly FitnessLiveSetSnapshot[]> {
+  return (await liveRows<Row>(runtime, `SELECT
+      id,session_exercise_id,set_index,set_kind,load_grams,reps,duration_seconds,
+      rir,rpe,completed,pain_note,completed_at,client_mutation_id,created_at,updated_at
+    FROM fitness_sets WHERE session_exercise_id=? ORDER BY set_index,id LIMIT ?`, [
+    exerciseId,
+    LIVE_MAX_ATOMIC_ROWS + 1,
+  ])).map(mapLiveSet).sort((left, right) =>
+    left.set_index - right.set_index || compareLiveId(left.id, right.id)
+  );
+}
+
+async function readLiveSet(
+  runtime: FitnessLiveStorageRuntime,
+  id: string,
+): Promise<FitnessLiveSetSnapshot | null> {
+  const row = (await liveRows<Row>(runtime, `SELECT
+      id,session_exercise_id,set_index,set_kind,load_grams,reps,duration_seconds,
+      rir,rpe,completed,pain_note,completed_at,client_mutation_id,created_at,updated_at
+    FROM fitness_sets WHERE id=? LIMIT 1`, [id]))[0];
+  return row ? mapLiveSet(row) : null;
+}
+
+async function readLiveExerciseProjection(
+  runtime: FitnessLiveStorageRuntime,
+  exerciseId: string,
+): Promise<FitnessLiveExerciseProjection | null> {
+  const exercise = await readLiveExercise(runtime, exerciseId);
+  if (!exercise) return null;
+  const [session, sets] = await Promise.all([
+    readLiveSession(runtime, exercise.session_id),
+    readLiveSetsForExercise(runtime, exercise.id),
+  ]);
+  if (!session) return null;
+  return { session, exercise, sets };
+}
+
+async function readLiveSessionProjection(
+  runtime: FitnessLiveStorageRuntime,
+  sessionId: string,
+  eventId: string | null,
+): Promise<FitnessLiveSessionProjection> {
+  const [session, exercises, setRows, cardioEntries, event, capabilities] = await Promise.all([
+    readLiveSession(runtime, sessionId),
+    liveRows<FitnessSessionExercise>(runtime,
+      "SELECT * FROM fitness_session_exercises WHERE session_id=? ORDER BY order_index,id LIMIT ?",
+      [sessionId, LIVE_MAX_ATOMIC_ROWS + 1]),
+    liveRows<Row>(runtime, `SELECT recorded_set.id,recorded_set.session_exercise_id,
+        recorded_set.set_index,recorded_set.set_kind,recorded_set.load_grams,
+        recorded_set.reps,recorded_set.duration_seconds,recorded_set.rir,recorded_set.rpe,
+        recorded_set.completed,recorded_set.pain_note,recorded_set.completed_at,
+        recorded_set.client_mutation_id,recorded_set.created_at,recorded_set.updated_at
+      FROM fitness_sets recorded_set
+      JOIN fitness_session_exercises exercise
+        ON exercise.id=recorded_set.session_exercise_id
+      WHERE exercise.session_id=? ORDER BY recorded_set.set_index,recorded_set.id LIMIT ?`,
+      [sessionId, LIVE_MAX_ATOMIC_ROWS + 1]),
+    liveRows<FitnessCardioEntry>(runtime,
+      "SELECT * FROM fitness_cardio_entries WHERE session_id=? ORDER BY created_at,id LIMIT ?",
+      [sessionId, LIVE_MAX_ATOMIC_ROWS + 1]),
+    eventId === null
+      ? Promise.resolve([] as readonly FitnessCalendarEvent[])
+      : liveRows<FitnessCalendarEvent>(runtime,
+        "SELECT * FROM fitness_calendar_events WHERE id=? LIMIT 1", [eventId]),
+    liveRows<FitnessCapability>(runtime, `SELECT capability.*
+      FROM fitness_capabilities capability
+      JOIN fitness_sets recorded_set ON recorded_set.id=capability.source_set_id
+      JOIN fitness_session_exercises exercise
+        ON exercise.id=recorded_set.session_exercise_id
+      WHERE exercise.session_id=?
+      ORDER BY capability.recorded_at,capability.id LIMIT ?`,
+      [sessionId, LIVE_MAX_ATOMIC_ROWS + 1]),
+  ]);
+  return {
+    session,
+    exercises: sortedExercises(exercises),
+    sets: sortedByIndexAndId(setRows.map(mapLiveSet)),
+    cardioEntries: sortedCardio(cardioEntries),
+    event: event[0] ?? null,
+    capabilities: sortedCapabilities(capabilities),
+  };
+}
+
+function publicExerciseExpectation(
+  projection: FitnessLiveExerciseProjection,
+): FitnessLiveExerciseExpectation {
+  const sets = projection.sets.map(publicLiveSet);
+  return {
+    session: projection.session,
+    exercise: projection.exercise,
+    sets,
+    nextSetIndex: sets.reduce(
+      (maximum, set) => Math.max(maximum, set.set_index + 1),
+      0,
+    ),
+  };
+}
+
+function publicSessionExpectation(
+  projection: FitnessLiveSessionProjection,
+): FitnessLiveSessionExpectation | null {
+  if (projection.session === null) return null;
+  return {
+    session: projection.session,
+    exercises: projection.exercises,
+    sets: projection.sets.map(publicLiveSet),
+    cardioEntries: projection.cardioEntries,
+    event: projection.event,
+    capabilities: projection.capabilities,
+  };
+}
+
+function nextLiveTimestamp(now: number, values: readonly number[]): number {
+  if (!safeTimestamp(now)) throw liveError("invalid_input", "设备时间不在可接受范围。");
+  const greatest = values.reduce((maximum, value) => Math.max(maximum, value), -1);
+  const next = Math.max(now, greatest + 1);
+  if (!safeTimestamp(next)) throw liveError("invalid_input", "训练记录版本时间已经超出范围。");
+  return next;
+}
+
+function generatedLiveUuid(runtime: FitnessLiveStorageRuntime, prefix = ""): string {
+  const uuid = runtime.randomUUID();
+  if (!LIVE_UUID_PATTERN.test(uuid)) {
+    throw liveError("invalid_input", "无法生成可靠的训练写入标识。");
+  }
+  return `${prefix}${uuid}`;
+}
+
+export type PrepareFitnessSetRecordInput = Omit<RecordFitnessSetInput, "clientMutationId">;
+export type PrepareFitnessSessionFinishInput = Readonly<{
+  endedEarly?: boolean;
+  reflection?: string;
+}>;
+
+export function createFitnessLiveStorageService(
+  runtime: FitnessLiveStorageRuntime = {
+    withExclusiveLock: (operation) => withFitnessWriteLock(operation, { requireSupport: true }),
+    query: async <Result extends object>(sql: string, params?: SqlParams) => ({
+      rows: await rawQuery<Result>(sql, params),
+    }),
+    batch: (statements) => rawBatch(statements),
+    currentGeneration: () => localDb.currentGeneration(DB),
+    now: () => Date.now(),
+    randomUUID: () => crypto.randomUUID(),
+    broadcast: broadcastFitnessChange,
+  },
+) {
+  async function prepareLocked<Result>(operation: () => Promise<Result>): Promise<Result> {
+    try {
+      return await runtime.withExclusiveLock(operation);
+    } catch (error) {
+      if (error instanceof FitnessLiveMutationError) throw error;
+      if (error instanceof TypeError) throw liveError("invalid_input", error.message);
+      throw liveError("inspect_failed", "暂时无法核对训练现场；没有开始写入。");
+    }
+  }
+
+  async function prepareSetRecord(
+    input: PrepareFitnessSetRecordInput,
+    expected: FitnessLiveExerciseExpectation,
+  ): Promise<FitnessSetRecordReceipt> {
+    const stableInput = snapshotLiveInput(input);
+    const stableExpected = snapshotLiveInput(expected);
+    return prepareLocked(async () => {
+      if (!isLiveExerciseExpectation(stableExpected)) {
+        throw liveError("invalid_input", "训练画面快照无效；没有准备组记录。");
+      }
+      if (!safeOpaqueId(stableInput.sessionExerciseId) ||
+          !liveInteger(stableInput.setIndex, 0, 10_000) ||
+          stableInput.setIndex !== stableExpected.nextSetIndex) {
+        throw liveError("invalid_input", "组序号与当前画面不一致；没有准备写入。");
+      }
+      const setKind = stableInput.setKind ?? "work";
+      if (!["warmup", "work", "drop", "amrap"].includes(setKind)) {
+        throw liveError("invalid_input", "组类型不受支持；没有准备写入。");
+      }
+      const loadGrams = stableInput.loadGrams ?? null;
+      const reps = stableInput.reps ?? null;
+      const durationSeconds = stableInput.durationSeconds ?? null;
+      const rir = stableInput.rir ?? null;
+      const rpe = stableInput.rpe ?? null;
+      const painNote = stableInput.painNote?.trim() ?? "";
+      if (!liveNullableInteger(loadGrams, 0, 10_000_000) ||
+          !liveNullableInteger(reps, 0, 10_000) ||
+          !liveNullableInteger(durationSeconds, 0, 86_400) ||
+          !liveNullableInteger(rir, 0, 5) || !liveNullableInteger(rpe, 1, 10) ||
+          (reps === null && durationSeconds === null) || !safeString(painNote, 10_000)) {
+        throw liveError("invalid_input", "组记录内容不在可接受范围；没有准备写入。");
+      }
+      const current = await readLiveExerciseProjection(runtime, stableInput.sessionExerciseId);
+      if (!current || !isLiveExerciseProjection(current) ||
+          !sameProjection(publicExerciseExpectation(current), stableExpected)) {
+        throw liveError("changed", "训练现场已在别处变化；没有准备这条组记录。");
+      }
+      if (current.session.status !== "active") {
+        throw liveError("changed", "这场训练已经结束；没有准备这条组记录。");
+      }
+      if (current.exercise.status === "completed" || current.exercise.status === "skipped") {
+        throw liveError("changed", "这个动作已经结束；没有准备这条组记录。");
+      }
+      const generation = await readConfigGeneration(runtime);
+      const preparedAt = nextLiveTimestamp(runtime.now(), [
+        ...exerciseProjectionVersions(current),
+      ]);
+      const setId = generatedLiveUuid(runtime, "set-");
+      const clientMutationId = generatedLiveUuid(runtime, "fitness-live-mutation-");
+      const operationId = generatedLiveUuid(runtime, "fitness-live-operation-");
+      const set: FitnessLiveSetSnapshot = {
+        id: setId,
+        session_exercise_id: current.exercise.id,
+        set_index: stableInput.setIndex,
+        set_kind: setKind,
+        load_grams: loadGrams,
+        reps,
+        duration_seconds: durationSeconds,
+        rir,
+        rpe,
+        completed: true,
+        pain_note: painNote,
+        completed_at: preparedAt,
+        client_mutation_id: clientMutationId,
+        created_at: preparedAt,
+        updated_at: preparedAt,
+      };
+      const receipt = await sealLiveReceipt<FitnessSetRecordReceipt>({
+        purpose: "fitness-live-write",
+        version: 1,
+        operationId,
+        ...generation,
+        preparedAt,
+        kind: "set-record",
+        before: current,
+        after: {
+          session: { ...current.session, updated_at: preparedAt },
+          exercise: { ...current.exercise, status: "active", updated_at: preparedAt },
+          sets: sortedByIndexAndId([...current.sets, set]),
+        },
+      });
+      if (!isFitnessLiveWriteReceipt(receipt)) {
+        throw liveError("invalid_input", "无法构造可靠的组记录回执。");
+      }
+      return receipt;
+    });
+  }
+
+  async function prepareSetUndo(
+    setId: string,
+    expected: FitnessLiveExerciseExpectation,
+  ): Promise<FitnessSetUndoReceipt> {
+    const stableSetId = snapshotLiveInput(setId);
+    const stableExpected = snapshotLiveInput(expected);
+    return prepareLocked(async () => {
+      if (!safeOpaqueId(stableSetId) || !isLiveExerciseExpectation(stableExpected) ||
+          !stableExpected.sets.some(({ id }) => id === stableSetId)) {
+        throw liveError("invalid_input", "要撤销的组不在这份训练画面里。");
+      }
+      const current = await readLiveExerciseProjection(runtime, stableExpected.exercise.id);
+      if (!current || !isLiveExerciseProjection(current) ||
+          !sameProjection(publicExerciseExpectation(current), stableExpected) ||
+          current.session.status !== "active" ||
+          !current.sets.some(({ id }) => id === stableSetId)) {
+        throw liveError("changed", "这条组记录或训练现场已变化；没有准备撤销。");
+      }
+      const generation = await readConfigGeneration(runtime);
+      const preparedAt = nextLiveTimestamp(runtime.now(), [
+        ...exerciseProjectionVersions(current),
+      ]);
+      const operationId = generatedLiveUuid(runtime, "fitness-live-operation-");
+      const receipt = await sealLiveReceipt<FitnessSetUndoReceipt>({
+        purpose: "fitness-live-write",
+        version: 1,
+        operationId,
+        ...generation,
+        preparedAt,
+        kind: "set-undo",
+        before: current,
+        after: {
+          session: { ...current.session, updated_at: preparedAt },
+          exercise: { ...current.exercise, status: "active", updated_at: preparedAt },
+          sets: current.sets.filter(({ id }) => id !== stableSetId),
+        },
+      });
+      if (!isFitnessLiveWriteReceipt(receipt)) {
+        throw liveError("invalid_input", "无法构造可靠的撤销回执。");
+      }
+      return receipt;
+    });
+  }
+
+  async function prepareSessionFinish(
+    sessionId: string,
+    input: PrepareFitnessSessionFinishInput,
+    expected: FitnessLiveSessionExpectation,
+  ): Promise<FitnessSessionFinishReceipt> {
+    const stableSessionId = snapshotLiveInput(sessionId);
+    const stableInput = snapshotLiveInput(input);
+    const stableExpected = snapshotLiveInput(expected);
+    return prepareLocked(async () => {
+      if (!safeOpaqueId(stableSessionId) || !isLiveSessionExpectation(stableExpected) ||
+          stableExpected.session.id !== stableSessionId ||
+          !stableInput || typeof stableInput !== "object" || Array.isArray(stableInput) ||
+          (stableInput.endedEarly !== undefined && typeof stableInput.endedEarly !== "boolean") ||
+          (stableInput.reflection !== undefined && typeof stableInput.reflection !== "string")) {
+        throw liveError("invalid_input", "结束训练的内容或画面快照无效。");
+      }
+      const reflection = stableInput.reflection === undefined
+        ? stableExpected.session.reflection
+        : stableInput.reflection.trim();
+      if (!safeString(reflection, 20_000)) {
+        throw liveError("invalid_input", "训练感受过长；没有准备结束训练。");
+      }
+      const current = await readLiveSessionProjection(
+        runtime,
+        stableSessionId,
+        stableExpected.session.event_id,
+      );
+      if (!isLiveSessionProjection(current) ||
+          !sameProjection(publicSessionExpectation(current), stableExpected) ||
+          current.session === null || current.session.status !== "active") {
+        throw liveError("changed", "训练现场已在别处变化；没有准备结束。");
+      }
+      if (current.event !== null && current.event.status !== "in_progress") {
+        throw liveError("changed", "关联日历安排已变化；没有准备结束训练。");
+      }
+      const generation = await readConfigGeneration(runtime);
+      const preparedAt = nextLiveTimestamp(runtime.now(), [
+        ...sessionProjectionVersions(
+          current as FitnessLiveSessionProjection & Readonly<{ session: FitnessSession }>,
+        ),
+      ]);
+      const operationId = generatedLiveUuid(runtime, "fitness-live-operation-");
+      const afterCapabilities = [...current.capabilities];
+      const capabilitiesBySource = new Map(current.capabilities.map((capability) =>
+        [capability.source_set_id, capability]
+      ));
+      const exercises = new Map(current.exercises.map((exercise) => [exercise.id, exercise]));
+      for (const set of current.sets) {
+        if (!set.completed || set.set_kind !== "work" || set.pain_note !== "" ||
+            set.completed_at === null || (set.reps === null && set.load_grams === null) ||
+            capabilitiesBySource.has(set.id)) continue;
+        const exercise = exercises.get(set.session_exercise_id);
+        if (!exercise) throw liveError("inspect_failed", "训练组与动作关联不完整；没有准备结束。");
+        afterCapabilities.push({
+          id: generatedLiveUuid(runtime),
+          exercise_id: exercise.exercise_id,
+          equipment_id: exercise.equipment_id,
+          source_set_id: set.id,
+          load_grams: set.load_grams,
+          reps: set.reps,
+          rir: set.rir,
+          rpe: set.rpe,
+          confidence: "observed",
+          recorded_at: set.completed_at,
+          created_at: preparedAt,
+        });
+      }
+      const receipt = await sealLiveReceipt<FitnessSessionFinishReceipt>({
+        purpose: "fitness-live-write",
+        version: 1,
+        operationId,
+        ...generation,
+        preparedAt,
+        kind: "session-finish",
+        before: current as FitnessLiveSessionProjection & Readonly<{ session: FitnessSession }>,
+        after: {
+          session: {
+            ...current.session,
+            status: stableInput.endedEarly ? "ended_early" : "completed",
+            ended_at: preparedAt,
+            reflection,
+            updated_at: preparedAt,
+          },
+          exercises: sortedExercises(current.exercises.map((exercise) =>
+            transformedFinishedExercise(exercise, current.sets, preparedAt)
+          )),
+          sets: current.sets,
+          cardioEntries: current.cardioEntries,
+          event: current.event === null ? null : {
+            ...current.event,
+            status: "completed",
+            updated_at: preparedAt,
+          },
+          capabilities: sortedCapabilities(afterCapabilities),
+        },
+      });
+      if (!isFitnessLiveWriteReceipt(receipt)) {
+        throw liveError("invalid_input", "无法构造可靠的结束训练回执。");
+      }
+      return receipt;
+    });
+  }
+
+  async function prepareEmptySessionCancel(
+    sessionId: string,
+    expected: FitnessLiveSessionExpectation,
+  ): Promise<FitnessEmptySessionCancelReceipt> {
+    const stableSessionId = snapshotLiveInput(sessionId);
+    const stableExpected = snapshotLiveInput(expected);
+    return prepareLocked(async () => {
+      if (!safeOpaqueId(stableSessionId) || !isLiveSessionExpectation(stableExpected) ||
+          stableExpected.session.id !== stableSessionId) {
+        throw liveError("invalid_input", "撤销训练的画面快照无效。");
+      }
+      const current = await readLiveSessionProjection(
+        runtime,
+        stableSessionId,
+        stableExpected.session.event_id,
+      );
+      if (!isLiveSessionProjection(current) ||
+          !sameProjection(publicSessionExpectation(current), stableExpected) ||
+          current.session === null || current.session.status !== "active") {
+        throw liveError("changed", "训练现场已在别处变化；没有准备撤销。");
+      }
+      if (current.sets.length !== 0 || current.cardioEntries.length !== 0 ||
+          current.capabilities.length !== 0) {
+        throw liveError("changed", "这场训练已经有现场事实，不能作为空训练撤销。");
+      }
+      if (current.event !== null && current.event.status !== "in_progress") {
+        throw liveError("changed", "关联日历安排已变化；没有准备撤销训练。");
+      }
+      const generation = await readConfigGeneration(runtime);
+      const preparedAt = nextLiveTimestamp(runtime.now(), [
+        ...sessionProjectionVersions(
+          current as FitnessLiveSessionProjection & Readonly<{ session: FitnessSession }>,
+        ),
+      ]);
+      const operationId = generatedLiveUuid(runtime, "fitness-live-operation-");
+      const receipt = await sealLiveReceipt<FitnessEmptySessionCancelReceipt>({
+        purpose: "fitness-live-write",
+        version: 1,
+        operationId,
+        ...generation,
+        preparedAt,
+        kind: "session-cancel",
+        before: current as FitnessLiveSessionProjection & Readonly<{ session: FitnessSession }>,
+        after: {
+          session: null,
+          exercises: [],
+          sets: [],
+          cardioEntries: [],
+          event: current.event === null ? null : {
+            ...current.event,
+            status: "planned",
+            updated_at: preparedAt,
+          },
+          capabilities: [],
+        },
+      });
+      if (!isFitnessLiveWriteReceipt(receipt)) {
+        throw liveError("invalid_input", "无法构造可靠的撤销训练回执。");
+      }
+      return receipt;
+    });
+  }
+
+  async function receiptStateUnlocked(
+    receipt: FitnessLiveWriteReceipt,
+  ): Promise<Exclude<FitnessLiveWriteInspection, "still_unknown" | "invalid_receipt">> {
+    const generation = await readConfigGeneration(runtime);
+    if (generation.generationId !== receipt.generationId ||
+        generation.generationSequence !== receipt.generationSequence) return "changed";
+    if (receipt.kind === "set-record") {
+      const beforeIds = new Set(receipt.before.sets.map(({ id }) => id));
+      const target = receipt.after.sets.find(({ id }) => !beforeIds.has(id));
+      if (!target) return "changed";
+      const storedTarget = await readLiveSet(runtime, target.id);
+      if (sameProjection(storedTarget, target)) return "exact_saved";
+      const current = await readLiveExerciseProjection(runtime, receipt.before.exercise.id);
+      return current && sameProjection(current, receipt.before) ? "expected" : "changed";
+    }
+    if (receipt.kind === "set-undo") {
+      const afterIds = new Set(receipt.after.sets.map(({ id }) => id));
+      const target = receipt.before.sets.find(({ id }) => !afterIds.has(id));
+      if (!target) return "changed";
+      const storedTarget = await readLiveSet(runtime, target.id);
+      if (storedTarget === null) return "exact_saved";
+      const current = await readLiveExerciseProjection(runtime, receipt.before.exercise.id);
+      return current && sameProjection(current, receipt.before) ? "expected" : "changed";
+    }
+    const current = await readLiveSessionProjection(
+      runtime,
+      receipt.before.session.id,
+      receipt.before.event?.id ?? null,
+    );
+    if (sameProjection(current, receipt.after)) return "exact_saved";
+    return sameProjection(current, receipt.before) ? "expected" : "changed";
+  }
+
+  type LivePredicate = Readonly<{ sql: string; params: readonly unknown[] }>;
+
+  function joinedLivePredicate(predicates: readonly LivePredicate[]): LivePredicate {
+    return {
+      sql: predicates.length === 0
+        ? "1"
+        : predicates.map(({ sql }) => `(${sql})`).join(" AND "),
+      params: predicates.flatMap(({ params }) => [...params]),
+    };
+  }
+
+  function liveSessionPredicate(row: FitnessSession): LivePredicate {
+    return {
+      sql: `EXISTS(SELECT 1 FROM fitness_sessions WHERE id=? AND event_id IS ?
+        AND venue_id IS ? AND program_day_id IS ? AND started_at IS ? AND ended_at IS ?
+        AND status IS ? AND available_minutes IS ? AND energy_note IS ?
+        AND soreness_note IS ? AND reflection IS ? AND created_at IS ? AND updated_at IS ?)`,
+      params: [
+        row.id, row.event_id, row.venue_id, row.program_day_id, row.started_at,
+        row.ended_at, row.status, row.available_minutes, row.energy_note,
+        row.soreness_note, row.reflection, row.created_at, row.updated_at,
+      ],
+    };
+  }
+
+  function liveExercisePredicate(row: FitnessSessionExercise): LivePredicate {
+    return {
+      sql: `EXISTS(SELECT 1 FROM fitness_session_exercises WHERE id=? AND session_id IS ?
+        AND exercise_id IS ? AND equipment_id IS ? AND planned_item_id IS ?
+        AND order_index IS ? AND status IS ? AND substituted_for_exercise_id IS ?
+        AND substitution_reason IS ? AND equipment_snapshot IS ? AND note IS ?
+        AND created_at IS ? AND updated_at IS ?)`,
+      params: [
+        row.id, row.session_id, row.exercise_id, row.equipment_id, row.planned_item_id,
+        row.order_index, row.status, row.substituted_for_exercise_id,
+        row.substitution_reason, row.equipment_snapshot, row.note, row.created_at,
+        row.updated_at,
+      ],
+    };
+  }
+
+  function liveSetPredicate(row: FitnessLiveSetSnapshot): LivePredicate {
+    return {
+      sql: `EXISTS(SELECT 1 FROM fitness_sets WHERE id=? AND session_exercise_id IS ?
+        AND set_index IS ? AND set_kind IS ? AND load_grams IS ? AND reps IS ?
+        AND duration_seconds IS ? AND rir IS ? AND rpe IS ? AND completed IS ?
+        AND pain_note IS ? AND completed_at IS ? AND client_mutation_id IS ?
+        AND created_at IS ? AND updated_at IS ?)`,
+      params: [
+        row.id, row.session_exercise_id, row.set_index, row.set_kind, row.load_grams,
+        row.reps, row.duration_seconds, row.rir, row.rpe, Number(row.completed),
+        row.pain_note, row.completed_at, row.client_mutation_id, row.created_at,
+        row.updated_at,
+      ],
+    };
+  }
+
+  function liveCardioPredicate(row: FitnessCardioEntry): LivePredicate {
+    return {
+      sql: `EXISTS(SELECT 1 FROM fitness_cardio_entries WHERE id=? AND session_id IS ?
+        AND equipment_id IS ? AND mode IS ? AND duration_seconds IS ?
+        AND distance_meters IS ? AND resistance IS ? AND average_heart_rate IS ?
+        AND effort IS ? AND note IS ? AND created_at IS ?)`,
+      params: [
+        row.id, row.session_id, row.equipment_id, row.mode, row.duration_seconds,
+        row.distance_meters, row.resistance, row.average_heart_rate, row.effort,
+        row.note, row.created_at,
+      ],
+    };
+  }
+
+  function liveEventPredicate(row: FitnessCalendarEvent): LivePredicate {
+    return {
+      sql: `EXISTS(SELECT 1 FROM fitness_calendar_events WHERE id=?
+        AND program_day_id IS ? AND venue_id IS ? AND title IS ? AND kind IS ?
+        AND starts_at IS ? AND occurrence_key IS ? AND planned_minutes IS ?
+        AND status IS ? AND rescheduled_from_id IS ? AND note IS ?
+        AND created_at IS ? AND updated_at IS ?)`,
+      params: [
+        row.id, row.program_day_id, row.venue_id, row.title, row.kind, row.starts_at,
+        row.occurrence_key, row.planned_minutes, row.status, row.rescheduled_from_id,
+        row.note, row.created_at, row.updated_at,
+      ],
+    };
+  }
+
+  function liveCapabilityPredicate(row: FitnessCapability): LivePredicate {
+    return {
+      sql: `EXISTS(SELECT 1 FROM fitness_capabilities WHERE id=?
+        AND exercise_id IS ? AND equipment_id IS ? AND source_set_id IS ?
+        AND load_grams IS ? AND reps IS ? AND rir IS ? AND rpe IS ?
+        AND confidence IS ? AND recorded_at IS ? AND created_at IS ?)`,
+      params: [
+        row.id, row.exercise_id, row.equipment_id, row.source_set_id, row.load_grams,
+        row.reps, row.rir, row.rpe, row.confidence, row.recorded_at, row.created_at,
+      ],
+    };
+  }
+
+  function exerciseSetPredicate(
+    exerciseId: string,
+    sets: readonly FitnessLiveSetSnapshot[],
+  ): LivePredicate {
+    return joinedLivePredicate([{
+      sql: "(SELECT COUNT(*) FROM fitness_sets WHERE session_exercise_id=?)=?",
+      params: [exerciseId, sets.length],
+    }, ...sets.map(liveSetPredicate)]);
+  }
+
+  function sessionExerciseSetPredicate(
+    sessionId: string,
+    exercises: readonly FitnessSessionExercise[],
+    sets: readonly FitnessLiveSetSnapshot[],
+  ): LivePredicate {
+    return joinedLivePredicate([{
+      sql: "(SELECT COUNT(*) FROM fitness_session_exercises WHERE session_id=?)=?",
+      params: [sessionId, exercises.length],
+    }, ...exercises.map(liveExercisePredicate), {
+      sql: `(SELECT COUNT(*) FROM fitness_sets recorded_set
+        JOIN fitness_session_exercises exercise
+          ON exercise.id=recorded_set.session_exercise_id
+        WHERE exercise.session_id=?)=?`,
+      params: [sessionId, sets.length],
+    }, ...sets.map(liveSetPredicate)]);
+  }
+
+  function sessionCardioPredicate(
+    sessionId: string,
+    rows: readonly FitnessCardioEntry[],
+  ): LivePredicate {
+    return joinedLivePredicate([{
+      sql: "(SELECT COUNT(*) FROM fitness_cardio_entries WHERE session_id=?)=?",
+      params: [sessionId, rows.length],
+    }, ...rows.map(liveCardioPredicate)]);
+  }
+
+  function sessionCapabilityPredicate(
+    sessionId: string,
+    rows: readonly FitnessCapability[],
+  ): LivePredicate {
+    return joinedLivePredicate([{
+      sql: `(SELECT COUNT(*) FROM fitness_capabilities capability
+        JOIN fitness_sets recorded_set ON recorded_set.id=capability.source_set_id
+        JOIN fitness_session_exercises exercise
+          ON exercise.id=recorded_set.session_exercise_id
+        WHERE exercise.session_id=?)=?`,
+      params: [sessionId, rows.length],
+    }, ...rows.map(liveCapabilityPredicate)]);
+  }
+
+  function exerciseProjectionPredicate(
+    projection: FitnessLiveExerciseProjection,
+  ): LivePredicate {
+    return joinedLivePredicate([
+      liveSessionPredicate(projection.session),
+      liveExercisePredicate(projection.exercise),
+      exerciseSetPredicate(projection.exercise.id, projection.sets),
+    ]);
+  }
+
+  function sessionProjectionPredicate(
+    projection: FitnessLiveSessionProjection & Readonly<{ session: FitnessSession }>,
+  ): LivePredicate {
+    return joinedLivePredicate([
+      liveSessionPredicate(projection.session),
+      sessionExerciseSetPredicate(projection.session.id, projection.exercises, projection.sets),
+      sessionCardioPredicate(projection.session.id, projection.cardioEntries),
+      projection.event === null
+        ? { sql: "1", params: [] }
+        : liveEventPredicate(projection.event),
+      sessionCapabilityPredicate(projection.session.id, projection.capabilities),
+    ]);
+  }
+
+  function liveCasSentinel(predicate: LivePredicate): SqlStatement {
+    return {
+      sql: `INSERT INTO fitness_settings(key,value,updated_at)
+        SELECT '__fitness_live_cas_abort__',NULL,0 WHERE NOT (${predicate.sql})`,
+      params: predicate.params,
+    };
+  }
+
+  function insertLiveSet(row: FitnessLiveSetSnapshot): SqlStatement {
+    return {
+      sql: `INSERT INTO fitness_sets(
+        id,session_exercise_id,set_index,set_kind,load_grams,reps,duration_seconds,
+        rir,rpe,completed,pain_note,completed_at,client_mutation_id,created_at,updated_at
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      params: [
+        row.id, row.session_exercise_id, row.set_index, row.set_kind, row.load_grams,
+        row.reps, row.duration_seconds, row.rir, row.rpe, Number(row.completed),
+        row.pain_note, row.completed_at, row.client_mutation_id, row.created_at,
+        row.updated_at,
+      ],
+    };
+  }
+
+  function insertLiveCapability(row: FitnessCapability): SqlStatement {
+    return {
+      sql: `INSERT INTO fitness_capabilities(
+        id,exercise_id,equipment_id,source_set_id,load_grams,reps,rir,rpe,
+        confidence,recorded_at,created_at
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
+      params: [
+        row.id, row.exercise_id, row.equipment_id, row.source_set_id, row.load_grams,
+        row.reps, row.rir, row.rpe, row.confidence, row.recorded_at, row.created_at,
+      ],
+    };
+  }
+
+  function receiptStatements(receipt: FitnessLiveWriteReceipt): SqlStatement[] {
+    if (receipt.kind === "set-record") {
+      const beforeIds = new Set(receipt.before.sets.map(({ id }) => id));
+      const set = receipt.after.sets.find(({ id }) => !beforeIds.has(id));
+      if (!set) throw liveError("invalid_receipt", "组记录回执缺少目标行。", receipt);
+      return [
+        liveCasSentinel(exerciseProjectionPredicate(receipt.before)),
+        insertLiveSet(set),
+        {
+          sql: "UPDATE fitness_session_exercises SET status='active',updated_at=? WHERE id=?",
+          params: [receipt.preparedAt, receipt.before.exercise.id],
+        },
+        {
+          sql: "UPDATE fitness_sessions SET updated_at=? WHERE id=?",
+          params: [receipt.preparedAt, receipt.before.session.id],
+        },
+      ];
+    }
+    if (receipt.kind === "set-undo") {
+      const afterIds = new Set(receipt.after.sets.map(({ id }) => id));
+      const set = receipt.before.sets.find(({ id }) => !afterIds.has(id));
+      if (!set) throw liveError("invalid_receipt", "撤销回执缺少目标行。", receipt);
+      return [
+        liveCasSentinel(exerciseProjectionPredicate(receipt.before)),
+        { sql: "DELETE FROM fitness_sets WHERE id=?", params: [set.id] },
+        {
+          sql: "UPDATE fitness_session_exercises SET status='active',updated_at=? WHERE id=?",
+          params: [receipt.preparedAt, receipt.before.exercise.id],
+        },
+        {
+          sql: "UPDATE fitness_sessions SET updated_at=? WHERE id=?",
+          params: [receipt.preparedAt, receipt.before.session.id],
+        },
+      ];
+    }
+    if (receipt.kind === "session-finish") {
+      const statements: SqlStatement[] = [
+        liveCasSentinel(sessionProjectionPredicate(receipt.before)),
+        {
+          sql: `UPDATE fitness_sessions SET status=?,ended_at=?,reflection=?,updated_at=?
+            WHERE id=?`,
+          params: [
+            receipt.after.session.status,
+            receipt.after.session.ended_at,
+            receipt.after.session.reflection,
+            receipt.after.session.updated_at,
+            receipt.after.session.id,
+          ],
+        },
+      ];
+      for (const after of receipt.after.exercises) {
+        const before = receipt.before.exercises.find(({ id }) => id === after.id);
+        if (before && !sameProjection(before, after)) statements.push({
+          sql: "UPDATE fitness_session_exercises SET status=?,updated_at=? WHERE id=?",
+          params: [after.status, after.updated_at, after.id],
+        });
+      }
+      if (receipt.after.event !== null) statements.push({
+        sql: "UPDATE fitness_calendar_events SET status='completed',updated_at=? WHERE id=?",
+        params: [receipt.after.event.updated_at, receipt.after.event.id],
+      });
+      const beforeCapabilityIds = new Set(receipt.before.capabilities.map(({ id }) => id));
+      statements.push(...receipt.after.capabilities
+        .filter(({ id }) => !beforeCapabilityIds.has(id))
+        .map(insertLiveCapability));
+      return statements;
+    }
+    const statements: SqlStatement[] = [
+      liveCasSentinel(sessionProjectionPredicate(receipt.before)),
+    ];
+    if (receipt.after.event !== null) statements.push({
+      sql: "UPDATE fitness_calendar_events SET status='planned',updated_at=? WHERE id=?",
+      params: [receipt.after.event.updated_at, receipt.after.event.id],
+    });
+    statements.push({
+      sql: "DELETE FROM fitness_sessions WHERE id=?",
+      params: [receipt.before.session.id],
+    });
+    return statements;
+  }
+
+  function receiptEntity(receipt: FitnessLiveWriteReceipt): {
+    id: string;
+    updatedAt: number;
+    reason: string;
+  } {
+    if (receipt.kind === "set-record") {
+      const beforeIds = new Set(receipt.before.sets.map(({ id }) => id));
+      return {
+        id: receipt.after.sets.find(({ id }) => !beforeIds.has(id))?.id ??
+          receipt.before.exercise.id,
+        updatedAt: receipt.preparedAt,
+        reason: "set-recorded",
+      };
+    }
+    if (receipt.kind === "set-undo") {
+      const afterIds = new Set(receipt.after.sets.map(({ id }) => id));
+      return {
+        id: receipt.before.sets.find(({ id }) => !afterIds.has(id))?.id ??
+          receipt.before.exercise.id,
+        updatedAt: receipt.preparedAt,
+        reason: "set-undone",
+      };
+    }
+    return {
+      id: receipt.before.session.id,
+      updatedAt: receipt.preparedAt,
+      reason: receipt.kind === "session-finish" ? "session-finished" : "session-cancelled",
+    };
+  }
+
+  function safeLiveBroadcast(reason: string): void {
+    try {
+      runtime.broadcast(reason);
+    } catch {
+      // A refresh hint is advisory and cannot reverse a durable commit.
+    }
+  }
+
+  async function inspectWrite(value: unknown): Promise<FitnessLiveWriteInspection> {
+    if (!isFitnessLiveWriteReceipt(value)) return "invalid_receipt";
+    let stableReceipt: FitnessLiveWriteReceipt;
+    try {
+      stableReceipt = snapshotLiveInput(value);
+    } catch {
+      return "invalid_receipt";
+    }
+    if (!isFitnessLiveWriteReceipt(stableReceipt)) return "invalid_receipt";
+    try {
+      if (!await liveReceiptHashIsValid(stableReceipt)) return "invalid_receipt";
+    } catch {
+      return "invalid_receipt";
+    }
+    try {
+      return await runtime.withExclusiveLock(() => receiptStateUnlocked(stableReceipt));
+    } catch {
+      return "still_unknown";
+    }
+  }
+
+  async function commitWrite(value: unknown): Promise<FitnessLiveWriteResult> {
+    if (!isFitnessLiveWriteReceipt(value)) {
+      throw liveError("invalid_receipt", "训练写入回执无效；没有改动现场记录。");
+    }
+    let stableReceipt: FitnessLiveWriteReceipt;
+    try {
+      stableReceipt = snapshotLiveInput(value);
+    } catch {
+      throw liveError("invalid_receipt", "训练写入回执无效；没有改动现场记录。");
+    }
+    if (!isFitnessLiveWriteReceipt(stableReceipt)) {
+      throw liveError("invalid_receipt", "训练写入回执无效；没有改动现场记录。");
+    }
+    try {
+      if (!await liveReceiptHashIsValid(stableReceipt)) {
+        throw liveError("invalid_receipt", "训练写入回执无效；没有改动现场记录。");
+      }
+    } catch (error) {
+      if (error instanceof FitnessLiveMutationError) throw error;
+      throw liveError("invalid_receipt", "训练写入回执无法验证；没有改动现场记录。");
+    }
+    const receipt = stableReceipt;
+    const entity = receiptEntity(receipt);
+    try {
+      return await runtime.withExclusiveLock(async () => {
+        const before = await receiptStateUnlocked(receipt);
+        if (before === "exact_saved") {
+          safeLiveBroadcast(entity.reason);
+          return {
+            outcome: "already_saved",
+            receipt,
+            entityId: entity.id,
+            updatedAt: entity.updatedAt,
+          };
+        }
+        if (before === "changed") {
+          return { outcome: "changed", receipt, entityId: entity.id, retryable: false };
+        }
+        try {
+          await runtime.batch(receiptStatements(receipt));
+        } catch {
+          // The transaction may have committed even though its response was lost.
+        }
+        const after = await receiptStateUnlocked(receipt);
+        if (after === "exact_saved") {
+          safeLiveBroadcast(entity.reason);
+          return {
+            outcome: "saved",
+            receipt,
+            entityId: entity.id,
+            updatedAt: entity.updatedAt,
+          };
+        }
+        if (after === "expected") {
+          throw liveError(
+            "write_failed",
+            "这次现场记录确定没有写入；保留回执后可以重试。",
+            receipt,
+          );
+        }
+        return { outcome: "changed", receipt, entityId: entity.id, retryable: false };
+      });
+    } catch (error) {
+      if (error instanceof FitnessLiveMutationError) throw error;
+      return {
+        outcome: "outcome_uncertain",
+        receipt,
+        entityId: entity.id,
+        retryable: true,
+      };
+    }
+  }
+
+  return {
+    prepareFitnessSetRecord: prepareSetRecord,
+    prepareFitnessSetUndo: prepareSetUndo,
+    prepareFitnessSessionFinish: prepareSessionFinish,
+    prepareFitnessEmptySessionCancel: prepareEmptySessionCancel,
+    inspectFitnessLiveWrite: inspectWrite,
+    commitFitnessLiveWrite: commitWrite,
+  } as const;
+}
+
+const defaultFitnessLiveStorageService = createFitnessLiveStorageService();
+
+export const prepareFitnessSetRecord =
+  defaultFitnessLiveStorageService.prepareFitnessSetRecord;
+export const prepareFitnessSetUndo =
+  defaultFitnessLiveStorageService.prepareFitnessSetUndo;
+export const prepareFitnessSessionFinish =
+  defaultFitnessLiveStorageService.prepareFitnessSessionFinish;
+export const prepareFitnessEmptySessionCancel =
+  defaultFitnessLiveStorageService.prepareFitnessEmptySessionCancel;
+export const inspectFitnessLiveWrite =
+  defaultFitnessLiveStorageService.inspectFitnessLiveWrite;
+export const commitFitnessLiveWrite =
+  defaultFitnessLiveStorageService.commitFitnessLiveWrite;
+
 function canComposePlateLoadedWeight(
   targetGrams: number,
   primary: FitnessEquipment,
