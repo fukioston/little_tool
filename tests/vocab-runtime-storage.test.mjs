@@ -461,6 +461,22 @@ test("seed cleanup preserves user occurrences and review history with safe FKs",
       "SELECT COUNT(*) FROM vocab_activity WHERE id='seed_activity_today'",
     ), 0);
     assert.deepEqual(database.selectObjects("PRAGMA foreign_key_check"), []);
+
+    const preserved = (await store.loadVocabSnapshot()).reviewCards.find(
+      ({ id }) => id === "seed_card_deliberate",
+    );
+    assert.ok(preserved);
+    const rating = await store.prepareVocabReviewRating(preserved, "good");
+    globalThis.__vocabBatchFault = "after_commit";
+    assert.equal((await store.commitVocabReviewRating(rating)).status, "exact");
+    assert.equal(await store.inspectVocabReviewRating(rating), "exact");
+    const undo = await store.prepareVocabReviewUndo(rating.eventId);
+    globalThis.__vocabBatchFault = "after_commit";
+    assert.equal((await store.commitVocabReviewUndo(undo)).status, "exact");
+    assert.equal(await store.inspectVocabReviewUndo(undo), "exact");
+    assert.equal(database.selectValue(
+      "SELECT COUNT(*) FROM vocab_review_events WHERE id='user_review'",
+    ), 1);
   } finally {
     database.close();
   }

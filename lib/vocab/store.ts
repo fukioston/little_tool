@@ -94,6 +94,117 @@ export type VocabWriteReceipt =
   | VocabImportWriteReceipt
   | VocabOccurrenceWriteReceipt;
 
+export type VocabReviewStateProjection = Readonly<{
+  state: ReviewCard["state"];
+  due_at: number;
+  interval_days: number;
+  ease: number;
+  reps: number;
+  lapses: number;
+  last_review_at: number | null;
+  algorithm_version: number;
+  suspended_from_state: ReviewCard["suspended_from_state"];
+  suspended_reason: string | null;
+  updated_at: number;
+}>;
+
+type VocabReviewReceiptBase = Readonly<{
+  version: 1;
+  operationId: string;
+  eventId: string;
+  activityId: string;
+  cardId: string;
+  rating: ReviewRating;
+  reviewedAt: number;
+  day: string;
+  before: VocabReviewStateProjection;
+  after: VocabReviewStateProjection;
+}>;
+
+export type VocabReviewRatingReceipt = VocabReviewReceiptBase & Readonly<{
+  kind: "review-rating";
+  projectionSha256: string;
+}>;
+
+export type VocabReviewUndoReceipt = VocabReviewReceiptBase & Readonly<{
+  kind: "review-undo";
+  ratingOperationId: string | null;
+  undoneAt: number;
+  projectionSha256: string;
+}>;
+
+export type VocabReviewReceipt =
+  | VocabReviewRatingReceipt
+  | VocabReviewUndoReceipt;
+
+export type VocabReviewInspection =
+  | "exact"
+  | "absent"
+  | "conflict"
+  | "still_unknown"
+  | "changed";
+
+export type VocabReviewCommitResult<Receipt extends VocabReviewReceipt> =
+  Readonly<{
+    status: "exact" | "already";
+    eventId: string;
+    receipt: Receipt;
+  }>;
+
+export class VocabReviewConflictError extends Error {
+  readonly code = "VOCAB_REVIEW_CONFLICT";
+
+  constructor(
+    message: string,
+    readonly receipt: VocabReviewReceipt,
+  ) {
+    super(message);
+    this.name = "VocabReviewConflictError";
+  }
+}
+
+export class VocabReviewChangedError extends Error {
+  readonly code = "VOCAB_REVIEW_CHANGED";
+
+  constructor(
+    message: string,
+    readonly receipt: VocabReviewReceipt,
+  ) {
+    super(message);
+    this.name = "VocabReviewChangedError";
+  }
+}
+
+export class VocabReviewUncertainError extends Error {
+  readonly code = "VOCAB_REVIEW_UNCERTAIN";
+  override readonly cause: unknown;
+
+  constructor(
+    message: string,
+    readonly receipt: VocabReviewReceipt,
+    cause?: unknown,
+  ) {
+    super(message);
+    this.name = "VocabReviewUncertainError";
+    this.cause = cause;
+  }
+}
+
+export class VocabReviewNotSavedError extends Error {
+  readonly code = "VOCAB_REVIEW_NOT_SAVED";
+  override readonly cause: unknown;
+
+  constructor(
+    message: string,
+    readonly receipt: VocabReviewReceipt,
+    cause?: unknown,
+  ) {
+    super(message);
+    this.name = "VocabReviewNotSavedError";
+    this.cause = cause;
+  }
+}
+
 export class VocabWriteConflictError extends Error {
   readonly code = "VOCAB_WRITE_CONFLICT";
 
@@ -143,6 +254,34 @@ function isReceiptId(value: unknown, prefix: string): value is string {
   return typeof value === "string" &&
     value.startsWith(`${prefix}_`) &&
     RECEIPT_ID_PATTERN.test(value);
+}
+
+function isSafeOpaqueReviewCardId(value: unknown): value is string {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.length > 512 ||
+    value.trim().length === 0 ||
+    Array.from(value).length > 256
+  ) return false;
+  for (let index = 0; index < value.length; index += 1) {
+    const unit = value.charCodeAt(index);
+    if (unit <= 0x1f || (unit >= 0x7f && unit <= 0x9f)) {
+      return false;
+    }
+    if (unit >= 0xd800 && unit <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (
+        index + 1 >= value.length ||
+        next < 0xdc00 ||
+        next > 0xdfff
+      ) return false;
+      index += 1;
+    } else if (unit >= 0xdc00 && unit <= 0xdfff) {
+      return false;
+    }
+  }
+  return true;
 }
 
 function isReceiptTimestamp(value: unknown): value is number {
@@ -1959,7 +2098,149 @@ export async function updateItemStatus(
   });
 }
 
-function storedReviewState(card: StoredReviewCard) {
+const REVIEW_STATES: readonly ReviewCard["state"][] = [
+  "new",
+  "learning",
+  "review",
+  "relearning",
+  "suspended",
+];
+const REVIEW_RATINGS: readonly ReviewRating[] = [
+  "again",
+  "hard",
+  "good",
+  "easy",
+];
+const REVIEW_STATE_KEYS = [
+  "state",
+  "due_at",
+  "interval_days",
+  "ease",
+  "reps",
+  "lapses",
+  "last_review_at",
+  "algorithm_version",
+  "suspended_from_state",
+  "suspended_reason",
+  "updated_at",
+] as const;
+const REVIEW_RATING_RECEIPT_KEYS = [
+  "version",
+  "kind",
+  "operationId",
+  "eventId",
+  "activityId",
+  "cardId",
+  "rating",
+  "reviewedAt",
+  "day",
+  "before",
+  "after",
+  "projectionSha256",
+] as const;
+const REVIEW_UNDO_RECEIPT_KEYS = [
+  "version",
+  "kind",
+  "operationId",
+  "eventId",
+  "activityId",
+  "cardId",
+  "rating",
+  "reviewedAt",
+  "day",
+  "before",
+  "after",
+  "ratingOperationId",
+  "undoneAt",
+  "projectionSha256",
+] as const;
+const REVIEW_WRITE_METADATA_KEY = "_review_write";
+
+type ReviewActivityProjection = Readonly<{
+  id: string;
+  day: string;
+  read_seconds: number;
+  listen_seconds: number;
+  review_count: number;
+  lookups: number;
+  created_at: number;
+}>;
+
+type ReviewEventProjection = Readonly<{
+  id: string;
+  card_id: string;
+  rating: string;
+  reviewed_at: number;
+  before_json: string;
+  after_json: string;
+  undone_at: number | null;
+  activity_id: string | null;
+}>;
+
+type ReviewWriteMetadata = Readonly<{
+  version: 1;
+  operationId: string;
+  eventId: string;
+  activityId: string;
+  cardId: string;
+  day: string;
+}>;
+
+function hasExactKeys(
+  value: object,
+  expected: readonly string[],
+): boolean {
+  const actual = Object.keys(value).sort();
+  const wanted = [...expected].sort();
+  return sameStrings(actual, wanted);
+}
+
+function isReviewTimestamp(value: unknown): value is number {
+  return isReceiptTimestamp(value) && value <= 8_640_000_000_000_000;
+}
+
+function isReviewDueTime(value: unknown): value is number {
+  return isFiniteNumber(value) && value <= 8_640_000_000_000_000;
+}
+
+function isFiniteNumber(value: unknown, minimum = 0): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= minimum;
+}
+
+function isReviewStateProjection(
+  value: unknown,
+): value is VocabReviewStateProjection {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const state = value as Partial<VocabReviewStateProjection>;
+  return hasExactKeys(value, REVIEW_STATE_KEYS) &&
+    typeof state.state === "string" &&
+    REVIEW_STATES.includes(state.state as ReviewCard["state"]) &&
+    isReviewDueTime(state.due_at) &&
+    isFiniteNumber(state.interval_days) &&
+    isFiniteNumber(state.ease, 1) &&
+    Number.isSafeInteger(state.reps) && Number(state.reps) >= 0 &&
+    Number.isSafeInteger(state.lapses) && Number(state.lapses) >= 0 &&
+    (state.last_review_at === null || isReviewTimestamp(state.last_review_at)) &&
+    Number.isSafeInteger(state.algorithm_version) &&
+    Number(state.algorithm_version) >= 1 &&
+    (
+      state.suspended_from_state === null ||
+      REVIEW_STATES.slice(0, -1).includes(
+        state.suspended_from_state as ReviewCard["state"],
+      )
+    ) &&
+    (state.suspended_reason === null || typeof state.suspended_reason === "string") &&
+    isReviewTimestamp(state.updated_at);
+}
+
+function sameReviewState(
+  left: VocabReviewStateProjection,
+  right: VocabReviewStateProjection,
+): boolean {
+  return REVIEW_STATE_KEYS.every((key) => left[key] === right[key]);
+}
+
+function storedReviewState(card: StoredReviewCard): VocabReviewStateProjection {
   return {
     state: card.state,
     due_at: card.due_at,
@@ -1975,189 +2256,973 @@ function storedReviewState(card: StoredReviewCard) {
   };
 }
 
-function parseStoredReviewState(
-  value: string,
-): Omit<StoredReviewCard, "id"> {
-  let parsed: Partial<Omit<StoredReviewCard, "id">>;
+function scheduledReviewState(
+  before: VocabReviewStateProjection,
+  rating: ReviewRating,
+  reviewedAt: number,
+): VocabReviewStateProjection {
+  const schedule = scheduleReviewV2(before, rating, reviewedAt);
+  return {
+    ...schedule,
+    suspended_from_state: null,
+    suspended_reason: null,
+    updated_at: Math.max(reviewedAt, before.updated_at + 1),
+  };
+}
+
+function isReviewReceiptBase(
+  receipt: Partial<VocabReviewReceiptBase>,
+): receipt is VocabReviewReceiptBase {
+  if (
+    receipt.version !== 1 ||
+    !isReceiptId(receipt.operationId, "operation") ||
+    !isReceiptId(receipt.eventId, "review") ||
+    !isReceiptId(receipt.activityId, "activity") ||
+    !isSafeOpaqueReviewCardId(receipt.cardId) ||
+    typeof receipt.rating !== "string" ||
+    !REVIEW_RATINGS.includes(receipt.rating as ReviewRating) ||
+    !isReviewTimestamp(receipt.reviewedAt) ||
+    typeof receipt.day !== "string" ||
+    !/^\d{4}-\d{2}-\d{2}$/.test(receipt.day) ||
+    !isReviewStateProjection(receipt.before) ||
+    !isReviewStateProjection(receipt.after) ||
+    receipt.before.state === "suspended" ||
+    receipt.after.state === "suspended" ||
+    receipt.before.updated_at >= 8_640_000_000_000_000
+  ) return false;
+  return sameReviewState(
+    receipt.after,
+    scheduledReviewState(receipt.before, receipt.rating, receipt.reviewedAt),
+  );
+}
+
+export function isVocabReviewRatingReceipt(
+  value: unknown,
+): value is VocabReviewRatingReceipt {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const receipt = value as Partial<VocabReviewRatingReceipt>;
+  return hasExactKeys(value, REVIEW_RATING_RECEIPT_KEYS) &&
+    receipt.kind === "review-rating" &&
+    typeof receipt.projectionSha256 === "string" &&
+    RECEIPT_HASH_PATTERN.test(receipt.projectionSha256) &&
+    isReviewReceiptBase(receipt);
+}
+
+export function isVocabReviewUndoReceipt(
+  value: unknown,
+): value is VocabReviewUndoReceipt {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const receipt = value as Partial<VocabReviewUndoReceipt>;
+  return hasExactKeys(value, REVIEW_UNDO_RECEIPT_KEYS) &&
+    receipt.kind === "review-undo" &&
+    (
+      receipt.ratingOperationId === null ||
+      isReceiptId(receipt.ratingOperationId, "operation")
+    ) &&
+    isReviewTimestamp(receipt.undoneAt) &&
+    isReviewTimestamp(receipt.reviewedAt) &&
+    receipt.undoneAt >= receipt.reviewedAt &&
+    typeof receipt.projectionSha256 === "string" &&
+    RECEIPT_HASH_PATTERN.test(receipt.projectionSha256) &&
+    isReviewReceiptBase(receipt);
+}
+
+function reviewWriteMetadata(
+  receipt: VocabReviewRatingReceipt,
+): ReviewWriteMetadata {
+  return {
+    version: 1,
+    operationId: receipt.operationId,
+    eventId: receipt.eventId,
+    activityId: receipt.activityId,
+    cardId: receipt.cardId,
+    day: receipt.day,
+  };
+}
+
+function reviewEventJson(
+  state: VocabReviewStateProjection,
+  metadata: ReviewWriteMetadata | null,
+): string {
+  return JSON.stringify(metadata
+    ? { ...state, [REVIEW_WRITE_METADATA_KEY]: metadata }
+    : state);
+}
+
+function parseReviewWriteMetadata(value: string): ReviewWriteMetadata | null {
   try {
-    parsed = JSON.parse(value) as Partial<Omit<StoredReviewCard, "id">>;
+    const parsed = JSON.parse(value) as Record<string, unknown>;
+    const metadata = parsed[REVIEW_WRITE_METADATA_KEY];
+    if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) {
+      return null;
+    }
+    const candidate = metadata as Partial<ReviewWriteMetadata>;
+    return hasExactKeys(metadata, [
+      "version", "operationId", "eventId", "activityId", "cardId", "day",
+    ]) &&
+        candidate.version === 1 &&
+        isReceiptId(candidate.operationId, "operation") &&
+        isReceiptId(candidate.eventId, "review") &&
+        isReceiptId(candidate.activityId, "activity") &&
+        isSafeOpaqueReviewCardId(candidate.cardId) &&
+        typeof candidate.day === "string" &&
+        /^\d{4}-\d{2}-\d{2}$/.test(candidate.day)
+      ? candidate as ReviewWriteMetadata
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function expectedReviewEvent(
+  receipt: VocabReviewRatingReceipt,
+): ReviewEventProjection {
+  const metadata = reviewWriteMetadata(receipt);
+  return {
+    id: receipt.eventId,
+    card_id: receipt.cardId,
+    rating: receipt.rating,
+    reviewed_at: receipt.reviewedAt,
+    before_json: reviewEventJson(receipt.before, metadata),
+    after_json: reviewEventJson(receipt.after, metadata),
+    undone_at: null,
+    activity_id: receipt.activityId,
+  };
+}
+
+function expectedReviewActivity(
+  receipt: VocabReviewReceiptBase,
+): ReviewActivityProjection {
+  return {
+    id: receipt.activityId,
+    day: receipt.day,
+    read_seconds: 0,
+    listen_seconds: 0,
+    review_count: 1,
+    lookups: 0,
+    created_at: receipt.reviewedAt,
+  };
+}
+
+function ratingProjection(
+  receipt: VocabReviewRatingReceipt,
+  event = expectedReviewEvent(receipt),
+  activity = expectedReviewActivity(receipt),
+) {
+  return {
+    version: 1,
+    receipt: {
+      operationId: receipt.operationId,
+      eventId: receipt.eventId,
+      activityId: receipt.activityId,
+      cardId: receipt.cardId,
+      rating: receipt.rating,
+      reviewedAt: receipt.reviewedAt,
+      day: receipt.day,
+      before: receipt.before,
+      after: receipt.after,
+    },
+    event,
+    activity,
+  };
+}
+
+async function ratingReceiptHasValidProjection(
+  receipt: VocabReviewRatingReceipt,
+): Promise<boolean> {
+  return isVocabReviewRatingReceipt(receipt) &&
+    await projectionSha256(ratingProjection(receipt)) === receipt.projectionSha256;
+}
+
+export async function prepareVocabReviewRating(
+  card: ReviewCard,
+  rating: ReviewRating,
+): Promise<VocabReviewRatingReceipt> {
+  const before = storedReviewState(card);
+  if (
+    !isSafeOpaqueReviewCardId(card.id) ||
+    !isReviewStateProjection(before) ||
+    before.state === "suspended" ||
+    !REVIEW_RATINGS.includes(rating)
+  ) {
+    throw new Error("这张复习卡无法生成可验证的评分记录。");
+  }
+  const reviewedAt = Math.max(Date.now(), before.updated_at + 1);
+  const draft: VocabReviewRatingReceipt = {
+    version: 1,
+    kind: "review-rating",
+    operationId: uid("operation"),
+    eventId: uid("review"),
+    activityId: uid("activity"),
+    cardId: card.id,
+    rating,
+    reviewedAt,
+    day: localDayKey(reviewedAt),
+    before,
+    after: scheduledReviewState(before, rating, reviewedAt),
+    projectionSha256: "",
+  };
+  return {
+    ...draft,
+    projectionSha256: await projectionSha256(ratingProjection(draft)),
+  };
+}
+
+const reviewStatePredicate = (alias: string) => `${alias}.state=? AND
+  ${alias}.due_at=? AND ${alias}.interval_days=? AND ${alias}.ease=? AND
+  ${alias}.reps=? AND ${alias}.lapses=? AND ${alias}.last_review_at IS ? AND
+  ${alias}.algorithm_version=? AND ${alias}.suspended_from_state IS ? AND
+  ${alias}.suspended_reason IS ? AND ${alias}.updated_at=?`;
+
+function reviewStateParams(state: VocabReviewStateProjection): SqlValue[] {
+  return REVIEW_STATE_KEYS.map((key) => state[key]);
+}
+
+function exactActivityPredicate(alias: string): string {
+  return `${alias}.id=? AND ${alias}.day=? AND ${alias}.read_seconds=? AND
+    ${alias}.listen_seconds=? AND ${alias}.review_count=? AND
+    ${alias}.lookups=? AND ${alias}.created_at=?`;
+}
+
+function activityParams(activity: ReviewActivityProjection): SqlValue[] {
+  return [
+    activity.id,
+    activity.day,
+    activity.read_seconds,
+    activity.listen_seconds,
+    activity.review_count,
+    activity.lookups,
+    activity.created_at,
+  ];
+}
+
+function exactEventPredicate(alias: string, includeUndo = true): string {
+  return `${alias}.id=? AND ${alias}.card_id=? AND ${alias}.rating=? AND
+    ${alias}.reviewed_at=? AND ${alias}.before_json=? AND
+    ${alias}.after_json=?${includeUndo ? ` AND ${alias}.undone_at IS ?` : ""} AND
+    ${alias}.activity_id IS ?`;
+}
+
+function eventParams(
+  event: ReviewEventProjection,
+  includeUndo = true,
+): SqlValue[] {
+  return [
+    event.id,
+    event.card_id,
+    event.rating,
+    event.reviewed_at,
+    event.before_json,
+    event.after_json,
+    ...(includeUndo ? [event.undone_at] : []),
+    event.activity_id,
+  ];
+}
+
+async function reviewRows(receipt: VocabReviewReceiptBase): Promise<Readonly<{
+  events: ReviewEventProjection[];
+  activity: ReviewActivityProjection[];
+  cards: StoredReviewCard[];
+}>> {
+  const [events, activity, cards] = await Promise.all([
+    rawQuery<ReviewEventProjection>(
+      `SELECT id,card_id,rating,reviewed_at,before_json,after_json,
+              undone_at,activity_id
+       FROM vocab_review_events WHERE id=?`,
+      [receipt.eventId],
+    ),
+    rawQuery<ReviewActivityProjection>(
+      `SELECT id,day,read_seconds,listen_seconds,review_count,lookups,created_at
+       FROM vocab_activity WHERE id=?`,
+      [receipt.activityId],
+    ),
+    rawQuery<StoredReviewCard>(
+      `SELECT id,state,due_at,interval_days,ease,reps,lapses,last_review_at,
+              algorithm_version,suspended_from_state,suspended_reason,updated_at
+       FROM vocab_review_cards WHERE id=?`,
+      [receipt.cardId],
+    ),
+  ]);
+  return { events, activity, cards };
+}
+
+async function inspectReviewRatingUnlocked(
+  receipt: VocabReviewRatingReceipt,
+): Promise<VocabReviewInspection> {
+  try {
+    if (!await ratingReceiptHasValidProjection(receipt)) return "conflict";
+    const { events, activity, cards } = await reviewRows(receipt);
+    if (events.length === 0 && activity.length === 0) {
+      return cards.length === 1 &&
+          sameReviewState(storedReviewState(cards[0]), receipt.before)
+        ? "absent"
+        : "changed";
+    }
+    if (events.length !== 1 || activity.length !== 1) {
+      if (
+        events.length === 1 &&
+        activity.length === 0 &&
+        events[0].undone_at !== null
+      ) {
+        const expected = expectedReviewEvent(receipt);
+        return sameEventImmutable(events[0], expected) ? "changed" : "conflict";
+      }
+      return "conflict";
+    }
+    const digest = await projectionSha256(
+      ratingProjection(receipt, events[0], activity[0]),
+    );
+    return digest === receipt.projectionSha256 ? "exact" : "conflict";
+  } catch {
+    return "still_unknown";
+  }
+}
+
+export async function inspectVocabReviewRating(
+  receipt: VocabReviewRatingReceipt,
+): Promise<VocabReviewInspection> {
+  if (!isVocabReviewRatingReceipt(receipt)) return "conflict";
+  try {
+    return await withVocabReadLock(() => inspectReviewRatingUnlocked(receipt));
+  } catch {
+    return "still_unknown";
+  }
+}
+
+function throwReviewCommitStatus(
+  status: Exclude<VocabReviewInspection, "exact">,
+  receipt: VocabReviewReceipt,
+  action: "评分" | "撤销",
+  cause?: unknown,
+): never {
+  if (status === "changed") {
+    throw new VocabReviewChangedError(
+      `这张复习卡已发生变化，未重复${action}。`,
+      receipt,
+    );
+  }
+  if (status === "conflict") {
+    throw new VocabReviewConflictError(
+      `${action}凭据与数据库中的记录冲突，已停止写入。`,
+      receipt,
+    );
+  }
+  if (status === "still_unknown") {
+    throw new VocabReviewUncertainError(
+      `${action}结果暂时无法确认，请保留恢复凭据后再核对。`,
+      receipt,
+      cause,
+    );
+  }
+  throw new VocabReviewNotSavedError(
+    `${action}没有写入数据库，可以使用同一凭据安全重试。`,
+    receipt,
+    cause,
+  );
+}
+
+function broadcastReviewChange(reason: string): void {
+  try {
+    broadcastVocabChange(reason);
+  } catch {
+    // The database is already durable; a notification failure must not undo it.
+  }
+}
+
+function ratingStatements(receipt: VocabReviewRatingReceipt): Statement[] {
+  const event = expectedReviewEvent(receipt);
+  const activity = expectedReviewActivity(receipt);
+  return [
+    {
+      sql: `INSERT INTO vocab_activity(
+              id,day,read_seconds,listen_seconds,review_count,lookups,created_at
+            )
+            SELECT ?,?,?,?,?,?,?
+            WHERE NOT EXISTS (SELECT 1 FROM vocab_activity WHERE id=?)
+              AND NOT EXISTS (SELECT 1 FROM vocab_review_events WHERE id=?)
+              AND EXISTS (
+                SELECT 1 FROM vocab_review_cards c
+                WHERE c.id=? AND ${reviewStatePredicate("c")}
+              )`,
+      params: [
+        ...activityParams(activity),
+        receipt.activityId,
+        receipt.eventId,
+        receipt.cardId,
+        ...reviewStateParams(receipt.before),
+      ],
+    },
+    {
+      sql: `INSERT INTO vocab_review_events(
+              id,card_id,rating,reviewed_at,before_json,after_json,
+              undone_at,activity_id
+            )
+            SELECT ?,?,?,?,?,?,?,?
+            WHERE EXISTS (
+              SELECT 1 FROM vocab_review_cards c
+              WHERE c.id=? AND ${reviewStatePredicate("c")}
+            ) AND EXISTS (
+              SELECT 1 FROM vocab_activity a
+              WHERE ${exactActivityPredicate("a")}
+            )`,
+      params: [
+        ...eventParams(event),
+        receipt.cardId,
+        ...reviewStateParams(receipt.before),
+        ...activityParams(activity),
+      ],
+    },
+    {
+      sql: `UPDATE vocab_review_cards
+            SET state=?,due_at=?,interval_days=?,ease=?,reps=?,lapses=?,
+                last_review_at=?,algorithm_version=?,suspended_from_state=?,
+                suspended_reason=?,updated_at=?
+            WHERE id=? AND ${reviewStatePredicate("vocab_review_cards")}
+              AND EXISTS (
+                SELECT 1 FROM vocab_review_events e
+                WHERE ${exactEventPredicate("e")}
+              )
+              AND EXISTS (
+                SELECT 1 FROM vocab_activity a
+                WHERE ${exactActivityPredicate("a")}
+              )`,
+      params: [
+        ...reviewStateParams(receipt.after),
+        receipt.cardId,
+        ...reviewStateParams(receipt.before),
+        ...eventParams(event),
+        ...activityParams(activity),
+      ],
+    },
+    {
+      sql: `INSERT INTO vocab_review_events(
+              id,card_id,rating,reviewed_at,before_json,after_json,
+              undone_at,activity_id
+            )
+            SELECT ?,NULL,'again',0,'','',NULL,NULL
+            WHERE NOT EXISTS (
+              SELECT 1
+              FROM vocab_review_cards c
+              JOIN vocab_review_events e ON e.id=?
+              JOIN vocab_activity a ON a.id=?
+              WHERE c.id=? AND ${reviewStatePredicate("c")}
+                AND ${exactEventPredicate("e")}
+                AND ${exactActivityPredicate("a")}
+            )`,
+      params: [
+        receipt.eventId,
+        receipt.eventId,
+        receipt.activityId,
+        receipt.cardId,
+        ...reviewStateParams(receipt.after),
+        ...eventParams(event),
+        ...activityParams(activity),
+      ],
+    },
+  ];
+}
+
+export async function commitVocabReviewRating(
+  receipt: VocabReviewRatingReceipt,
+): Promise<VocabReviewCommitResult<VocabReviewRatingReceipt>> {
+  if (!isVocabReviewRatingReceipt(receipt)) {
+    throw new VocabReviewConflictError("评分凭据格式无效。", receipt);
+  }
+  return withVocabWriteLock(async () => {
+    let initial: VocabReviewInspection;
+    try {
+      initial = await inspectReviewRatingUnlocked(receipt);
+    } catch (cause) {
+      throw new VocabReviewUncertainError(
+        "暂时无法核对评分凭据，请稍后重试。",
+        receipt,
+        cause,
+      );
+    }
+    if (initial === "exact") {
+      return { status: "already", eventId: receipt.eventId, receipt };
+    }
+    if (initial !== "absent") {
+      return throwReviewCommitStatus(initial, receipt, "评分");
+    }
+
+    let batchError: unknown;
+    try {
+      await rawBatch(ratingStatements(receipt));
+    } catch (cause) {
+      batchError = cause;
+    }
+    const settled = await inspectReviewRatingUnlocked(receipt);
+    if (settled === "exact") {
+      broadcastReviewChange("review-rated");
+      return { status: "exact", eventId: receipt.eventId, receipt };
+    }
+    return throwReviewCommitStatus(settled, receipt, "评分", batchError);
+  });
+}
+
+function parseReviewEventState(value: string): VocabReviewStateProjection {
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(value) as Record<string, unknown>;
   } catch {
     throw new Error("复习撤销记录无法验证。");
   }
-  const validStates: readonly ReviewCard["state"][] = [
-    "new",
-    "learning",
-    "review",
-    "relearning",
-    "suspended",
-  ];
-  if (
-    !parsed ||
-    typeof parsed.state !== "string" ||
-    !validStates.includes(parsed.state as ReviewCard["state"]) ||
-    typeof parsed.due_at !== "number" ||
-    typeof parsed.interval_days !== "number" ||
-    typeof parsed.ease !== "number" ||
-    typeof parsed.reps !== "number" ||
-    typeof parsed.lapses !== "number"
-  ) {
-    throw new Error("复习撤销记录无法验证。");
+  const state = Object.fromEntries(
+    REVIEW_STATE_KEYS.map((key) => [key, parsed[key]]),
+  );
+  if (!isReviewStateProjection(state)) {
+    throw new Error("复习记录里的卡片状态无法严格验证。");
   }
-  return {
-    state: parsed.state as ReviewCard["state"],
-    due_at: parsed.due_at,
-    interval_days: parsed.interval_days,
-    ease: parsed.ease,
-    reps: parsed.reps,
-    lapses: parsed.lapses,
-    last_review_at: typeof parsed.last_review_at === "number"
-      ? parsed.last_review_at
-      : null,
-    algorithm_version: typeof parsed.algorithm_version === "number"
-      ? parsed.algorithm_version
-      : 1,
-    suspended_from_state: parsed.suspended_from_state ?? null,
-    suspended_reason: typeof parsed.suspended_reason === "string"
-      ? parsed.suspended_reason
-      : null,
-    updated_at: typeof parsed.updated_at === "number" ? parsed.updated_at : 0,
+  return state;
+}
+
+function metadataForUndoReceipt(
+  receipt: VocabReviewUndoReceipt,
+): ReviewWriteMetadata | null {
+  return receipt.ratingOperationId === null ? null : {
+    version: 1,
+    operationId: receipt.ratingOperationId,
+    eventId: receipt.eventId,
+    activityId: receipt.activityId,
+    cardId: receipt.cardId,
+    day: receipt.day,
   };
+}
+
+function expectedUndoOriginalEvent(
+  receipt: VocabReviewUndoReceipt,
+): ReviewEventProjection {
+  const metadata = metadataForUndoReceipt(receipt);
+  return {
+    id: receipt.eventId,
+    card_id: receipt.cardId,
+    rating: receipt.rating,
+    reviewed_at: receipt.reviewedAt,
+    before_json: reviewEventJson(receipt.before, metadata),
+    after_json: reviewEventJson(receipt.after, metadata),
+    undone_at: null,
+    activity_id: receipt.activityId,
+  };
+}
+
+function expectedUndoFinalEvent(
+  receipt: VocabReviewUndoReceipt,
+): ReviewEventProjection {
+  return {
+    ...expectedUndoOriginalEvent(receipt),
+    undone_at: receipt.undoneAt,
+    activity_id: null,
+  };
+}
+
+function undoProjection(receipt: VocabReviewUndoReceipt) {
+  return {
+    version: 1,
+    receipt: {
+      operationId: receipt.operationId,
+      eventId: receipt.eventId,
+      activityId: receipt.activityId,
+      cardId: receipt.cardId,
+      rating: receipt.rating,
+      reviewedAt: receipt.reviewedAt,
+      day: receipt.day,
+      before: receipt.before,
+      after: receipt.after,
+      ratingOperationId: receipt.ratingOperationId,
+      undoneAt: receipt.undoneAt,
+    },
+    originalEvent: expectedUndoOriginalEvent(receipt),
+    finalEvent: expectedUndoFinalEvent(receipt),
+    removedActivity: expectedReviewActivity(receipt),
+  };
+}
+
+async function undoReceiptHasValidProjection(
+  receipt: VocabReviewUndoReceipt,
+): Promise<boolean> {
+  return isVocabReviewUndoReceipt(receipt) &&
+    await projectionSha256(undoProjection(receipt)) === receipt.projectionSha256;
+}
+
+function sameReviewWriteMetadata(
+  left: ReviewWriteMetadata,
+  right: ReviewWriteMetadata,
+): boolean {
+  return left.version === right.version &&
+    left.operationId === right.operationId &&
+    left.eventId === right.eventId &&
+    left.activityId === right.activityId &&
+    left.cardId === right.cardId &&
+    left.day === right.day;
+}
+
+function sameActivity(
+  left: ReviewActivityProjection,
+  right: ReviewActivityProjection,
+): boolean {
+  return left.id === right.id &&
+    left.day === right.day &&
+    left.read_seconds === right.read_seconds &&
+    left.listen_seconds === right.listen_seconds &&
+    left.review_count === right.review_count &&
+    left.lookups === right.lookups &&
+    left.created_at === right.created_at;
+}
+
+function sameEventImmutable(
+  left: ReviewEventProjection,
+  right: ReviewEventProjection,
+): boolean {
+  return left.id === right.id &&
+    left.card_id === right.card_id &&
+    left.rating === right.rating &&
+    left.reviewed_at === right.reviewed_at &&
+    left.before_json === right.before_json &&
+    left.after_json === right.after_json;
+}
+
+async function hasLaterActiveReview(eventId: string): Promise<boolean> {
+  const rows = await rawQuery<{ has_later: number }>(
+    `SELECT EXISTS(
+       SELECT 1
+       FROM vocab_review_events current
+       JOIN vocab_review_events later ON later.card_id=current.card_id
+       WHERE current.id=? AND later.undone_at IS NULL
+         AND (
+           later.reviewed_at>current.reviewed_at OR
+           (later.reviewed_at=current.reviewed_at AND later.rowid>current.rowid)
+         )
+     ) AS has_later`,
+    [eventId],
+  );
+  return Number(rows[0]?.has_later ?? 0) === 1;
+}
+
+export async function prepareVocabReviewUndo(
+  eventId: string,
+): Promise<VocabReviewUndoReceipt> {
+  return withVocabReadLock(async () => {
+    if (!isReceiptId(eventId, "review")) {
+      throw new Error("复习事件编号无法验证。");
+    }
+    const events = await rawQuery<ReviewEventProjection>(
+      `SELECT id,card_id,rating,reviewed_at,before_json,after_json,
+              undone_at,activity_id
+       FROM vocab_review_events WHERE id=?`,
+      [eventId],
+    );
+    if (events.length !== 1) throw new Error("没有找到可核对的复习评分。");
+    const event = events[0];
+    if (
+      !isSafeOpaqueReviewCardId(event.card_id) ||
+      typeof event.rating !== "string" ||
+      !REVIEW_RATINGS.includes(event.rating as ReviewRating) ||
+      !isReviewTimestamp(event.reviewed_at)
+    ) throw new Error("复习评分的基础字段无法验证。");
+
+    const before = parseReviewEventState(event.before_json);
+    const after = parseReviewEventState(event.after_json);
+    const beforeMetadata = parseReviewWriteMetadata(event.before_json);
+    const afterMetadata = parseReviewWriteMetadata(event.after_json);
+    if (
+      (beforeMetadata === null) !== (afterMetadata === null) ||
+      (
+        beforeMetadata && afterMetadata &&
+        !sameReviewWriteMetadata(beforeMetadata, afterMetadata)
+      )
+    ) throw new Error("复习评分的恢复绑定不完整。");
+    const metadata = beforeMetadata;
+    if (
+      metadata &&
+      (
+        metadata.eventId !== event.id ||
+        metadata.cardId !== event.card_id ||
+        (event.activity_id !== null && metadata.activityId !== event.activity_id)
+      )
+    ) throw new Error("复习评分的恢复绑定与数据库不一致。");
+
+    const activityId = event.activity_id ?? metadata?.activityId;
+    if (!activityId || !isReceiptId(activityId, "activity")) {
+      throw new Error("旧版撤销记录缺少可恢复的活动编号。");
+    }
+    const [activity, cards, later] = await Promise.all([
+      rawQuery<ReviewActivityProjection>(
+        `SELECT id,day,read_seconds,listen_seconds,review_count,lookups,created_at
+         FROM vocab_activity WHERE id=?`,
+        [activityId],
+      ),
+      rawQuery<StoredReviewCard>(
+        `SELECT id,state,due_at,interval_days,ease,reps,lapses,last_review_at,
+                algorithm_version,suspended_from_state,suspended_reason,updated_at
+         FROM vocab_review_cards WHERE id=?`,
+        [event.card_id],
+      ),
+      hasLaterActiveReview(event.id),
+    ]);
+    const day = event.undone_at === null
+      ? activity[0]?.day ?? metadata?.day
+      : metadata?.day;
+    if (typeof day !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(day)) {
+      throw new Error("复习评分缺少原始日期绑定。");
+    }
+    if (metadata && metadata.day !== day) {
+      throw new Error("复习评分的日期绑定与活动记录不一致。");
+    }
+    const semanticBase: VocabReviewReceiptBase = {
+      version: 1,
+      operationId: uid("operation"),
+      eventId: event.id,
+      activityId,
+      cardId: event.card_id,
+      rating: event.rating as ReviewRating,
+      reviewedAt: event.reviewed_at,
+      day,
+      before,
+      after,
+    };
+    if (!isReviewReceiptBase(semanticBase)) {
+      throw new Error("复习评分前后的调度语义无法验证。");
+    }
+
+    if (event.undone_at === null) {
+      const expectedActivity = expectedReviewActivity(semanticBase);
+      if (
+        event.activity_id !== activityId ||
+        activity.length !== 1 ||
+        !sameActivity(activity[0], expectedActivity)
+      ) throw new Error("复习活动与评分记录不一致，已停止撤销。");
+      if (
+        later ||
+        cards.length !== 1 ||
+        !sameReviewState(storedReviewState(cards[0]), after)
+      ) throw new Error("只能撤销这张卡最近一次未被后续改动的评分。");
+    } else if (
+      !isReviewTimestamp(event.undone_at) ||
+      event.activity_id !== null ||
+      activity.length !== 0
+    ) {
+      throw new Error("已撤销评分的数据库事实不完整。");
+    }
+
+    const draft: VocabReviewUndoReceipt = {
+      ...semanticBase,
+      kind: "review-undo",
+      ratingOperationId: metadata?.operationId ?? null,
+      undoneAt: event.undone_at ?? Math.max(Date.now(), event.reviewed_at),
+      projectionSha256: "",
+    };
+    return {
+      ...draft,
+      projectionSha256: await projectionSha256(undoProjection(draft)),
+    };
+  });
+}
+
+async function inspectReviewUndoUnlocked(
+  receipt: VocabReviewUndoReceipt,
+): Promise<VocabReviewInspection> {
+  try {
+    if (!await undoReceiptHasValidProjection(receipt)) return "conflict";
+    const [{ events, activity, cards }, later] = await Promise.all([
+      reviewRows(receipt),
+      hasLaterActiveReview(receipt.eventId),
+    ]);
+    if (events.length !== 1) return "conflict";
+    const event = events[0];
+    const original = expectedUndoOriginalEvent(receipt);
+    if (!sameEventImmutable(event, original)) return "conflict";
+    if (
+      event.undone_at === receipt.undoneAt &&
+      event.activity_id === null &&
+      activity.length === 0
+    ) return "exact";
+    if (event.undone_at !== null) return "changed";
+    if (event.activity_id !== receipt.activityId) return "conflict";
+    if (
+      activity.length !== 1 ||
+      !sameActivity(activity[0], expectedReviewActivity(receipt))
+    ) return "conflict";
+    return !later && cards.length === 1 &&
+        sameReviewState(storedReviewState(cards[0]), receipt.after)
+      ? "absent"
+      : "changed";
+  } catch {
+    return "still_unknown";
+  }
+}
+
+export async function inspectVocabReviewUndo(
+  receipt: VocabReviewUndoReceipt,
+): Promise<VocabReviewInspection> {
+  if (!isVocabReviewUndoReceipt(receipt)) return "conflict";
+  try {
+    return await withVocabReadLock(() => inspectReviewUndoUnlocked(receipt));
+  } catch {
+    return "still_unknown";
+  }
+}
+
+const laterActiveEventPredicate = (alias: string) => `NOT EXISTS (
+  SELECT 1 FROM vocab_review_events later
+  WHERE later.card_id=${alias}.card_id AND later.undone_at IS NULL
+    AND (
+      later.reviewed_at>${alias}.reviewed_at OR
+      (later.reviewed_at=${alias}.reviewed_at AND later.rowid>${alias}.rowid)
+    )
+)`;
+
+function undoStatements(receipt: VocabReviewUndoReceipt): Statement[] {
+  const original = expectedUndoOriginalEvent(receipt);
+  const final = expectedUndoFinalEvent(receipt);
+  const activity = expectedReviewActivity(receipt);
+  const eventAfterMark = { ...original, undone_at: receipt.undoneAt };
+  return [
+    {
+      sql: `UPDATE vocab_review_events AS e SET undone_at=?
+            WHERE ${exactEventPredicate("e")}
+              AND ${laterActiveEventPredicate("e")}
+              AND EXISTS (
+                SELECT 1 FROM vocab_review_cards c
+                WHERE c.id=? AND ${reviewStatePredicate("c")}
+              )
+              AND EXISTS (
+                SELECT 1 FROM vocab_activity a
+                WHERE ${exactActivityPredicate("a")}
+              )`,
+      params: [
+        receipt.undoneAt,
+        ...eventParams(original),
+        receipt.cardId,
+        ...reviewStateParams(receipt.after),
+        ...activityParams(activity),
+      ],
+    },
+    {
+      sql: `UPDATE vocab_review_cards
+            SET state=?,due_at=?,interval_days=?,ease=?,reps=?,lapses=?,
+                last_review_at=?,algorithm_version=?,suspended_from_state=?,
+                suspended_reason=?,updated_at=?
+            WHERE id=? AND ${reviewStatePredicate("vocab_review_cards")}
+              AND EXISTS (
+                SELECT 1 FROM vocab_review_events e
+                WHERE ${exactEventPredicate("e")}
+              )
+              AND EXISTS (
+                SELECT 1 FROM vocab_activity a
+                WHERE ${exactActivityPredicate("a")}
+              )`,
+      params: [
+        ...reviewStateParams(receipt.before),
+        receipt.cardId,
+        ...reviewStateParams(receipt.after),
+        ...eventParams(eventAfterMark),
+        ...activityParams(activity),
+      ],
+    },
+    {
+      sql: `DELETE FROM vocab_activity
+            WHERE ${exactActivityPredicate("vocab_activity")}
+              AND EXISTS (
+                SELECT 1 FROM vocab_review_events e
+                WHERE ${exactEventPredicate("e")}
+              )
+              AND EXISTS (
+                SELECT 1 FROM vocab_review_cards c
+                WHERE c.id=? AND ${reviewStatePredicate("c")}
+              )`,
+      params: [
+        ...activityParams(activity),
+        ...eventParams(eventAfterMark),
+        receipt.cardId,
+        ...reviewStateParams(receipt.before),
+      ],
+    },
+    {
+      sql: `INSERT INTO vocab_review_events(
+              id,card_id,rating,reviewed_at,before_json,after_json,
+              undone_at,activity_id
+            )
+            SELECT ?,NULL,'again',0,'','',NULL,NULL
+            WHERE NOT EXISTS (
+              SELECT 1 FROM vocab_review_events e
+              JOIN vocab_review_cards c ON c.id=?
+              WHERE ${exactEventPredicate("e")}
+                AND ${reviewStatePredicate("c")}
+                AND NOT EXISTS (
+                  SELECT 1 FROM vocab_activity a WHERE a.id=?
+                )
+            )`,
+      params: [
+        receipt.eventId,
+        receipt.cardId,
+        ...eventParams(final),
+        ...reviewStateParams(receipt.before),
+        receipt.activityId,
+      ],
+    },
+  ];
+}
+
+export async function commitVocabReviewUndo(
+  receipt: VocabReviewUndoReceipt,
+): Promise<VocabReviewCommitResult<VocabReviewUndoReceipt>> {
+  if (!isVocabReviewUndoReceipt(receipt)) {
+    throw new VocabReviewConflictError("撤销凭据格式无效。", receipt);
+  }
+  return withVocabWriteLock(async () => {
+    const initial = await inspectReviewUndoUnlocked(receipt);
+    if (initial === "exact") {
+      return { status: "already", eventId: receipt.eventId, receipt };
+    }
+    if (initial !== "absent") {
+      return throwReviewCommitStatus(initial, receipt, "撤销");
+    }
+    let batchError: unknown;
+    try {
+      await rawBatch(undoStatements(receipt));
+    } catch (cause) {
+      batchError = cause;
+    }
+    const settled = await inspectReviewUndoUnlocked(receipt);
+    if (settled === "exact") {
+      broadcastReviewChange("review-undone");
+      return { status: "exact", eventId: receipt.eventId, receipt };
+    }
+    return throwReviewCommitStatus(settled, receipt, "撤销", batchError);
+  });
 }
 
 export async function rateReview(
   card: ReviewCard,
   rating: ReviewRating,
 ): Promise<string> {
-  return withWrite("review-rated", async () => {
-    const current = (await rawQuery<StoredReviewCard>(
-      `SELECT id,state,due_at,interval_days,ease,reps,lapses,last_review_at,
-              algorithm_version,suspended_from_state,suspended_reason,updated_at
-       FROM vocab_review_cards WHERE id=?`,
-      [card.id],
-    ))[0];
-    if (
-      !current ||
-      current.state === "suspended" ||
-      current.updated_at !== card.updated_at
-    ) {
-      throw new Error("这张复习卡已发生变化，请刷新后重试。");
-    }
-    const now = Date.now();
-    const changedAt = Math.max(now, current.updated_at + 1);
-    const schedule = scheduleReviewV2(current, rating, now);
-    const eventId = uid("review");
-    const activityId = uid("activity");
-    const after = {
-      ...schedule,
-      suspended_from_state: null,
-      suspended_reason: null,
-      updated_at: changedAt,
-    };
-    await rawBatch([
-      {
-        sql: `UPDATE vocab_review_cards
-          SET state=?,due_at=?,interval_days=?,ease=?,reps=?,lapses=?,
-              last_review_at=?,algorithm_version=?,suspended_from_state=NULL,
-              suspended_reason=NULL,updated_at=?
-          WHERE id=?`,
-        params: [
-          schedule.state,
-          schedule.due_at,
-          schedule.interval_days,
-          schedule.ease,
-          schedule.reps,
-          schedule.lapses,
-          schedule.last_review_at,
-          schedule.algorithm_version,
-          changedAt,
-          current.id,
-        ],
-      },
-      {
-        sql: `INSERT INTO vocab_activity(
-          id,day,read_seconds,listen_seconds,review_count,lookups,created_at
-        ) VALUES (?,?,?,?,?,?,?)`,
-        params: [activityId, localDayKey(now), 0, 0, 1, 0, now],
-      },
-      {
-        sql: `INSERT INTO vocab_review_events(
-          id,card_id,rating,reviewed_at,before_json,after_json,undone_at,activity_id
-        ) VALUES (?,?,?,?,?,?,?,?)`,
-        params: [
-          eventId,
-          current.id,
-          rating,
-          now,
-          JSON.stringify(storedReviewState(current)),
-          JSON.stringify(after),
-          null,
-          activityId,
-        ],
-      },
-    ]);
-    return eventId;
-  });
+  const receipt = await prepareVocabReviewRating(card, rating);
+  return (await commitVocabReviewRating(receipt)).eventId;
 }
 
 export async function undoReview(eventId: string): Promise<void> {
-  await withWrite("review-undone", async () => {
-    const event = (await rawQuery<{
-      card_id: string;
-      before_json: string;
-      activity_id: string | null;
-    }>(
-      `SELECT e.card_id,e.before_json,e.activity_id
-       FROM vocab_review_events e
-       WHERE e.id=? AND e.undone_at IS NULL
-         AND NOT EXISTS (
-           SELECT 1 FROM vocab_review_events later
-           WHERE later.card_id=e.card_id AND later.undone_at IS NULL
-             AND (
-               later.reviewed_at>e.reviewed_at OR
-               (later.reviewed_at=e.reviewed_at AND later.rowid>e.rowid)
-             )
-         )`,
-      [eventId],
-    ))[0];
-    if (!event) {
-      throw new Error("只能撤销这张卡最近一次尚未撤销的评分。");
-    }
-    const before = parseStoredReviewState(event.before_json);
-    const statements: Statement[] = [
-      {
-        sql: `UPDATE vocab_review_cards
-          SET state=?,due_at=?,interval_days=?,ease=?,reps=?,lapses=?,
-              last_review_at=?,algorithm_version=?,suspended_from_state=?,
-              suspended_reason=?,updated_at=?
-          WHERE id=?`,
-        params: [
-          before.state,
-          before.due_at,
-          before.interval_days,
-          before.ease,
-          before.reps,
-          before.lapses,
-          before.last_review_at,
-          before.algorithm_version,
-          before.suspended_from_state,
-          before.suspended_reason,
-          before.updated_at,
-          event.card_id,
-        ],
-      },
-      {
-        sql: "UPDATE vocab_review_events SET undone_at=? WHERE id=?",
-        params: [Date.now(), eventId],
-      },
-    ];
-    if (event.activity_id) {
-      statements.push({
-        sql: "DELETE FROM vocab_activity WHERE id=? AND review_count=1",
-        params: [event.activity_id],
+  try {
+    const receipt = await prepareVocabReviewUndo(eventId);
+    await commitVocabReviewUndo(receipt);
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      error.message === "旧版撤销记录缺少可恢复的活动编号。"
+    ) {
+      const alreadyUndone = await withVocabReadLock(async () => {
+        const rows = await rawQuery<{ undone_at: number | null; activity_id: string | null }>(
+          "SELECT undone_at,activity_id FROM vocab_review_events WHERE id=?",
+          [eventId],
+        );
+        return rows.length === 1 &&
+          rows[0].undone_at !== null &&
+          rows[0].activity_id === null;
       });
+      if (alreadyUndone) return;
     }
-    await rawBatch(statements);
-  });
+    throw error;
+  }
 }
 
 export async function saveSettings(settings: VocabSettings): Promise<void> {
