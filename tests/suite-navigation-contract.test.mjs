@@ -67,6 +67,27 @@ test("landing shortcuts and cards share the typed suite-space registry", async (
   assert.match(source, /aria-label=\{`进入\$\{space\.name\}空间`\}/);
 });
 
+test("global CSS contains only reset and suite landing styles", async () => {
+  const source = await readFile(new URL("app/globals.css", projectRoot), "utf8");
+  const classNames = [...source.matchAll(/\.([_a-zA-Z][_a-zA-Z0-9-]*)/g)]
+    .map((match) => match[1]);
+  assert.deepEqual(
+    [...new Set(classNames.filter((className) => !className.startsWith("suite-")))],
+    [],
+    "product-specific prototypes belong in their product stylesheet, never globals.css",
+  );
+
+  assert.match(source, /^@import "tailwindcss";/);
+  assert.match(source, /\.suite-home\{/);
+  assert.match(source, /\.suite-career\{/);
+  assert.match(source, /\.suite-vocab\{/);
+  assert.match(source, /\.suite-fitness\{/);
+  assert.match(source, /@media\(min-width:651px\) and \(max-width:919px\)/);
+  assert.match(source, /@media\(max-width:650px\)/);
+  assert.match(source, /@media\(max-width:360px\)/);
+  assert.match(source, /@media\(prefers-reduced-motion:reduce\)/);
+});
+
 test("offline app shell contains every configured suite entry exactly once", async () => {
   const source = await readFile(new URL("public/sw.js", projectRoot), "utf8");
   const declaration = /const APP_SHELL = (\[[^;]+\]);/.exec(source);
