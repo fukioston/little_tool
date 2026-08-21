@@ -52,7 +52,7 @@ async function suiteRoutes() {
 
 test("Career brand is a home link without nesting the mobile close button", async () => {
   const source = await readFile(new URL("app/career/CareerApp.tsx", projectRoot), "utf8");
-  const brandStart = source.indexOf('<Link href="/" className="career-brand" aria-label="返回私人工作台">');
+  const brandStart = source.indexOf('<Link href="/" className="career-brand" aria-label="返回私人工作台"');
   assert.notEqual(brandStart, -1);
   const brandEnd = source.indexOf("</Link>", brandStart);
   assert.ok(brandEnd > brandStart);

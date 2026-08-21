@@ -86,8 +86,28 @@ import {
   type CareerJobImportPreview,
 } from "@/lib/career/imports";
 import { careerJobIsWatched, resolveCareerJobNextItem, type CareerJobNextItem } from "@/lib/career/calm-view";
-import { subscribeToCareerGenerationChanges, withCareerWriteLock } from "@/lib/career/lock";
-import { createLocalFileObjectUrl, deleteLocalFile, saveLocalFile } from "@/lib/local-db/files";
+import {
+  CareerMaterialSaveError,
+  inspectCareerMaterialSaveCleanup,
+  inspectCareerMaterialSave,
+  retryCareerMaterialSaveCleanup,
+  saveCareerMaterial,
+  type CareerMaterialSaveCleanupBlockedReason,
+  type CareerMaterialSaveCleanupReceipt,
+  type CareerMaterialSaveExpectedSnapshot,
+  type CareerMaterialSaveInput,
+} from "@/lib/career/material-save";
+import {
+  CareerMaterialDeletionError,
+  deleteCareerMaterial,
+  loadCareerMaterialDeletionState,
+  type CareerMaterialDeletedFileAction,
+  type CareerMaterialDeletionPendingReason,
+  type CareerMaterialDeletionReceipt,
+  type CareerMaterialDeletionState,
+} from "@/lib/career/materials";
+import { subscribeToCareerGenerationChanges } from "@/lib/career/lock";
+import { createLocalFileObjectUrl } from "@/lib/local-db/files";
 import type {
   AiAction, CareerData, CareerView, Contact, Interview, InterviewQuestion,
   Job, Material, Notice, Stage, Task,
@@ -108,6 +128,135 @@ const navItems: Array<{ id: CareerView; label: string; compact: string; icon: ty
 const emptyData: CareerData = { stages: [], jobs: [], tasks: [], interviews: [], contacts: [], materials: [], activities: [] };
 const emptyLifecycleSnapshot: CareerLifecycleSnapshot = { jobs: [], tasks: [], interviews: [] };
 type CareerJobScope = Exclude<CareerLifecycleScope, "all">;
+
+const CAREER_MATERIAL_SAVE_RECOVERY_PREFIX = "career.material-save-recovery.v1:";
+const CAREER_MATERIAL_SAVE_RECOVERY_MAX_BYTES = 256 * 1024;
+const CAREER_MATERIAL_ATTACHMENT_MAX_BYTES = 512 * 1024 * 1024;
+const CAREER_SHA256_PATTERN = /^[0-9a-f]{64}$/;
+
+type CareerMaterialSaveRecoveryTicket =
+  | Readonly<{
+      version: 1;
+      kind: "uncertain-save";
+      materialId: string;
+      expectedSnapshot: CareerMaterialSaveExpectedSnapshot;
+      cleanupReceipt: CareerMaterialSaveCleanupReceipt | null;
+      recordedAt: string;
+    }>
+  | Readonly<{
+      version: 1;
+      kind: "cleanup-only";
+      cleanupReceipt: CareerMaterialSaveCleanupReceipt;
+      recordedAt: string;
+    }>;
+
+type CareerMaterialSaveRecoveryEntry = Readonly<{
+  ticket: CareerMaterialSaveRecoveryTicket;
+  persisted: boolean;
+}>;
+
+function materialSaveRecoveryKey(ticket: CareerMaterialSaveRecoveryTicket) {
+  if (ticket.kind === "cleanup-only") return `attachment:${ticket.cleanupReceipt.digest}`;
+  if (ticket.cleanupReceipt) return `attachment:${ticket.cleanupReceipt.digest}`;
+  return `save:${ticket.materialId}`;
+}
+
+function hasExactObjectKeys(value: object, expected: readonly string[]) {
+  const actual = Object.keys(value).sort();
+  const sortedExpected = [...expected].sort();
+  return actual.length === sortedExpected.length && actual.every((key, index) => key === sortedExpected[index]);
+}
+
+function isRecoveryIdentifier(value: unknown) {
+  return typeof value === "string" && value.length > 0 && value.length <= 240 &&
+    value === value.trim() && !Array.from(value).some((character) => {
+      const point = character.codePointAt(0) ?? 0;
+      return point <= 31 || point === 127;
+    });
+}
+
+function isRecoveryText(value: unknown, maximum: number, allowNewlines = false) {
+  return typeof value === "string" && Array.from(value).length <= maximum &&
+    !Array.from(value).some((character) => {
+      const point = character.codePointAt(0) ?? 0;
+      if (allowNewlines && (point === 9 || point === 10 || point === 13)) return false;
+      return point <= 31 || point === 127;
+    });
+}
+
+function isMaterialSaveExpectedSnapshot(value: unknown): value is CareerMaterialSaveExpectedSnapshot {
+  if (!value || typeof value !== "object" || Array.isArray(value) || !hasExactObjectKeys(value, [
+    "name", "kind", "version", "updatedAt", "linkedJobId", "status", "notes", "attachment",
+  ])) return false;
+  const snapshot = value as Record<string, unknown>;
+  if (!isRecoveryText(snapshot.name, 240) || !String(snapshot.name).trim() ||
+    !isRecoveryText(snapshot.kind, 80) || !String(snapshot.kind).trim() ||
+    !isRecoveryText(snapshot.version, 80) || !String(snapshot.version).trim() ||
+    typeof snapshot.updatedAt !== "string" || !Number.isFinite(Date.parse(snapshot.updatedAt)) ||
+    (snapshot.linkedJobId !== null && !isRecoveryIdentifier(snapshot.linkedJobId)) ||
+    (snapshot.status !== "ready" && snapshot.status !== "draft" && snapshot.status !== "sent") ||
+    !isRecoveryText(snapshot.notes, 20_000, true)) return false;
+  if (snapshot.attachment === null) return true;
+  if (!snapshot.attachment || typeof snapshot.attachment !== "object" || Array.isArray(snapshot.attachment) ||
+    !hasExactObjectKeys(snapshot.attachment, ["originalName", "mimeType", "byteSize", "sha256"])) return false;
+  const attachment = snapshot.attachment as Record<string, unknown>;
+  return isRecoveryText(attachment.originalName, 255) && Boolean(String(attachment.originalName).trim()) &&
+    isRecoveryText(attachment.mimeType, 127) && Boolean(String(attachment.mimeType).includes("/")) &&
+    Number.isSafeInteger(attachment.byteSize) && Number(attachment.byteSize) > 0 &&
+    Number(attachment.byteSize) <= CAREER_MATERIAL_ATTACHMENT_MAX_BYTES &&
+    typeof attachment.sha256 === "string" && CAREER_SHA256_PATTERN.test(attachment.sha256);
+}
+
+function isMaterialCleanupReceipt(value: unknown): value is CareerMaterialSaveCleanupReceipt {
+  if (!value || typeof value !== "object" || Array.isArray(value) ||
+    !hasExactObjectKeys(value, ["purpose", "version", "opaquePayload", "digest"])) return false;
+  const receipt = value as Record<string, unknown>;
+  return receipt.purpose === "career-material-save-cleanup" && receipt.version === 1 &&
+    typeof receipt.opaquePayload === "string" && receipt.opaquePayload.length > 0 &&
+    receipt.opaquePayload.length <= CAREER_MATERIAL_SAVE_RECOVERY_MAX_BYTES &&
+    typeof receipt.digest === "string" && CAREER_SHA256_PATTERN.test(receipt.digest);
+}
+
+function isMaterialSaveRecoveryTicket(value: unknown): value is CareerMaterialSaveRecoveryTicket {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const ticket = value as Record<string, unknown>;
+  if (ticket.version !== 1 || typeof ticket.recordedAt !== "string" ||
+    !Number.isFinite(Date.parse(ticket.recordedAt))) return false;
+  if (ticket.kind === "cleanup-only") {
+    return hasExactObjectKeys(ticket, ["version", "kind", "cleanupReceipt", "recordedAt"]) &&
+      isMaterialCleanupReceipt(ticket.cleanupReceipt);
+  }
+  return ticket.kind === "uncertain-save" &&
+    hasExactObjectKeys(ticket, ["version", "kind", "materialId", "expectedSnapshot", "cleanupReceipt", "recordedAt"]) &&
+    isRecoveryIdentifier(ticket.materialId) && isMaterialSaveExpectedSnapshot(ticket.expectedSnapshot) &&
+    (ticket.cleanupReceipt === null || isMaterialCleanupReceipt(ticket.cleanupReceipt));
+}
+
+function readMaterialSaveRecoveryStorage() {
+  const tickets: CareerMaterialSaveRecoveryTicket[] = [];
+  const unreadableKeys: string[] = [];
+  if (typeof window === "undefined") return { tickets, unreadableKeys, storageUnavailable: false };
+  try {
+    for (let index = 0; index < window.localStorage.length; index += 1) {
+      const key = window.localStorage.key(index);
+      if (!key?.startsWith(CAREER_MATERIAL_SAVE_RECOVERY_PREFIX)) continue;
+      try {
+        const raw = window.localStorage.getItem(key);
+        if (!raw || raw.length > CAREER_MATERIAL_SAVE_RECOVERY_MAX_BYTES) throw new Error("invalid recovery size");
+        const parsed: unknown = JSON.parse(raw);
+        if (!isMaterialSaveRecoveryTicket(parsed)) throw new Error("invalid recovery ticket");
+        if (key !== `${CAREER_MATERIAL_SAVE_RECOVERY_PREFIX}${materialSaveRecoveryKey(parsed)}`) throw new Error("misbound recovery key");
+        tickets.push(parsed);
+      } catch {
+        unreadableKeys.push(key);
+      }
+    }
+  } catch {
+    return { tickets, unreadableKeys, storageUnavailable: true };
+  }
+  tickets.sort((left, right) => left.recordedAt.localeCompare(right.recordedAt));
+  return { tickets, unreadableKeys, storageUnavailable: false };
+}
 
 const CAREER_AI_SHARED_FIELDS_BY_ACTION = Object.freeze({
   fit_analysis: CAREER_REQUIREMENTS_SHARED_FIELDS,
@@ -199,6 +348,18 @@ function useCareerClock() {
     };
   }, []);
   return clock;
+}
+
+function useCareerMobileLayout() {
+  const [mobile, setMobile] = useState(false);
+  useEffect(() => {
+    const query = window.matchMedia("(max-width: 760px)");
+    const sync = () => setMobile(query.matches);
+    sync();
+    query.addEventListener("change", sync);
+    return () => query.removeEventListener("change", sync);
+  }, []);
+  return mobile;
 }
 
 function dateInputValue(value: string | null | undefined) {
@@ -495,6 +656,7 @@ function useDialogA11y(onClose: () => void, inertToasts = false) {
 
 export default function CareerApp() {
   const careerClock = useCareerClock();
+  const mobileLayout = useCareerMobileLayout();
   const [data, setData] = useState<CareerData>(emptyData);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState("");
@@ -517,6 +679,14 @@ export default function CareerApp() {
   const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
   const [selectedInterviewId, setSelectedInterviewId] = useState<string | null>(null);
   const [selectedContactId, setSelectedContactId] = useState<string | null>(null);
+  const [materialRemoval, setMaterialRemoval] = useState<Pick<Material, "id" | "name" | "file_key"> | null>(null);
+  const [materialListStale, setMaterialListStale] = useState(false);
+  const [materialRefreshBusy, setMaterialRefreshBusy] = useState(false);
+  const [materialRecoveryLoaded, setMaterialRecoveryLoaded] = useState(false);
+  const [materialRecoveryStorageUnavailable, setMaterialRecoveryStorageUnavailable] = useState(false);
+  const [materialRecoveryUnreadableKeys, setMaterialRecoveryUnreadableKeys] = useState<string[]>([]);
+  const [persistedMaterialRecoveries, setPersistedMaterialRecoveries] = useState<CareerMaterialSaveRecoveryTicket[]>([]);
+  const [volatileMaterialRecoveries, setVolatileMaterialRecoveries] = useState<CareerMaterialSaveRecoveryTicket[]>([]);
   const [contactEditorId, setContactEditorId] = useState<string | null | undefined>(undefined);
   const [contactAction, setContactAction] = useState<{ kind: "interaction" | "task"; contactId: string } | null>(null);
   const [contactRevision, setContactRevision] = useState(0);
@@ -540,24 +710,91 @@ export default function CareerApp() {
   const sidebarRef = useRef<HTMLElement | null>(null);
   const importOpenerRef = useRef<HTMLButtonElement | null>(null);
   const importFocusReturnPendingRef = useRef(false);
+  const materialRemovalOpenerRef = useRef<HTMLButtonElement | null>(null);
+  const materialRemovalFocusPendingRef = useRef(false);
+  const materialModalFocusPendingRef = useRef(false);
+  const materialStaleFocusPendingRef = useRef(false);
+  const materialRefreshRef = useRef(false);
   const [refreshKey, setRefreshKey] = useState(0);
+
+  const materialSaveRecoveryEntries = useMemo<CareerMaterialSaveRecoveryEntry[]>(() => {
+    const entries = new Map<string, CareerMaterialSaveRecoveryEntry>();
+    persistedMaterialRecoveries.forEach((ticket) => entries.set(materialSaveRecoveryKey(ticket), { ticket, persisted: true }));
+    volatileMaterialRecoveries.forEach((ticket) => {
+      const key = materialSaveRecoveryKey(ticket);
+      if (!entries.has(key)) entries.set(key, { ticket, persisted: false });
+    });
+    return Array.from(entries.values()).sort((left, right) => left.ticket.recordedAt.localeCompare(right.ticket.recordedAt));
+  }, [persistedMaterialRecoveries, volatileMaterialRecoveries]);
+
+  const reloadMaterialSaveRecoveries = useCallback(() => {
+    const stored = readMaterialSaveRecoveryStorage();
+    const storedKeys = new Set(stored.tickets.map(materialSaveRecoveryKey));
+    setPersistedMaterialRecoveries(stored.tickets);
+    setVolatileMaterialRecoveries((current) => current.filter((ticket) => !storedKeys.has(materialSaveRecoveryKey(ticket))));
+    setMaterialRecoveryUnreadableKeys(stored.unreadableKeys);
+    setMaterialRecoveryStorageUnavailable(stored.storageUnavailable);
+    setMaterialRecoveryLoaded(true);
+  }, []);
+
+  const persistMaterialSaveRecovery = useCallback((ticket: CareerMaterialSaveRecoveryTicket) => {
+    const logicalKey = materialSaveRecoveryKey(ticket);
+    const storageKey = `${CAREER_MATERIAL_SAVE_RECOVERY_PREFIX}${logicalKey}`;
+    try {
+      window.localStorage.setItem(storageKey, JSON.stringify(ticket));
+      setPersistedMaterialRecoveries((current) => [...current.filter((item) => materialSaveRecoveryKey(item) !== logicalKey), ticket]);
+      setVolatileMaterialRecoveries((current) => current.filter((item) => materialSaveRecoveryKey(item) !== logicalKey));
+      setMaterialRecoveryUnreadableKeys((current) => current.filter((key) => key !== storageKey));
+      setMaterialRecoveryStorageUnavailable(false);
+      return true;
+    } catch {
+      setVolatileMaterialRecoveries((current) => [...current.filter((item) => materialSaveRecoveryKey(item) !== logicalKey), ticket]);
+      setMaterialRecoveryStorageUnavailable(true);
+      return false;
+    }
+  }, []);
+
+  const clearMaterialSaveRecovery = useCallback((ticket: CareerMaterialSaveRecoveryTicket, persisted: boolean) => {
+    const logicalKey = materialSaveRecoveryKey(ticket);
+    const storageKey = `${CAREER_MATERIAL_SAVE_RECOVERY_PREFIX}${logicalKey}`;
+    if (!persisted) {
+      try { window.localStorage.removeItem(storageKey); } catch { /* No durable entry was created for this volatile ticket. */ }
+      setVolatileMaterialRecoveries((current) => current.filter((item) => materialSaveRecoveryKey(item) !== logicalKey));
+      setPersistedMaterialRecoveries((current) => current.filter((item) => materialSaveRecoveryKey(item) !== logicalKey));
+      return true;
+    }
+    try {
+      window.localStorage.removeItem(storageKey);
+      setPersistedMaterialRecoveries((current) => current.filter((item) => materialSaveRecoveryKey(item) !== logicalKey));
+      setVolatileMaterialRecoveries((current) => current.filter((item) => materialSaveRecoveryKey(item) !== logicalKey));
+      setMaterialRecoveryUnreadableKeys((current) => current.filter((key) => key !== storageKey));
+      return true;
+    } catch {
+      setMaterialRecoveryStorageUnavailable(true);
+      return false;
+    }
+  }, []);
 
   const refresh = useCallback(async (requestedScope: CareerJobScope = jobScopeRef.current) => {
     const requestToken = ++uiReadRequestRef.current;
     const next = await loadCareerUiState(requestedScope);
-    if (uiReadRequestRef.current !== requestToken) return;
+    if (uiReadRequestRef.current !== requestToken) return false;
     setData(next.base);
     setAllLifecycle(next.all);
     if (jobScopeRef.current === requestedScope) setScopedLifecycle(next.scoped);
+    return true;
   }, []);
+  const requireRefresh = useCallback(async (requestedScope: CareerJobScope = jobScopeRef.current) => {
+    if (!await refresh(requestedScope)) throw new Error("A newer Career read superseded this refresh.");
+  }, [refresh]);
   const refreshContacts = useCallback(async () => {
-    await refresh();
+    await requireRefresh();
     setContactRevision((current) => current + 1);
-  }, [refresh]);
+  }, [requireRefresh]);
   const refreshTasks = useCallback(async () => {
-    await refresh();
+    await requireRefresh();
     setContactRevision((current) => current + 1);
-  }, [refresh]);
+  }, [requireRefresh]);
 
   useEffect(() => {
     let live = true;
@@ -585,6 +822,29 @@ export default function CareerApp() {
   useEffect(() => () => aiRequestRef.current?.controller.abort(), []);
 
   useEffect(() => {
+    reloadMaterialSaveRecoveries();
+    function handleRecoveryStorage(event: StorageEvent) {
+      if (event.key === null || event.key.startsWith(CAREER_MATERIAL_SAVE_RECOVERY_PREFIX)) reloadMaterialSaveRecoveries();
+    }
+    window.addEventListener("storage", handleRecoveryStorage);
+    window.addEventListener("focus", reloadMaterialSaveRecoveries);
+    return () => {
+      window.removeEventListener("storage", handleRecoveryStorage);
+      window.removeEventListener("focus", reloadMaterialSaveRecoveries);
+    };
+  }, [reloadMaterialSaveRecoveries]);
+
+  useEffect(() => {
+    if (volatileMaterialRecoveries.length === 0) return;
+    function protectVolatileMaterialRecovery(event: BeforeUnloadEvent) {
+      event.preventDefault();
+      event.returnValue = "";
+    }
+    window.addEventListener("beforeunload", protectVolatileMaterialRecovery);
+    return () => window.removeEventListener("beforeunload", protectVolatileMaterialRecovery);
+  }, [volatileMaterialRecoveries.length]);
+
+  useEffect(() => {
     if (modal === "import" || !importFocusReturnPendingRef.current) return;
     importFocusReturnPendingRef.current = false;
     const opener = importOpenerRef.current;
@@ -594,6 +854,41 @@ export default function CareerApp() {
     });
     return () => window.cancelAnimationFrame(focusFrame);
   }, [modal]);
+
+  useEffect(() => {
+    if (materialRemoval || !materialRemovalFocusPendingRef.current) return;
+    materialRemovalFocusPendingRef.current = false;
+    const opener = materialRemovalOpenerRef.current;
+    const focusFrame = window.requestAnimationFrame(() => {
+      const fallback = document.querySelector<HTMLButtonElement>("[data-material-refresh]") ?? document.querySelector<HTMLButtonElement>("[data-material-add]");
+      if (opener?.isConnected && !opener.disabled) opener.focus({ preventScroll: true });
+      else fallback?.focus({ preventScroll: true });
+      materialRemovalOpenerRef.current = null;
+    });
+    return () => window.cancelAnimationFrame(focusFrame);
+  }, [materialRemoval]);
+
+  useEffect(() => {
+    if (modal === "material" || !materialModalFocusPendingRef.current || materialListStale) return;
+    materialModalFocusPendingRef.current = false;
+    const focusFrame = window.requestAnimationFrame(() => {
+      const target = document.querySelector<HTMLButtonElement>("[data-material-recover]") ??
+        document.querySelector<HTMLButtonElement>("[data-material-recovery-clear]") ??
+        document.querySelector<HTMLButtonElement>("[data-material-add]:not(:disabled)") ??
+        document.querySelector<HTMLButtonElement>(".career-material-actions button:not(:disabled)");
+      target?.focus({ preventScroll: true });
+    });
+    return () => window.cancelAnimationFrame(focusFrame);
+  }, [materialListStale, modal]);
+
+  useEffect(() => {
+    if (!materialListStale || !materialStaleFocusPendingRef.current || modal === "material" || materialRemoval) return;
+    materialStaleFocusPendingRef.current = false;
+    const focusFrame = window.requestAnimationFrame(() => {
+      document.querySelector<HTMLButtonElement>("[data-material-refresh]")?.focus({ preventScroll: true });
+    });
+    return () => window.cancelAnimationFrame(focusFrame);
+  }, [materialListStale, materialRemoval, modal]);
 
   useEffect(() => subscribeToCareerGenerationChanges(() => window.location.reload()), []);
 
@@ -684,6 +979,76 @@ export default function CareerApp() {
     setNotices((current) => [...current, item]);
     window.setTimeout(() => setNotices((current) => current.filter((notice) => notice.id !== item.id)), 3600);
   }, []);
+
+  async function refreshMaterials() {
+    if (materialRefreshRef.current) return;
+    materialRefreshRef.current = true;
+    const restoreMaterialFocus = document.activeElement?.matches("[data-material-refresh]") ?? false;
+    setMaterialRefreshBusy(true);
+    try {
+      await requireRefresh();
+      setMaterialListStale(false);
+      if (restoreMaterialFocus) {
+        notify("材料列表已更新。", "info");
+        window.requestAnimationFrame(() => {
+          const target = document.querySelector<HTMLButtonElement>("[data-material-recover]") ??
+            document.querySelector<HTMLButtonElement>("[data-material-recovery-clear]") ??
+            document.querySelector<HTMLButtonElement>("[data-material-add]:not(:disabled)") ??
+            document.querySelector<HTMLButtonElement>(".career-material-actions button:not(:disabled)");
+          target?.focus({ preventScroll: true });
+        });
+      }
+    } finally {
+      materialRefreshRef.current = false;
+      setMaterialRefreshBusy(false);
+    }
+  }
+
+  function clearUnreadableMaterialRecoveryEntries() {
+    let failed = false;
+    for (const key of materialRecoveryUnreadableKeys) {
+      try { window.localStorage.removeItem(key); }
+      catch { failed = true; }
+    }
+    if (failed) {
+      setMaterialRecoveryStorageUnavailable(true);
+      notify("浏览器暂时无法清除这条提醒；没有自动删除任何原件。", "error");
+      return;
+    }
+    setMaterialRecoveryUnreadableKeys([]);
+    notify("无法读取的收尾提醒已清除；没有自动删除任何原件。", "info");
+    window.requestAnimationFrame(() => {
+      document.querySelector<HTMLButtonElement>("[data-material-add]:not(:disabled)")?.focus({ preventScroll: true });
+    });
+  }
+
+  function retryMaterialRecoveryStorage() {
+    reloadMaterialSaveRecoveries();
+    window.requestAnimationFrame(() => {
+      const target = document.querySelector<HTMLButtonElement>("[data-material-recovery-retry]") ??
+        document.querySelector<HTMLButtonElement>("[data-material-recover]") ??
+        document.querySelector<HTMLButtonElement>("[data-material-recovery-clear]") ??
+        document.querySelector<HTMLButtonElement>("[data-material-add]:not(:disabled)");
+      target?.focus({ preventScroll: true });
+    });
+  }
+
+  function closeMaterialWithStaleList() {
+    materialModalFocusPendingRef.current = false;
+    materialStaleFocusPendingRef.current = true;
+    setMaterialListStale(true);
+    setModal(null);
+  }
+
+  function closeMaterialModal() {
+    materialModalFocusPendingRef.current = true;
+    setModal(null);
+  }
+
+  function closeRemovalWithStaleList() {
+    setMaterialListStale(true);
+    closeMaterialRemoval();
+  }
 
   const activeLifecycle = useMemo(
     () => projectCareerLifecycleScope(allLifecycle, data.stages, "active"),
@@ -778,7 +1143,7 @@ export default function CareerApp() {
 
       lifecycleRefreshOnlyRef.current = true;
       try {
-        await refresh();
+        await requireRefresh();
       } catch {
         setLifecycleDialog({
           phase: "refresh-recovery",
@@ -868,7 +1233,7 @@ export default function CareerApp() {
     lifecycleWriteRef.current = true;
     setLifecycleBusy(true);
     try {
-      await refresh();
+      await requireRefresh();
       lifecycleRefreshOnlyRef.current = false;
       updateLifecycleUndo(lifecycleDialog.prepared, lifecycleDialog.rememberUndo);
       setLifecycleDialog(null);
@@ -996,11 +1361,15 @@ export default function CareerApp() {
     setModal(null);
     setImportInitial(null);
   }
+  function closeMaterialRemoval() {
+    materialRemovalFocusPendingRef.current = true;
+    setMaterialRemoval(null);
+  }
   if (loading) return <CareerLoading />;
   if (loadError) return <CareerError message={loadError} onRetry={() => { setLoading(true); setLoadError(""); setRefreshKey((key) => key + 1); }} />;
 
   return <main className="career-app">
-    <Sidebar sidebarRef={sidebarRef} view={view} open={sidebarOpen} onNavigate={navigate} onClose={() => setSidebarOpen(false)} />
+    <Sidebar sidebarRef={sidebarRef} view={view} open={sidebarOpen} mobile={mobileLayout} onNavigate={navigate} onClose={() => setSidebarOpen(false)} />
     <section className="career-main">
       <Topbar title={navItems.find((item) => item.id === view)?.label ?? "职迹"} query={query} menuOpen={sidebarOpen} onQuery={setQuery} onSearch={() => setSearchOpen(true)} onMenu={() => setSidebarOpen(true)} onAdd={() => setModal("job")} onSettings={() => navigate("settings")} />
       <div className="career-content">
@@ -1011,24 +1380,24 @@ export default function CareerApp() {
         {view === "calendar" && <CalendarView data={allData} now={careerClock} onOpenTask={openTask} onCompleteTask={completeTask} onAddTask={() => setModal("task")} onAddInterview={() => setModal("interview")} onSelectInterview={setSelectedInterviewId} />}
         {view === "interviews" && <InterviewsView data={data} now={careerClock} onAdd={() => setModal("interview")} onSelect={setSelectedInterviewId} onAi={runAi} />}
         {view === "contacts" && <ContactsView data={data} now={careerClock} revision={contactRevision} onAdd={() => setContactEditorId(null)} onSelect={setSelectedContactId} />}
-        {view === "materials" && <MaterialsView data={data} onAdd={() => setModal("material")} onRemove={async (material) => {
-          if (!window.confirm(`移除「${material.name}」${material.file_key ? "及其本地附件原件" : ""}？这个操作无法撤销。`)) return;
-          try {
-            let fileCleanupFailed = false;
-            await withCareerWriteLock(async (context) => {
-              await runCareerSql("DELETE FROM career_materials WHERE id = ?", [material.id], context);
-              if (material.file_key) {
-                try { await deleteLocalFile("career", material.file_key); }
-                catch { fileCleanupFailed = true; }
-              }
-            });
-            await refresh();
-            if (fileCleanupFailed) { notify("材料记录已移除，但本地附件原件未能清理", "info"); return; }
-            notify("材料已移除", "info");
-          } catch (error) { notify(error instanceof Error ? error.message : "材料移除失败", "error"); }
-        }} />}
+        {view === "materials" && <MaterialsView
+          data={data}
+          stale={materialListStale}
+          refreshBusy={materialRefreshBusy}
+          recoveryLoaded={materialRecoveryLoaded}
+          recoveryCount={materialSaveRecoveryEntries.length}
+          recoveryUnreadable={materialRecoveryUnreadableKeys.length > 0}
+          recoveryStorageUnavailable={materialRecoveryStorageUnavailable || volatileMaterialRecoveries.length > 0}
+          onRefresh={refreshMaterials}
+          onAdd={() => setModal("material")}
+          onRecover={() => setModal("material")}
+          onClearUnreadable={clearUnreadableMaterialRecoveryEntries}
+          onRetryRecoveryStorage={retryMaterialRecoveryStorage}
+          onRemove={(material, opener) => { materialRemovalOpenerRef.current = opener; materialRemovalFocusPendingRef.current = false; setMaterialRemoval({ id: material.id, name: material.name, file_key: material.file_key }); }}
+          notify={notify}
+        />}
         {view === "analytics" && <AnalyticsView data={data} now={careerClock} />}
-        {view === "settings" && <SettingsView data={data} onRefresh={refresh} onExport={async () => {
+        {view === "settings" && <SettingsView data={data} onRefresh={requireRefresh} onExport={async () => {
           try {
             const exported = await exportCompleteCareerBackup();
             const url = URL.createObjectURL(exported.blob);
@@ -1049,11 +1418,11 @@ export default function CareerApp() {
           try {
             if (complete) {
               const restored = await restoreCompleteCareerBackup(file);
-              await refresh();
+              await requireRefresh();
               notify(`数据与 ${restored.attachmentCount} 个附件已完整恢复；上一版本已保留作安全回退`);
             } else {
               await restoreLegacyCareerDatabase(file);
-              await refresh();
+              await requireRefresh();
               notify("旧版 SQLite 数据已恢复；附件索引已清空，上一版本已保留作安全回退", "info");
             }
           }
@@ -1062,8 +1431,8 @@ export default function CareerApp() {
       </div>
     </section>
     <MobileNav view={view} onNavigate={navigate} onMore={() => setSidebarOpen(true)} />
-    {selectedJob && <JobDrawer key={`${selectedJob.id}:${selectedJob.archived}`} job={selectedJob} data={allData} now={careerClock} lifecyclePending={lifecycleLocked} onClose={() => setSelectedJobId(null)} onLifecycle={(intent) => requestLifecycleChange(intent)} onRefresh={refresh} onOpenTask={openTask} onCompleteTask={completeTask} onAi={runAi} onSelectContact={(contactId) => { setSelectedJobId(null); setSelectedContactId(contactId); }} notify={notify} />}
-    {selectedInterview && <InterviewDrawer interview={selectedInterview} data={allData} onClose={() => setSelectedInterviewId(null)} onRefresh={refresh} onAi={runAi} notify={notify} />}
+    {selectedJob && <JobDrawer key={`${selectedJob.id}:${selectedJob.archived}`} job={selectedJob} data={allData} now={careerClock} lifecyclePending={lifecycleLocked} onClose={() => setSelectedJobId(null)} onLifecycle={(intent) => requestLifecycleChange(intent)} onRefresh={requireRefresh} onOpenTask={openTask} onCompleteTask={completeTask} onAi={runAi} onSelectContact={(contactId) => { setSelectedJobId(null); setSelectedContactId(contactId); }} notify={notify} />}
+    {selectedInterview && <InterviewDrawer interview={selectedInterview} data={allData} onClose={() => setSelectedInterviewId(null)} onRefresh={requireRefresh} onAi={runAi} notify={notify} />}
     {lifecycleDialog && <CareerLifecycleModal
       state={lifecycleDialog}
       busy={lifecycleBusy}
@@ -1102,11 +1471,22 @@ export default function CareerApp() {
       }}
       notify={notify}
     />}
-    {modal === "job" && <JobModal data={data} onClose={() => setModal(null)} onSaved={async (id) => { setModal(null); await refresh(); setSelectedJobId(id); notify("职位已加入职迹"); }} />}
+    {modal === "job" && <JobModal data={data} onClose={() => setModal(null)} onSaved={async (id) => { setModal(null); await requireRefresh(); setSelectedJobId(id); notify("职位已加入职迹"); }} />}
     {modal === "task" && <TaskModal data={data} initialJobId={selectedJobId} onClose={() => { setModal(null); setSelectedJobId(null); }} onSaved={async () => { await refreshTasks(); setModal(null); setSelectedJobId(null); notify("待办已创建"); }} />}
-    {modal === "interview" && <InterviewModal data={data} onClose={() => setModal(null)} onSaved={async () => { setModal(null); await refresh(); notify("面试轮次已安排"); }} />}
-    {modal === "material" && <MaterialModal data={data} onClose={() => setModal(null)} onSaved={async () => { setModal(null); await refresh(); notify("材料已保存"); }} />}
-    {modal === "import" && <CareerImportModal data={allData} initialCapture={importInitial} onClose={closeCareerImport} onRefresh={refresh} notify={notify} />}
+    {modal === "interview" && <InterviewModal data={data} onClose={() => setModal(null)} onSaved={async () => { setModal(null); await requireRefresh(); notify("面试轮次已安排"); }} />}
+    {modal === "material" && <MaterialModal
+      data={data}
+      initialRecovery={materialSaveRecoveryEntries[0] ?? null}
+      otherRecoveryPending={materialSaveRecoveryEntries.length > (materialSaveRecoveryEntries[0] ? 1 : 0) || materialRecoveryUnreadableKeys.length > 0}
+      onRecoveryUpsert={persistMaterialSaveRecovery}
+      onRecoveryClear={clearMaterialSaveRecovery}
+      onClose={closeMaterialModal}
+      onStaleClose={closeMaterialWithStaleList}
+      onRefresh={refreshMaterials}
+      notify={notify}
+    />}
+    {materialRemoval && <MaterialDeletionModal material={materialRemoval} onClose={closeMaterialRemoval} onStaleClose={closeRemovalWithStaleList} onRefresh={refreshMaterials} notify={notify} />}
+    {modal === "import" && <CareerImportModal data={allData} initialCapture={importInitial} onClose={closeCareerImport} onRefresh={requireRefresh} notify={notify} />}
     {searchOpen && <CommandPalette data={data} onClose={() => setSearchOpen(false)} onNavigate={navigate} onSelectJob={(id) => { setSearchOpen(false); setSelectedJobId(id); }} onAdd={() => { setSearchOpen(false); setModal("job"); }} />}
     {contactEditorId !== undefined && <ContactModal
       contactId={contactEditorId}
@@ -1170,10 +1550,11 @@ export default function CareerApp() {
 function CareerLoading() { return <main className="career-loading" role="status"><div className="career-loading-mark">职</div><LoaderCircle className="spin" size={20} /><p>正在打开你的求职工作台…</p></main>; }
 function CareerError({ message, onRetry }: { message: string; onRetry: () => void }) { return <main className="career-error"><ShieldCheck size={30} /><h1>本地资料暂时没有打开</h1><p>{message}</p><button className="career-button primary" onClick={onRetry}><RotateCcw size={16} />重新尝试</button></main>; }
 
-function Sidebar({ sidebarRef, view, open, onNavigate, onClose }: { sidebarRef: { current: HTMLElement | null }; view: CareerView; open: boolean; onNavigate: (view: CareerView) => void; onClose: () => void }) {
-  return <><button className={`career-scrim ${open ? "show" : ""}`} tabIndex={-1} aria-label="关闭导航" onClick={onClose} /><aside ref={sidebarRef} id="career-sidebar" className={`career-sidebar ${open ? "open" : ""}`} role={open ? "dialog" : undefined} aria-modal={open ? "true" : undefined} aria-label={open ? "职迹导航" : undefined} tabIndex={open ? -1 : undefined}>
-    <Link href="/" className="career-brand" aria-label="返回私人工作台"><span>职</span><div><b>职迹</b><small>每一步，都算数</small></div></Link><button data-sidebar-close className="career-icon-button mobile-only" style={{ position: "absolute", insetBlockStart: 29, insetInlineEnd: 24 }} onClick={onClose} aria-label="关闭导航"><X size={18} /></button>
-    <nav className="career-nav" aria-label="职迹主导航">{navItems.map((item) => <button key={item.id} aria-label={item.label} className={view === item.id ? "active" : ""} onClick={() => onNavigate(item.id)}><item.icon size={18} strokeWidth={1.8} /><span>{item.label}</span></button>)}</nav>
+function Sidebar({ sidebarRef, view, open, mobile, onNavigate, onClose }: { sidebarRef: { current: HTMLElement | null }; view: CareerView; open: boolean; mobile: boolean; onNavigate: (view: CareerView) => void; onClose: () => void }) {
+  const hidden = mobile && !open;
+  return <><button className={`career-scrim ${open ? "show" : ""}`} tabIndex={-1} aria-label="关闭导航" onClick={onClose} /><aside ref={sidebarRef} id="career-sidebar" className={`career-sidebar ${open ? "open" : ""}`} role={open ? "dialog" : undefined} aria-modal={open ? "true" : undefined} aria-label={open ? "职迹导航" : undefined} aria-hidden={hidden || undefined} inert={hidden || undefined} tabIndex={open ? -1 : undefined}>
+    <Link href="/" className="career-brand" aria-label="返回私人工作台" tabIndex={hidden ? -1 : undefined}><span>职</span><div><b>职迹</b><small>每一步，都算数</small></div></Link><button data-sidebar-close className="career-icon-button mobile-only" tabIndex={hidden ? -1 : undefined} style={{ position: "absolute", insetBlockStart: 29, insetInlineEnd: 24 }} onClick={onClose} aria-label="关闭导航"><X size={18} /></button>
+    <nav className="career-nav" aria-label="职迹主导航">{navItems.map((item) => <button key={item.id} tabIndex={hidden ? -1 : undefined} aria-label={item.label} className={view === item.id ? "active" : ""} onClick={() => onNavigate(item.id)}><item.icon size={18} strokeWidth={1.8} /><span>{item.label}</span></button>)}</nav>
     <div className="career-sidebar-spacer" /><div className="career-sidebar-calm"><ShieldCheck size={15} /><div><b>这里不评价进度</b><p>等待、暂停或暂时没有新变化，都是正常状态。</p></div></div><div className="career-privacy"><ShieldCheck size={15} /><span>资料保存在本地 SQLite</span><i /></div>
   </aside></>;
 }
@@ -1406,18 +1787,70 @@ function ContactsView({ data, now, revision, onAdd, onSelect }: { data: CareerDa
   })}</div>}{!loading && contacts.length === 0 && <EmptyState icon={<UsersRound />} title={scope === "archived" ? "归档里很安静" : "还没有联系人"} text={scope === "archived" ? "移入归档的联系人会保留全部历史，也可以随时恢复。" : "不需要为了数量而添加。下一次真实认识某个人时，再把关系记下来。"} action={scope === "active" ? <button className="career-button primary" onClick={onAdd}>添加第一位联系人</button> : undefined} />}</div>;
 }
 
-function MaterialsView({ data, onAdd, onRemove }: { data: CareerData; onAdd: () => void; onRemove: (material: Material) => void | Promise<void> }) {
+function careerMaterialStatusText(status: string) {
+  if (status === "deleting") return "待收尾";
+  if (status === "sent") return "已发送";
+  if (status === "draft") return "编辑中";
+  if (status === "ready") return "可使用";
+  return "状态待确认";
+}
+
+function careerMaterialFileDetails(fileName: string, byteSize: number | null | undefined) {
+  return Number.isFinite(byteSize) && Number(byteSize) > 0
+    ? `${fileName} · ${Math.max(1, Math.round(Number(byteSize) / 1024))} KB`
+    : `${fileName} · 大小未记录`;
+}
+
+function MaterialsView({ data, stale, refreshBusy, recoveryLoaded, recoveryCount, recoveryUnreadable, recoveryStorageUnavailable, onRefresh, onAdd, onRecover, onClearUnreadable, onRetryRecoveryStorage, onRemove, notify }: { data: CareerData; stale: boolean; refreshBusy: boolean; recoveryLoaded: boolean; recoveryCount: number; recoveryUnreadable: boolean; recoveryStorageUnavailable: boolean; onRefresh: () => Promise<void>; onAdd: () => void; onRecover: () => void; onClearUnreadable: () => void; onRetryRecoveryStorage: () => void; onRemove: (material: Material, opener: HTMLButtonElement) => void; notify: (text: string, tone?: Notice["tone"]) => void }) {
+  const recoveryLocked = !recoveryLoaded || recoveryCount > 0 || recoveryUnreadable || recoveryStorageUnavailable;
+  const actionsLocked = stale || recoveryLocked;
   async function openFile(fileKey: string) {
-    const object = await createLocalFileObjectUrl("career", fileKey);
-    const anchor = document.createElement("a");
-    anchor.href = object.url;
-    anchor.download = object.metadata.originalName;
-    anchor.target = "_blank";
-    anchor.rel = "noreferrer";
-    anchor.click();
-    window.setTimeout(() => object.revoke(), 30_000);
+    try {
+      const object = await createLocalFileObjectUrl("career", fileKey);
+      const anchor = document.createElement("a");
+      anchor.href = object.url;
+      anchor.download = object.metadata.originalName;
+      anchor.target = "_blank";
+      anchor.rel = "noreferrer";
+      anchor.click();
+      window.setTimeout(() => object.revoke(), 30_000);
+    } catch {
+      notify("附件原件暂时没有打开；材料记录没有改动。", "error");
+    }
   }
-  return <div className="career-view"><SectionHeading eyebrow="MATERIALS" title="求职材料" description="保留每一个版本，也记住哪一份发给了谁" action={<button className="career-button primary" onClick={onAdd}><Plus size={16} />添加材料</button>} /><div className="career-material-grid">{data.materials.map((material) => { const job = data.jobs.find((item) => item.id === material.linked_job_id); return <article className="career-material-card" key={material.id}><span className={`career-file-icon ${material.kind}`}><FileText size={23} /></span><div><header><span>{material.kind}</span><em className={material.status}>{material.status === "sent" ? "已发送" : material.status === "draft" ? "编辑中" : "可使用"}</em>{material.file_key && <em className="attached">本地附件</em>}</header><h3>{material.name}</h3><p>{material.notes}</p><footer><span>{material.version} · 更新于 {formatDate(material.updated_at)}</span>{job && <small>用于 {job.company}</small>}{material.file_name && <small>{material.file_name} · {Math.max(1, Math.round((material.byte_size ?? 0) / 1024))} KB</small>}</footer></div><div className="career-material-actions">{material.file_key ? <button className="career-icon-button" onClick={() => void openFile(material.file_key!)} aria-label={`打开 ${material.file_name ?? material.name}`}><Download size={17} /></button> : <button className="career-button ghost" onClick={onAdd}>新建带附件版本</button>}<button className="career-icon-button danger" onClick={() => void onRemove(material)} aria-label={`移除 ${material.name}`}><Trash2 size={16} /></button></div></article>; })}</div></div>;
+  return <div className="career-view">
+    <SectionHeading eyebrow="MATERIALS" title="求职材料" description="保留每一个版本，也记住哪一份发给了谁" action={<button className="career-button primary" data-material-add disabled={actionsLocked} onClick={onAdd}><Plus size={16} />添加材料</button>} />
+    {stale && <div className="career-material-stale" role="status"><ShieldCheck size={20} /><div><b>材料列表需要重新读取</b><p>刚才的本机操作可能已完成；在读取最新状态前，材料按钮会暂时停用，避免重复保存或移除。</p></div><button className="career-button primary" data-material-refresh disabled={refreshBusy} onClick={() => { void onRefresh().catch(() => notify("材料列表暂时没有读到最新状态；不会重复保存或移除。", "error")); }}>{refreshBusy ? <LoaderCircle className="spin" size={16} /> : <RotateCcw size={16} />}{refreshBusy ? "正在读取…" : "重新读取"}</button></div>}
+    {!stale && !recoveryLoaded && <div className="career-material-recovery-banner" role="status"><LoaderCircle className="spin" size={20} /><div><b>正在核对附件收尾记录</b><p>核对完成前先不开放新附件，避免重复写入。</p></div></div>}
+    {!stale && recoveryLoaded && recoveryCount > 0 && <div className="career-material-recovery-banner" role="status"><ShieldCheck size={20} /><div><b>有材料保存需要继续核对</b><p>{recoveryStorageUnavailable ? "这条核对线索目前只留在本次打开的页面；刷新前请先继续收尾。" : "先把已有保存核对清楚，再开放新的附件；不会重复上传或盲目删除原件。"}</p></div><button className="career-button primary" data-material-recover onClick={onRecover}><RotateCcw size={16} />继续核对与收尾</button></div>}
+    {!stale && recoveryLoaded && recoveryCount === 0 && recoveryUnreadable && <div className="career-material-recovery-banner warning" role="status"><ShieldCheck size={20} /><div><b>有一条旧的收尾线索无法验证</b><p>系统没有据此删除任何原件。你可以明确保留原件，并只清除这条不可用的提醒。</p></div><button className="career-button secondary" data-material-recovery-clear onClick={onClearUnreadable}>保留原件并清除提醒</button></div>}
+    {!stale && recoveryLoaded && recoveryCount === 0 && !recoveryUnreadable && recoveryStorageUnavailable && <div className="career-material-recovery-banner warning" role="status"><ShieldCheck size={20} /><div><b>暂时无法读取附件收尾记录</b><p>为避免重复写入，新建材料暂时停用；现有材料没有改动。</p></div><button className="career-button secondary" data-material-recovery-retry onClick={onRetryRecoveryStorage}><RotateCcw size={16} />重新检查</button></div>}
+    <div className="career-material-grid">
+      {data.materials.map((material) => {
+        const job = data.jobs.find((item) => item.id === material.linked_job_id);
+        const cleanupPending = material.status === "deleting";
+        const statusText = careerMaterialStatusText(material.status);
+        return <article className={`career-material-card ${cleanupPending ? "cleanup-pending" : ""}`} key={material.id}>
+          <span className={`career-file-icon ${material.kind}`}><FileText size={23} /></span>
+          <div>
+            <header><span>{material.kind}</span><em className={material.status}>{statusText}</em>{material.file_key && !cleanupPending && <em className="attached">已关联本机原件</em>}</header>
+            <h3>{material.name}</h3>
+            <p>{cleanupPending ? "上次移除还在收尾；继续时会重新核对原件状态与其他引用。" : material.notes}</p>
+            <footer><span>{material.version} · 更新于 {formatDate(material.updated_at)}</span>{job && <small>用于 {job.company}</small>}{material.file_name && !cleanupPending && <small>{careerMaterialFileDetails(material.file_name, material.byte_size)}</small>}{cleanupPending && <small>原件状态会在继续收尾时核对</small>}</footer>
+          </div>
+          <div className="career-material-actions">
+            {cleanupPending
+              ? <button className="career-button secondary" disabled={actionsLocked} onClick={(event) => onRemove(material, event.currentTarget)}><RotateCcw size={15} />继续收尾</button>
+              : <>{material.file_key
+                ? <button className="career-icon-button" disabled={stale} onClick={() => void openFile(material.file_key!)} aria-label={`打开 ${material.file_name ?? material.name}`}><Download size={17} /></button>
+                : <button className="career-button ghost" disabled={actionsLocked} onClick={onAdd}>新建带附件版本</button>}
+                <button className="career-icon-button danger" disabled={actionsLocked} onClick={(event) => onRemove(material, event.currentTarget)} aria-label={`移除 ${material.name}`}><Trash2 size={16} /></button></>}
+          </div>
+        </article>;
+      })}
+      {!stale && !recoveryLocked && data.materials.length === 0 && <EmptyState icon={<FileText />} title="还没有材料版本" text="需要保存一份真实材料时再添加；空白不会影响其他求职记录。" action={<button className="career-button primary" data-material-add onClick={onAdd}>添加第一份材料</button>} />}
+    </div>
+  </div>;
 }
 
 function AnalyticsView({ data, now }: { data: CareerData; now: number }) {
@@ -1786,7 +2219,7 @@ function JobDrawer({ job, data, now, lifecyclePending, onClose, onLifecycle, onR
   }, [job.id]);
   async function save(event: FormEvent<HTMLFormElement>) { event.preventDefault(); if (archived) return; const form = new FormData(event.currentTarget); const result = await runCareerSql("UPDATE career_jobs SET company=?,role=?,location=?,salary=?,work_mode=?,description=?,note=?,tags=?,deadline=?,updated_at=? WHERE id=? AND archived=0", [form.get("company"), form.get("role"), form.get("location"), form.get("salary"), form.get("work_mode"), form.get("description"), form.get("note"), form.get("tags"), fromDateInput(String(form.get("deadline") || "")), new Date().toISOString(), job.id]); await onRefresh(); setEditing(false); if (result.changes === 0) { notify("职位状态刚有变化，这次编辑没有保存。请重新打开后确认。", "info"); return; } notify("职位信息已保存"); }
   return <Drawer label={`${job.company} · ${job.role}`} onClose={onClose} wide><div className="career-job-drawer-head"><CompanyMark company={job.company} /><div><SourceBadge source={job.source} /><h2>{job.role}</h2><p>{job.company} · {job.location || "地点待确认"}</p></div><button className="career-icon-button" onClick={onClose} aria-label="关闭职位详情"><X size={19} /></button></div><div className="career-job-status-row">{archived ? <span className="career-archived-state"><Archive size={14} />已归档 · {currentStage?.name ?? "原阶段"}</span> : <select value={job.stage_id} disabled={lifecyclePending} onChange={(event) => void onLifecycle({ kind: "stage", jobId: job.id, nextStageId: event.target.value })} aria-label="职位阶段">{data.stages.map((stage) => <option key={stage.id} value={stage.id}>{stage.name}</option>)}</select>}{ended && !archived && <span className="career-ended-state">已结束 · 只记录结果</span>}{careerJobIsWatched(job.priority) && <span><Target size={14} />已关注</span>}{safeLink(job.source_url) && <a href={job.source_url} target="_blank" rel="noreferrer">查看原职位 <ExternalLink size={14} /></a>}</div><div className="career-drawer-tabs">{[["overview", "职位概览"], ["tasks", `待办 ${tasks.length}`], ["interviews", `面试 ${interviews.length}`], ["materials", `材料 ${materials.length}`]].map(([id, label]) => <button className={tab === id ? "active" : ""} aria-pressed={tab === id} key={id} onClick={() => setTab(id as typeof tab)}>{label}</button>)}</div><div className="career-drawer-body">{tab === "overview" && (editing ? <form className="career-form" onSubmit={save}><Field label="公司"><input name="company" defaultValue={job.company} required /></Field><Field label="职位"><input name="role" defaultValue={job.role} required /></Field><div className="career-form-row"><Field label="地点"><input name="location" defaultValue={job.location} /></Field><Field label="工作方式"><input name="work_mode" defaultValue={job.work_mode} /></Field></div><div className="career-form-row"><Field label="薪资"><input name="salary" defaultValue={job.salary} /></Field><Field label="截止时间"><input name="deadline" type="datetime-local" defaultValue={dateInputValue(job.deadline)} /></Field></div><Field label="标签"><input name="tags" defaultValue={job.tags} /></Field><Field label="职位描述"><textarea name="description" rows={7} defaultValue={job.description} /></Field><Field label="个人备注"><textarea name="note" rows={4} defaultValue={job.note} /></Field><div className="career-form-actions"><button type="button" className="career-button ghost" onClick={() => setEditing(false)}>取消</button><button className="career-button primary">保存修改</button></div></form> : <>{!archived && <div className="career-detail-actions"><button className="career-button secondary career-ai-trigger" onClick={() => onAi("fit_analysis", "AI 职位要求拆解", { job })}><Sparkles size={15} />拆解职位要求</button><button className="career-button ghost" onClick={() => setEditing(true)}><Pencil size={15} />编辑</button><CareerAiDisclosure action="fit_analysis" className="in-job-actions" /></div>}<dl className="career-detail-grid"><div><dt>薪资范围</dt><dd>{job.salary || "未记录"}</dd></div><div><dt>工作方式</dt><dd>{job.work_mode || "未记录"}</dd></div><div><dt>申请来源</dt><dd>{job.source}</dd></div><div><dt>投递时间</dt><dd>{job.applied_at ? formatDate(job.applied_at) : "尚未投递"}</dd></div><div><dt>旧版联系人备注</dt><dd>{job.contact_name || "没有旧版备注"}</dd></div><div><dt>截止时间</dt><dd>{job.deadline ? formatDate(job.deadline, true) : "未记录"}</dd></div></dl><section className="career-detail-section"><h3>已关联联系人</h3>{linkedContacts.length > 0 ? <div className="career-job-contact-links">{linkedContacts.map((contact) => <button key={contact.id} onClick={() => onSelectContact(contact.id)}><span className="career-contact-avatar">{initials(contact.name)}</span><span><b>{contact.name}</b><small>{[contact.role, contact.company, contact.archived === 1 ? "已归档" : ""].filter(Boolean).join(" · ")}</small></span><ChevronRight size={16} /></button>)}</div> : <p className="career-contact-calm-copy">{job.contact_name ? `旧版备注写着“${job.contact_name}”，尚未确认成联系人关系。请从联系人页面明确关联。` : "还没有明确关联的联系人。可在联系人详情中管理职位关系。"}</p>}</section><section className="career-detail-section"><h3>职位描述</h3><p className="career-long-copy">{job.description || "还没有保存职位描述。"}</p></section><section className="career-detail-section"><h3>我的备注</h3><p className="career-long-copy">{job.note || "还没有添加备注。"}</p></section><div className="career-card-tags">{job.tags.split(",").filter(Boolean).map((tag) => <i key={tag}>{tag}</i>)}</div></>)}
-    {tab === "tasks" && <div className="career-drawer-list career-drawer-task-list">{tasks.map((task) => <CareerTaskRow key={task.id} task={task} data={data} now={now} onOpen={onOpenTask} onComplete={onCompleteTask} />)}{tasks.length === 0 && <EmptyState icon={<ListTodo />} title="还没有待办" text="为这个职位安排一个具体的下一步。" />}</div>}{tab === "interviews" && <div className="career-drawer-list">{interviews.map((item) => <article key={item.id}><span className="career-list-icon"><MessageSquareText size={16} /></span><div><b>{item.round_name}</b><small>{formatDate(item.scheduled_at, true)} · {item.interviewer || "面试官待确认"}{isCareerLifecyclePaused(item) ? " · 随职位暂停" : item.status === "canceled" ? " · 已取消" : ""}</small><p>{item.summary}</p></div></article>)}{interviews.length === 0 && <EmptyState icon={<MessageSquareText />} title="还没有面试轮次" text="推进到面试后，在这里完整记录每一轮。" />}</div>}{tab === "materials" && <div className="career-drawer-list">{materials.map((item) => <article key={item.id}><span className="career-list-icon"><FileText size={16} /></span><div><b>{item.name}</b><small>{item.kind} · {item.version}</small><p>{item.notes}</p></div></article>)}{materials.length === 0 && <EmptyState icon={<FileText />} title="还没有关联材料" text="关联确切版本，之后随时知道发出的是哪一份。" />}</div>}</div><footer className="career-drawer-footer">{archived ? <button className="career-button secondary" disabled={lifecyclePending} onClick={() => void onLifecycle({ kind: "restore", jobId: job.id })}><RotateCcw size={15} />从归档取回</button> : <button className="career-button ghost" disabled={lifecyclePending} onClick={() => void onLifecycle({ kind: "archive", jobId: job.id })}><Archive size={15} />收进归档</button>}<span>{archived ? "取回不会自动恢复已经过去或后来修改过的安排。" : "归档只是整理，不会删除职位或相关记录。"}</span></footer></Drawer>;
+    {tab === "tasks" && <div className="career-drawer-list career-drawer-task-list">{tasks.map((task) => <CareerTaskRow key={task.id} task={task} data={data} now={now} onOpen={onOpenTask} onComplete={onCompleteTask} />)}{tasks.length === 0 && <EmptyState icon={<ListTodo />} title="还没有待办" text="为这个职位安排一个具体的下一步。" />}</div>}{tab === "interviews" && <div className="career-drawer-list">{interviews.map((item) => <article key={item.id}><span className="career-list-icon"><MessageSquareText size={16} /></span><div><b>{item.round_name}</b><small>{formatDate(item.scheduled_at, true)} · {item.interviewer || "面试官待确认"}{isCareerLifecyclePaused(item) ? " · 随职位暂停" : item.status === "canceled" ? " · 已取消" : ""}</small><p>{item.summary}</p></div></article>)}{interviews.length === 0 && <EmptyState icon={<MessageSquareText />} title="还没有面试轮次" text="推进到面试后，在这里完整记录每一轮。" />}</div>}{tab === "materials" && <div className="career-drawer-list">{materials.map((item) => <article key={item.id}><span className="career-list-icon"><FileText size={16} /></span><div><b>{item.name}</b><small>{item.kind} · {item.version}{item.status === "deleting" ? " · 等待收尾" : ""}</small><p>{item.status === "deleting" ? "原件状态尚未确认，请到材料页继续或稍后核对。" : item.notes}</p></div></article>)}{materials.length === 0 && <EmptyState icon={<FileText />} title="还没有关联材料" text="关联确切版本，之后随时知道发出的是哪一份。" />}</div>}</div><footer className="career-drawer-footer">{archived ? <button className="career-button secondary" disabled={lifecyclePending} onClick={() => void onLifecycle({ kind: "restore", jobId: job.id })}><RotateCcw size={15} />从归档取回</button> : <button className="career-button ghost" disabled={lifecyclePending} onClick={() => void onLifecycle({ kind: "archive", jobId: job.id })}><Archive size={15} />收进归档</button>}<span>{archived ? "取回不会自动恢复已经过去或后来修改过的安排。" : "归档只是整理，不会删除职位或相关记录。"}</span></footer></Drawer>;
 }
 
 type InterviewEditorSnapshot = {
@@ -2327,30 +2760,774 @@ function ContactTaskModal({ contactId, data, onClose, onSaved }: { contactId: st
   return <Modal title="安排下一步" description="这是你主动选择的提醒；计划时间可以留空。" onClose={phase === "writing" ? () => undefined : onClose}><form className="career-form" onSubmit={submit}><Field label="要做什么"><input name="title" required placeholder="例如：确认下一轮时间" /></Field><Field label="关联职位" hint="可选；不会按公司自动猜"><select name="job_id" defaultValue=""><option value="">不关联职位</option>{availableJobs.map((job) => <option key={job.id} value={job.id}>{job.company} · {job.role}</option>)}</select></Field><div className="career-form-row"><Field label="计划时间（可选）" hint="不设时间会放在“以后再说”"><input name="due_at" type="datetime-local" /></Field><Field label="类型"><select name="kind" defaultValue="跟进"><option>跟进</option><option>材料</option><option>面试准备</option><option>其他</option></select></Field></div><Field label="优先级"><select name="priority" defaultValue="1"><option value="1">普通</option><option value="2">重点</option><option value="3">时间敏感</option></select></Field>{error && <div className="career-inline-error" role="alert"><X size={15} />{error}</div>}<div className="career-form-actions"><button type="button" className="career-button ghost" disabled={phase === "writing"} onClick={onClose}>取消</button><button className="career-button primary" disabled={phase === "writing"}>{phase === "writing" ? <LoaderCircle className="spin" size={16} /> : <CalendarDays size={16} />}{phase === "writing" ? "正在保存…" : "创建待办"}</button></div></form></Modal>;
 }
 
-function MaterialModal({ data, onClose, onSaved }: { data: CareerData; onClose: () => void; onSaved: () => Promise<void> }) {
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState("");
+type CareerMaterialSavePhase =
+  | "editing"
+  | "saving"
+  | "uncertain"
+  | "checking"
+  | "refreshing"
+  | "refresh-only"
+  | "conflict"
+  | "cleanup-review"
+  | "cleanup-checking"
+  | "cleanup-ready"
+  | "cleanup-running"
+  | "cleanup-pending"
+  | "cleanup-blocked"
+  | "cleanup-unavailable";
+type CareerMaterialDeletionPhase = "loading" | "ready" | "deleting" | "cleanup" | "uncertain" | "checking" | "refreshing" | "changed" | "refresh-only";
+
+function materialDeletionPendingMessage(reason: CareerMaterialDeletionPendingReason) {
+  if (reason === "reference_check_failed") return "本机暂时无法确认这个原件是否仍被其他版本使用，因此没有删除原件。";
+  if (reason === "file_cleanup_failed") return "材料记录还在等待收尾，本地原件暂时没有清理完成。";
+  return "本地原件已经处理，材料记录还在等待收尾。";
+}
+
+function materialDeletionSuccessMessage(action: CareerMaterialDeletedFileAction) {
+  if (action === "retained_shared") return "材料记录已移除；同一原件仍被其他版本使用，因此完整保留。";
+  if (action === "removed") return "材料记录与这份本地原件已移除。";
+  if (action === "already_absent") return "材料记录已移除；本地原件此前已经不存在。";
+  return "材料记录已移除。";
+}
+
+function materialSaveCleanupBlockedMessage(reason: CareerMaterialSaveCleanupBlockedReason) {
+  if (reason === "material_present") return "这个附件现在对应一份材料记录，因此系统保留了原件。";
+  if (reason === "file_referenced") return "这个附件仍被其他材料版本使用，因此系统保留了原件。";
+  if (reason === "file_changed") return "本机原件与收尾记录已不完全一致，系统没有删除它。";
+  return "职迹数据版本已经变化，系统停止了自动清理，也没有删除原件。";
+}
+
+function useMaterialPhaseFocus(phase: string, enabled = true) {
+  const phaseRootRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (!enabled) return;
+    const frame = window.requestAnimationFrame(() => {
+      const root = phaseRootRef.current;
+      const target = Array.from(root?.querySelectorAll<HTMLElement>("[data-dialog-initial]:not(:disabled)") ?? [])
+        .find((element) => !element.hidden && element.getAttribute("aria-hidden") !== "true" && element.getClientRects().length > 0) ?? root;
+      target?.focus({ preventScroll: true });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [enabled, phase]);
+  return phaseRootRef;
+}
+
+function MaterialModal({ data, initialRecovery, otherRecoveryPending, onRecoveryUpsert, onRecoveryClear, onClose, onStaleClose, onRefresh, notify }: { data: CareerData; initialRecovery: CareerMaterialSaveRecoveryEntry | null; otherRecoveryPending: boolean; onRecoveryUpsert: (ticket: CareerMaterialSaveRecoveryTicket) => boolean; onRecoveryClear: (ticket: CareerMaterialSaveRecoveryTicket, persisted: boolean) => boolean; onClose: () => void; onStaleClose: () => void; onRefresh: () => Promise<void>; notify: (text: string, tone?: Notice["tone"]) => void }) {
+  const initialSnapshot = initialRecovery?.ticket.kind === "uncertain-save" ? initialRecovery.ticket.expectedSnapshot : null;
+  const [materialId] = useState(() => initialRecovery?.ticket.kind === "uncertain-save" ? initialRecovery.ticket.materialId : newId("material"));
+  const [phase, setPhase] = useState<CareerMaterialSavePhase>(() => initialRecovery?.ticket.kind === "uncertain-save" ? "uncertain" : initialRecovery ? "cleanup-review" : "editing");
+  const [error, setError] = useState(() => initialRecovery?.ticket.kind === "uncertain-save"
+    ? "上次保存结果需要继续核对。核对只读取本机记录，不会再次保存。"
+    : initialRecovery ? "有一份未关联的暂存附件等待核对；只有确认安全后才会清理。" : "");
+  const [dirty, setDirty] = useState(false);
+  const [closeConfirm, setCloseConfirm] = useState(false);
+  const [refreshContext, setRefreshContext] = useState<"saved" | "conflict" | "recovery">("saved");
+  const [allowStaleExit, setAllowStaleExit] = useState(false);
+  const [activeRecovery, setActiveRecovery] = useState<CareerMaterialSaveRecoveryTicket | null>(initialRecovery?.ticket ?? null);
+  const [recoveryPersisted, setRecoveryPersisted] = useState(initialRecovery?.persisted ?? false);
+  const [cleanupReceipt, setCleanupReceipt] = useState<CareerMaterialSaveCleanupReceipt | null>(() => initialRecovery?.ticket.cleanupReceipt ?? null);
+  const [cleanupBlockedReason, setCleanupBlockedReason] = useState<CareerMaterialSaveCleanupBlockedReason | null>(null);
+  const [cleanupContinuation, setCleanupContinuation] = useState<"editing" | "refresh">(initialRecovery ? "refresh" : "editing");
+  const expectedRef = useRef<CareerMaterialSaveExpectedSnapshot | null>(initialRecovery?.ticket.kind === "uncertain-save" ? initialRecovery.ticket.expectedSnapshot : null);
+  const activeRecoveryRef = useRef<CareerMaterialSaveRecoveryTicket | null>(initialRecovery?.ticket ?? null);
+  const recoveryPersistedRef = useRef(initialRecovery?.persisted ?? false);
+  const boundRecoveryKeyRef = useRef(initialRecovery ? materialSaveRecoveryKey(initialRecovery.ticket) : null);
+  const savingRef = useRef(false);
+  const refreshingRef = useRef(false);
+  const savedOutcomeRef = useRef<"saved" | "already_saved">("saved");
+  const preparedTicketRef = useRef<CareerMaterialSaveRecoveryTicket | null>(null);
+  const finalClosePendingRef = useRef(false);
+  const resumeEditingFocusPendingRef = useRef(false);
+  const closeConfirmReturnRef = useRef<HTMLElement | null>(null);
+  const updatedAtRef = useRef<string | null>(initialSnapshot?.updatedAt ?? null);
+  const phaseRootRef = useMaterialPhaseFocus(phase);
+  const incomingRecoveryKey = initialRecovery ? materialSaveRecoveryKey(initialRecovery.ticket) : null;
+  const unboundRecoveryPending = otherRecoveryPending || incomingRecoveryKey !== boundRecoveryKeyRef.current;
+  const materialKinds = ["简历", "求职信", "作品集", "案例", "其他"] as const;
+  const initialLinkedJobUnavailable = Boolean(initialSnapshot?.linkedJobId && !data.jobs.some((job) => job.id === initialSnapshot.linkedJobId));
+
+  useEffect(() => {
+    if (closeConfirm || !finalClosePendingRef.current) return;
+    finalClosePendingRef.current = false;
+    const frame = window.requestAnimationFrame(onClose);
+    return () => window.cancelAnimationFrame(frame);
+  }, [closeConfirm, onClose]);
+
+  useEffect(() => {
+    if (closeConfirm || !resumeEditingFocusPendingRef.current) return;
+    resumeEditingFocusPendingRef.current = false;
+    const frame = window.requestAnimationFrame(() => {
+      const previous = closeConfirmReturnRef.current;
+      const fallback = phaseRootRef.current?.querySelector<HTMLInputElement>('input[name="name"]');
+      const target = previous?.isConnected && previous.getClientRects().length > 0 ? previous : fallback;
+      target?.focus({ preventScroll: true });
+      closeConfirmReturnRef.current = null;
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [closeConfirm, phaseRootRef]);
+
+  useEffect(() => {
+    const writeInFlight = phase === "saving" || phase === "checking" || phase === "refreshing" || phase === "cleanup-checking" || phase === "cleanup-running";
+    if (!dirty && !writeInFlight && !(activeRecovery && !recoveryPersisted)) return;
+    function protectMaterialWork(event: BeforeUnloadEvent) {
+      event.preventDefault();
+      event.returnValue = "";
+    }
+    window.addEventListener("beforeunload", protectMaterialWork);
+    return () => window.removeEventListener("beforeunload", protectMaterialWork);
+  }, [activeRecovery, dirty, phase, recoveryPersisted]);
+
+  function rememberRecovery(ticket: CareerMaterialSaveRecoveryTicket) {
+    const persisted = onRecoveryUpsert(ticket);
+    boundRecoveryKeyRef.current = materialSaveRecoveryKey(ticket);
+    setActiveRecovery(ticket);
+    activeRecoveryRef.current = ticket;
+    setRecoveryPersisted(persisted);
+    recoveryPersistedRef.current = persisted;
+    return persisted;
+  }
+
+  function forgetRecovery(ticket: CareerMaterialSaveRecoveryTicket | null = activeRecoveryRef.current) {
+    if (!ticket) return true;
+    const cleared = onRecoveryClear(ticket, recoveryPersistedRef.current);
+    if (cleared) {
+      if (!activeRecoveryRef.current || materialSaveRecoveryKey(activeRecoveryRef.current) === materialSaveRecoveryKey(ticket)) {
+        setActiveRecovery(null);
+        activeRecoveryRef.current = null;
+        boundRecoveryKeyRef.current = null;
+        setRecoveryPersisted(false);
+        recoveryPersistedRef.current = false;
+      }
+    }
+    return cleared;
+  }
+
+  function requestClose() {
+    if (phase !== "editing") {
+      if (activeRecovery && recoveryPersisted && (phase === "uncertain" || phase === "cleanup-review" || phase === "cleanup-pending" || phase === "cleanup-ready" || phase === "cleanup-blocked")) onClose();
+      return;
+    }
+    if (dirty) {
+      closeConfirmReturnRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+      setCloseConfirm(true);
+      return;
+    }
+    onClose();
+  }
+
+  function resumeMaterialEditing() {
+    resumeEditingFocusPendingRef.current = true;
+    setCloseConfirm(false);
+  }
+
+  function recoveryWithCleanupReceipt(receipt: CareerMaterialSaveCleanupReceipt) : CareerMaterialSaveRecoveryTicket {
+    if (activeRecoveryRef.current?.kind === "uncertain-save") return { ...activeRecoveryRef.current, cleanupReceipt: receipt };
+    return {
+      version: 1,
+      kind: "cleanup-only",
+      cleanupReceipt: receipt,
+      recordedAt: activeRecoveryRef.current?.recordedAt ?? new Date().toISOString(),
+    };
+  }
+
+  function enterCleanupBlocked(receipt: CareerMaterialSaveCleanupReceipt, reason: CareerMaterialSaveCleanupBlockedReason | null, message?: string) {
+    const ticket = recoveryWithCleanupReceipt(receipt);
+    rememberRecovery(ticket);
+    setCleanupReceipt(receipt);
+    setCleanupBlockedReason(reason);
+    setPhase("cleanup-blocked");
+    setError(message ?? (reason ? materialSaveCleanupBlockedMessage(reason) : "这条收尾线索无法继续验证；系统没有删除任何原件。"));
+  }
+
+  function finishUnavailableRecovery() {
+    const ticket = activeRecoveryRef.current;
+    if (ticket && !forgetRecovery(ticket)) {
+      setError("系统仍会保留原件，但浏览器暂时无法清除这条提醒。请稍后再试；这里不会删除或重新保存。");
+      return;
+    }
+    expectedRef.current = null;
+    setCleanupReceipt(null);
+    setDirty(false);
+    onClose();
+  }
+
+  async function inspectAttachmentCleanup(receiptInput: CareerMaterialSaveCleanupReceipt = cleanupReceipt!) {
+    if (savingRef.current || !receiptInput) return;
+    savingRef.current = true;
+    setPhase("cleanup-checking");
+    setError("");
+    try {
+      const inspected = await inspectCareerMaterialSaveCleanup(receiptInput);
+      const ticket = recoveryWithCleanupReceipt(inspected.receipt);
+      rememberRecovery(ticket);
+      setCleanupReceipt(inspected.receipt);
+      if (inspected.state === "cleanup_ready") {
+        setPhase("cleanup-ready");
+        setError("已确认这是一份未被材料记录引用的暂存附件；只有你继续，才会清理它。");
+      } else if (inspected.state === "blocked") {
+        enterCleanupBlocked(inspected.receipt, inspected.reason);
+      } else {
+        setPhase("cleanup-pending");
+        setError("本机暂时还无法确认附件状态。稍后继续只读核对，不会重复上传或盲目删除。");
+      }
+    } catch (caught) {
+      if (caught instanceof CareerMaterialSaveError && caught.code === "invalid_cleanup_receipt") {
+        setPhase("cleanup-unavailable");
+        setError("这条附件收尾线索已经损坏，无法继续验证。系统没有删除任何原件；你可以明确保留原件并结束这条提醒。");
+      } else {
+        setPhase("cleanup-pending");
+        setError(caught instanceof Error ? caught.message : "本机暂时无法核对附件收尾状态；没有删除任何原件。");
+      }
+    } finally {
+      savingRef.current = false;
+    }
+  }
+
+  async function retryAttachmentCleanup() {
+    if (savingRef.current || !cleanupReceipt) return;
+    savingRef.current = true;
+    setPhase("cleanup-running");
+    setError("");
+    try {
+      const result = await retryCareerMaterialSaveCleanup(cleanupReceipt);
+      if (result.outcome === "cleaned" || result.outcome === "already_cleaned") {
+        if (!forgetRecovery()) {
+          setPhase("cleanup-pending");
+          setError("附件已经收尾，但浏览器暂时没有清除恢复提醒。请留在这里再试一次；不会重复清理。");
+          return;
+        }
+        expectedRef.current = null;
+        setCleanupReceipt(null);
+        setCleanupBlockedReason(null);
+        if (cleanupContinuation === "editing") {
+          setDirty(true);
+          setPhase("editing");
+          setError(unboundRecoveryPending
+            ? "上次未关联的暂存附件已经收尾，文字内容仍保留在表单中。另一份材料还在等待核对；你可以先查看或复制当前内容，再明确关闭。"
+            : "上次未关联的暂存附件已经收尾。文字内容仍保留；需要时可重新选择文件并保存。");
+          notify("未关联的暂存附件已收尾。", "info");
+        } else {
+          setDirty(false);
+          await refreshAfterRecovery();
+        }
+      } else if (result.outcome === "blocked") {
+        enterCleanupBlocked(result.receipt, result.reason);
+      } else if ("receipt" in result) {
+        const ticket = recoveryWithCleanupReceipt(result.receipt);
+        rememberRecovery(ticket);
+        setCleanupReceipt(result.receipt);
+        setPhase("cleanup-pending");
+        setError("附件收尾暂时没有完成。恢复线索仍保留；稍后继续不会重复保存材料。");
+      }
+    } catch (caught) {
+      setPhase("cleanup-pending");
+      setError(caught instanceof Error ? caught.message : "附件收尾暂时没有完成；恢复线索仍保留。");
+    } finally {
+      savingRef.current = false;
+    }
+  }
+
+  async function keepAttachmentAndFinishRecovery() {
+    if (!activeRecoveryRef.current || refreshingRef.current) return;
+    if (!forgetRecovery()) {
+      setError("原件仍会保留，但浏览器暂时无法清除这条提醒。请稍后再试。");
+      return;
+    }
+    refreshingRef.current = true;
+    setRefreshContext("recovery");
+    setAllowStaleExit(false);
+    setPhase("refreshing");
+    try {
+      await onRefresh();
+      notify("已保留本机原件，并结束这条收尾提醒。", "info");
+      onClose();
+    } catch {
+      setPhase("refresh-only");
+      setAllowStaleExit(true);
+      setError("原件已经保留、收尾提醒已经结束；材料列表暂时没有重新读取。这里只需要刷新画面。");
+    } finally {
+      refreshingRef.current = false;
+    }
+  }
+
+  async function refreshAfterRecovery() {
+    if (refreshingRef.current) return;
+    refreshingRef.current = true;
+    setRefreshContext("recovery");
+    setAllowStaleExit(false);
+    setPhase("refreshing");
+    setError("");
+    try {
+      await onRefresh();
+      notify("附件收尾已完成，材料列表已重新读取。", "info");
+      onClose();
+    } catch {
+      setPhase("refresh-only");
+      setAllowStaleExit(true);
+      setError("附件收尾已经完成，但材料列表暂时没有重新读取。这里只需要刷新画面。");
+    } finally {
+      refreshingRef.current = false;
+    }
+  }
+
+  async function refreshAfterSave() {
+    if (refreshingRef.current) return;
+    refreshingRef.current = true;
+    setAllowStaleExit(false);
+    setRefreshContext("saved");
+    setPhase("refreshing");
+    setError("");
+    try {
+      await onRefresh();
+      notify(savedOutcomeRef.current === "already_saved" ? "这份材料已经保存在本机，没有重复创建。" : "材料已保存在本机。");
+      onClose();
+    } catch {
+      setPhase("refresh-only");
+      setAllowStaleExit(true);
+      setError("材料已经写入本机 SQLite，但画面暂时没有重新读取。请只重新读取，不要再次保存。");
+    } finally {
+      refreshingRef.current = false;
+    }
+  }
+
+  async function inspectUncertainSave() {
+    if (savingRef.current || !expectedRef.current) return;
+    savingRef.current = true;
+    setPhase("checking");
+    setError("");
+    try {
+      const inspection = await inspectCareerMaterialSave(materialId, expectedRef.current);
+      if (inspection === "exact_saved") {
+        if (!forgetRecovery()) {
+          setPhase("uncertain");
+          setError("已经确认材料保存在本机，但浏览器暂时没有清除核对提醒。不会重复保存；请稍后再核对一次。");
+          return;
+        }
+        savedOutcomeRef.current = "saved";
+        await refreshAfterSave();
+      } else if (inspection === "absent") {
+        if (cleanupReceipt) {
+          setCleanupContinuation("editing");
+          setPhase("cleanup-review");
+          setError("已确认材料记录没有写入。先核对并收尾这次暂存附件，完成后才会重新开放保存。");
+        } else if (forgetRecovery()) {
+          expectedRef.current = null;
+          setDirty(true);
+          setPhase("editing");
+          setError(initialSnapshot?.attachment
+            ? `已确认材料记录没有写入。文字内容已恢复；浏览器不能重新填入“${initialSnapshot.attachment.originalName}”，请重新选择文件后再保存。`
+            : "已确认材料记录没有写入。文字内容已恢复，可以在准备好时重试。");
+        } else {
+          setPhase("uncertain");
+          setError("已确认材料记录没有写入，但浏览器暂时没有清除核对提醒。这里不会重新保存。");
+        }
+      } else if (inspection === "conflict") {
+        if (cleanupReceipt) {
+          setCleanupContinuation("refresh");
+          setPhase("cleanup-review");
+          setError("同一材料标识现在对应不同内容，没有覆盖它。先核对这次暂存附件，再重新读取列表。");
+        } else if (forgetRecovery()) {
+          setPhase("conflict");
+          setError("同一材料标识现在对应不同内容。没有覆盖任何记录，请只重新读取材料列表后再决定。");
+        } else {
+          setPhase("uncertain");
+          setError("没有覆盖另一份内容，但浏览器暂时没有清除核对提醒。这里不会重新保存。");
+        }
+      } else {
+        setPhase("uncertain");
+        setError("本机仍无法确认是否已经保存。继续核对不会重复写入，也不会重新上传附件。");
+      }
+    } catch (caught) {
+      if (caught instanceof CareerMaterialSaveError &&
+        (caught.code === "invalid_input" || caught.code === "invalid_cleanup_receipt")) {
+        setPhase("cleanup-unavailable");
+        setError("这条保存核对线索已经损坏，无法继续验证。系统不会重新保存或删除原件；你可以明确保留原件并结束这条提醒。");
+      } else {
+        setPhase("uncertain");
+        setError("本机暂时无法核对保存结果。这里不会重新提交；稍后可以继续只读核对。");
+      }
+    } finally {
+      savingRef.current = false;
+    }
+  }
+
+  async function refreshAfterConflict() {
+    if (refreshingRef.current) return;
+    refreshingRef.current = true;
+    setAllowStaleExit(false);
+    setRefreshContext("conflict");
+    setPhase("refreshing");
+    try {
+      await onRefresh();
+      notify("材料列表已重新读取；没有覆盖另一份内容。", "info");
+      onClose();
+    } catch {
+      setPhase("conflict");
+      setAllowStaleExit(true);
+      setError("没有覆盖另一份内容，但材料列表暂时没有重新读取。请稍后只重试读取；这里不会覆盖或重新保存。");
+    } finally {
+      refreshingRef.current = false;
+    }
+  }
+
   async function submit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault(); setSaving(true); setError("");
+    event.preventDefault();
+    if (savingRef.current) return;
+    if (unboundRecoveryPending) {
+      setError("还有一份材料保存等待核对。先完成已有收尾，再添加新的附件。");
+      return;
+    }
+    savingRef.current = true;
+    setPhase("saving");
+    setError("");
     const form = new FormData(event.currentTarget);
     const selected = form.get("attachment");
     const file = selected instanceof File && selected.size > 0 ? selected : null;
+    updatedAtRef.current ??= new Date().toISOString();
+    const input: CareerMaterialSaveInput = {
+      materialId,
+      name: String(form.get("name") ?? ""),
+      kind: String(form.get("kind") ?? ""),
+      version: String(form.get("version") ?? ""),
+      updatedAt: updatedAtRef.current,
+      linkedJobId: String(form.get("linked_job_id") ?? "") || null,
+      status: String(form.get("status") ?? "ready") as CareerMaterialSaveInput["status"],
+      notes: String(form.get("notes") ?? ""),
+      attachment: file ? { blob: file, originalName: file.name, mimeType: file.type } : null,
+    };
+    preparedTicketRef.current = null;
     try {
-      await withCareerWriteLock(async (context) => {
-        const metadata = file ? await saveLocalFile("career", file, { originalName: file.name, mimeType: file.type, category: "career-material" }) : null;
-        try {
-          await runCareerSql("INSERT INTO career_materials (id,name,kind,version,updated_at,linked_job_id,status,notes,file_key,file_name,mime_type,byte_size) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", [newId("material"), form.get("name"), form.get("kind"), form.get("version"), new Date().toISOString(), form.get("linked_job_id") || null, form.get("status"), form.get("notes"), metadata?.key ?? null, metadata?.originalName ?? null, metadata?.mimeType ?? null, metadata?.byteSize ?? null], context);
-        } catch (caught) {
-          if (metadata) await deleteLocalFile("career", metadata.key).catch(() => undefined);
-          throw caught;
-        }
+      const result = await saveCareerMaterial(input, {
+        onRecoveryPrepared(prepared) {
+          const ticket: CareerMaterialSaveRecoveryTicket = {
+            version: 1,
+            kind: "uncertain-save",
+            materialId: prepared.materialId,
+            expectedSnapshot: prepared.expectedSnapshot,
+            cleanupReceipt: prepared.cleanupReceipt,
+            recordedAt: new Date().toISOString(),
+          };
+          preparedTicketRef.current = ticket;
+          expectedRef.current = prepared.expectedSnapshot;
+          setCleanupReceipt(prepared.cleanupReceipt);
+          if (!rememberRecovery(ticket)) throw new Error("recovery storage unavailable");
+        },
       });
-      await onSaved();
+      const preparedTicket = preparedTicketRef.current as CareerMaterialSaveRecoveryTicket | null;
+      if (result.outcome === "outcome_uncertain") {
+        expectedRef.current = result.expectedSnapshot;
+        setCleanupReceipt(result.cleanupReceipt);
+        const ticket = preparedTicket ?? {
+          version: 1 as const,
+          kind: "uncertain-save" as const,
+          materialId: result.materialId,
+          expectedSnapshot: result.expectedSnapshot,
+          cleanupReceipt: result.cleanupReceipt,
+          recordedAt: new Date().toISOString(),
+        };
+        const persisted = preparedTicket ? recoveryPersistedRef.current : rememberRecovery(ticket);
+        setPhase("uncertain");
+        setError(persisted
+          ? "附件与记录可能已经保存在本机，但最终回执没有返回。请先只读核对，不要再次保存。"
+          : "保存结果需要核对，恢复线索目前只留在本次打开的页面。请不要刷新，先继续只读核对。");
+      } else {
+        if (preparedTicket && !forgetRecovery(preparedTicket)) {
+          setPhase("uncertain");
+          setError("材料已经保存在本机，但浏览器暂时没有清除核对提醒。不会重复保存；请只读核对。");
+          return;
+        }
+        savedOutcomeRef.current = result.outcome;
+        await refreshAfterSave();
+      }
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "材料保存失败");
-    } finally { setSaving(false); }
+      const preparedTicket = preparedTicketRef.current as CareerMaterialSaveRecoveryTicket | null;
+      if (caught instanceof CareerMaterialSaveError && caught.code === "temporary_file_cleanup_failed") {
+        if (caught.cleanupReceipt) {
+          const ticket: CareerMaterialSaveRecoveryTicket = preparedTicket
+            ? { ...preparedTicket, cleanupReceipt: caught.cleanupReceipt }
+            : {
+                version: 1,
+                kind: "cleanup-only",
+                cleanupReceipt: caught.cleanupReceipt,
+                recordedAt: new Date().toISOString(),
+              };
+          const persisted = rememberRecovery(ticket);
+          setCleanupReceipt(caught.cleanupReceipt);
+          if (ticket.kind === "uncertain-save") {
+            expectedRef.current = ticket.expectedSnapshot;
+            setPhase("uncertain");
+            setError(persisted
+              ? "这次写入没有拿到完整回执。先只读核对材料记录，再决定是否需要收尾附件；不会重新保存。"
+              : "写入结果需要核对，线索目前只留在本次打开的页面。请不要刷新，先继续只读核对。");
+          } else {
+            setCleanupContinuation("refresh");
+            setPhase("cleanup-review");
+            setError(persisted
+              ? "材料记录没有写入；有一份未关联的暂存附件等待核对。不会重新保存，只有确认安全后才会清理。"
+              : "材料记录没有写入；收尾线索目前只留在本次打开的页面。请不要刷新，先继续核对附件。");
+          }
+        } else {
+          if (preparedTicket) forgetRecovery(preparedTicket);
+          setPhase("cleanup-unavailable");
+          setError("材料记录没有写入，但浏览器没有返回可验证的附件收尾线索。系统不会猜测或删除原件；请保留原件并结束这次操作。");
+        }
+      } else if (caught instanceof CareerMaterialSaveError && caught.code === "recovery_prepare_failed") {
+        if (preparedTicket && forgetRecovery(preparedTicket)) {
+          setPhase("editing");
+          setError("浏览器没能保留恢复线索，因此没有写入材料；已安全收尾的暂存附件不会显示成材料记录。稍后可以再试。");
+        } else {
+          setPhase("uncertain");
+          setError("材料没有继续写入，但恢复提醒暂时无法清除。这里不会重复保存；请继续只读核对。");
+        }
+      } else if (caught instanceof CareerMaterialSaveError && caught.code === "conflict") {
+        if (preparedTicket && !forgetRecovery(preparedTicket)) {
+          setPhase("uncertain");
+          setError("没有覆盖另一份内容，但浏览器暂时没有清除核对提醒。请只读核对，不要再次保存。");
+        } else {
+          setPhase("conflict");
+          setAllowStaleExit(true);
+          setError(caught.message);
+        }
+      } else {
+        if (preparedTicket && !forgetRecovery(preparedTicket)) {
+          setPhase("uncertain");
+          setError("这次写入没有继续，但浏览器暂时没有清除核对提醒。请只读核对，不要再次保存。");
+          return;
+        }
+        setPhase("editing");
+        setError(caught instanceof Error ? caught.message : "这次没有确认写入；表单内容仍保留。请稍后重试。");
+      }
+    } finally {
+      savingRef.current = false;
+    }
   }
-  return <Modal title="添加求职材料" description="记录版本与用途；可选文件会保存到本机 OPFS。" onClose={onClose}><form className="career-form" onSubmit={submit}><Field label="材料名称"><input name="name" required placeholder="产品设计主简历" /></Field><div className="career-form-row"><Field label="类型"><select name="kind"><option>简历</option><option>求职信</option><option>作品集</option><option>案例</option><option>其他</option></select></Field><Field label="版本"><input name="version" defaultValue="v1.0" required /></Field></div><Field label="本地文件" hint="可选；不会写入 SQLite"><input name="attachment" type="file" accept=".pdf,.doc,.docx,.ppt,.pptx,.txt,.md,application/pdf" /></Field><Field label="关联职位"><select name="linked_job_id"><option value="">主材料 / 不关联</option>{data.jobs.map((job) => <option key={job.id} value={job.id}>{job.company} · {job.role}</option>)}</select></Field><Field label="状态"><select name="status"><option value="ready">可使用</option><option value="draft">编辑中</option><option value="sent">已发送</option></select></Field><Field label="备注"><textarea name="notes" rows={4} placeholder="这版材料做了哪些调整？" /></Field>{error && <div className="career-inline-error"><X size={15} />{error}</div>}<div className="career-form-actions"><button type="button" className="career-button ghost" onClick={onClose}>取消</button><button className="career-button primary" disabled={saving}>{saving ? <LoaderCircle className="spin" size={16} /> : <Upload size={16} />}{saving ? "正在保存…" : "保存材料"}</button></div></form></Modal>;
+
+  const canPauseRecovery = Boolean(activeRecovery && recoveryPersisted && (phase === "uncertain" || phase === "cleanup-review" || phase === "cleanup-pending" || phase === "cleanup-ready" || phase === "cleanup-blocked"));
+  const dismissible = phase === "editing" || canPauseRecovery;
+  const cleanupPhase = phase.startsWith("cleanup-");
+  const recoveryRefreshPhase = (phase === "refreshing" || phase === "refresh-only") && refreshContext !== "saved";
+  const modalTitle = cleanupPhase || (recoveryRefreshPhase && refreshContext === "recovery")
+    ? "附件收尾"
+    : phase === "uncertain" || phase === "checking"
+      ? "核对材料保存"
+      : recoveryRefreshPhase || phase === "conflict"
+        ? "核对材料列表"
+        : phase === "refreshing" || phase === "refresh-only"
+          ? "材料已保存在本机"
+          : "添加求职材料";
+  return <><Modal title={modalTitle} description={cleanupPhase || refreshContext === "recovery" ? "只处理上次未完成的本机附件，不会新增或覆盖材料。" : "记录版本与用途；可选文件会保存到当前浏览器的本地存储。"} onClose={requestClose} dismissible={dismissible} inertToasts={phase !== "editing"}>
+    <div ref={phaseRootRef} className="career-material-modal-body" data-material-phase-focus tabIndex={-1}>
+    <form className="career-form" hidden={phase !== "editing"} aria-hidden={phase !== "editing"} onChange={() => setDirty(true)} onSubmit={submit}><Field label="材料名称"><input name="name" data-dialog-initial defaultValue={initialSnapshot?.name ?? ""} required placeholder="产品设计主简历" /></Field><div className="career-form-row"><Field label="类型"><select name="kind" defaultValue={initialSnapshot?.kind ?? "简历"}>{initialSnapshot && !materialKinds.includes(initialSnapshot.kind as typeof materialKinds[number]) && <option value={initialSnapshot.kind}>{initialSnapshot.kind}（已恢复）</option>}{materialKinds.map((kind) => <option key={kind}>{kind}</option>)}</select></Field><Field label="版本"><input name="version" defaultValue={initialSnapshot?.version ?? "v1.0"} required /></Field></div><Field label="本地文件" hint="可选；SQLite 只保存文件索引，原件留在浏览器私有存储"><input name="attachment" type="file" accept=".pdf,.doc,.docx,.ppt,.pptx,.txt,.md,application/pdf" />{initialSnapshot?.attachment && <small className="career-field-recovery-note">上次选择过“{initialSnapshot.attachment.originalName}”。浏览器不会自动重新选取文件；若核对确认未保存，请重新选择。</small>}</Field><Field label="关联职位"><select name="linked_job_id" defaultValue={initialSnapshot?.linkedJobId ?? ""}><option value="">主材料 / 不关联</option>{initialLinkedJobUnavailable && <option value={initialSnapshot!.linkedJobId!}>原关联职位（当前列表不可用）</option>}{data.jobs.map((job) => <option key={job.id} value={job.id}>{job.company} · {job.role}</option>)}</select></Field><Field label="状态"><select name="status" defaultValue={initialSnapshot?.status ?? "ready"}><option value="ready">可使用</option><option value="draft">编辑中</option><option value="sent">已发送</option></select></Field><Field label="备注"><textarea name="notes" rows={4} defaultValue={initialSnapshot?.notes ?? ""} placeholder="这版材料做了哪些调整？" /></Field>{unboundRecoveryPending && <div className="career-inline-error" role="status"><ShieldCheck size={15} />另一份材料保存正在等待核对。当前输入会保留；请先关闭并处理已有收尾。</div>}{error && <div className="career-inline-error" role="alert"><X size={15} />{error}</div>}<div className="career-form-actions"><button type="button" className="career-button ghost" onClick={requestClose}>取消</button><button className="career-button primary" disabled={unboundRecoveryPending}><Upload size={16} />保存材料</button></div></form>
+    {phase === "saving" && <div className="career-material-recovery" role="status"><LoaderCircle className="spin" size={23} /><h3>正在保存到本机</h3><p>先写入附件，再写入材料记录；完成前不会让重复提交。</p></div>}
+    {phase === "uncertain" && <div className="career-material-recovery uncertain" role="status" aria-live="polite"><ShieldCheck size={24} /><h3>需要核对保存结果</h3><p>{error}</p><div className="career-material-recovery-actions">{recoveryPersisted && <button className="career-button secondary" onClick={onClose}>稍后继续</button>}<button className="career-button primary" data-dialog-initial onClick={() => void inspectUncertainSave()}><Search size={16} />只读核对</button></div><small>{recoveryPersisted ? "核对线索已留在这台设备；核对只读取 SQLite 与附件校验值。" : "核对线索只在本次打开期间可用；请先不要刷新或关闭页面。"}</small></div>}
+    {phase === "checking" && <div className="career-material-recovery" role="status"><LoaderCircle className="spin" size={23} /><h3>正在只读核对</h3><p>不会再次保存，也不会换一个材料标识。</p></div>}
+    {phase === "cleanup-review" && <div className="career-material-recovery cleanup" role="status" aria-live="polite"><ShieldCheck size={24} /><h3>先核对这份暂存附件</h3><p>{error}</p><div className="career-material-recovery-actions">{recoveryPersisted && <button className="career-button secondary" onClick={onClose}>稍后继续</button>}<button className="career-button primary" data-dialog-initial onClick={() => void inspectAttachmentCleanup()}><Search size={16} />只读核对附件</button></div><small>这里只确认附件是否未被材料使用；还不会删除它。</small></div>}
+    {phase === "cleanup-checking" && <div className="career-material-recovery" role="status"><LoaderCircle className="spin" size={23} /><h3>正在核对附件状态</h3><p>会再次确认数据版本、材料引用与原件校验值；不会写入材料。</p></div>}
+    {phase === "cleanup-ready" && <div className="career-material-recovery cleanup" role="status" aria-live="polite"><ShieldCheck size={24} /><h3>可以安全收尾</h3><p>{error}</p><div className="career-material-recovery-actions">{recoveryPersisted && <button className="career-button secondary" onClick={onClose}>稍后继续</button>}<button className="career-button primary" data-dialog-initial onClick={() => void retryAttachmentCleanup()}><Trash2 size={16} />清理未关联附件</button></div><small>执行前还会重新检查一次；条件变化就会停止，不会盲目删除。</small></div>}
+    {phase === "cleanup-running" && <div className="career-material-recovery" role="status"><LoaderCircle className="spin" size={23} /><h3>正在完成附件收尾</h3><p>只处理恢复凭据绑定的那一份未关联附件。</p></div>}
+    {phase === "cleanup-pending" && <div className="career-material-recovery cleanup" role="status" aria-live="polite"><ShieldCheck size={24} /><h3>附件暂时还不能收尾</h3><p>{error}</p><div className="career-material-recovery-actions">{recoveryPersisted && <button className="career-button secondary" onClick={onClose}>稍后继续</button>}<button className="career-button primary" data-dialog-initial onClick={() => void inspectAttachmentCleanup()}><RotateCcw size={16} />再次只读核对</button></div><small>{recoveryPersisted ? "恢复线索会保留；页面关闭后也不会把它当作已完成。" : "恢复线索只在本次打开期间可用，请先不要刷新。"}</small></div>}
+    {phase === "cleanup-blocked" && <div className="career-material-recovery conflict" role="status" aria-live="polite"><ShieldCheck size={24} /><h3>这份原件会保留</h3><p>{error}</p><div className="career-material-recovery-actions">{recoveryPersisted && <button className="career-button secondary" onClick={onClose}>先保留提醒</button>}<button className="career-button primary" data-dialog-initial onClick={() => void keepAttachmentAndFinishRecovery()}><ShieldCheck size={16} />保留原件并结束提醒</button></div><small>{cleanupBlockedReason === "material_present" || cleanupBlockedReason === "file_referenced" ? "原件与现有材料有关联，保留它是安全默认。" : "无法证明安全时，系统不会删除原件。"}</small></div>}
+    {phase === "cleanup-unavailable" && <div className="career-material-recovery conflict" role="status" aria-live="polite"><ShieldCheck size={24} /><h3>这份原件会保留</h3><p>{error}</p><div className="career-material-recovery-actions"><button className="career-button primary" data-dialog-initial onClick={finishUnavailableRecovery}><ShieldCheck size={16} />保留原件并结束提醒</button></div><small>这不会声称原件已清理；也不会自动删除任何本机文件。</small></div>}
+    {phase === "refreshing" && <div className="career-material-recovery" role="status"><LoaderCircle className="spin" size={23} /><h3>正在重新读取材料列表</h3><p>{refreshContext === "saved" ? "材料已经写入；这里只更新画面，不会再次保存。" : refreshContext === "conflict" ? "只读取最新内容，不会覆盖或重新保存。" : "附件处理结果已经确定；这里只更新画面。"}</p></div>}
+    {phase === "refresh-only" && <div className="career-material-recovery" role="status"><ShieldCheck size={24} /><h3>{refreshContext === "saved" ? "材料已经保存在本机" : "材料状态需要重新读取"}</h3><p>{error || "现在只需重新读取画面；这一步不会创建新材料或再次写入附件。"}</p><div className="career-material-recovery-actions">{allowStaleExit && <button className="career-button secondary" onClick={onStaleClose}>先回材料页</button>}<button className="career-button primary" data-dialog-initial onClick={() => void (refreshContext === "saved" ? refreshAfterSave() : refreshContext === "conflict" ? refreshAfterConflict() : refreshAfterRecovery())}><RotateCcw size={16} />只重新读取</button></div></div>}
+    {phase === "conflict" && <div className="career-material-recovery conflict" role="alert"><ShieldCheck size={24} /><h3>没有覆盖另一份内容</h3><p>{error}</p><div className="career-material-recovery-actions">{allowStaleExit && <button className="career-button secondary" onClick={onStaleClose}>先回材料页</button>}<button className="career-button primary" data-dialog-initial onClick={() => void refreshAfterConflict()}><RotateCcw size={16} />重新读取材料列表</button></div></div>}
+    </div>
+  </Modal>{closeConfirm && <Modal title="放弃这份材料草稿吗？" description="表单和所选文件还没有写入职迹。" onClose={resumeMaterialEditing} inertToasts><div className="career-material-close-choice"><p>继续编辑会保留当前输入；明确放弃只关闭表单，不会影响已经存在的材料。</p><div><button className="career-button primary" data-dialog-initial onClick={resumeMaterialEditing}>继续编辑</button><button className="career-button danger" onClick={() => { resumeEditingFocusPendingRef.current = false; finalClosePendingRef.current = true; setCloseConfirm(false); }}>放弃这次输入</button></div></div></Modal>}</>;
+}
+
+function MaterialDeletionModal({ material, onClose, onStaleClose, onRefresh, notify }: { material: Pick<Material, "id" | "name" | "file_key">; onClose: () => void; onStaleClose: () => void; onRefresh: () => Promise<void>; notify: (text: string, tone?: Notice["tone"]) => void }) {
+  const [phase, setPhase] = useState<CareerMaterialDeletionPhase>("loading");
+  const [state, setState] = useState<CareerMaterialDeletionState | null>(null);
+  const [message, setMessage] = useState("");
+  const [allowStaleExit, setAllowStaleExit] = useState(false);
+  const mutationRef = useRef(false);
+  const successMessageRef = useRef("材料记录已经不在当前列表中。");
+  const phaseRootRef = useMaterialPhaseFocus(phase);
+
+  useEffect(() => {
+    let live = true;
+    void (async () => {
+      try {
+        const inspected = await loadCareerMaterialDeletionState(material.id);
+        if (!live) return;
+        setState(inspected);
+        setPhase(inspected.state === "already_absent" ? "refresh-only" : inspected.state === "cleanup_pending" ? "cleanup" : "ready");
+        if (inspected.state === "already_absent") setMessage("这份材料记录已经不存在；现在只需重新读取列表。");
+        if (inspected.state === "cleanup_pending") setMessage("这份材料还在等待收尾。继续处理会重新核对引用，不会盲目删除原件。");
+      } catch (caught) {
+        if (!live) return;
+        setPhase("changed");
+        setMessage(caught instanceof Error ? caught.message : "暂时无法核对这份材料；没有开始删除。请重新读取后再试。");
+      }
+    })();
+    return () => { live = false; };
+  }, [material.id]);
+
+  useEffect(() => {
+    if (phase === "loading" || phase === "ready") return;
+    function protectDeletionCheck(event: BeforeUnloadEvent) {
+      event.preventDefault();
+      event.returnValue = "";
+    }
+    window.addEventListener("beforeunload", protectDeletionCheck);
+    return () => window.removeEventListener("beforeunload", protectDeletionCheck);
+  }, [phase]);
+
+  async function closeAfterRead() {
+    if (mutationRef.current) return;
+    mutationRef.current = true;
+    setAllowStaleExit(false);
+    const returnPhase = phase;
+    setPhase("refreshing");
+    try {
+      await onRefresh();
+      onClose();
+    } catch {
+      setPhase(returnPhase);
+      setAllowStaleExit(true);
+      setMessage("材料状态暂时没有重新读取。请留在这里稍后再试；不会重复删除或清理。");
+    } finally {
+      mutationRef.current = false;
+    }
+  }
+
+  async function refreshAfterDeletion() {
+    if (mutationRef.current) return;
+    mutationRef.current = true;
+    setAllowStaleExit(false);
+    setPhase("refreshing");
+    try {
+      await onRefresh();
+      notify(successMessageRef.current, "info");
+      onClose();
+    } catch {
+      setPhase("refresh-only");
+      setAllowStaleExit(true);
+      setMessage("删除结果已经写入本机，但画面暂时没有重新读取。请只重新读取，不要再次删除。");
+    } finally {
+      mutationRef.current = false;
+    }
+  }
+
+  async function performDeletion() {
+    if (mutationRef.current) return;
+    const receipt: CareerMaterialDeletionReceipt | null = state?.state === "present" || state?.state === "cleanup_pending" ? state.receipt : null;
+    if (!receipt) {
+      setPhase("changed");
+      setMessage("这份材料的确认信息已经变化。没有开始移除，请重新读取后再决定。");
+      return;
+    }
+    mutationRef.current = true;
+    setPhase("deleting");
+    setMessage("");
+    try {
+      const result = await deleteCareerMaterial(receipt);
+      if (result.outcome === "deleted") {
+        successMessageRef.current = materialDeletionSuccessMessage(result.fileAction);
+        mutationRef.current = false;
+        await refreshAfterDeletion();
+        return;
+      }
+      if (result.outcome === "already_absent") {
+        successMessageRef.current = "这份材料记录已经不存在，没有重复删除。";
+        mutationRef.current = false;
+        await refreshAfterDeletion();
+        return;
+      }
+      if (result.outcome === "changed") {
+        setPhase("changed");
+        setAllowStaleExit(true);
+        setMessage("材料或本地数据版本刚发生了变化。没有依据旧确认继续移除，请重新读取后再决定。");
+        return;
+      }
+      if (result.outcome === "cleanup_pending") {
+        const pendingMessage = materialDeletionPendingMessage(result.reason);
+        setState((current) => current?.state === "present" || current?.state === "cleanup_pending"
+          ? { ...current, state: "cleanup_pending", receipt: result.receipt, retryable: true }
+          : current);
+        setPhase("refreshing");
+        setMessage(pendingMessage);
+        try { await onRefresh(); }
+        catch { setAllowStaleExit(true); setMessage(`${pendingMessage} 材料列表暂时没有重新读取；可以稍后只重试读取。`); }
+        setPhase("cleanup");
+        return;
+      }
+      setPhase("uncertain");
+      setAllowStaleExit(true);
+      setMessage("最终删除回执没有返回。本机可能已经完成，也可能仍在清理；请先只读核对，不要再次删除。");
+    } catch (caught) {
+      if (caught instanceof CareerMaterialDeletionError && (caught.code === "inspect_failed" || caught.code === "mark_failed")) {
+        setPhase("ready");
+        setMessage(caught.message);
+      } else if (caught instanceof CareerMaterialDeletionError && caught.code === "invalid_receipt") {
+        setPhase("changed");
+        setAllowStaleExit(true);
+        setMessage("这份移除确认已经变化。没有依据旧确认继续处理，请重新读取后再决定。");
+      } else {
+        setPhase("uncertain");
+        setAllowStaleExit(true);
+        setMessage("移除过程没有返回可确认的结果。请先只读核对，不要复用刚才的确认再次删除。");
+      }
+    } finally {
+      mutationRef.current = false;
+    }
+  }
+
+  async function inspectUncertainDeletion() {
+    if (mutationRef.current) return;
+    mutationRef.current = true;
+    setPhase("checking");
+    setMessage("");
+    try {
+      const inspected = await loadCareerMaterialDeletionState(material.id);
+      setState(inspected);
+      if (inspected.state === "already_absent") {
+        successMessageRef.current = "核对后确认材料记录已经移除，没有重复删除。";
+        mutationRef.current = false;
+        await refreshAfterDeletion();
+        return;
+      }
+      let refreshed = true;
+      try { await onRefresh(); }
+      catch { refreshed = false; setAllowStaleExit(true); }
+      if (inspected.state === "cleanup_pending") {
+        setPhase("cleanup");
+        setMessage(refreshed ? "核对后确认记录仍在等待收尾。可以继续收尾，也可以稍后再回来。" : "核对到记录仍在等待收尾，但材料列表暂时没有重新读取。请留在这里稍后再试。");
+      } else {
+        setPhase("changed");
+        setMessage(refreshed ? "核对后确认材料记录仍在。为避免依据旧信息删除，请回到最新材料卡片重新决定。" : "核对后确认材料记录仍在，但材料列表暂时没有重新读取。请先只重试读取，再重新决定。");
+      }
+    } catch {
+      setPhase("uncertain");
+      setAllowStaleExit(true);
+      setMessage("本机暂时仍无法确认删除结果。继续核对不会重复删除；也可以稍后再回来。");
+    } finally {
+      mutationRef.current = false;
+    }
+  }
+
+  const canClose = phase === "loading" || phase === "ready" || phase === "cleanup" || phase === "uncertain" || phase === "changed";
+  const closeSafely = phase === "loading" || phase === "ready" ? onClose : allowStaleExit ? onStaleClose : canClose ? () => { void closeAfterRead(); } : () => undefined;
+  const hasAttachment = state?.state === "present" || state?.state === "cleanup_pending" ? state.hasAttachment : Boolean(material.file_key);
+  const sharesAttachment = state?.state === "present" || state?.state === "cleanup_pending" ? state.sharesAttachment : false;
+  const confirmation = !hasAttachment
+    ? "只移除这条材料记录；没有本地原件需要处理。"
+    : sharesAttachment
+      ? "当前同一原件仍被其他版本使用；移除时会在锁内再次核对，仍共享就保留，只有最后一个引用才会清理原件。"
+      : "移除这条材料记录，并在确认没有其他引用后清理本地原件。";
+  return <Modal title={phase === "cleanup" ? "继续完成收尾" : `移除「${material.name}」？`} description="这里只整理你选择的这一份材料，不影响职位、投递或其他版本。" onClose={closeSafely} dismissible={canClose} inertToasts>
+    <div ref={phaseRootRef} className="career-material-modal-body" data-material-phase-focus tabIndex={-1}>
+    {phase === "loading" && <div className="career-material-recovery" role="status"><LoaderCircle className="spin" size={23} /><h3>正在核对材料与原件</h3><p>先确认是否共享同一个本地文件，再显示会发生什么。</p></div>}
+    {phase === "ready" && <div className="career-material-delete-confirm" role={message ? "alert" : undefined}><ShieldCheck size={24} /><h3>先看清这次会处理什么</h3><p>{message || confirmation}</p><div><button className="career-button primary" data-dialog-initial onClick={onClose}>继续保留</button><button className="career-button danger" onClick={() => void performDeletion()}><Trash2 size={16} />确认移除</button></div></div>}
+    {phase === "deleting" && <div className="career-material-recovery" role="status"><LoaderCircle className="spin" size={23} /><h3>正在安全移除</h3><p>会先留下可重试状态，再核对引用与原件，完成前不会开放重复操作。</p></div>}
+    {phase === "cleanup" && <div className="career-material-recovery cleanup" role="status" aria-live="polite"><RotateCcw size={24} /><h3>还有一步没有收尾</h3><p>{message}</p><div className="career-material-recovery-actions"><button className="career-button secondary" data-dialog-initial onClick={allowStaleExit ? onStaleClose : () => void closeAfterRead()}>稍后处理</button><button className="career-button primary" onClick={() => void performDeletion()}><RotateCcw size={16} />继续收尾</button></div><small>材料卡会保留“待收尾”，不会把尚未完成的状态伪装成已删除。</small></div>}
+    {phase === "uncertain" && <div className="career-material-recovery uncertain" role="status" aria-live="polite"><ShieldCheck size={24} /><h3>需要核对删除结果</h3><p>{message}</p><div className="career-material-recovery-actions"><button className="career-button secondary" data-dialog-initial onClick={allowStaleExit ? onStaleClose : () => void closeAfterRead()}>稍后再核对</button><button className="career-button primary" onClick={() => void inspectUncertainDeletion()}><Search size={16} />只读核对</button></div></div>}
+    {phase === "checking" && <div className="career-material-recovery" role="status"><LoaderCircle className="spin" size={23} /><h3>正在只读核对</h3><p>不会再次删除原件或材料记录。</p></div>}
+    {phase === "refreshing" && <div className="career-material-recovery" role="status"><LoaderCircle className="spin" size={23} /><h3>正在重新读取材料状态</h3><p>只更新画面，不会重复删除或清理。</p></div>}
+    {phase === "changed" && <div className="career-material-recovery conflict" role="alert"><ShieldCheck size={24} /><h3>没有依据旧信息继续删除</h3><p>{message}</p><button className="career-button primary" data-dialog-initial onClick={allowStaleExit ? onStaleClose : () => void closeAfterRead()}>回到最新材料列表</button></div>}
+    {phase === "refresh-only" && <div className="career-material-recovery" role="status"><ShieldCheck size={24} /><h3>删除结果已写入本机</h3><p>{message || "现在只需重新读取画面；不会再次删除记录或原件。"}</p><div className="career-material-recovery-actions">{allowStaleExit && <button className="career-button secondary" onClick={onStaleClose}>先回材料页</button>}<button className="career-button primary" data-dialog-initial onClick={() => void refreshAfterDeletion()}><RotateCcw size={16} />只重新读取</button></div></div>}
+    </div>
+  </Modal>;
 }
 
 type CareerImportMode = "paste" | "capture" | "csv";

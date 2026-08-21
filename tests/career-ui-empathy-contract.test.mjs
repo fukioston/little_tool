@@ -201,7 +201,7 @@ test("changed previews and committed refresh recovery cannot repeat a write", ()
   const retryStart = source.indexOf("async function retryLifecycleRefresh");
   const undoStart = source.indexOf("async function handleUndo", retryStart);
   const retrySource = source.slice(retryStart, undoStart);
-  assert.match(retrySource, /await refresh\(\)/);
+  assert.match(retrySource, /await requireRefresh\(\)/);
   assert.doesNotMatch(retrySource, /commitPreparedCareerLifecycleChange|prepareCareerLifecycleChange/);
   assert.match(source, /请不要重复提交/);
   assert.match(source, /dismissible=\{false\} inertToasts/);
@@ -339,4 +339,12 @@ test("legacy uncertainty is disclosed without deleting or accusing", () => {
   assert.ok(contentStart >= 0 && globalNotice > contentStart && globalNotice < viewStart,
     "legacy uncertainty must be visible before every Career view, not buried in Settings");
   assert.doesNotMatch(source, /一键删除示例|确认这些是假数据/);
+});
+
+test("the off-canvas mobile sidebar leaves no hidden keyboard stops", () => {
+  assert.match(source, /function useCareerMobileLayout/);
+  assert.match(source, /const hidden = mobile && !open/);
+  assert.match(source, /aria-hidden=\{hidden \|\| undefined\} inert=\{hidden \|\| undefined\}/);
+  assert.match(source, /tabIndex=\{hidden \? -1 : undefined\}/);
+  assert.match(source, /query\.addEventListener\("change", sync\)/);
 });
