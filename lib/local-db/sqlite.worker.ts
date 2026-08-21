@@ -648,20 +648,32 @@ async function assertActivationToken(
 async function openDatabase(
   name: LocalDatabaseName,
 ): Promise<{ state: OpenDatabase; opened: boolean }> {
-  const existing = openDatabases.get(name);
-  if (existing?.db.isOpen()) return { state: existing, opened: false };
-
+  const cached = openDatabases.get(name);
+  const existing = cached?.db.isOpen() ? cached : undefined;
+  if (cached && !existing) openDatabases.delete(name);
   const sqlite3 = await getSqlite();
+  // Workers are tab-local, so a BroadcastChannel refresh cannot invalidate
+  // another tab's handle. Durable pointers are the authority on every request.
   const pointers = await readRankedGenerationPointers(name);
   for (const pointer of pointers) {
+    if (existing?.filename === pointer.filename) {
+      const generationId = generationIdFromFilename(name, pointer.filename);
+      if (!generationId) continue;
+      existing.generationId = generationId;
+      existing.sequence = pointer.sequence;
+      existing.pointerSlot = pointer.slot;
+      return { state: existing, opened: false };
+    }
+
     let db: Database | undefined;
+    let state: OpenDatabase | undefined;
     try {
       db = new sqlite3.oo1.OpfsDb(`/${pointer.filename}`, "w");
       configureDatabase(db);
       assertIntegrity(db);
       const generationId = generationIdFromFilename(name, pointer.filename);
       if (!generationId) throw new Error("Invalid generation filename.");
-      const state = {
+      state = {
         db,
         name,
         filename: pointer.filename,
@@ -669,16 +681,28 @@ async function openDatabase(
         sequence: pointer.sequence,
         pointerSlot: pointer.slot,
       } satisfies OpenDatabase;
-      openDatabases.set(name, state);
-      return { state, opened: true };
     } catch {
       db?.close();
       // A corrupt or missing newer generation must not mask the older valid
       // pointer. The legacy path below remains the final recovery anchor.
+      continue;
     }
+    openDatabases.set(name, state);
+    try {
+      existing?.db.close();
+    } catch {
+      // The newly selected durable generation is already authoritative.
+    }
+    return { state, opened: true };
   }
 
   const filename = DATABASE_FILES[name];
+  if (existing?.filename === filename) {
+    existing.generationId = "legacy";
+    existing.sequence = 0;
+    existing.pointerSlot = null;
+    return { state: existing, opened: false };
+  }
   const db = new sqlite3.oo1.OpfsDb(`/${filename}`, "c");
   try {
     configureDatabase(db);
@@ -692,6 +716,11 @@ async function openDatabase(
       pointerSlot: null,
     } satisfies OpenDatabase;
     openDatabases.set(name, state);
+    try {
+      existing?.db.close();
+    } catch {
+      // The legacy recovery handle is already selected in the cache.
+    }
     return { state, opened: true };
   } catch (error) {
     db.close();

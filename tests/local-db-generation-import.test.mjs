@@ -133,6 +133,87 @@ test("worker rejects corrupt namespaced pointers and falls back through older ge
   );
 });
 
+test("every worker request revalidates a cached handle against durable generation pointers", async () => {
+  const worker = await readFile(
+    new URL("lib/local-db/sqlite.worker.ts", projectRoot),
+    "utf8",
+  );
+  const opener = section(
+    worker,
+    "async function openDatabase(",
+    "async function initDatabase(",
+  );
+  const pointerRead = opener.indexOf("await readRankedGenerationPointers(name)");
+  const pointerLoop = opener.indexOf("for (const pointer of pointers)");
+  const cachedMatch = opener.indexOf("existing?.filename === pointer.filename");
+  const installReplacement = opener.indexOf("openDatabases.set(name, state)");
+  const closeCached = opener.indexOf("existing?.db.close()");
+  const legacyFallback = opener.indexOf("const filename = DATABASE_FILES[name]");
+
+  assert.ok(pointerRead >= 0 && pointerRead < pointerLoop);
+  assert.ok(
+    pointerLoop < cachedMatch && cachedMatch < legacyFallback,
+    "a cached handle may only be reused after every newer durable pointer is considered",
+  );
+  assert.ok(
+    installReplacement >= 0 && installReplacement < closeCached,
+    "the validated replacement must become authoritative before the stale handle closes",
+  );
+  assert.doesNotMatch(
+    opener,
+    /if \(existing\?\.db\.isOpen\(\)\) return/,
+    "an open in-memory handle must never bypass durable pointer revalidation",
+  );
+
+  const requestHandler = section(
+    worker,
+    "async function handleRequest(",
+    "function serializeError(",
+  );
+  for (const operation of ["query", "run", "batch", "export"]) {
+    const operationCase = section(
+      requestHandler,
+      `case "${operation}"`,
+      operation === "export" ? 'case "import"' : `case "${({ query: "run", run: "batch", batch: "export" })[operation]}"`,
+    );
+    assert.match(
+      operationCase,
+      /await openDatabase\(request\.database\)/,
+      `${operation} must revalidate its generation before touching SQLite`,
+    );
+  }
+});
+
+test("Fitness attachment reconciliation resolves its database generation before OPFS garbage collection", async () => {
+  const files = await readFile(
+    new URL("lib/fitness/files.ts", projectRoot),
+    "utf8",
+  );
+  const reconcile = section(
+    files,
+    "async function reconcileUnlocked(",
+    "export function createFitnessFileService(",
+  );
+  const rowsQuery = reconcile.indexOf('runtime.query<StoredFitnessFile>(');
+  const localListing = reconcile.indexOf("runtime.listFiles()");
+  const orphanDelete = reconcile.lastIndexOf("runtime.deleteFile(metadata.key)");
+  assert.ok(
+    rowsQuery >= 0 && rowsQuery < localListing && localListing < orphanDelete,
+    "reconcile must enter the generation-aware DB path before listing or deleting managed OPFS files",
+  );
+
+  const service = section(
+    files,
+    "export function createFitnessFileService(",
+    "const service = createFitnessFileService(",
+  );
+  assert.match(
+    service,
+    /async function reconcile\(\)[\s\S]*?runtime\.withExclusiveLock/,
+    "generation selection and attachment GC must remain inside one exclusive product lock",
+  );
+});
+
 test("first activation preserves legacy, then commits the candidate to the other pointer", async () => {
   const worker = await readFile(
     new URL("lib/local-db/sqlite.worker.ts", projectRoot),
