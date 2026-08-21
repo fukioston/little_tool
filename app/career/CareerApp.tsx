@@ -25,14 +25,21 @@ import {
   FormEvent, ReactNode, useCallback, useEffect, useId, useMemo, useRef, useState,
 } from "react";
 import {
-  addActivity, exportCareerDb, importCareerDb, initializeCareerDb,
+  addActivity, initializeCareerDb,
   loadCareerData, newId, runCareerBatch, runCareerSql,
 } from "@/lib/career/db";
+import {
+  exportCompleteCareerBackup,
+  isCompleteCareerBackup,
+  restoreCompleteCareerBackup,
+  restoreLegacyCareerDatabase,
+} from "@/lib/career/backup";
 import { createStructuredInterviewDraft } from "@/lib/career/interview-ai";
+import { subscribeToCareerGenerationChanges, withCareerWriteLock } from "@/lib/career/lock";
 import { createLocalFileObjectUrl, deleteLocalFile, saveLocalFile } from "@/lib/local-db/files";
 import type {
   AiAction, CareerData, CareerView, Contact, Interview, InterviewQuestion,
-  Job, Notice, Stage, Task,
+  Job, Material, Notice, Stage, Task,
 } from "@/lib/career/types";
 
 const navItems: Array<{ id: CareerView; label: string; compact: string; icon: typeof LayoutDashboard }> = [
@@ -316,6 +323,10 @@ export default function CareerApp() {
     return () => { live = false; };
   }, [refreshKey]);
 
+  useEffect(() => () => aiRequestRef.current?.controller.abort(), []);
+
+  useEffect(() => subscribeToCareerGenerationChanges(() => window.location.reload()), []);
+
   useEffect(() => {
     function onKeydown(event: KeyboardEvent) {
       const target = event.target as HTMLElement | null;
@@ -452,19 +463,52 @@ export default function CareerApp() {
         {view === "calendar" && <CalendarView data={data} onToggleTask={toggleTask} onAddTask={() => setModal("task")} onAddInterview={() => setModal("interview")} onSelectJob={setSelectedJobId} />}
         {view === "interviews" && <InterviewsView data={data} onAdd={() => setModal("interview")} onSelect={setSelectedInterviewId} onAi={runAi} />}
         {view === "contacts" && <ContactsView data={data} onAdd={() => setModal("contact")} onCreateTask={(contact) => { setSelectedJobId(data.jobs.find((job) => job.company === contact.company)?.id ?? null); setModal("task"); }} />}
-        {view === "materials" && <MaterialsView data={data} onAdd={() => setModal("material")} />}
+        {view === "materials" && <MaterialsView data={data} onAdd={() => setModal("material")} onRemove={async (material) => {
+          if (!window.confirm(`移除「${material.name}」${material.file_key ? "及其本地附件原件" : ""}？这个操作无法撤销。`)) return;
+          try {
+            let fileCleanupFailed = false;
+            await withCareerWriteLock(async (context) => {
+              await runCareerSql("DELETE FROM career_materials WHERE id = ?", [material.id], context);
+              if (material.file_key) {
+                try { await deleteLocalFile("career", material.file_key); }
+                catch { fileCleanupFailed = true; }
+              }
+            });
+            await refresh();
+            if (fileCleanupFailed) { notify("材料记录已移除，但本地附件原件未能清理", "info"); return; }
+            notify("材料已移除", "info");
+          } catch (error) { notify(error instanceof Error ? error.message : "材料移除失败", "error"); }
+        }} />}
         {view === "analytics" && <AnalyticsView data={data} />}
         {view === "settings" && <SettingsView data={data} onRefresh={refresh} onExport={async () => {
           try {
-            const exported = await exportCareerDb();
-            const payload = exported && typeof exported === "object" && "data" in exported ? (exported as { data: Uint8Array }).data : exported as Uint8Array;
-            const copy = new Uint8Array(payload); const blob = new Blob([copy.buffer], { type: "application/x-sqlite3" });
-            const url = URL.createObjectURL(blob); const anchor = document.createElement("a");
-            anchor.href = url; anchor.download = `zhiji-${new Date().toISOString().slice(0, 10)}.sqlite3`; anchor.click(); URL.revokeObjectURL(url); notify("SQLite 数据已导出，不含附件原件");
+            const exported = await exportCompleteCareerBackup();
+            const url = URL.createObjectURL(exported.blob);
+            const anchor = document.createElement("a");
+            anchor.href = url;
+            anchor.download = exported.fileName;
+            anchor.click();
+            anchor.remove();
+            window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
+            notify(`完整备份已交给浏览器下载，包含 ${exported.attachmentCount} 个材料附件`);
           } catch (error) { notify(error instanceof Error ? error.message : "导出失败", "error"); }
         }} onImport={async (file) => {
-          if (!window.confirm("恢复备份会替换当前职迹数据库。确定继续吗？")) return;
-          try { await importCareerDb(new Uint8Array(await file.arrayBuffer())); await initializeCareerDb(); await refresh(); notify("SQLite 数据已恢复；附件原件未包含在备份中"); }
+          const complete = await isCompleteCareerBackup(file);
+          const confirmation = complete
+            ? "恢复完整备份会切换当前职迹数据与已关联材料。文件会先完整校验并写入安全候选，切换前不会改动现有数据。确定继续吗？"
+            : "这是旧版 SQLite 备份，只能恢复结构化数据，不包含材料附件原件。它也会先写入安全候选；备份中的附件索引会被清空，避免显示不存在的原件。确定继续吗？";
+          if (!window.confirm(confirmation)) return;
+          try {
+            if (complete) {
+              const restored = await restoreCompleteCareerBackup(file);
+              await refresh();
+              notify(`数据与 ${restored.attachmentCount} 个附件已完整恢复；上一版本已保留作安全回退`);
+            } else {
+              await restoreLegacyCareerDatabase(file);
+              await refresh();
+              notify("旧版 SQLite 数据已恢复；附件索引已清空，上一版本已保留作安全回退", "info");
+            }
+          }
           catch (error) { notify(error instanceof Error ? error.message : "恢复失败", "error"); }
         }} notify={notify} />}
       </div>
@@ -602,7 +646,7 @@ function ContactsView({ data, onAdd, onCreateTask }: { data: CareerData; onAdd: 
   return <div className="career-view"><SectionHeading eyebrow="RELATIONSHIPS" title="求职人脉" description="把每次沟通变成清晰、得体的下一步" action={<button className="career-button primary" onClick={onAdd}><Plus size={16} />添加联系人</button>} /><div className="career-contact-grid">{data.contacts.map((contact) => <article className="career-contact-card" key={contact.id}><header><span className="career-contact-avatar">{initials(contact.name)}</span><div><h3>{contact.name}</h3><p>{contact.role} · {contact.company}</p></div></header><div className="career-contact-meta"><span><ContactRound size={14} />{contact.channel}</span><span><Clock3 size={14} />{contact.last_contact_at ? `上次联系 ${formatDate(contact.last_contact_at)}` : "尚未记录联系"}</span></div><p>{contact.notes || "暂无备注"}</p><footer><span className={contact.next_follow_up && new Date(contact.next_follow_up).getTime() < CAREER_CLOCK ? "late" : ""}>下次跟进：{relativeDate(contact.next_follow_up)}</span><button onClick={() => onCreateTask(contact)}>创建待办 <ArrowRight size={14} /></button></footer></article>)}</div></div>;
 }
 
-function MaterialsView({ data, onAdd }: { data: CareerData; onAdd: () => void }) {
+function MaterialsView({ data, onAdd, onRemove }: { data: CareerData; onAdd: () => void; onRemove: (material: Material) => void | Promise<void> }) {
   async function openFile(fileKey: string) {
     const object = await createLocalFileObjectUrl("career", fileKey);
     const anchor = document.createElement("a");
@@ -613,7 +657,7 @@ function MaterialsView({ data, onAdd }: { data: CareerData; onAdd: () => void })
     anchor.click();
     window.setTimeout(() => object.revoke(), 30_000);
   }
-  return <div className="career-view"><SectionHeading eyebrow="MATERIALS" title="求职材料" description="保留每一个版本，也记住哪一份发给了谁" action={<button className="career-button primary" onClick={onAdd}><Plus size={16} />添加材料</button>} /><div className="career-material-grid">{data.materials.map((material) => { const job = data.jobs.find((item) => item.id === material.linked_job_id); return <article className="career-material-card" key={material.id}><span className={`career-file-icon ${material.kind}`}><FileText size={23} /></span><div><header><span>{material.kind}</span><em className={material.status}>{material.status === "sent" ? "已发送" : material.status === "draft" ? "编辑中" : "可使用"}</em>{material.file_key && <em className="attached">本地附件</em>}</header><h3>{material.name}</h3><p>{material.notes}</p><footer><span>{material.version} · 更新于 {formatDate(material.updated_at)}</span>{job && <small>用于 {job.company}</small>}{material.file_name && <small>{material.file_name} · {Math.max(1, Math.round((material.byte_size ?? 0) / 1024))} KB</small>}</footer></div>{material.file_key ? <button className="career-icon-button" onClick={() => void openFile(material.file_key!)} aria-label={`打开 ${material.file_name ?? material.name}`}><Download size={17} /></button> : <button className="career-button ghost" onClick={onAdd}>新建带附件版本</button>}</article>; })}</div></div>;
+  return <div className="career-view"><SectionHeading eyebrow="MATERIALS" title="求职材料" description="保留每一个版本，也记住哪一份发给了谁" action={<button className="career-button primary" onClick={onAdd}><Plus size={16} />添加材料</button>} /><div className="career-material-grid">{data.materials.map((material) => { const job = data.jobs.find((item) => item.id === material.linked_job_id); return <article className="career-material-card" key={material.id}><span className={`career-file-icon ${material.kind}`}><FileText size={23} /></span><div><header><span>{material.kind}</span><em className={material.status}>{material.status === "sent" ? "已发送" : material.status === "draft" ? "编辑中" : "可使用"}</em>{material.file_key && <em className="attached">本地附件</em>}</header><h3>{material.name}</h3><p>{material.notes}</p><footer><span>{material.version} · 更新于 {formatDate(material.updated_at)}</span>{job && <small>用于 {job.company}</small>}{material.file_name && <small>{material.file_name} · {Math.max(1, Math.round((material.byte_size ?? 0) / 1024))} KB</small>}</footer></div><div className="career-material-actions">{material.file_key ? <button className="career-icon-button" onClick={() => void openFile(material.file_key!)} aria-label={`打开 ${material.file_name ?? material.name}`}><Download size={17} /></button> : <button className="career-button ghost" onClick={onAdd}>新建带附件版本</button>}<button className="career-icon-button danger" onClick={() => void onRemove(material)} aria-label={`移除 ${material.name}`}><Trash2 size={16} /></button></div></article>; })}</div></div>;
 }
 
 function AnalyticsView({ data }: { data: CareerData }) {
@@ -630,8 +674,8 @@ function AnalyticsView({ data }: { data: CareerData }) {
 }
 
 function SettingsView({ data, onRefresh, onExport, onImport, notify }: { data: CareerData; onRefresh: () => Promise<void>; onExport: () => Promise<void>; onImport: (file: File) => Promise<void>; notify: (text: string, tone?: Notice["tone"]) => void }) {
-  const fileRef = useRef<HTMLInputElement>(null);
   const [savingStage, setSavingStage] = useState<string | null>(null);
+  const [backupBusy, setBackupBusy] = useState<"export" | "import" | null>(null);
   const [aiHealth, setAiHealth] = useState<{ status: "checking" | "configured" | "missing" | "error"; model: string }>({ status: "checking", model: "" });
   useEffect(() => {
     let active = true;
@@ -649,9 +693,11 @@ function SettingsView({ data, onRefresh, onExport, onImport, notify }: { data: C
   const bookmarklet = `javascript:(()=>{const t=window.getSelection()?.toString()||document.body.innerText.slice(0,12000);const u='http://localhost:3000/career?capture='+encodeURIComponent(location.href)+'&text='+encodeURIComponent(t);window.open(u,'_blank')})()`;
   const aiStatusLabel = aiHealth.status === "checking" ? "正在检查" : aiHealth.status === "configured" ? "已配置" : aiHealth.status === "missing" ? "尚未配置" : "检查失败";
   async function copyHelper() { try { await navigator.clipboard.writeText(bookmarklet); notify("浏览器采集器已复制，可拖到书签栏保存", "info"); } catch { notify("浏览器不允许复制，请在安全页面重试", "error"); } }
+  async function exportBackup() { setBackupBusy("export"); try { await onExport(); } finally { setBackupBusy(null); } }
+  async function importBackup(file: File) { setBackupBusy("import"); try { await onImport(file); } finally { setBackupBusy(null); } }
   return <div className="career-view"><SectionHeading eyebrow="PREFERENCES" title="设置" description="隐私、流程与数据，都由你掌控" /><div className="career-settings-layout"><nav><a href="#workflow">求职流程</a><a href="#privacy">AI 与隐私</a><a href="#data">数据与备份</a><a href="#capture">浏览器采集器</a></nav><div><section className="career-settings-card" id="workflow"><header><div><h3>看板阶段</h3><p>调整名称，保留一致的数据分析口径。</p></div></header><div className="career-stage-settings">{data.stages.map((stage) => <label key={stage.id}><i style={{ background: stage.color }} /><input defaultValue={stage.name} onBlur={(event) => void rename(stage, event.target.value)} aria-label={`${stage.name}阶段名称`} /><span>{savingStage === stage.id ? <LoaderCircle className="spin" size={14} /> : stage.is_terminal ? "终态" : "进行中"}</span></label>)}</div></section>
-    <section className="career-settings-card" id="privacy"><header><div><h3>AI 与隐私</h3><p>只有你主动使用 AI 时，所选内容才会发送至配置的服务。</p></div><span className={aiHealth.status === "configured" ? "career-status-good" : "career-status-neutral"} aria-live="polite"><i />{aiStatusLabel}</span></header><div className="career-setting-row"><span><b>当前模型</b><small>由服务器环境安全配置</small></span><code>{aiHealth.model || "DeepSeek"}</code></div><div className="career-setting-row"><span><b>结果保留方式</b><small>关闭预览不会自动保存，也不会留下隐藏副本</small></span><code>复制后手动粘贴</code></div><div className="career-privacy-note"><ShieldCheck size={18} /><p>API 密钥不会进入浏览器、本地数据库或备份。职位描述和面试笔记会被当作不可信数据处理。</p></div></section>
-    <section className="career-settings-card" id="data"><header><div><h3>数据与备份</h3><p>导出 SQLite 数据库，随时带走全部结构化职迹。</p></div></header><div className="career-data-actions"><button onClick={() => void onExport()}><span><Download size={19} /></span><div><b>导出 SQLite 备份</b><small>职位、任务、面经、人脉与材料索引</small></div><ChevronRight size={17} /></button><button onClick={() => fileRef.current?.click()}><span><Upload size={19} /></span><div><b>恢复 SQLite 备份</b><small>恢复前会再次确认，当前数据将被替换</small></div><ChevronRight size={17} /></button><input ref={fileRef} hidden type="file" accept=".sqlite,.sqlite3,.db,application/x-sqlite3" onChange={(event) => { const file = event.target.files?.[0]; if (file) void onImport(file); event.currentTarget.value = ""; }} /></div><p className="career-settings-footnote">SQLite 备份包含附件索引，但不包含保存在 OPFS 的简历/作品集文件原件；请另行保留原文件。</p></section>
+    <section className="career-settings-card" id="privacy"><header><div><h3>AI 与隐私</h3><p>只有你主动使用 AI 时，所选内容才会发送至配置的服务。</p></div><span className={aiHealth.status === "configured" ? "career-status-good" : "career-status-neutral"} aria-live="polite"><i />{aiStatusLabel}</span></header><div className="career-setting-row"><span><b>当前模型</b><small>由服务器环境安全配置</small></span><code>{aiHealth.model || "DeepSeek"}</code></div><div className="career-setting-row"><span><b>结果保留方式</b><small>关闭预览不会自动保存，也不会留下隐藏副本</small></span><code>核对后复制或填入草稿</code></div><div className="career-privacy-note"><ShieldCheck size={18} /><p>API 密钥不会进入浏览器、本地数据库或备份。职位描述和面试笔记会被当作不可信数据处理。</p></div></section>
+    <section className="career-settings-card" id="data"><header><div><h3>数据与备份</h3><p>一个文件带走结构化职迹与已关联的材料原件。</p></div></header><div className="career-data-actions"><button disabled={backupBusy !== null} onClick={() => void exportBackup()}><span>{backupBusy === "export" ? <LoaderCircle className="spin" size={19} /> : <Download size={19} />}</span><div><b>{backupBusy === "export" ? "正在校验并打包…" : "导出完整备份"}</b><small>SQLite、简历、作品集与案例附件</small></div><ChevronRight size={17} /></button><label className={backupBusy !== null ? "disabled" : ""}><span>{backupBusy === "import" ? <LoaderCircle className="spin" size={19} /> : <Upload size={19} />}</span><div><b>{backupBusy === "import" ? "正在验证并恢复…" : "恢复备份"}</b><small>支持完整备份与旧版 SQLite</small></div><ChevronRight size={17} /><input aria-label="选择要恢复的职迹备份" disabled={backupBusy !== null} type="file" accept=".career-backup,.sqlite,.sqlite3,.db,application/x-sqlite3,application/octet-stream" onChange={(event) => { const file = event.target.files?.[0]; if (file) void importBackup(file); event.currentTarget.value = ""; }} /></label></div><p className="career-settings-footnote">完整备份是明文文件，请安全保管；导出前会校验每个附件。恢复会先建立并验证安全候选，上一版本会暂时保留作回退。旧版 SQLite 不包含附件原件。</p></section>
     <section className="career-settings-card" id="capture"><header><div><h3>浏览器采集器</h3><p>把选中的 JD 文本带回本机职迹，不读取登录态，也不自动抓取。</p></div></header><div className="career-capture-steps"><span><b>1</b>复制下面的采集器</span><ArrowRight size={16} /><span><b>2</b>新建书签并粘贴到网址</span><ArrowRight size={16} /><span><b>3</b>选中 JD 后点击书签</span></div><button className="career-button secondary" onClick={() => void copyHelper()}><Command size={16} />复制采集器</button><p className="career-settings-footnote">采集器仅打开 localhost 职迹并附带当前页面 URL 与选中文字；不是 LinkedIn 或 BOSS直聘官方 API，也不会绕过登录或反爬限制。</p></section>
   </div></div></div>;
 }
@@ -812,14 +858,18 @@ function MaterialModal({ data, onClose, onSaved }: { data: CareerData; onClose: 
     const form = new FormData(event.currentTarget);
     const selected = form.get("attachment");
     const file = selected instanceof File && selected.size > 0 ? selected : null;
-    let fileKey: string | null = null;
     try {
-      const metadata = file ? await saveLocalFile("career", file, { originalName: file.name, mimeType: file.type, category: "career-material" }) : null;
-      fileKey = metadata?.key ?? null;
-      await runCareerSql("INSERT INTO career_materials (id,name,kind,version,updated_at,linked_job_id,status,notes,file_key,file_name,mime_type,byte_size) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", [newId("material"), form.get("name"), form.get("kind"), form.get("version"), new Date().toISOString(), form.get("linked_job_id") || null, form.get("status"), form.get("notes"), metadata?.key ?? null, metadata?.originalName ?? null, metadata?.mimeType ?? null, metadata?.byteSize ?? null]);
+      await withCareerWriteLock(async (context) => {
+        const metadata = file ? await saveLocalFile("career", file, { originalName: file.name, mimeType: file.type, category: "career-material" }) : null;
+        try {
+          await runCareerSql("INSERT INTO career_materials (id,name,kind,version,updated_at,linked_job_id,status,notes,file_key,file_name,mime_type,byte_size) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", [newId("material"), form.get("name"), form.get("kind"), form.get("version"), new Date().toISOString(), form.get("linked_job_id") || null, form.get("status"), form.get("notes"), metadata?.key ?? null, metadata?.originalName ?? null, metadata?.mimeType ?? null, metadata?.byteSize ?? null], context);
+        } catch (caught) {
+          if (metadata) await deleteLocalFile("career", metadata.key).catch(() => undefined);
+          throw caught;
+        }
+      });
       await onSaved();
     } catch (caught) {
-      if (fileKey) await deleteLocalFile("career", fileKey).catch(() => undefined);
       setError(caught instanceof Error ? caught.message : "材料保存失败");
     } finally { setSaving(false); }
   }

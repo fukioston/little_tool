@@ -1,4 +1,5 @@
 const CAREER_LOCK_NAME = "private-ai-suite:career-storage";
+const CAREER_CHANNEL_NAME = "private-ai-suite:career-storage-events";
 const CAREER_LOCK_TOKEN = Symbol("career-storage-lock");
 
 export type CareerLockContext = Readonly<{
@@ -48,4 +49,27 @@ export function withCareerWriteLock<T>(
 
 export function withCareerBackupLock<T>(task: (context: CareerLockContext) => Promise<T>) {
   return withCareerLock("exclusive", task, { requireSupport: true });
+}
+
+export function broadcastCareerGenerationChanged(generationId: string) {
+  if (typeof BroadcastChannel === "undefined") return;
+  const channel = new BroadcastChannel(CAREER_CHANNEL_NAME);
+  channel.postMessage({ type: "generation-changed", generationId });
+  channel.close();
+}
+
+export function subscribeToCareerGenerationChanges(onChange: () => void) {
+  if (typeof BroadcastChannel === "undefined") return () => undefined;
+  const channel = new BroadcastChannel(CAREER_CHANNEL_NAME);
+  channel.addEventListener("message", (event: MessageEvent<unknown>) => {
+    if (
+      event.data &&
+      typeof event.data === "object" &&
+      "type" in event.data &&
+      event.data.type === "generation-changed"
+    ) {
+      onChange();
+    }
+  });
+  return () => channel.close();
 }

@@ -340,6 +340,8 @@
 .career-ai-applied-note > button { min-height: 36px; padding: 0 10px; display: inline-flex; flex: 0 0 auto; align-items: center; gap: 5px; color: #2c684d; border: 1px solid #c6dbd0; border-radius: 10px; background: #fff; font-size: 12px; font-weight: 650; }
 .career-ai-preview .career-inline-error { margin-top: 12px; }
 .career-ai-preview .career-form-actions { flex-wrap: wrap; }
+.career-material-actions { display: flex; align-items: flex-start; gap: 7px; }
+.career-material-actions .career-icon-button.danger { color: #9a5b54; border-color: #ead8d5; background: #fffafa; }
 
 @media (max-width: 760px) {
   .career-import-edit-grid { grid-template-columns: 1fr; }
@@ -348,3 +350,23 @@
   .career-ai-preview .career-form-actions { display: grid; grid-template-columns: 1fr; }
   .career-ai-preview .career-form-actions .career-button { min-height: 44px; }
 }
+
+.career-data-actions > label {
+  position: relative;
+  overflow: hidden;
+  padding: 13px;
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 10px;
+  border: 1px solid var(--career-line);
+  border-radius: 10px;
+  background: #fff;
+  text-align: left;
+  cursor: pointer;
+}
+.career-data-actions > label.disabled { cursor: default; opacity: .58; }
+.career-data-actions > label > span { width: 33px; height: 33px; display: grid; place-items: center; color: #507263; background: #edf3ef; border-radius: 9px; }
+.career-data-actions > label > div { display: grid; gap: 4px; }
+.career-data-actions > label > input { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; cursor: pointer; }
+.career-data-actions > label:has(input:focus-visible) { outline: 3px solid var(--career-focus); outline-offset: 2px; }

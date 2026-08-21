@@ -23,6 +23,8 @@ export type SaveLocalFileOptions = Readonly<{
   originalName?: string;
   mimeType?: string;
   category?: string;
+  createdAt?: string;
+  updatedAt?: string;
 }>;
 
 export type LocalFileResult = Readonly<{
@@ -133,6 +135,12 @@ function safeMimeType(value: string | undefined): string {
     .replace(/[^a-z0-9!#$&^_.+\-/]/g, "")
     .slice(0, 127);
   return sanitized.includes("/") ? sanitized : "application/octet-stream";
+}
+
+function safeTimestamp(value: string | undefined, fallback: string): string {
+  if (!value) return fallback;
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) ? new Date(timestamp).toISOString() : fallback;
 }
 
 function objectFilename(key: string): string {
@@ -298,6 +306,8 @@ export async function saveLocalFile(
   try {
     const digest = await writeBlobAndHash(objectHandle, blob);
     const now = new Date().toISOString();
+    const createdAt = safeTimestamp(options.createdAt, now);
+    const updatedAt = safeTimestamp(options.updatedAt, createdAt);
     const fileName =
       options.originalName ??
       (typeof File !== "undefined" && blob instanceof File ? blob.name : undefined);
@@ -312,8 +322,8 @@ export async function saveLocalFile(
         : null,
       byteSize: digest.byteSize,
       sha256: digest.sha256,
-      createdAt: now,
-      updatedAt: now,
+      createdAt,
+      updatedAt,
     };
     await writeMetadata(metadataDirectory, metadata);
     return metadata;
