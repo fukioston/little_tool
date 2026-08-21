@@ -4,6 +4,52 @@ import { errorResponse, HttpError } from "@/lib/server/http";
 const MAX_REDIRECTS = 4;
 const MAX_MEDIA_BYTES = 500 * 1024 * 1024;
 
+function boundedMediaBody(source: ReadableStream<Uint8Array>, abort: AbortController) {
+  const reader = source.getReader();
+  let total = 0;
+  let finished = false;
+  let inactivity = setTimeout(() => abort.abort(), 30_000);
+  const refreshTimeout = () => {
+    clearTimeout(inactivity);
+    inactivity = setTimeout(() => abort.abort(), 30_000);
+  };
+  const finish = () => {
+    if (finished) return;
+    finished = true;
+    clearTimeout(inactivity);
+  };
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const { done, value } = await reader.read();
+        if (done) {
+          finish();
+          controller.close();
+          return;
+        }
+        refreshTimeout();
+        total += value.byteLength;
+        if (total > MAX_MEDIA_BYTES) {
+          finish();
+          abort.abort();
+          await reader.cancel("media byte limit exceeded").catch(() => undefined);
+          controller.error(new Error("远程音频超过 500 MB，传输已停止。"));
+          return;
+        }
+        controller.enqueue(value);
+      } catch (error) {
+        finish();
+        controller.error(error);
+      }
+    },
+    async cancel(reason) {
+      finish();
+      abort.abort();
+      await reader.cancel(reason).catch(() => undefined);
+    },
+  });
+}
+
 export async function GET(request: Request) {
   try {
     const fetchSite = request.headers.get("sec-fetch-site");
@@ -15,6 +61,7 @@ export async function GET(request: Request) {
     let url = assertPublicHttpUrl(input);
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 30_000);
+    let handedOff = false;
     try {
       for (let redirect = 0; redirect <= MAX_REDIRECTS; redirect += 1) {
         const headers = new Headers({
@@ -48,9 +95,13 @@ export async function GET(request: Request) {
           const value = upstream.headers.get(name);
           if (value) responseHeaders.set(name, value);
         }
-        return new Response(upstream.body, { status: upstream.status, headers: responseHeaders });
+        if (!upstream.body) throw new HttpError(502, "音频源没有返回可读取内容。", "MEDIA_BODY_MISSING");
+        clearTimeout(timeout);
+        const body = boundedMediaBody(upstream.body, controller);
+        handedOff = true;
+        return new Response(body, { status: upstream.status, headers: responseHeaders });
       }
       throw new HttpError(502, "音频链接重定向次数过多。", "MEDIA_TOO_MANY_REDIRECTS");
-    } finally { clearTimeout(timeout); }
+    } finally { if (!handedOff) clearTimeout(timeout); }
   } catch (error) { return errorResponse(error); }
 }

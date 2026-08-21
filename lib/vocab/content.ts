@@ -95,9 +95,9 @@ export function parseTranscript(raw: string, filename = "transcript.vtt") {
   });
 
   if (cues.length) return cues.sort((a, b) => a.start_ms - b.start_ms);
-  return text.split(/(?<=[.!?。！？])\s+(?=[A-Z“"'])|\n+/).filter(Boolean).map((line, index) => ({
-    start_ms: index * 5000,
-    end_ms: (index + 1) * 5000,
+  return text.split(/(?<=[.!?。！？])\s+(?=[A-Z“"'])|\n+/).filter(Boolean).map((line) => ({
+    start_ms: 0,
+    end_ms: 0,
     text: line.trim(),
     speaker: null,
   }));
@@ -152,12 +152,16 @@ export function normalizePodcastApi(value: unknown): ParsedPodcast[] {
       transcriptUrl: typeof episode.transcriptUrl === "string" ? episode.transcriptUrl : undefined,
       transcriptType: typeof episode.transcriptType === "string" ? episode.transcriptType : undefined,
       durationMs: Number(episode.duration_ms ?? 0) || durationToMs(episode.duration),
-      segments: transcript.flatMap((segment, index) => {
+      segments: transcript.flatMap((segment) => {
         if (!segment || typeof segment !== "object") return [];
         const row = segment as Record<string, unknown>;
         return [{
-          start_ms: Number(row.start_ms ?? Number(row.start ?? index * 5) * 1000),
-          end_ms: Number(row.end_ms ?? Number(row.end ?? (index + 1) * 5) * 1000),
+          start_ms: Number.isFinite(Number(row.start_ms))
+            ? Number(row.start_ms)
+            : Number.isFinite(Number(row.start)) ? Number(row.start) * 1000 : 0,
+          end_ms: Number.isFinite(Number(row.end_ms))
+            ? Number(row.end_ms)
+            : Number.isFinite(Number(row.end)) ? Number(row.end) * 1000 : 0,
           text: String(row.text ?? ""),
           speaker: typeof row.speaker === "string" ? row.speaker : null,
         }];
@@ -198,6 +202,20 @@ export function wordAt(text: string, offset: number) {
   while (start > 0 && isWord(text[start - 1])) start -= 1;
   while (end < text.length && isWord(text[end])) end += 1;
   return { text: text.slice(start, end), start, end };
+}
+
+export function wordRanges(text: string): Array<{ text: string; start: number; end: number }> {
+  if (!text) return [];
+  if (Intl.Segmenter) {
+    return Array.from(new Intl.Segmenter("en", { granularity: "word" }).segment(text))
+      .filter((segment) => segment.isWordLike && /[\p{L}\p{N}]/u.test(segment.segment))
+      .map((segment) => ({ text: segment.segment, start: segment.index, end: segment.index + segment.segment.length }));
+  }
+  return Array.from(text.matchAll(/[\p{L}\p{N}]+(?:['’-][\p{L}\p{N}]+)*/gu), (match) => ({
+    text: match[0],
+    start: match.index,
+    end: match.index + match[0].length,
+  }));
 }
 
 export function formatDuration(ms: number) {

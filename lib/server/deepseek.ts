@@ -71,7 +71,7 @@ async function requestCompletion(
         : response.status === 429
           ? "AI 请求过于频繁，请稍后重试。"
           : `AI 服务暂时不可用（${response.status}）。`;
-      throw new HttpError(response.status === 401 ? 401 : 502, message, code);
+      throw new HttpError(response.status === 401 ? 401 : response.status === 429 ? 429 : 502, message, code);
     }
 
     const raw = await response.json() as {

@@ -16,18 +16,22 @@ export function Loader() {
   return <main className="shici sc-loading"><div className="sc-loader-mark">拾</div><div className="sc-loader-line" /><p>正在打开你的词库…</p></main>;
 }
 
-export function AnnotatedText({ text, ranges }: { text: string; ranges: Array<{ id: string; surface: string; start_utf16: number; end_utf16: number }> }) {
+export function AnnotatedText({ text, ranges, activeRange }: { text: string; ranges: Array<{ id: string; surface: string; start_utf16: number; end_utf16: number }>; activeRange?: { start: number; end: number } | null }) {
   const located = ranges.map((entry) => {
     const stored = text.slice(entry.start_utf16, entry.end_utf16);
     const start = stored.toLowerCase() === entry.surface.toLowerCase() ? entry.start_utf16 : text.toLowerCase().indexOf(entry.surface.toLowerCase());
-    return { id: entry.id, start, end: start + entry.surface.length };
-  }).filter((entry) => entry.start >= 0).sort((a, b) => a.start - b.start);
+    return { id: entry.id, start, end: start + entry.surface.length, active: false };
+  });
+  if (activeRange) located.push({ id: "keyboard-selection", start: activeRange.start, end: activeRange.end, active: true });
+  located.sort((a, b) => a.start - b.start || Number(b.active) - Number(a.active));
   const nodes: ReactNode[] = [];
   let cursor = 0;
-  located.forEach((entry) => {
+  located.filter((entry) => entry.start >= 0).forEach((entry) => {
     if (entry.start < cursor) return;
     nodes.push(text.slice(cursor, entry.start));
-    nodes.push(<mark key={entry.id}>{text.slice(entry.start, entry.end)}</mark>);
+    nodes.push(entry.active
+      ? <span className="sc-keyboard-word" key={entry.id}>{text.slice(entry.start, entry.end)}</span>
+      : <mark key={entry.id}>{text.slice(entry.start, entry.end)}</mark>);
     cursor = entry.end;
   });
   nodes.push(text.slice(cursor));
