@@ -6,6 +6,8 @@ import {
   type DatabaseExportResult,
   type DatabaseImportResult,
   type DatabaseInitResult,
+  type DatabaseRecoveryReceipt,
+  type DatabaseRecoveryStageOptions,
   type DatabaseSchemaRequirements,
   type DiscardedDatabaseGeneration,
   type InitAllResult,
@@ -185,6 +187,7 @@ export class LocalDatabaseClient {
     data: Uint8Array | ArrayBuffer,
     statements: readonly SqlStatement[],
     requirements: DatabaseSchemaRequirements,
+    options: Readonly<{ recovery?: DatabaseRecoveryStageOptions }> = {},
   ): Promise<StagedDatabaseImportResult<typeof this.database>> {
     const transferable =
       data instanceof Uint8Array
@@ -197,6 +200,7 @@ export class LocalDatabaseClient {
         data: transferable,
         statements,
         requirements,
+        recovery: options.recovery,
       },
       [transferable],
     );
@@ -205,12 +209,28 @@ export class LocalDatabaseClient {
   activateStaged(
     generationId: string,
     activationToken: string,
+    recoveryReceipt?: DatabaseRecoveryReceipt<typeof this.database>,
   ): Promise<ActivatedDatabaseGeneration<typeof this.database>> {
     return rpc.request({
       operation: "activateStaged",
       database: this.database,
       generationId,
       activationToken,
+      recoveryReceipt,
+    });
+  }
+
+  inspectStaged(
+    generationId: string,
+    activationToken: string,
+    recoveryReceipt?: DatabaseRecoveryReceipt<typeof this.database>,
+  ): Promise<CurrentDatabaseGeneration<typeof this.database>> {
+    return rpc.request({
+      operation: "inspectStaged",
+      database: this.database,
+      generationId,
+      activationToken,
+      recoveryReceipt,
     });
   }
 
@@ -224,12 +244,14 @@ export class LocalDatabaseClient {
   discardStaged(
     generationId: string,
     activationToken: string,
+    recoveryReceipt?: DatabaseRecoveryReceipt<typeof this.database>,
   ): Promise<DiscardedDatabaseGeneration<typeof this.database>> {
     return rpc.request({
       operation: "discardStaged",
       database: this.database,
       generationId,
       activationToken,
+      recoveryReceipt,
     });
   }
 
@@ -301,16 +323,22 @@ export const localDb = {
     data: Uint8Array | ArrayBuffer,
     statements: readonly SqlStatement[],
     requirements: DatabaseSchemaRequirements,
+    options: Readonly<{ recovery?: DatabaseRecoveryStageOptions }> = {},
   ): Promise<StagedDatabaseImportResult> {
-    return getLocalDatabase(database).stageImport(data, statements, requirements);
+    return getLocalDatabase(database).stageImport(data, statements, requirements, options);
   },
 
   activateStaged(
     database: LocalDatabaseId,
     generationId: string,
     activationToken: string,
+    recoveryReceipt?: DatabaseRecoveryReceipt,
   ): Promise<ActivatedDatabaseGeneration> {
-    return getLocalDatabase(database).activateStaged(generationId, activationToken);
+    return getLocalDatabase(database).activateStaged(
+      generationId,
+      activationToken,
+      recoveryReceipt,
+    );
   },
 
   currentGeneration(
@@ -319,12 +347,30 @@ export const localDb = {
     return getLocalDatabase(database).currentGeneration();
   },
 
+  inspectStaged(
+    database: LocalDatabaseId,
+    generationId: string,
+    activationToken: string,
+    recoveryReceipt?: DatabaseRecoveryReceipt,
+  ): Promise<CurrentDatabaseGeneration> {
+    return getLocalDatabase(database).inspectStaged(
+      generationId,
+      activationToken,
+      recoveryReceipt,
+    );
+  },
+
   discardStaged(
     database: LocalDatabaseId,
     generationId: string,
     activationToken: string,
+    recoveryReceipt?: DatabaseRecoveryReceipt,
   ): Promise<DiscardedDatabaseGeneration> {
-    return getLocalDatabase(database).discardStaged(generationId, activationToken);
+    return getLocalDatabase(database).discardStaged(
+      generationId,
+      activationToken,
+      recoveryReceipt,
+    );
   },
 
   reset(database: LocalDatabaseId): Promise<DatabaseInitResult> {

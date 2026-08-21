@@ -101,6 +101,36 @@ export type DatabaseSchemaRequirements = Readonly<{
   allowedTriggers?: readonly string[];
 }>;
 
+/**
+ * App-owned data which must remain byte-for-byte associated with a staged
+ * database generation. The worker persists only this digest; it never needs
+ * access to product-specific attachment identifiers or restore summaries.
+ */
+export type DatabaseRecoveryStageOptions = Readonly<{
+  projectionSha256: string;
+}>;
+
+/**
+ * A JSON-safe, worker-issued capability for a bound staged generation.
+ *
+ * The plaintext recovery token is deliberately returned only to the caller;
+ * OPFS stores its SHA-256 digest. Every other field is copied from durable
+ * worker state and is compared again before activation or discard.
+ */
+export type DatabaseRecoveryReceipt<
+  DatabaseName extends LocalDatabaseName = LocalDatabaseName,
+> = Readonly<{
+  version: 1;
+  database: DatabaseName;
+  generationId: string;
+  recoveryToken: string;
+  expectedCurrentGenerationId: string;
+  expectedCurrentSequence: number;
+  canonicalApplicationId: number;
+  canonicalUserVersion: number;
+  projectionSha256: string;
+}>;
+
 export type StagedDatabaseImportResult<
   DatabaseName extends LocalDatabaseName = LocalDatabaseName,
 > = Readonly<{
@@ -110,6 +140,8 @@ export type StagedDatabaseImportResult<
   activationToken: string;
   importedBytes: number;
   schemaVersion: number;
+  /** Present only when stageImport was given recovery options. */
+  recoveryReceipt?: DatabaseRecoveryReceipt<DatabaseName>;
 }>;
 
 export type ActivatedDatabaseGeneration<
@@ -246,6 +278,7 @@ export type WorkerOperation =
   | "import"
   | "stageImport"
   | "activateStaged"
+  | "inspectStaged"
   | "currentGeneration"
   | "discardStaged"
   | "reset";
@@ -270,15 +303,23 @@ export type LocalDbWorkerRequest =
       data: ArrayBuffer;
       statements: readonly SqlStatement[];
       requirements: DatabaseSchemaRequirements;
+      recovery?: DatabaseRecoveryStageOptions;
     })
   | (RequestBase<"activateStaged"> & {
       generationId: string;
       activationToken: string;
+      recoveryReceipt?: DatabaseRecoveryReceipt;
+    })
+  | (RequestBase<"inspectStaged"> & {
+      generationId: string;
+      activationToken: string;
+      recoveryReceipt?: DatabaseRecoveryReceipt;
     })
   | RequestBase<"currentGeneration">
   | (RequestBase<"discardStaged"> & {
       generationId: string;
       activationToken: string;
+      recoveryReceipt?: DatabaseRecoveryReceipt;
     })
   | RequestBase<"reset">;
 

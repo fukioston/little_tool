@@ -268,6 +268,7 @@ test("public RPC stages all three products independently without cross-product p
   for (const operation of [
     "stageImport",
     "activateStaged",
+    "inspectStaged",
     "currentGeneration",
     "discardStaged",
   ]) {
@@ -278,6 +279,7 @@ test("public RPC stages all three products independently without cross-product p
   assert.match(client, /activateStaged\(\s*database: LocalDatabaseId/);
   assert.match(worker, /stageDatabaseImport\(\s*request\.database/);
   assert.match(worker, /activateStagedDatabaseGeneration\(\s*request\.database/);
+  assert.match(worker, /inspectStagedDatabaseGeneration\(\s*request\.database/);
   assert.match(worker, /assertActivationToken\(name, ready, activationToken\)/);
   assert.match(worker, /zhiji\.active-a\.json/);
   assert.match(worker, /zhiji\.active-b\.json/);
@@ -292,4 +294,157 @@ test("public RPC stages all three products independently without cross-product p
   assert.match(worker, /rawPointerReferences\(\s*name,/);
   assert.match(worker, /generationIdFromFilename\(name, filename\)/);
   assert.doesNotMatch(worker, /assertCareerOnly/);
+});
+
+test("bound recovery READY records persist a worker-owned baseline and app projection digest", async () => {
+  const worker = await readFile(
+    new URL("lib/local-db/sqlite.worker.ts", projectRoot),
+    "utf8",
+  );
+  const staging = section(
+    worker,
+    "async function stageDatabaseImport(",
+    "async function validateReadyCandidate(",
+  );
+  const capture = staging.indexOf("const recoveryBaselineState");
+  const primitiveCopy = staging.indexOf("generationId: recoveryBaselineState.generationId");
+  const importWrite = staging.indexOf("OpfsDb.importDb");
+  const readyWrite = staging.indexOf("version: 2");
+  assert.ok(
+    capture >= 0 && capture < primitiveCopy && primitiveCopy < importWrite && importWrite < readyWrite,
+    "the durable baseline must be copied before any candidate import and persisted in v2 READY",
+  );
+  assert.match(staging, /recoveryTokenSha256: await sha256Text\(recoveryToken\)/);
+  assert.match(staging, /databaseSha256: await sha256Bytes\([\s\S]*?recoveryBaselineState\.db/);
+  assert.match(staging, /expectedCurrentDatabaseSha256: recoveryBaseline\.databaseSha256/);
+  assert.match(staging, /canonicalApplicationId: requirements\.applicationId/);
+  assert.match(staging, /canonicalUserVersion: canonicalSchemaVersion/);
+  assert.match(staging, /projectionSha256: recoveryOptions\.projectionSha256/);
+  assert.doesNotMatch(
+    staging,
+    /expectedCurrentGenerationId:\s*rawRecovery/,
+    "the app may provide a projection digest, never its own baseline",
+  );
+});
+
+test("v1 READY stays compatible while v2 requires an exact durable recovery binding", async () => {
+  const worker = await readFile(
+    new URL("lib/local-db/sqlite.worker.ts", projectRoot),
+    "utf8",
+  );
+  const reader = section(
+    worker,
+    "async function readStagedReady(",
+    "function normalizeRecoveryStageOptions(",
+  );
+  assert.match(reader, /parsed\.version !== 1 && parsed\.version !== 2/);
+  assert.match(reader, /parsed\.version === 1 \? commonKeys : \[\.\.\.commonKeys, "recovery"\]/);
+  assert.match(reader, /parseStoredRecoveryBinding\(name, parsed\.recovery\)/);
+  assert.match(worker, /"expectedCurrentDatabaseSha256"/);
+  assert.match(reader, /recovery\.canonicalApplicationId !== common\.requirements\.applicationId/);
+
+  const validation = section(
+    worker,
+    "async function assertRecoveryReceipt(",
+    "async function openDatabase(",
+  );
+  assert.match(validation, /if \(ready\.version === 1\)/);
+  assert.match(validation, /RECOVERY_BINDING_REQUIRED/);
+  assert.match(validation, /value\.expectedCurrentGenerationId !== recovery\.expectedCurrentGenerationId/);
+  assert.match(validation, /value\.projectionSha256 !== recovery\.projectionSha256/);
+  assert.match(validation, /sha256Text\(value\.recoveryToken\)/);
+});
+
+test("bound activation validates the receipt before idempotence and enforces worker baseline", async () => {
+  const worker = await readFile(
+    new URL("lib/local-db/sqlite.worker.ts", projectRoot),
+    "utf8",
+  );
+  const activation = section(
+    worker,
+    "async function activateStagedDatabaseGeneration(",
+    "async function currentDatabaseGeneration(",
+  );
+  const binding = activation.indexOf("await assertRecoveryReceipt");
+  const open = activation.indexOf("await openDatabase(name)");
+  const idempotent = activation.indexOf("if (active.filename === ready.filename)");
+  const baseline = activation.indexOf("active.generationId !== recovery.expectedCurrentGenerationId");
+  const pointer = activation.indexOf("const committed = await writeGenerationPointer");
+  assert.ok(
+    binding >= 0 && binding < open && open < idempotent && idempotent < baseline && baseline < pointer,
+  );
+  assert.match(activation, /"STAGED_BASELINE_CHANGED"/);
+  assert.match(
+    activation,
+    /sha256Bytes\(exportUnmodifiedBytes\(sqlite3, active\.db\)\)/,
+  );
+  assert.match(activation, /discardedGenerationFilename\(name, generationId\)/);
+});
+
+test("bound discard is idempotent only through a validated durable tombstone", async () => {
+  const worker = await readFile(
+    new URL("lib/local-db/sqlite.worker.ts", projectRoot),
+    "utf8",
+  );
+  const discard = section(
+    worker,
+    "async function discardStagedDatabaseGeneration(",
+    "async function replaceDatabase(",
+  );
+  const tombstoneRead = discard.indexOf("readDiscardedBoundGeneration");
+  const tokenCheck = discard.indexOf("discarded.activationTokenSha256");
+  const bindingCheck = discard.indexOf("assertRecoveryReceiptMatches");
+  const retryDelete = discard.indexOf("if (discarded.status === \"pending\")");
+  const firstPendingWrite = discard.indexOf("writeDiscardedBoundGeneration(name, pending)");
+  const candidateDelete = discard.indexOf(
+    "removeOpfsEntryIfPresent(ready.filename)",
+    firstPendingWrite,
+  );
+  const completeWrite = discard.indexOf("status: \"complete\"", candidateDelete);
+  assert.ok(
+    tombstoneRead >= 0 && tombstoneRead < tokenCheck && tokenCheck < bindingCheck &&
+      bindingCheck < retryDelete,
+  );
+  assert.ok(
+    firstPendingWrite >= 0 && firstPendingWrite < candidateDelete && candidateDelete < completeWrite,
+    "a pending tombstone must make response-lost discard retryable before READY is removed",
+  );
+  assert.match(discard, /await assertRecoveryReceipt\(name, ready, recoveryReceipt\)/);
+  assert.match(discard, /GENERATION_ALREADY_ACTIVATED/);
+});
+
+test("client forwards recovery capabilities without changing legacy Vocab or Fitness calls", async () => {
+  const [types, client, vocab, fitness] = await Promise.all([
+    readFile(new URL("lib/local-db/types.ts", projectRoot), "utf8"),
+    readFile(new URL("lib/local-db/client.ts", projectRoot), "utf8"),
+    readFile(new URL("lib/vocab/backup.ts", projectRoot), "utf8"),
+    readFile(new URL("lib/fitness/backup.ts", projectRoot), "utf8"),
+  ]);
+  assert.match(types, /export type DatabaseRecoveryReceipt</);
+  assert.match(types, /recovery\?: DatabaseRecoveryStageOptions/);
+  assert.match(types, /recoveryReceipt\?: DatabaseRecoveryReceipt/);
+  assert.match(client, /recovery: options\.recovery/);
+  assert.match(client, /recoveryReceipt,/);
+  assert.match(vocab, /localDb\.stageImport\(DATABASE, database, statements, VOCAB_SCHEMA_REQUIREMENTS\)/);
+  assert.match(fitness, /localDb\.stageImport\([\s\S]*?FITNESS_SCHEMA_REQUIREMENTS,[\s\S]*?\)/);
+});
+
+test("staged inspection validates both capabilities and only returns current generation", async () => {
+  const worker = await readFile(
+    new URL("lib/local-db/sqlite.worker.ts", projectRoot),
+    "utf8",
+  );
+  const inspection = section(
+    worker,
+    "async function inspectStagedDatabaseGeneration(",
+    "async function rawPointerReferences(",
+  );
+  assert.match(inspection, /await readStagedReady\(name, generationId\)/);
+  assert.match(inspection, /await assertActivationToken\(name, ready, activationToken\)/);
+  assert.match(inspection, /await assertRecoveryReceipt\(name, ready, recoveryReceipt\)/);
+  assert.match(inspection, /return currentDatabaseGeneration\(name\)/);
+  assert.doesNotMatch(
+    inspection,
+    /write|removeOpfsEntry|importDb|executeBatch|activateStagedDatabaseGeneration/,
+  );
 });

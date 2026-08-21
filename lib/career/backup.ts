@@ -7,12 +7,16 @@ import {
   type LocalFileMetadata,
 } from "@/lib/local-db/files";
 import type {
+  ActivatedDatabaseGeneration,
+  CurrentDatabaseGeneration,
+  DatabaseRecoveryReceipt,
   SqlStatement,
   StagedDatabaseImportResult,
 } from "@/lib/local-db/types";
 import {
   CAREER_BACKUP_LIMITS,
   CAREER_BACKUP_MAGIC,
+  CareerBackupFormatError,
   createCareerBackupBlob,
   parseCareerBackupBlob,
   type CareerBackupAttachmentMetadata,
@@ -33,7 +37,13 @@ import {
 import type { Material } from "./types";
 
 const DB = "career" as const;
+const CANONICAL_DB = "zhiji" as const;
+const SQLITE_IDENTITY_BYTE_SIZE = 72;
+const sqliteHeaderBytes = new TextEncoder().encode("SQLite format 3\u0000");
 const careerBackupMagicBytes = new TextEncoder().encode(CAREER_BACKUP_MAGIC);
+const UUID_V4_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 
 export type CompleteCareerBackupExport = Readonly<{
   blob: Blob;
@@ -54,15 +64,240 @@ export type LegacyCareerBackupRestore = Readonly<{
   previousRecoverySnapshotRetained: true;
 }>;
 
+/**
+ * Counts which require a read-only query against the staged generation stay
+ * null until local-db exposes that narrow capability. They must never be
+ * substituted with counts from the currently active Career database.
+ */
+export type CareerRestoreSummary = Readonly<{
+  kind: "complete-backup" | "legacy-career-sqlite";
+  fileName: string | null;
+  byteSize: number;
+  databaseByteSize: number;
+  exportedAt: string | null;
+  sourceUserVersion: number;
+  canonicalUserVersion: number;
+  attachmentCount: number;
+  jobCount: null;
+  materialCount: null;
+  verification:
+    | "container-and-payload-verified"
+    | "career-schema-verified";
+}>;
+
+/**
+ * A JSON-safe capability receipt. The source Blob, SQL statements, attachment
+ * names and attachment bytes are deliberately absent, so a refresh can resume
+ * activation or cleanup without retaining the selected file in JavaScript.
+ */
+export type CareerRestoreReceipt = Readonly<{
+  version: 1;
+  database: "zhiji";
+  generationId: string;
+  activationToken: string;
+  recoveryToken: string;
+  expectedCurrentGenerationId: string;
+  expectedCurrentSequence: number;
+  canonicalApplicationId: number;
+  canonicalUserVersion: number;
+  projectionSha256: string;
+  preparedAt: string;
+  summary: CareerRestoreSummary;
+  stagedAttachmentKeys: readonly string[];
+}>;
+
+export type CareerRestoreActivation = Readonly<{
+  generationId: string;
+  summary: CareerRestoreSummary;
+  outcome: "activated" | "already-current" | "confirmed-after-lost-response";
+  previousRecoverySnapshotRetained: true;
+}>;
+
+export type CareerRestoreActivationInspection = Readonly<{
+  status: "current" | "different-current";
+  currentGenerationId: string;
+  currentSequence: number;
+}>;
+
+export type CareerRestoreDiscard = Readonly<{
+  discarded: true;
+  attachmentCleanup: "complete" | "incomplete";
+  failedAttachmentKeys: readonly string[];
+}>;
+
+export type CareerRestoreErrorCode =
+  | "INVALID_RECEIPT"
+  | "PREPARE_ABORTED"
+  | "LEGACY_BACKUP_TOO_LARGE"
+  | "UNRECOGNIZED_SQLITE"
+  | "UNSUPPORTED_SOURCE"
+  | "PREPARE_FAILED"
+  | "PREPARE_CLEANUP_INCOMPLETE"
+  | "PREPARE_UNCERTAIN"
+  | "CURRENT_GENERATION_UNAVAILABLE"
+  | "CURRENT_GENERATION_CHANGED"
+  | "ACTIVATION_FAILED"
+  | "ACTIVATION_UNCERTAIN"
+  | "DISCARD_UNCERTAIN";
+
+export class CareerRestoreError extends Error {
+  readonly cause?: unknown;
+
+  constructor(
+    message: string,
+    readonly code: CareerRestoreErrorCode,
+    cause?: unknown,
+  ) {
+    super(message);
+    this.name = "CareerRestoreError";
+    this.cause = cause;
+  }
+}
+
+export class CareerRestoreAbortedError extends CareerRestoreError {
+  constructor() {
+    super("已停止核对备份，当前资料没有改变。", "PREPARE_ABORTED");
+    this.name = "AbortError";
+  }
+}
+
+export class CareerActivationUncertainError extends CareerRestoreError {
+  constructor(
+    readonly targetGenerationId: string,
+    readonly receipt: CareerRestoreReceipt,
+    cause?: unknown,
+  ) {
+    super(
+      "恢复切换结果暂时无法确认。候选与核对信息均已保留；请只核对当前版本，不要重新恢复。",
+      "ACTIVATION_UNCERTAIN",
+      cause,
+    );
+    this.name = "CareerActivationUncertainError";
+  }
+}
+
+export class CareerCurrentGenerationChangedError extends CareerRestoreError {
+  constructor(
+    readonly currentGenerationId: string,
+    readonly currentSequence: number,
+  ) {
+    super(
+      "当前职迹已在另一个页面更新或切换。这次没有覆盖它，请重新核对后再决定。",
+      "CURRENT_GENERATION_CHANGED",
+    );
+    this.name = "CareerCurrentGenerationChangedError";
+  }
+}
+
+export class CareerDiscardUncertainError extends CareerRestoreError {
+  constructor(
+    readonly receipt: CareerRestoreReceipt,
+    cause?: unknown,
+  ) {
+    super(
+      "候选清理结果暂时无法确认。恢复凭据已保留，请稍后只重试清理。",
+      "DISCARD_UNCERTAIN",
+      cause,
+    );
+    this.name = "CareerDiscardUncertainError";
+  }
+}
+
+const prepareCleanupKeys = new WeakMap<
+  CareerPrepareCleanupIncompleteError,
+  readonly string[]
+>();
+
+class CareerPrepareCleanupIncompleteError extends CareerRestoreError {
+  readonly failedAttachmentCount: number;
+
+  constructor(keys: readonly string[], cause?: unknown) {
+    super(
+      `有 ${keys.length} 个未启用的暂存附件尚未清理。当前职迹没有改变；可直接重试清理。`,
+      "PREPARE_CLEANUP_INCOMPLETE",
+      cause,
+    );
+    this.name = "CareerPrepareCleanupIncompleteError";
+    this.failedAttachmentCount = keys.length;
+    prepareCleanupKeys.set(this, [...keys]);
+  }
+
+  async retryCleanup(): Promise<Readonly<{ cleaned: true }>> {
+    const keys = prepareCleanupKeys.get(this);
+    if (!keys) {
+      throw new CareerRestoreError(
+        "这次暂存清理已经完成或不再可用。",
+        "PREPARE_CLEANUP_INCOMPLETE",
+      );
+    }
+    const failed = await deleteAttachmentKeys(keys);
+    if (failed.length > 0) {
+      throw new CareerPrepareCleanupIncompleteError(failed, this);
+    }
+    prepareCleanupKeys.delete(this);
+    return { cleaned: true };
+  }
+}
+
 type StagedAttachment = Readonly<{
   original: CareerBackupAttachmentMetadata;
   staged: LocalFileMetadata;
 }>;
 
-class CareerActivationUncertainError extends Error {
-  constructor() {
-    super("恢复切换结果暂时无法确认。请保留页面并刷新；应用不会在结果不明时清理候选数据。");
-    this.name = "CareerActivationUncertainError";
+type PreparedRestoreSource =
+  | Readonly<{
+      kind: "complete-backup";
+      parsed: ParsedCareerBackup;
+      database: Uint8Array;
+      fileName: string | null;
+      byteSize: number;
+      sourceUserVersion: number;
+      exportedAt: string;
+    }>
+  | Readonly<{
+      kind: "legacy-career-sqlite";
+      database: Uint8Array;
+      fileName: string | null;
+      byteSize: number;
+      sourceUserVersion: number;
+      exportedAt: null;
+    }>;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  const expected = new Set(keys);
+  const actual = Object.keys(value);
+  return actual.length === expected.size && actual.every((key) => expected.has(key));
+}
+
+function isCanonicalIsoTimestamp(value: string): boolean {
+  const parsed = new Date(value);
+  return value.length === 24 && !Number.isNaN(parsed.getTime()) && parsed.toISOString() === value;
+}
+
+function safeFileName(blob: Blob): string | null {
+  const value = (blob as Blob & { name?: unknown }).name;
+  if (typeof value !== "string") return null;
+  const sanitized = Array.from(value, (character) => {
+    const codePoint = character.codePointAt(0) ?? 0;
+    return codePoint <= 31 || codePoint === 127 ? " " : character;
+  }).join("").replace(/\s+/g, " ").trim().slice(0, 255);
+  return sanitized || null;
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new CareerRestoreAbortedError();
+}
+
+function assertExclusiveContext(context: CareerLockContext): void {
+  if (context.mode !== "exclusive") {
+    throw new CareerRestoreError(
+      "恢复需要独占职迹存储锁。当前资料没有改变。",
+      "PREPARE_FAILED",
+    );
   }
 }
 
@@ -75,15 +310,58 @@ function databaseBytes(value: unknown): Uint8Array {
   throw new Error("本地数据库没有返回可导出的 SQLite 字节");
 }
 
-function sqliteUserVersion(database: Uint8Array): number {
-  if (database.byteLength < 64) {
-    throw new Error("这份 SQLite 备份不完整，已在迁移前拒绝");
+function sqliteIdentity(database: Uint8Array): Readonly<{
+  applicationId: number;
+  userVersion: number;
+}> {
+  if (database.byteLength < SQLITE_IDENTITY_BYTE_SIZE) {
+    throw new CareerRestoreError(
+      "这不是可识别的职迹数据库，当前资料没有改变。",
+      "UNRECOGNIZED_SQLITE",
+    );
   }
-  return new DataView(
+  for (let index = 0; index < sqliteHeaderBytes.byteLength; index += 1) {
+    if (database[index] !== sqliteHeaderBytes[index]) {
+      throw new CareerRestoreError(
+        "这不是可识别的职迹数据库，当前资料没有改变。",
+        "UNRECOGNIZED_SQLITE",
+      );
+    }
+  }
+  const view = new DataView(
     database.buffer,
     database.byteOffset,
     database.byteLength,
-  ).getUint32(60, false);
+  );
+  return {
+    applicationId: view.getUint32(68, false),
+    userVersion: view.getUint32(60, false),
+  };
+}
+
+function assertSupportedSourceIdentity(
+  applicationId: number,
+  userVersion: number,
+): void {
+  const sourceApplicationIds = CAREER_SCHEMA_REQUIREMENTS.sourceApplicationIds ?? [
+    CAREER_SCHEMA_REQUIREMENTS.applicationId,
+  ];
+  const minimum = CAREER_SCHEMA_REQUIREMENTS.sourceMinimumUserVersion ??
+    CAREER_SCHEMA_REQUIREMENTS.minimumUserVersion;
+  const maximum = CAREER_SCHEMA_REQUIREMENTS.sourceMaximumUserVersion ??
+    CAREER_SCHEMA_REQUIREMENTS.maximumUserVersion;
+  if (
+    !Number.isSafeInteger(applicationId) ||
+    !sourceApplicationIds.some((supportedId) => supportedId === applicationId) ||
+    !Number.isSafeInteger(userVersion) ||
+    userVersion < minimum ||
+    userVersion > maximum
+  ) {
+    throw new CareerRestoreError(
+      "这份数据库不是当前支持的职迹版本，当前资料没有改变。",
+      "UNSUPPORTED_SOURCE",
+    );
+  }
 }
 
 function attachedMaterials(materials: readonly Material[]) {
@@ -102,37 +380,46 @@ function assertMaterialMetadata(material: Material, metadata: LocalFileMetadata)
   }
 }
 
-async function activateCandidate(staged: StagedDatabaseImportResult) {
-  try {
-    await localDb.activateStaged(DB, staged.generationId, staged.activationToken);
-    return;
-  } catch (activationError) {
-    try {
-      const current = await localDb.currentGeneration(DB);
-      if (current.generationId === staged.generationId) {
-        return;
-      }
-    } catch {
-      throw new CareerActivationUncertainError();
-    }
-    throw activationError;
+function assertStagedAttachment(
+  original: CareerBackupAttachmentMetadata,
+  staged: LocalFileMetadata,
+): void {
+  if (
+    staged.version !== 1 ||
+    staged.namespace !== DB ||
+    !UUID_V4_PATTERN.test(staged.key) ||
+    staged.originalName !== original.originalName ||
+    staged.mimeType !== original.mimeType ||
+    staged.category !== original.category ||
+    staged.byteSize !== original.byteSize ||
+    staged.sha256 !== original.sha256 ||
+    staged.createdAt !== original.createdAt ||
+    staged.updatedAt !== original.updatedAt
+  ) {
+    throw new CareerRestoreError(
+      `暂存附件「${original.originalName}」时校验失败，当前资料没有改变。`,
+      "PREPARE_FAILED",
+    );
   }
 }
 
-async function discardCandidate(staged: StagedDatabaseImportResult | null) {
-  if (!staged) return;
-  await localDb.discardStaged(DB, staged.generationId, staged.activationToken).catch(() => undefined);
+async function deleteAttachmentKeys(keys: readonly string[]): Promise<string[]> {
+  const results = await Promise.allSettled(keys.map((key) => deleteLocalFile(DB, key)));
+  return results.flatMap((result, index) => result.status === "rejected" ? [keys[index]] : []);
 }
 
-async function deleteStagedAttachments(staged: readonly StagedAttachment[]) {
-  await Promise.allSettled(staged.map(({ staged: metadata }) =>
-    deleteLocalFile(DB, metadata.key)));
+async function deleteStagedAttachments(staged: readonly StagedAttachment[]): Promise<string[]> {
+  return deleteAttachmentKeys(staged.map(({ staged: metadata }) => metadata.key));
 }
 
-async function stageAttachments(parsed: ParsedCareerBackup): Promise<StagedAttachment[]> {
+async function stageAttachments(
+  parsed: ParsedCareerBackup,
+  signal?: AbortSignal,
+): Promise<StagedAttachment[]> {
   const staged: StagedAttachment[] = [];
   try {
     for (const attachment of parsed.attachments) {
+      throwIfAborted(signal);
       const metadata = await saveLocalFile(DB, attachment.blob, {
         originalName: attachment.metadata.originalName,
         mimeType: attachment.metadata.mimeType,
@@ -140,60 +427,756 @@ async function stageAttachments(parsed: ParsedCareerBackup): Promise<StagedAttac
         createdAt: attachment.metadata.createdAt,
         updatedAt: attachment.metadata.updatedAt,
       });
-      if (
-        metadata.byteSize !== attachment.metadata.byteSize ||
-        metadata.sha256 !== attachment.metadata.sha256
-      ) {
-        throw new Error(`暂存附件「${attachment.metadata.originalName}」时校验失败`);
-      }
       staged.push({ original: attachment.metadata, staged: metadata });
+      assertStagedAttachment(attachment.metadata, metadata);
+      throwIfAborted(signal);
     }
     return staged;
   } catch (error) {
-    await deleteStagedAttachments(staged);
+    const failed = await deleteStagedAttachments(staged);
+    if (failed.length > 0) {
+      throw new CareerPrepareCleanupIncompleteError(failed, error);
+    }
     throw error;
   }
 }
 
-async function stageAndActivate(
-  database: Uint8Array,
-  statements: readonly SqlStatement[],
-  context: CareerLockContext,
-  stagedAttachments: readonly StagedAttachment[],
-) {
-  if (context.mode !== "exclusive") {
-    throw new Error("恢复需要独占职迹存储锁");
+function summaryFor(source: PreparedRestoreSource): CareerRestoreSummary {
+  return {
+    kind: source.kind,
+    fileName: source.fileName,
+    byteSize: source.byteSize,
+    databaseByteSize: source.database.byteLength,
+    exportedAt: source.exportedAt,
+    sourceUserVersion: source.sourceUserVersion,
+    canonicalUserVersion: CAREER_SCHEMA_REQUIREMENTS.maximumUserVersion,
+    attachmentCount: source.kind === "complete-backup"
+      ? source.parsed.attachments.length
+      : 0,
+    jobCount: null,
+    materialCount: null,
+    verification: source.kind === "complete-backup"
+      ? "container-and-payload-verified"
+      : "career-schema-verified",
+  };
+}
+
+type CareerRestoreProjection = Readonly<{
+  version: 1;
+  database: "zhiji";
+  preparedAt: string;
+  summary: CareerRestoreSummary;
+  stagedAttachmentKeys: readonly string[];
+}>;
+
+function restoreProjection(
+  preparedAt: string,
+  summary: CareerRestoreSummary,
+  stagedAttachmentKeys: readonly string[],
+): CareerRestoreProjection {
+  return {
+    version: 1,
+    database: CANONICAL_DB,
+    preparedAt,
+    summary,
+    stagedAttachmentKeys: [...stagedAttachmentKeys],
+  };
+}
+
+async function restoreProjectionSha256(
+  projection: CareerRestoreProjection,
+): Promise<string> {
+  return sha256Blob(new Blob([
+    JSON.stringify({
+      version: projection.version,
+      database: projection.database,
+      preparedAt: projection.preparedAt,
+      summary: {
+        kind: projection.summary.kind,
+        fileName: projection.summary.fileName,
+        byteSize: projection.summary.byteSize,
+        databaseByteSize: projection.summary.databaseByteSize,
+        exportedAt: projection.summary.exportedAt,
+        sourceUserVersion: projection.summary.sourceUserVersion,
+        canonicalUserVersion: projection.summary.canonicalUserVersion,
+        attachmentCount: projection.summary.attachmentCount,
+        jobCount: projection.summary.jobCount,
+        materialCount: projection.summary.materialCount,
+        verification: projection.summary.verification,
+      },
+      stagedAttachmentKeys: projection.stagedAttachmentKeys,
+    }),
+  ], { type: "application/json" }));
+}
+
+function parseStagedRecoveryReceipt(
+  value: unknown,
+  generationId: string,
+  projectionSha256: string,
+): DatabaseRecoveryReceipt<"zhiji"> {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, [
+      "version", "database", "generationId", "recoveryToken",
+      "expectedCurrentGenerationId", "expectedCurrentSequence",
+      "canonicalApplicationId", "canonicalUserVersion", "projectionSha256",
+    ]) ||
+    value.version !== 1 ||
+    value.database !== CANONICAL_DB ||
+    value.generationId !== generationId ||
+    typeof value.recoveryToken !== "string" ||
+    !SHA256_PATTERN.test(value.recoveryToken) ||
+    typeof value.expectedCurrentGenerationId !== "string" ||
+    !(value.expectedCurrentGenerationId === "legacy" ||
+      UUID_V4_PATTERN.test(value.expectedCurrentGenerationId)) ||
+    typeof value.expectedCurrentSequence !== "number" ||
+    !Number.isSafeInteger(value.expectedCurrentSequence) ||
+    value.expectedCurrentSequence < 0 ||
+    (value.expectedCurrentGenerationId === "legacy" &&
+      value.expectedCurrentSequence !== 0) ||
+    value.canonicalApplicationId !== CAREER_SCHEMA_REQUIREMENTS.applicationId ||
+    value.canonicalUserVersion !== CAREER_SCHEMA_REQUIREMENTS.maximumUserVersion ||
+    value.projectionSha256 !== projectionSha256
+  ) {
+    throw new CareerRestoreError(
+      "候选数据库返回了无效的恢复凭据，当前资料没有改变。",
+      "PREPARE_FAILED",
+    );
   }
-  let stagedDatabase: StagedDatabaseImportResult | null = null;
-  let activated = false;
+  return {
+    version: 1,
+    database: CANONICAL_DB,
+    generationId,
+    recoveryToken: value.recoveryToken,
+    expectedCurrentGenerationId: value.expectedCurrentGenerationId,
+    expectedCurrentSequence: value.expectedCurrentSequence,
+    canonicalApplicationId: value.canonicalApplicationId,
+    canonicalUserVersion: value.canonicalUserVersion,
+    projectionSha256: value.projectionSha256,
+  };
+}
+
+function receiptFor(
+  staged: StagedDatabaseImportResult,
+  recovery: DatabaseRecoveryReceipt,
+  projection: CareerRestoreProjection,
+  projectionSha256: string,
+): CareerRestoreReceipt {
+  return {
+    version: 1,
+    database: CANONICAL_DB,
+    generationId: staged.generationId,
+    activationToken: staged.activationToken,
+    recoveryToken: recovery.recoveryToken,
+    expectedCurrentGenerationId: recovery.expectedCurrentGenerationId,
+    expectedCurrentSequence: recovery.expectedCurrentSequence,
+    canonicalApplicationId: recovery.canonicalApplicationId,
+    canonicalUserVersion: recovery.canonicalUserVersion,
+    projectionSha256,
+    preparedAt: projection.preparedAt,
+    summary: projection.summary,
+    stagedAttachmentKeys: [...projection.stagedAttachmentKeys],
+  };
+}
+
+function parseRestoreSummary(value: unknown): CareerRestoreSummary {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, [
+      "kind", "fileName", "byteSize", "databaseByteSize", "exportedAt",
+      "sourceUserVersion", "canonicalUserVersion", "attachmentCount",
+      "jobCount", "materialCount", "verification",
+    ]) ||
+    (value.kind !== "complete-backup" && value.kind !== "legacy-career-sqlite") ||
+    !(value.fileName === null || (
+      typeof value.fileName === "string" && value.fileName.length > 0 && value.fileName.length <= 255
+    )) ||
+    typeof value.byteSize !== "number" || !Number.isSafeInteger(value.byteSize) ||
+    value.byteSize < 0 || value.byteSize > CAREER_BACKUP_LIMITS.totalBytes ||
+    typeof value.databaseByteSize !== "number" || !Number.isSafeInteger(value.databaseByteSize) ||
+    value.databaseByteSize < SQLITE_IDENTITY_BYTE_SIZE ||
+    value.databaseByteSize > CAREER_BACKUP_LIMITS.databaseBytes ||
+    !(value.exportedAt === null || (
+      typeof value.exportedAt === "string" && isCanonicalIsoTimestamp(value.exportedAt)
+    )) ||
+    typeof value.sourceUserVersion !== "number" || !Number.isSafeInteger(value.sourceUserVersion) ||
+    value.sourceUserVersion < 0 || value.sourceUserVersion > CAREER_SCHEMA_REQUIREMENTS.maximumUserVersion ||
+    typeof value.canonicalUserVersion !== "number" || !Number.isSafeInteger(value.canonicalUserVersion) ||
+    value.canonicalUserVersion !== CAREER_SCHEMA_REQUIREMENTS.maximumUserVersion ||
+    typeof value.attachmentCount !== "number" || !Number.isSafeInteger(value.attachmentCount) ||
+    value.attachmentCount < 0 || value.attachmentCount > CAREER_BACKUP_LIMITS.attachmentCount ||
+    value.jobCount !== null || value.materialCount !== null ||
+    (value.verification !== "container-and-payload-verified" && value.verification !== "career-schema-verified") ||
+    (value.kind === "complete-backup" && (
+      value.exportedAt === null || value.verification !== "container-and-payload-verified"
+    )) ||
+    (value.kind === "legacy-career-sqlite" && (
+      value.exportedAt !== null || value.attachmentCount !== 0 ||
+      value.verification !== "career-schema-verified"
+    ))
+  ) {
+    throw new CareerRestoreError(
+      "恢复核对信息无效。为保护当前资料，没有继续操作。",
+      "INVALID_RECEIPT",
+    );
+  }
+  return {
+    kind: value.kind,
+    fileName: value.fileName,
+    byteSize: value.byteSize,
+    databaseByteSize: value.databaseByteSize,
+    exportedAt: value.exportedAt,
+    sourceUserVersion: value.sourceUserVersion,
+    canonicalUserVersion: value.canonicalUserVersion,
+    attachmentCount: value.attachmentCount,
+    jobCount: null,
+    materialCount: null,
+    verification: value.verification,
+  };
+}
+
+function parseRestoreReceipt(value: unknown): CareerRestoreReceipt {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, [
+      "version", "database", "generationId", "activationToken", "recoveryToken",
+      "expectedCurrentGenerationId", "expectedCurrentSequence",
+      "canonicalApplicationId", "canonicalUserVersion", "projectionSha256",
+      "preparedAt", "summary", "stagedAttachmentKeys",
+    ]) ||
+    value.version !== 1 ||
+    value.database !== CANONICAL_DB ||
+    typeof value.generationId !== "string" || !UUID_V4_PATTERN.test(value.generationId) ||
+    typeof value.activationToken !== "string" || !SHA256_PATTERN.test(value.activationToken) ||
+    typeof value.recoveryToken !== "string" || !SHA256_PATTERN.test(value.recoveryToken) ||
+    typeof value.expectedCurrentGenerationId !== "string" ||
+    !(value.expectedCurrentGenerationId === "legacy" || UUID_V4_PATTERN.test(value.expectedCurrentGenerationId)) ||
+    typeof value.expectedCurrentSequence !== "number" || !Number.isSafeInteger(value.expectedCurrentSequence) ||
+    value.expectedCurrentSequence < 0 ||
+    value.canonicalApplicationId !== CAREER_SCHEMA_REQUIREMENTS.applicationId ||
+    value.canonicalUserVersion !== CAREER_SCHEMA_REQUIREMENTS.maximumUserVersion ||
+    typeof value.projectionSha256 !== "string" ||
+    !SHA256_PATTERN.test(value.projectionSha256) ||
+    typeof value.preparedAt !== "string" || !isCanonicalIsoTimestamp(value.preparedAt) ||
+    !Array.isArray(value.stagedAttachmentKeys) ||
+    value.stagedAttachmentKeys.length > CAREER_BACKUP_LIMITS.attachmentCount ||
+    value.stagedAttachmentKeys.some((key) => typeof key !== "string" || !UUID_V4_PATTERN.test(key)) ||
+    new Set(value.stagedAttachmentKeys).size !== value.stagedAttachmentKeys.length
+  ) {
+    throw new CareerRestoreError(
+      "恢复核对信息无效。为保护当前资料，没有继续操作。",
+      "INVALID_RECEIPT",
+    );
+  }
+  const summary = parseRestoreSummary(value.summary);
+  if (
+    summary.attachmentCount !== value.stagedAttachmentKeys.length ||
+    summary.canonicalUserVersion !== value.canonicalUserVersion ||
+    (value.expectedCurrentGenerationId === "legacy" && value.expectedCurrentSequence !== 0)
+  ) {
+    throw new CareerRestoreError(
+      "恢复核对信息彼此不一致。为保护当前资料，没有继续操作。",
+      "INVALID_RECEIPT",
+    );
+  }
+  return {
+    version: 1,
+    database: CANONICAL_DB,
+    generationId: value.generationId,
+    activationToken: value.activationToken,
+    recoveryToken: value.recoveryToken,
+    expectedCurrentGenerationId: value.expectedCurrentGenerationId,
+    expectedCurrentSequence: value.expectedCurrentSequence,
+    canonicalApplicationId: value.canonicalApplicationId,
+    canonicalUserVersion: value.canonicalUserVersion,
+    projectionSha256: value.projectionSha256,
+    preparedAt: value.preparedAt,
+    summary,
+    stagedAttachmentKeys: [...value.stagedAttachmentKeys] as string[],
+  };
+}
+
+async function verifyRestoreReceipt(value: unknown): Promise<CareerRestoreReceipt> {
+  const receipt = parseRestoreReceipt(value);
+  const digest = await restoreProjectionSha256(restoreProjection(
+    receipt.preparedAt,
+    receipt.summary,
+    receipt.stagedAttachmentKeys,
+  ));
+  if (digest !== receipt.projectionSha256) {
+    throw new CareerRestoreError(
+      "恢复核对信息与候选版本不一致。为保护当前资料，没有继续操作。",
+      "INVALID_RECEIPT",
+    );
+  }
+  return receipt;
+}
+
+function databaseRecoveryReceiptFor(
+  receipt: CareerRestoreReceipt,
+): DatabaseRecoveryReceipt<"zhiji"> {
+  return {
+    version: 1,
+    database: CANONICAL_DB,
+    generationId: receipt.generationId,
+    recoveryToken: receipt.recoveryToken,
+    expectedCurrentGenerationId: receipt.expectedCurrentGenerationId,
+    expectedCurrentSequence: receipt.expectedCurrentSequence,
+    canonicalApplicationId: receipt.canonicalApplicationId,
+    canonicalUserVersion: receipt.canonicalUserVersion,
+    projectionSha256: receipt.projectionSha256,
+  };
+}
+
+function isCurrentTarget(current: CurrentDatabaseGeneration, receipt: CareerRestoreReceipt): boolean {
+  return current.database === CANONICAL_DB && current.generationId === receipt.generationId;
+}
+
+function isExpectedCurrent(current: CurrentDatabaseGeneration, receipt: CareerRestoreReceipt): boolean {
+  return current.database === CANONICAL_DB &&
+    current.generationId === receipt.expectedCurrentGenerationId &&
+    current.sequence === receipt.expectedCurrentSequence;
+}
+
+function recoveryCredentialErrorCode(error: unknown): string | null {
+  if (!isRecord(error) || typeof error.code !== "string") return null;
+  return [
+    "RECOVERY_BINDING_REQUIRED",
+    "RECOVERY_BINDING_MISMATCH",
+    "INVALID_ACTIVATION_TOKEN",
+    "INVALID_GENERATION_ID",
+  ].includes(error.code) ? error.code : null;
+}
+
+function parseCurrentGeneration(value: unknown): CurrentDatabaseGeneration<"zhiji"> {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, [
+      "database", "generationId", "filename", "sequence", "legacy",
+    ]) ||
+    value.database !== CANONICAL_DB ||
+    typeof value.generationId !== "string" ||
+    !(value.generationId === "legacy" || UUID_V4_PATTERN.test(value.generationId)) ||
+    typeof value.filename !== "string" ||
+    typeof value.sequence !== "number" ||
+    !Number.isSafeInteger(value.sequence) ||
+    value.sequence < 0 ||
+    typeof value.legacy !== "boolean" ||
+    (value.generationId === "legacy"
+      ? value.filename !== "zhiji.sqlite3" || value.sequence !== 0 || value.legacy !== true
+      : value.filename !== `zhiji.${value.generationId}.sqlite3` || value.legacy !== false)
+  ) {
+    throw new Error("Invalid current Career database generation response.");
+  }
+  return {
+    database: CANONICAL_DB,
+    generationId: value.generationId,
+    filename: value.filename as `${string}.sqlite3`,
+    sequence: value.sequence,
+    legacy: value.legacy,
+  };
+}
+
+function parseActivatedGeneration(
+  value: unknown,
+  receipt: CareerRestoreReceipt,
+): ActivatedDatabaseGeneration<"zhiji"> {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, [
+      "database", "filename", "persistent", "sqliteVersion", "schemaVersion",
+      "seeded", "generationId", "sequence",
+    ]) ||
+    value.database !== CANONICAL_DB ||
+    value.filename !== `${CANONICAL_DB}.${receipt.generationId}.sqlite3` ||
+    value.persistent !== true ||
+    typeof value.sqliteVersion !== "string" || value.sqliteVersion.length === 0 ||
+    value.schemaVersion !== receipt.canonicalUserVersion ||
+    value.seeded !== false ||
+    value.generationId !== receipt.generationId ||
+    typeof value.sequence !== "number" ||
+    !Number.isSafeInteger(value.sequence) || value.sequence < 1
+  ) {
+    throw new Error("Invalid staged Career activation response.");
+  }
+  return {
+    database: CANONICAL_DB,
+    filename: value.filename as `zhiji.${string}.sqlite3`,
+    persistent: true,
+    sqliteVersion: value.sqliteVersion,
+    schemaVersion: value.schemaVersion,
+    seeded: false,
+    generationId: receipt.generationId,
+    sequence: value.sequence,
+  };
+}
+
+async function currentGenerationFor(message: string): Promise<CurrentDatabaseGeneration> {
   try {
+    return parseCurrentGeneration(await localDb.currentGeneration(DB));
+  } catch (error) {
+    throw new CareerRestoreError(message, "CURRENT_GENERATION_UNAVAILABLE", error);
+  }
+}
+
+async function inspectBoundCurrentGeneration(
+  receipt: CareerRestoreReceipt,
+): Promise<CurrentDatabaseGeneration> {
+  try {
+    return parseCurrentGeneration(await localDb.inspectStaged(
+      DB,
+      receipt.generationId,
+      receipt.activationToken,
+      databaseRecoveryReceiptFor(receipt),
+    ));
+  } catch (error) {
+    if (recoveryCredentialErrorCode(error)) {
+      throw new CareerRestoreError(
+        "恢复凭据与已核对的候选版本不一致。没有更改当前资料。",
+        "INVALID_RECEIPT",
+        error,
+      );
+    }
+    throw new CareerRestoreError(
+      "暂时无法核对当前职迹版本。候选与恢复信息都已保留。",
+      "CURRENT_GENERATION_UNAVAILABLE",
+      error,
+    );
+  }
+}
+
+function broadcastKnownActivation(generationId: string): void {
+  try {
+    broadcastCareerGenerationChanged(generationId);
+  } catch {
+    // The durable pointer is already authoritative. Cross-tab notification is
+    // best effort and must never turn success into a retryable restore.
+  }
+}
+
+async function discardStagedCandidate(receipt: CareerRestoreReceipt): Promise<void> {
+  let result: unknown;
+  try {
+    result = await localDb.discardStaged(
+      DB,
+      receipt.generationId,
+      receipt.activationToken,
+      databaseRecoveryReceiptFor(receipt),
+    );
+  } catch (error) {
+    throw new CareerRestoreError(
+      "候选状态暂时无法确认，因此没有清理任何暂存附件。",
+      "DISCARD_UNCERTAIN",
+      error,
+    );
+  }
+  if (!isRecord(result) || result.database !== CANONICAL_DB ||
+      result.generationId !== receipt.generationId || result.discarded !== true) {
+    throw new CareerRestoreError(
+      "候选没有返回明确的清理结果，因此没有清理任何暂存附件。",
+      "DISCARD_UNCERTAIN",
+    );
+  }
+}
+
+async function discardPreparedInContext(
+  rawReceipt: CareerRestoreReceipt,
+  context: CareerLockContext,
+): Promise<CareerRestoreDiscard> {
+  assertExclusiveContext(context);
+  const receipt = await verifyRestoreReceipt(rawReceipt);
+  await discardStagedCandidate(receipt);
+  const failedAttachmentKeys = await deleteAttachmentKeys(receipt.stagedAttachmentKeys);
+  return {
+    discarded: true,
+    attachmentCleanup: failedAttachmentKeys.length === 0 ? "complete" : "incomplete",
+    failedAttachmentKeys,
+  };
+}
+
+async function stageSourceInContext(
+  source: PreparedRestoreSource,
+  context: CareerLockContext,
+  signal?: AbortSignal,
+): Promise<CareerRestoreReceipt> {
+  assertExclusiveContext(context);
+  throwIfAborted(signal);
+
+  let stagedAttachments: StagedAttachment[] = [];
+  let stagedDatabase: StagedDatabaseImportResult | null = null;
+  let preparedReceipt: CareerRestoreReceipt | null = null;
+  let atomicStageStarted = false;
+  try {
+    if (source.kind === "complete-backup") {
+      stagedAttachments = await stageAttachments(source.parsed, signal);
+    }
+    throwIfAborted(signal);
+    const statements: readonly SqlStatement[] = source.kind === "complete-backup"
+      ? createCompleteCareerRestoreStatements(stagedAttachments, source.sourceUserVersion)
+      : createLegacyCareerRestoreStatements(source.sourceUserVersion);
+    throwIfAborted(signal);
+
+    const projection = restoreProjection(
+      new Date().toISOString(),
+      summaryFor(source),
+      stagedAttachments.map(({ staged: metadata }) => metadata.key),
+    );
+    const projectionSha256 = await restoreProjectionSha256(projection);
+    throwIfAborted(signal);
+
+    // Once atomic worker staging starts, a late AbortSignal is ignored. A
+    // returned receipt is safer than an unreachable READY candidate.
+    atomicStageStarted = true;
     stagedDatabase = await localDb.stageImport(
       DB,
-      database,
+      source.database,
       statements,
       CAREER_SCHEMA_REQUIREMENTS,
+      { recovery: { projectionSha256 } },
     );
-    await activateCandidate(stagedDatabase);
-    activated = true;
-    try {
-      broadcastCareerGenerationChanged(stagedDatabase.generationId);
-    } catch {
-      // Activation has already made this generation durable. A best-effort
-      // cross-tab notification must never turn that success into a retry or
-      // trigger cleanup of the active database and its restored attachments.
+    if (
+      stagedDatabase.database !== CANONICAL_DB ||
+      !UUID_V4_PATTERN.test(stagedDatabase.generationId) ||
+      !SHA256_PATTERN.test(stagedDatabase.activationToken) ||
+      stagedDatabase.filename !==
+        `${CANONICAL_DB}.${stagedDatabase.generationId}.sqlite3`
+    ) {
+      throw new CareerRestoreError(
+        "候选数据库返回了无效的核对信息，当前资料没有改变。",
+        "PREPARE_FAILED",
+      );
     }
+    const recovery = parseStagedRecoveryReceipt(
+      stagedDatabase.recoveryReceipt,
+      stagedDatabase.generationId,
+      projectionSha256,
+    );
+    preparedReceipt = receiptFor(
+      stagedDatabase,
+      recovery,
+      projection,
+      projectionSha256,
+    );
+    if (
+      stagedDatabase.importedBytes !== source.database.byteLength ||
+      !Number.isSafeInteger(stagedDatabase.schemaVersion) ||
+      stagedDatabase.schemaVersion !== CAREER_SCHEMA_REQUIREMENTS.maximumUserVersion
+    ) {
+      throw new CareerRestoreError(
+        "候选数据库返回了无效的核对信息，当前资料没有改变。",
+        "PREPARE_FAILED",
+      );
+    }
+    return preparedReceipt;
   } catch (error) {
-    if (!activated && !(error instanceof CareerActivationUncertainError)) {
-      await discardCandidate(stagedDatabase);
-      await deleteStagedAttachments(stagedAttachments);
+    if (preparedReceipt) {
+      try {
+        await discardStagedCandidate(preparedReceipt);
+      } catch (discardError) {
+        throw new CareerDiscardUncertainError(
+          preparedReceipt,
+          { prepareError: error, discardError },
+        );
+      }
     }
-    throw error;
+    if (atomicStageStarted && !preparedReceipt) {
+      throw new CareerRestoreError(
+        "候选建立结果暂时无法确认。为避免破坏可能已建立的候选，暂存内容已保留；请不要直接重试恢复。",
+        "PREPARE_UNCERTAIN",
+        error,
+      );
+    }
+    const failed = await deleteStagedAttachments(stagedAttachments);
+    if (failed.length > 0) {
+      throw new CareerPrepareCleanupIncompleteError(failed, error);
+    }
+    if (error instanceof CareerRestoreError || error instanceof CareerBackupFormatError) throw error;
+    throw new CareerRestoreError(
+      "未能建立安全的恢复候选，当前资料没有改变。",
+      "PREPARE_FAILED",
+      error,
+    );
   }
+}
+
+async function activatePreparedInContext(
+  rawReceipt: CareerRestoreReceipt,
+  context: CareerLockContext,
+): Promise<CareerRestoreActivation> {
+  assertExclusiveContext(context);
+  const receipt = await verifyRestoreReceipt(rawReceipt);
+  const current = await currentGenerationFor(
+    "暂时无法读取当前职迹版本，因此没有执行恢复切换。",
+  );
+
+  const wasAlreadyCurrent = isCurrentTarget(current, receipt);
+  if (wasAlreadyCurrent) {
+    const inspected = await inspectBoundCurrentGeneration(receipt);
+    if (!isCurrentTarget(inspected, receipt)) {
+      throw new CareerCurrentGenerationChangedError(
+        inspected.generationId,
+        inspected.sequence,
+      );
+    }
+    broadcastKnownActivation(receipt.generationId);
+    return {
+      generationId: receipt.generationId,
+      summary: receipt.summary,
+      outcome: "already-current",
+      previousRecoverySnapshotRetained: true,
+    };
+  }
+  if (!isExpectedCurrent(current, receipt)) {
+    throw new CareerCurrentGenerationChangedError(current.generationId, current.sequence);
+  }
+
+  try {
+    parseActivatedGeneration(
+      await localDb.activateStaged(
+        DB,
+        receipt.generationId,
+        receipt.activationToken,
+        databaseRecoveryReceiptFor(receipt),
+      ),
+      receipt,
+    );
+  } catch (activationError) {
+    if (recoveryCredentialErrorCode(activationError)) {
+      throw new CareerRestoreError(
+        "恢复凭据与已核对的候选版本不一致。没有更改当前资料。",
+        "INVALID_RECEIPT",
+        activationError,
+      );
+    }
+    let observed: CurrentDatabaseGeneration;
+    try {
+      observed = await currentGenerationFor(
+        "暂时无法核对恢复切换后的当前职迹版本。",
+      );
+    } catch (inspectionError) {
+      throw new CareerActivationUncertainError(
+        receipt.generationId,
+        receipt,
+        { activationError, inspectionError },
+      );
+    }
+    if (isCurrentTarget(observed, receipt)) {
+      broadcastKnownActivation(receipt.generationId);
+      return {
+        generationId: receipt.generationId,
+        summary: receipt.summary,
+        outcome: "confirmed-after-lost-response",
+        previousRecoverySnapshotRetained: true,
+      };
+    }
+    if (
+      isRecord(activationError) &&
+      activationError.code === "STAGED_BASELINE_CHANGED"
+    ) {
+      throw new CareerCurrentGenerationChangedError(
+        observed.generationId,
+        observed.sequence,
+      );
+    }
+    if (!isExpectedCurrent(observed, receipt)) {
+      throw new CareerCurrentGenerationChangedError(observed.generationId, observed.sequence);
+    }
+    throw new CareerRestoreError(
+      "恢复候选没有成为当前版本，当前职迹保持不变。",
+      "ACTIVATION_FAILED",
+      activationError,
+    );
+  }
+
+  broadcastKnownActivation(receipt.generationId);
+  return {
+    generationId: receipt.generationId,
+    summary: receipt.summary,
+    outcome: "activated",
+    previousRecoverySnapshotRetained: true,
+  };
+}
+
+async function readCompleteSource(
+  backup: Blob,
+  signal?: AbortSignal,
+): Promise<PreparedRestoreSource> {
+  throwIfAborted(signal);
+  const parsed = await parseCareerBackupBlob(backup, sha256Blob);
+  throwIfAborted(signal);
+  assertSupportedSourceIdentity(
+    parsed.manifest.database.applicationId,
+    parsed.manifest.database.userVersion,
+  );
+  return {
+    kind: "complete-backup",
+    parsed,
+    database: parsed.database,
+    fileName: safeFileName(backup),
+    byteSize: backup.size,
+    sourceUserVersion: parsed.manifest.database.userVersion,
+    exportedAt: parsed.manifest.exportedAt,
+  };
+}
+
+async function readLegacySource(
+  backup: Blob,
+  signal?: AbortSignal,
+): Promise<PreparedRestoreSource> {
+  if (backup.size > CAREER_BACKUP_LIMITS.databaseBytes) {
+    throw new CareerRestoreError(
+      "所选文件超过旧版职迹数据库的安全处理上限，当前资料没有改变。",
+      "LEGACY_BACKUP_TOO_LARGE",
+    );
+  }
+  throwIfAborted(signal);
+  const database = new Uint8Array(await backup.arrayBuffer());
+  throwIfAborted(signal);
+  const identity = sqliteIdentity(database);
+  assertSupportedSourceIdentity(identity.applicationId, identity.userVersion);
+  return {
+    kind: "legacy-career-sqlite",
+    database,
+    fileName: safeFileName(backup),
+    byteSize: backup.size,
+    sourceUserVersion: identity.userVersion,
+    exportedAt: null,
+  };
+}
+
+async function readAutoDetectedSource(
+  backup: Blob,
+  signal?: AbortSignal,
+): Promise<PreparedRestoreSource> {
+  throwIfAborted(signal);
+  const complete = await isCompleteCareerBackup(backup);
+  throwIfAborted(signal);
+  return complete ? readCompleteSource(backup, signal) : readLegacySource(backup, signal);
+}
+
+async function discardAfterLegacyApiFailure(
+  receipt: CareerRestoreReceipt,
+  context: CareerLockContext,
+  error: unknown,
+): Promise<never> {
+  if (!(error instanceof CareerActivationUncertainError)) {
+    try {
+      await discardPreparedInContext(receipt, context);
+    } catch (discardError) {
+      throw new CareerDiscardUncertainError(
+        receipt,
+        { activationError: error, discardError },
+      );
+    }
+  }
+  throw error;
 }
 
 export async function isCompleteCareerBackup(blob: Blob): Promise<boolean> {
-  if (blob.size < careerBackupMagicBytes.byteLength) return false;
-  const prefix = new Uint8Array(await blob.slice(0, careerBackupMagicBytes.byteLength).arrayBuffer());
+  if (!(blob instanceof Blob) || blob.size < careerBackupMagicBytes.byteLength) return false;
+  const prefix = new Uint8Array(
+    await blob.slice(0, careerBackupMagicBytes.byteLength).arrayBuffer(),
+  );
   return prefix.every((byte, index) => byte === careerBackupMagicBytes[index]);
 }
 
@@ -203,16 +1186,17 @@ export async function exportCompleteCareerBackup(): Promise<CompleteCareerBackup
     const exportedDatabase = databaseBytes(await exportCareerDb(context));
     const materials = attachedMaterials(data.materials);
     const byKey = new Map<string, CareerBackupAttachmentInput>();
-
     for (const material of materials) {
       const stored = await getLocalFile(DB, material.file_key);
       assertMaterialMetadata(material, stored.metadata);
       byKey.set(material.file_key, { metadata: stored.metadata, blob: stored.file });
     }
-
     const attachments = [...byKey.values()].sort((left, right) =>
       left.metadata.key.localeCompare(right.metadata.key));
-    const blob = await createCareerBackupBlob({ database: exportedDatabase, attachments }, sha256Blob);
+    const blob = await createCareerBackupBlob(
+      { database: exportedDatabase, attachments },
+      sha256Blob,
+    );
     return {
       blob,
       fileName: `zhiji-complete-${new Date().toISOString().slice(0, 10)}.career-backup`,
@@ -222,27 +1206,62 @@ export async function exportCompleteCareerBackup(): Promise<CompleteCareerBackup
   });
 }
 
+/** Validate and migrate into an isolated READY generation without activation. */
+export async function prepareCareerBackupRestore(
+  backup: Blob,
+  options: Readonly<{ signal?: AbortSignal }> = {},
+): Promise<CareerRestoreReceipt> {
+  if (!(backup instanceof Blob)) {
+    throw new CareerRestoreError("请选择一个可以读取的职迹备份文件。", "PREPARE_FAILED");
+  }
+  const source = await readAutoDetectedSource(backup, options.signal);
+  return withCareerBackupLock((context) =>
+    stageSourceInContext(source, context, options.signal));
+}
+
+export async function activatePreparedCareerRestore(
+  receipt: CareerRestoreReceipt,
+): Promise<CareerRestoreActivation> {
+  return withCareerBackupLock((context) =>
+    activatePreparedInContext(receipt, context));
+}
+
+/** Pure recovery read: exactly one currentGeneration call, with no writes. */
+export async function inspectCareerRestoreActivation(
+  receipt: CareerRestoreReceipt,
+): Promise<CareerRestoreActivationInspection> {
+  const parsedReceipt = await verifyRestoreReceipt(receipt);
+  const current = await inspectBoundCurrentGeneration(parsedReceipt);
+  return {
+    status: isCurrentTarget(current, parsedReceipt) ? "current" : "different-current",
+    currentGenerationId: current.generationId,
+    currentSequence: current.sequence,
+  };
+}
+
+/** Only an explicitly discarded candidate authorizes attachment deletion. */
+export async function discardPreparedCareerRestore(
+  receipt: CareerRestoreReceipt,
+): Promise<CareerRestoreDiscard> {
+  return withCareerBackupLock((context) =>
+    discardPreparedInContext(receipt, context));
+}
+
 export async function restoreCompleteCareerBackup(
   backup: Blob,
 ): Promise<CompleteCareerBackupRestore> {
-  // The complete container and every digest are verified before the first
-  // local write. The exclusive lock begins only after this CPU-bound parse.
-  const parsed = await parseCareerBackupBlob(backup, sha256Blob);
+  const source = await readCompleteSource(backup);
   return withCareerBackupLock(async (context) => {
-    const stagedAttachments = await stageAttachments(parsed);
-    await stageAndActivate(
-      parsed.database,
-      createCompleteCareerRestoreStatements(
-        stagedAttachments,
-        parsed.manifest.database.userVersion,
-      ),
-      context,
-      stagedAttachments,
-    );
+    const receipt = await stageSourceInContext(source, context);
+    try {
+      await activatePreparedInContext(receipt, context);
+    } catch (error) {
+      return discardAfterLegacyApiFailure(receipt, context, error);
+    }
     return {
-      attachmentCount: parsed.attachments.length,
-      byteSize: backup.size,
-      exportedAt: parsed.manifest.exportedAt,
+      attachmentCount: receipt.summary.attachmentCount,
+      byteSize: receipt.summary.byteSize,
+      exportedAt: receipt.summary.exportedAt!,
       previousRecoverySnapshotRetained: true,
     };
   });
@@ -251,17 +1270,17 @@ export async function restoreCompleteCareerBackup(
 export async function restoreLegacyCareerDatabase(
   backup: Blob,
 ): Promise<LegacyCareerBackupRestore> {
-  if (backup.size > CAREER_BACKUP_LIMITS.databaseBytes) {
-    throw new Error("旧版 SQLite 备份超过 512 MB，已在读取前拒绝");
-  }
-  const database = new Uint8Array(await backup.arrayBuffer());
+  const source = await readLegacySource(backup);
   return withCareerBackupLock(async (context) => {
-    await stageAndActivate(
-      database,
-      createLegacyCareerRestoreStatements(sqliteUserVersion(database)),
-      context,
-      [],
-    );
-    return { byteSize: database.byteLength, previousRecoverySnapshotRetained: true };
+    const receipt = await stageSourceInContext(source, context);
+    try {
+      await activatePreparedInContext(receipt, context);
+    } catch (error) {
+      return discardAfterLegacyApiFailure(receipt, context, error);
+    }
+    return {
+      byteSize: receipt.summary.byteSize,
+      previousRecoverySnapshotRetained: true,
+    };
   });
 }
