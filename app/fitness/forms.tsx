@@ -315,7 +315,7 @@ export function ConstraintForm({
       movement_patterns: patterns,
       exercise_ids: constraint?.exercise_ids ?? [],
       note: String(data.get("note") ?? "").trim(),
-      active: true,
+      active: constraint?.active ?? true,
     }).catch((reason) => setError(reason instanceof Error ? reason.message : "身体边界没有保存")).finally(() => setBusy(false));
   }}>
     <p className="sl-safety-copy strong">这里记录的是你的描述与专业人员建议，不是系统诊断。出现疼痛或异常不适时，先停止相关动作并寻求合格专业人士意见。</p>

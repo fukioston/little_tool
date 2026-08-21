@@ -12,6 +12,7 @@ import {
   getFitnessExercise,
 } from "@/lib/fitness/catalog";
 import { createPlanDraft, fitnessAiErrorMessage } from "@/lib/fitness/api";
+import { buildPrivateFitnessPlanInput } from "@/lib/fitness/ai-input";
 import type { PlanDraft as AiPlanDraft } from "@/lib/fitness/ai-contract";
 import {
   buildFitnessPlanDraft,
@@ -28,6 +29,7 @@ import {
   markCalendarEventNotPerformed,
   recordFitnessSet,
   rescheduleCalendarEvent,
+  restoreVenue,
   saveConstraint,
   saveEquipmentWithLoads,
   saveFitnessProfile,
@@ -35,6 +37,7 @@ import {
   saveProgramDraft,
   saveVenue,
   scheduleProgramWeek,
+  setFitnessConstraintActive,
   setEquipmentStatus,
   startFitnessSession,
   substituteSessionExercise,
@@ -46,8 +49,10 @@ import {
 } from "@/lib/fitness/store";
 import { initializeFitnessFiles } from "@/lib/fitness/files";
 import { subscribeFitnessChanges } from "@/lib/fitness/lock";
+import { localDayBounds, toLocalDateTimeInputValue } from "@/lib/fitness/time";
 import type {
   FitnessCalendarEvent,
+  FitnessConstraint,
   FitnessEquipment,
   FitnessEquipmentLoad,
   FitnessExercise,
@@ -275,6 +280,7 @@ export default function FitnessApp() {
   const [dialog, setDialog] = useState<DialogState>(null);
   const [editingVenue, setEditingVenue] = useState<FitnessVenue | null>(null);
   const [editingEquipment, setEditingEquipment] = useState<FitnessEquipment | null>(null);
+  const [editingConstraint, setEditingConstraint] = useState<FitnessConstraint | null>(null);
   const [planDraft, setPlanDraft] = useState<FitnessPlanDraft | null>(null);
   const [aiDraft, setAiDraft] = useState<AiPlanDraft | null>(null);
   const [busy, setBusy] = useState(false);
@@ -289,7 +295,7 @@ export default function FitnessApp() {
   const refresh = useCallback(async () => {
     const next = await loadFitnessSnapshot();
     setSnapshot(next);
-    setVenueId((current) => current && next.venues.some((venue) => venue.id === current)
+    setVenueId((current) => current && next.venues.some((venue) => venue.id === current && venue.status === "active")
       ? current
       : next.venues.find((venue) => venue.is_default && venue.status === "active")?.id ?? next.venues.find((venue) => venue.status === "active")?.id ?? null);
   }, []);
@@ -341,12 +347,12 @@ export default function FitnessApp() {
     return () => window.cancelAnimationFrame(frame);
   }, [firstRunDismissed, view]);
 
-  const venue = snapshot.venues.find((entry) => entry.id === venueId) ?? null;
+  const venue = snapshot.venues.find((entry) => entry.id === venueId && entry.status === "active") ?? null;
   const venueEquipment = snapshot.equipment.filter((entry) => entry.venue_id === venueId);
   const activeSession = snapshot.sessions.find((session) => session.status === "active") ?? null;
 
   const closeDialog = useCallback(() => {
-    setDialog(null); setError(""); setEditingEquipment(null); setEditingVenue(null);
+    setDialog(null); setError(""); setEditingEquipment(null); setEditingVenue(null); setEditingConstraint(null);
     setRescheduleEvent(null); setSessionExerciseId(null);
   }, []);
 
@@ -354,14 +360,32 @@ export default function FitnessApp() {
     setBusy(true); setError("");
     try {
       await operation();
-      await refresh();
-      if (success) setToast(success);
     } catch (reason) {
       setError(errorMessage(reason));
+      setBusy(false);
+      return;
+    }
+    try {
+      await refresh();
+      if (success) setToast(success);
+    } catch {
+      setError("更改已经保存在本地，但当前页面没有重新读取成功。请刷新页面，不要重复提交。");
     } finally {
       setBusy(false);
     }
   }, [refresh]);
+
+  const finalizePersistedDialogWrite = useCallback(async (success: string, apply?: () => void) => {
+    apply?.();
+    try {
+      await refresh();
+      setToast(success);
+    } catch {
+      setError("更改已经保存在本地，但当前页面没有重新读取成功。请刷新页面，不要重复提交。");
+    } finally {
+      closeDialog();
+    }
+  }, [closeDialog, refresh]);
 
   const generateLocal = useCallback(() => {
     if (!snapshot.profile || !venue) {
@@ -384,42 +408,7 @@ export default function FitnessApp() {
     if (!snapshot.profile || !venue) return;
     setBusy(true); setError("");
     try {
-      const allowed = exercisesForVenue(venueEquipment, snapshot.equipmentLoads).filter((exercise) =>
-        !snapshot.constraints.some((constraint) => constraint.active && constraint.severity === "avoid" && (constraint.exercise_ids.includes(exercise.id) || constraint.movement_patterns.includes(exercise.pattern))),
-      );
-      const result = await createPlanDraft({
-        venue: {
-          venue_id: venue.id,
-          name: venue.name,
-          equipment: venueEquipment.map((entry) => ({
-            equipment_id: entry.id,
-            name: entry.name,
-            category: entry.kind,
-            quantity: entry.quantity,
-            status: entry.status,
-            details: [entry.area, entry.notes].filter(Boolean),
-            available_loads: snapshot.equipmentLoads.filter((load) => load.equipment_id === entry.id).map((load) => ({ load_grams: load.load_grams, quantity: load.quantity, label: load.label || null, available: load.available })),
-          })),
-        },
-        goals: [...snapshot.profile.goals],
-        experience: snapshot.profile.experience,
-        weekly_schedule: {
-          strength_sessions: snapshot.profile.resistance_days_per_week,
-          cardio_sessions: snapshot.profile.cardio_days_per_week,
-          session_minutes: snapshot.profile.session_minutes,
-          available_days: snapshot.profile.preferred_weekdays.map(String),
-        },
-        constraints: snapshot.constraints.filter((entry) => entry.active).map((entry) => `${entry.severity}:${entry.label}:${entry.movement_patterns.join(",")}`),
-        preferences: snapshot.profile.notes ? [snapshot.profile.notes] : [],
-        known_capabilities: snapshot.capabilities.slice(0, 40).map((entry) => ({ equipment_id: entry.equipment_id, exercise_id: entry.exercise_id, load_grams: entry.load_grams, reps: entry.reps, rir: entry.rir, note: entry.confidence })),
-        allowed_exercises: allowed.map((exercise) => ({
-          exercise_id: exercise.id,
-          name: `${exercise.name_zh} / ${exercise.name_en}`,
-          movement_pattern: exercise.pattern,
-          required_equipment_ids: resourcesForExercise(exercise, venueEquipment, snapshot.equipmentLoads) ?? [],
-          is_bodyweight: exercise.requirements.length === 0 || exercise.requirements.every((requirement) => requirement.kind === "open_space" || requirement.kind === "mat"),
-        })),
-      });
+      const result = await createPlanDraft(buildPrivateFitnessPlanInput(snapshot, venue));
       setAiDraft(result);
       setDialog("ai-preview");
     } catch (reason) {
@@ -427,7 +416,7 @@ export default function FitnessApp() {
     } finally {
       setBusy(false);
     }
-  }, [snapshot, venue, venueEquipment]);
+  }, [snapshot, venue]);
 
   if (fatal) return <main className="shilian sl-fatal"><Logo /><section><span>数据库没有打开</span><h1>你的训练资料没有被改动。</h1><p>{fatal}</p><button onClick={() => window.location.reload()}>重新尝试</button></section></main>;
   if (!ready) return <main className="shilian sl-loading"><Logo /><i /><p>正在打开你的训练空间…</p></main>;
@@ -473,12 +462,12 @@ export default function FitnessApp() {
           });
         }, "训练已在本地开始")}
       />}
-      {view === "venues" && <VenuesView snapshot={snapshot} venue={venue} onSelect={setVenueId} onAdd={() => { setEditingVenue(null); setDialog("venue"); }} onEditVenue={(entry) => { setEditingVenue(entry); setDialog("venue"); }} onArchive={(entry) => { if (!window.confirm(`归档「${entry.name}」吗？它的未来计划会停用，尚未开始的安排会取消；历史记录会保留。`)) return; void run(async () => { await archiveVenue(entry.id); }, `「${entry.name}」已归档，历史仍保留`); }} onAddEquipment={() => setDialog("equipment")} onEditEquipment={(entry) => { setEditingEquipment(entry); setDialog("equipment"); }} onStatus={(entry, status) => void run(async () => { await setEquipmentStatus(entry.id, status); }, status === "maintenance" ? "已标记为临时停用，未来计划会避开它" : "器材状态已更新")} />}
+      {view === "venues" && <VenuesView snapshot={snapshot} venue={venue} busy={busy} onSelect={setVenueId} onAdd={() => { setEditingVenue(null); setDialog("venue"); }} onEditVenue={(entry) => { setEditingVenue(entry); setDialog("venue"); }} onArchive={(entry) => { if (!window.confirm(`归档「${entry.name}」吗？它的未来计划会停用，尚未开始的安排会取消；历史记录会保留。`)) return; void run(async () => { await archiveVenue(entry.id); }, `「${entry.name}」已归档，历史仍保留`); }} onRestore={(entry) => void run(async () => { await restoreVenue(entry.id); }, `「${entry.name}」已恢复为可用场地；旧计划和已取消安排没有被复活`)} onAddEquipment={() => setDialog("equipment")} onEditEquipment={(entry) => { setEditingEquipment(entry); setDialog("equipment"); }} onStatus={(entry, status) => void run(async () => { await setEquipmentStatus(entry.id, status); }, status === "maintenance" ? "已标记为临时停用，未来计划会避开它" : "器材状态已更新")} />}
       {view === "plan" && <PlanView snapshot={snapshot} venue={venue} busy={busy} error={error} onProfile={() => setDialog("profile")} onVenue={() => setDialog("venue")} onEquipment={() => setDialog("equipment")} onGenerate={generateLocal} onAi={() => void generateAi()} onSchedule={(program) => void run(async () => { await scheduleProgramWeek(program.id); }, "这一周已放入日历；随时可以改期或不进行")} />}
       {view === "calendar" && <CalendarView snapshot={snapshot} onStart={(event) => void run(async () => { if (!event.venue_id) throw new Error("请先为这次训练选择场地"); await startFitnessSession({ eventId: event.id, venueId: event.venue_id, programDayId: event.program_day_id, availableMinutes: event.planned_minutes }); }, "训练已在本地开始")} onReschedule={(event) => { setRescheduleEvent(event); setDialog("reschedule"); }} onSkip={(event) => { if (window.confirm("只记录“这次未进行”，不会把它变成欠账，也不会自动堆到明天。继续吗？")) void run(async () => { await markCalendarEventNotPerformed(event.id); }, "已记为这次未进行，其他安排没有改变"); }} />}
       {view === "history" && <HistoryView snapshot={snapshot} onStart={() => { if (!venue) setDialog("venue"); else void run(async () => { await startFitnessSession({ venueId: venue.id, availableMinutes: snapshot.profile?.session_minutes ?? venue.default_session_minutes }); }, "临时训练已开始"); }} />}
       {view === "exercises" && <ExercisesView equipment={venueEquipment} equipmentLoads={snapshot.equipmentLoads} venue={venue} />}
-      {view === "profile" && <ProfileView snapshot={snapshot} onProfile={() => setDialog("profile")} onConstraint={() => setDialog("constraint")} />}
+      {view === "profile" && <ProfileView snapshot={snapshot} busy={busy} onProfile={() => setDialog("profile")} onConstraint={(entry) => { setEditingConstraint(entry); setDialog("constraint"); }} onToggleConstraint={(entry) => void run(async () => { await setFitnessConstraintActive(entry.id, !entry.active); }, entry.active ? "这条身体边界已暂时结束；记录仍保留" : "这条身体边界已重新启用；它只影响未来草稿和现场选项，不改写历史")} />}
       {view === "settings" && <SettingsView snapshot={snapshot} storage={storage} onPersist={() => void run(async () => { await requestPersistentLocalStorage(); setStorage(await estimateLocalStorage()); }, "已重新请求浏览器保护；状态见下方")} onChange={(settings) => void run(async () => { await saveFitnessSettings(settings); }, "设置已保存在当前浏览器")} onRestored={refresh} />}
     </section>
 
@@ -486,11 +475,11 @@ export default function FitnessApp() {
 
     {!snapshot.venues.length && !firstRunDismissed && <FirstRun onStart={() => { setFirstRunDismissed(true); setDialog("venue"); }} onExercises={() => { setFirstRunDismissed(true); setView("exercises"); }} />}
 
-    <FitnessDialog open={dialog === "venue"} eyebrow="REAL PLACE FIRST" title={editingVenue ? "编辑场地" : "建立训练场地"} onClose={closeDialog}><VenueForm venue={editingVenue} onClose={closeDialog} onSave={async (input: SaveVenueInput) => { const id = await saveVenue(input); await refresh(); setVenueId(id); closeDialog(); setToast("场地已保存。接下来可以从眼前看得到的器材开始录入"); }} /></FitnessDialog>
-    <FitnessDialog open={dialog === "equipment"} eyebrow="WHAT IS ACTUALLY HERE" title={editingEquipment ? "编辑器材" : "录入器材"} onClose={closeDialog} wide>{venue ? <><EquipmentForm venueId={venue.id} equipment={editingEquipment} loads={snapshot.equipmentLoads.filter((entry) => entry.equipment_id === editingEquipment?.id)} unit={snapshot.profile?.unit ?? snapshot.settings.unit} onClose={closeDialog} onSave={async (input: SaveEquipmentInput) => { await saveEquipmentWithLoads(input); await refresh(); closeDialog(); setToast("器材与真实重量档位已保存"); }} />{editingEquipment && <div className="sl-equipment-photo-entry"><span><b>器材照片</b><small>{snapshot.files.filter((file) => file.entity_type === "equipment" && file.entity_id === editingEquipment.id && file.status === "ready").length} 张本地照片 · 不会发送给 AI</small></span><button type="button" onClick={() => setDialog("equipment-photos")}>查看与添加</button></div>}</> : <DialogNeed copy="先建立或选择一个场地，器材才有明确归属。" action={() => { closeDialog(); setDialog("venue"); }} label="建立场地" />}</FitnessDialog>
+    <FitnessDialog open={dialog === "venue"} eyebrow="REAL PLACE FIRST" title={editingVenue ? "编辑场地" : "建立训练场地"} onClose={closeDialog}><VenueForm venue={editingVenue} onClose={closeDialog} onSave={async (input: SaveVenueInput) => { const id = await saveVenue(input); await finalizePersistedDialogWrite("场地已保存。接下来可以从眼前看得到的器材开始录入", () => setVenueId(id)); }} /></FitnessDialog>
+    <FitnessDialog open={dialog === "equipment"} eyebrow="WHAT IS ACTUALLY HERE" title={editingEquipment ? "编辑器材" : "录入器材"} onClose={closeDialog} wide>{venue ? <><EquipmentForm venueId={venue.id} equipment={editingEquipment} loads={snapshot.equipmentLoads.filter((entry) => entry.equipment_id === editingEquipment?.id)} unit={snapshot.profile?.unit ?? snapshot.settings.unit} onClose={closeDialog} onSave={async (input: SaveEquipmentInput) => { await saveEquipmentWithLoads(input); await finalizePersistedDialogWrite("器材与真实重量档位已保存"); }} />{editingEquipment && <div className="sl-equipment-photo-entry"><span><b>器材照片</b><small>{snapshot.files.filter((file) => file.entity_type === "equipment" && file.entity_id === editingEquipment.id && file.status === "ready").length} 张本地照片 · 不会发送给 AI</small></span><button type="button" onClick={() => setDialog("equipment-photos")}>查看与添加</button></div>}</> : <DialogNeed copy="先建立或选择一个场地，器材才有明确归属。" action={() => { closeDialog(); setDialog("venue"); }} label="建立场地" />}</FitnessDialog>
     <FitnessDialog open={dialog === "equipment-photos"} eyebrow="LOCAL EQUIPMENT REFERENCE" title={editingEquipment ? `${editingEquipment.name}的照片` : "器材照片"} onClose={closeDialog} wide>{editingEquipment && <EquipmentPhotos equipment={editingEquipment} onChanged={refresh}/>}</FitnessDialog>
-    <FitnessDialog open={dialog === "profile"} eyebrow="YOUR TIME & PREFERENCES" title="训练偏好" onClose={closeDialog} wide><ProfileForm profile={snapshot.profile} onClose={closeDialog} onSave={async (input: SaveFitnessProfileInput) => { await saveFitnessProfile(input); await refresh(); closeDialog(); setToast("偏好已保存；它是规划输入，不是必须完成的配额"); }} /></FitnessDialog>
-    <FitnessDialog open={dialog === "constraint"} eyebrow="BODY BOUNDARIES" title="身体边界" onClose={closeDialog} wide><ConstraintForm onClose={closeDialog} onSave={async (input: SaveConstraintInput) => { await saveConstraint(input); await refresh(); closeDialog(); setToast(input.severity === "avoid" ? "身体边界已保存；指定动作模式会从计划中排除" : "身体边界已保存；计划与现场会如实提醒，不会自动猜测调整方式"); }} /></FitnessDialog>
+    <FitnessDialog open={dialog === "profile"} eyebrow="YOUR TIME & PREFERENCES" title="训练偏好" onClose={closeDialog} wide><ProfileForm profile={snapshot.profile} onClose={closeDialog} onSave={async (input: SaveFitnessProfileInput) => { await saveFitnessProfile(input); await finalizePersistedDialogWrite("偏好已保存；它是规划输入，不是必须完成的配额"); }} /></FitnessDialog>
+    <FitnessDialog open={dialog === "constraint"} eyebrow="BODY BOUNDARIES" title={editingConstraint ? "编辑身体边界" : "记录身体边界"} onClose={closeDialog} wide><ConstraintForm constraint={editingConstraint} onClose={closeDialog} onSave={async (input: SaveConstraintInput) => { await saveConstraint(input); await finalizePersistedDialogWrite(!input.active ? "内容已保存；这条边界仍是已结束状态" : input.severity === "avoid" ? "身体边界已保存；未来草稿与现场选项会避开指定范围，历史不会被改写" : "身体边界已保存；现场会显示原文提醒，不会自动推断调整方式"); }} /></FitnessDialog>
     <FitnessDialog open={dialog === "plan-preview"} eyebrow="LOCAL · VERIFIED" title="可执行计划草稿" onClose={closeDialog} wide>{planDraft && <PlanDraftPreview draft={planDraft} snapshot={snapshot} busy={busy} onSave={() => void run(async () => { const id = await saveProgramDraft(planDraft, "local", true); await scheduleProgramWeek(id); closeDialog(); setPlanDraft(null); setView("plan"); }, "计划已保存为新版本并放入日历")} />}</FitnessDialog>
     <FitnessDialog open={dialog === "ai-preview"} eyebrow="AI DRAFT · NOT SAVED" title="AI 计划草稿" onClose={closeDialog} wide>{aiDraft && <AiDraftPreview draft={aiDraft} busy={busy} onApply={() => { try { const local = aiDraftToLocal(aiDraft, snapshot, venue!); const validation = validateFitnessPlanDraft(local, plannerContext(snapshot, venue!, venueEquipment)); if (!validation.valid) throw new Error(validation.errors[0] ?? "AI 草稿没有通过本地校验"); setPlanDraft(local); setDialog("plan-preview"); } catch (reason) { setError(errorMessage(reason)); } }} />}</FitnessDialog>
     <FitnessDialog open={dialog === "reschedule"} eyebrow="MOVE, DON'T OWE" title="把它放到更合适的一天" onClose={closeDialog}>{rescheduleEvent && <RescheduleForm event={rescheduleEvent} onClose={closeDialog} onSave={(startsAt) => void run(async () => { await rescheduleCalendarEvent(rescheduleEvent.id, startsAt); closeDialog(); }, "已改期，原来的训练没有被算作失败")} />}</FitnessDialog>
@@ -519,32 +508,67 @@ function TodayView({ now, snapshot, venue, onView, onAddVenue, onStart }: { now:
   const nextEquipmentReady = items.length > 0 && items.every((item) => item.resource_equipment_ids.every((id) => nextVenueEquipment.some((entry) => entry.id === id)));
   return <div className="sl-page sl-today">
     <header className="sl-hero"><div><span>{formatDate(now)}</span><h1>今天在真实条件里，<br/><em>做得到什么？</em></h1><p>计划可以调整，实际发生的训练才会成为记录。</p></div><div className="sl-hero-place"><span>当前场地</span><strong>{venue?.name ?? "还没有场地"}</strong><small>{venue ? `${currentVenueEquipment.length} 类已录器材 · 上次核对 ${venue.last_verified_at ? formatDate(venue.last_verified_at) : "待记录"}` : "先从你实际训练的地方开始"}</small></div></header>
-    {next ? <section className="sl-next-session"><div className="sl-next-time"><span>{new Intl.DateTimeFormat("zh-CN", { weekday: "long" }).format(new Date(next.starts_at))}</span><strong>{new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit" }).format(new Date(next.starts_at))}</strong><small>约 {next.planned_minutes} 分钟</small></div><div className="sl-next-copy"><span>NEXT · {next.kind === "cardio" ? "心肺" : "力量"}</span><h2>{next.title}</h2><p>{nextDay?.focus || "开始前会再次核对场地和时间。"}</p><div>{items.slice(0, 5).map((item) => <span key={item.id}>{getFitnessExercise(item.exercise_id)?.name_zh ?? item.exercise_id}</span>)}</div><footer><button className="sl-primary" onClick={() => onStart(next)}>开始这场训练</button><button onClick={() => onView("calendar")}>改期或查看安排</button></footer></div><aside><i className={nextEquipmentReady ? "ok" : "check"}/><strong>{nextEquipmentReady ? "安排场地的器材档案完整" : "安排场地有器材需要重新确认"}</strong><small>{snapshot.venues.find((entry) => entry.id === next.venue_id)?.name ?? "场地待确认"} · 这不是实时空闲状态。</small></aside></section> : <section className="sl-open-day"><div><span>OPEN DAY</span><h2>今天没有安排。</h2><p>可以休息，也可以按当前时间开始一小段临时训练。</p></div><footer>{venue ? <button className="sl-primary" onClick={() => onStart(null)}>开始临时训练</button> : <button className="sl-primary" onClick={onAddVenue}>建立场地</button>}<button onClick={() => onView("plan")}>看看计划</button></footer></section>}
+    {next ? <section className="sl-next-session"><div className="sl-next-time"><span>{new Intl.DateTimeFormat("zh-CN", { weekday: "long" }).format(new Date(next.starts_at))}</span><strong>{new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit" }).format(new Date(next.starts_at))}</strong><small>约 {next.planned_minutes} 分钟</small></div><div className="sl-next-copy"><span>NEXT · {next.kind === "cardio" ? "心肺" : "力量"}</span><h2>{next.title}</h2><p>{nextDay?.focus || "开始前会再次核对场地和时间。"}</p><div>{items.slice(0, 5).map((item) => <span key={item.id}>{getFitnessExercise(item.exercise_id)?.name_zh ?? item.exercise_id}</span>)}</div><footer><button className="sl-primary" onClick={() => onStart(next)}>开始这场训练</button><button onClick={() => onView("calendar")}>改期或查看安排</button></footer></div><aside><i className={nextEquipmentReady ? "ok" : "check"}/><strong>{nextEquipmentReady ? "已找到计划引用的器材" : "安排场地有器材需要重新确认"}</strong><small>{snapshot.venues.find((entry) => entry.id === next.venue_id)?.name ?? "场地待确认"} · 开始时会重新核对数量、档位和当前状态。</small></aside></section> : <section className="sl-open-day"><div><span>OPEN DAY</span><h2>今天没有安排。</h2><p>可以休息，也可以按当前时间开始一小段临时训练。</p></div><footer>{venue ? <button className="sl-primary" onClick={() => onStart(null)}>开始临时训练</button> : <button className="sl-primary" onClick={onAddVenue}>建立场地</button>}<button onClick={() => onView("plan")}>看看计划</button></footer></section>}
     <section className="sl-today-grid"><article><header><span>接下来的安排</span><button onClick={() => onView("calendar")}>打开日历 →</button></header>{upcoming.length ? <div className="sl-mini-agenda">{upcoming.slice(0, 4).map((event) => <div key={event.id}><time>{formatDate(event.starts_at)}</time><span><strong>{event.title}</strong><small>{snapshot.venues.find((entry) => entry.id === event.venue_id)?.name ?? "场地待选"} · {event.planned_minutes} 分钟</small></span></div>)}</div> : <p className="sl-empty-copy">还没有后续安排。计划不会自动制造欠账。</p>}</article><article><header><span>这个场地</span><button onClick={() => onView("venues")}>查看器材 →</button></header>{venue ? <div className="sl-place-facts"><span><b>{currentVenueEquipment.length}</b><small>类可用器材</small></span><span><b>{currentVenueEquipment.filter((entry) => entry.busy_level === "high").length}</b><small>类常需替代</small></span><p>{venue.busy_notes || "还没有记录拥挤规律；现场观察后再补也可以。"}</p></div> : <p className="sl-empty-copy">没有场地时，适练不会假定你拥有任何器材。</p>}</article></section>
   </div>;
 }
 
-function VenuesView({ snapshot, venue, onSelect, onAdd, onEditVenue, onArchive, onAddEquipment, onEditEquipment, onStatus }: { snapshot: FitnessSnapshot; venue: FitnessVenue | null; onSelect: (id: string) => void; onAdd: () => void; onEditVenue: (venue: FitnessVenue) => void; onArchive: (venue: FitnessVenue) => void; onAddEquipment: () => void; onEditEquipment: (equipment: FitnessEquipment) => void; onStatus: (equipment: FitnessEquipment, status: FitnessEquipment["status"]) => void }) {
+function VenuesView({ snapshot, venue, busy, onSelect, onAdd, onEditVenue, onArchive, onRestore, onAddEquipment, onEditEquipment, onStatus }: {
+  snapshot: FitnessSnapshot;
+  venue: FitnessVenue | null;
+  busy: boolean;
+  onSelect: (id: string) => void;
+  onAdd: () => void;
+  onEditVenue: (venue: FitnessVenue) => void;
+  onArchive: (venue: FitnessVenue) => void;
+  onRestore: (venue: FitnessVenue) => void;
+  onAddEquipment: () => void;
+  onEditEquipment: (equipment: FitnessEquipment) => void;
+  onStatus: (equipment: FitnessEquipment, status: FitnessEquipment["status"]) => void;
+}) {
+  const activeVenues = snapshot.venues.filter((entry) => entry.status === "active");
+  const archivedVenues = snapshot.venues.filter((entry) => entry.status === "archived");
   const equipment = snapshot.equipment.filter((entry) => entry.venue_id === venue?.id && entry.status !== "removed");
-  return <div className="sl-page"><header className="sl-page-title"><div><span>REAL EQUIPMENT, REAL LOADS</span><h1>场地与器材</h1><p>只录真实存在的器材；重量不确定时可以先留空。</p></div><button className="sl-primary" onClick={onAdd}>＋ 新建场地</button></header>
-    <div className="sl-venue-tabs" role="tablist" aria-label="训练场地">{snapshot.venues.filter((entry) => entry.status === "active").map((entry) => <button role="tab" aria-selected={venue?.id === entry.id} className={venue?.id === entry.id ? "active" : ""} key={entry.id} onClick={() => onSelect(entry.id)}><i>{entry.name.slice(0, 1)}</i><span><strong>{entry.name}</strong><small>{entry.venue_type === "home" ? "家中" : entry.venue_type === "office" ? "公司" : "训练场地"}</small></span></button>)}</div>
-    {venue ? <><section className="sl-venue-overview"><div><span>当前场地</span><h2>{venue.name}</h2><p>{venue.location || "位置没有记录"}</p></div><dl><div><dt>通常时长</dt><dd>{venue.default_session_minutes} 分钟</dd></div><div><dt>上次核对</dt><dd>{venue.last_verified_at ? formatDate(venue.last_verified_at) : "待核对"}</dd></div><div><dt>跨器材组合</dt><dd>{venue.supersets_allowed ? "可以" : "尽量避免"}</dd></div></dl><footer><button onClick={() => onEditVenue(venue)}>编辑场地</button><button onClick={() => onArchive(venue)}>归档</button></footer></section><section className="sl-equipment-head"><div><span>器材清单</span><p>{equipment.length ? `${equipment.length} 条真实记录，不用一次补完。` : "从眼前看得到的开始，不必一次录完。"}</p></div><button className="sl-primary" onClick={onAddEquipment}>＋ 录入器材</button></section>{equipment.length ? <div className="sl-equipment-grid">{equipment.map((entry) => <article key={entry.id} className={entry.status}><header><i>{EQUIPMENT_KIND_LABELS[entry.kind].slice(0, 1)}</i><span><small>{EQUIPMENT_KIND_LABELS[entry.kind]} · {entry.area || "区域待记录"}</small><h3>{entry.name}</h3></span><button aria-label={`编辑${entry.name}`} onClick={() => onEditEquipment(entry)}>•••</button></header><div className="sl-load-summary"><strong>{equipmentSummary(entry, snapshot.equipmentLoads, snapshot.profile?.unit ?? snapshot.settings.unit)}</strong><span>{entry.quantity} 件 · {entry.load_semantics === "per_hand" ? "每只手" : entry.load_semantics === "per_side" ? "每侧" : entry.load_semantics === "stack_label" ? "面板档位" : "总负荷"}</span></div><p>{entry.notes || "还没有个人设置备注。"}</p><footer><span className={`sl-status ${entry.status}`}>{entry.status === "available" ? "已确认可用" : entry.status === "limited" ? "部分可用" : "临时停用"}</span>{entry.status === "maintenance" ? <button onClick={() => onStatus(entry, "available")}>恢复可用</button> : <button onClick={() => onStatus(entry, "maintenance")}>临时停用</button>}</footer></article>)}</div> : <div className="sl-empty-card"><i>场</i><h3>这里还没有器材记录</h3><p>先保存名称也可以；重量档位以后在现场慢慢补。</p><button className="sl-primary" onClick={onAddEquipment}>录入第一件器材</button></div>}</> : <div className="sl-empty-card"><i>＋</i><h3>先建立一个训练场地</h3><p>每个场地都有独立器材清单，计划不会把不同健身房混在一起。</p><button className="sl-primary" onClick={onAdd}>建立场地</button></div>}
+  return <div className="sl-page">
+    <header className="sl-page-title"><div><span>REAL EQUIPMENT, REAL LOADS</span><h1>场地与器材</h1><p>只录真实存在的器材；重量不确定时可以先留空。</p></div><button className="sl-primary" onClick={onAdd}>＋ 新建场地</button></header>
+    <div className="sl-venue-tabs" role="tablist" aria-label="训练场地">{activeVenues.map((entry) => <button role="tab" aria-selected={venue?.id === entry.id} className={venue?.id === entry.id ? "active" : ""} key={entry.id} onClick={() => onSelect(entry.id)}><i>{entry.name.slice(0, 1)}</i><span><strong>{entry.name}</strong><small>{entry.venue_type === "home" ? "家中" : entry.venue_type === "office" ? "公司" : "训练场地"}</small></span></button>)}</div>
+    {venue ? <>
+      <section className="sl-venue-overview"><div><span>当前场地</span><h2>{venue.name}</h2><p>{venue.location || "位置没有记录"}</p></div><dl><div><dt>通常时长</dt><dd>{venue.default_session_minutes} 分钟</dd></div><div><dt>上次核对</dt><dd>{venue.last_verified_at ? formatDate(venue.last_verified_at) : "待核对"}</dd></div><div><dt>跨器材组合</dt><dd>{venue.supersets_allowed ? "可以" : "尽量避免"}</dd></div></dl><footer><button onClick={() => onEditVenue(venue)}>编辑场地</button><button disabled={busy} onClick={() => onArchive(venue)}>归档</button></footer></section>
+      <section className="sl-equipment-head"><div><span>器材清单</span><p>{equipment.length ? `${equipment.length} 条真实记录，不用一次补完。` : "从眼前看得到的开始，不必一次录完。"}</p></div><button className="sl-primary" onClick={onAddEquipment}>＋ 录入器材</button></section>
+      {equipment.length ? <div className="sl-equipment-grid">{equipment.map((entry) => <article key={entry.id} className={entry.status}><header><i>{EQUIPMENT_KIND_LABELS[entry.kind].slice(0, 1)}</i><span><small>{EQUIPMENT_KIND_LABELS[entry.kind]} · {entry.area || "区域待记录"}</small><h3>{entry.name}</h3></span><button aria-label={`编辑${entry.name}`} onClick={() => onEditEquipment(entry)}>•••</button></header><div className="sl-load-summary"><strong>{equipmentSummary(entry, snapshot.equipmentLoads, snapshot.profile?.unit ?? snapshot.settings.unit)}</strong><span>{entry.quantity} 件 · {entry.load_semantics === "per_hand" ? "每只手" : entry.load_semantics === "per_side" ? "每侧" : entry.load_semantics === "stack_label" ? "面板档位" : "总负荷"}</span></div><p>{entry.notes || "还没有个人设置备注。"}</p><footer><span className={`sl-status ${entry.status}`}>{entry.status === "available" ? "已确认可用" : entry.status === "limited" ? "部分可用" : "临时停用"}</span>{entry.status === "maintenance" ? <button onClick={() => onStatus(entry, "available")}>恢复可用</button> : <button onClick={() => onStatus(entry, "maintenance")}>临时停用</button>}</footer></article>)}</div> : <div className="sl-empty-card"><i>场</i><h3>这里还没有器材记录</h3><p>先保存名称也可以；重量档位以后在现场慢慢补。</p><button className="sl-primary" onClick={onAddEquipment}>录入第一件器材</button></div>}
+    </> : <div className="sl-empty-card"><i>＋</i><h3>{archivedVenues.length ? "当前没有可用场地" : "先建立一个训练场地"}</h3><p>{archivedVenues.length ? "可以建立新的场地，也可以从下方恢复一条旧记录。" : "每个场地都有独立器材清单，计划不会把不同健身房混在一起。"}</p><button className="sl-primary" onClick={onAdd}>建立场地</button></div>}
+    {archivedVenues.length > 0 && <section className="sl-archived-venues"><header><div><span>已归档场地</span><p>恢复只让场地重新可选；旧计划和已取消安排不会自动复活。</p></div><strong>{archivedVenues.length}</strong></header><div>{archivedVenues.map((entry) => <article key={entry.id}><span><b>{entry.name}</b><small>{entry.location || "位置没有记录"} · 器材与历史仍保留</small></span><button disabled={busy} onClick={() => onRestore(entry)}>恢复为可用场地</button></article>)}</div></section>}
   </div>;
+}
+
+function exerciseMatchesActiveAvoid(exerciseId: string, constraints: readonly FitnessConstraint[]) {
+  const exercise = getFitnessExercise(exerciseId);
+  return Boolean(exercise && constraints.some((constraint) =>
+    constraint.active && constraint.severity === "avoid" &&
+    (constraint.exercise_ids.includes(exercise.id) || constraint.movement_patterns.includes(exercise.pattern)),
+  ));
 }
 
 function PlanView({ snapshot, venue, busy, error, onProfile, onVenue, onEquipment, onGenerate, onAi, onSchedule }: { snapshot: FitnessSnapshot; venue: FitnessVenue | null; busy: boolean; error: string; onProfile: () => void; onVenue: () => void; onEquipment: () => void; onGenerate: () => void; onAi: () => void; onSchedule: (program: FitnessSnapshot["programs"][number]) => void }) {
   const active = snapshot.programs.find((entry) => entry.status === "active") ?? null;
   const days = active ? snapshot.programDays.filter((entry) => entry.program_id === active.id) : [];
+  const activeDayIds = new Set(days.map((day) => day.id));
+  const conflictingExerciseIds = new Set(snapshot.programItems
+    .filter((item) => activeDayIds.has(item.program_day_id) && exerciseMatchesActiveAvoid(item.exercise_id, snapshot.constraints))
+    .map((item) => item.exercise_id));
+  const conflictNames = [...conflictingExerciseIds].map((id) => getFitnessExercise(id)?.name_zh ?? id);
+  const hasBoundaryConflict = conflictNames.length > 0;
   const ready = Boolean(snapshot.profile && venue && snapshot.equipment.some((entry) => entry.venue_id === venue.id && (entry.status === "available" || entry.status === "limited")));
   return <div className="sl-page"><header className="sl-page-title"><div><span>AN EXECUTABLE WEEK</span><h1>周蓝图</h1><p>计划是可协商的版本，不是必须偿还的训练清单。</p></div>{ready && <div className="sl-title-actions"><button disabled={busy || !snapshot.settings.ai_enabled} onClick={onAi}>AI 草稿</button><button className="sl-primary" disabled={busy} onClick={onGenerate}>生成本地计划</button></div>}</header>
     {!ready && <section className="sl-prerequisites"><header><span>让计划先认识现实</span><h2>还需要几项真实输入</h2></header><div><button className={snapshot.profile ? "done" : ""} onClick={onProfile}><i>{snapshot.profile ? "✓" : "1"}</i><span><b>训练偏好</b><small>{snapshot.profile ? `${snapshot.profile.resistance_days_per_week} 次力量 · ${snapshot.profile.cardio_days_per_week} 次有氧` : "频次、时间、经验与目标"}</small></span></button><button className={venue ? "done" : ""} onClick={onVenue}><i>{venue ? "✓" : "2"}</i><span><b>训练场地</b><small>{venue?.name ?? "你实际在哪里练"}</small></span></button><button className={venue && snapshot.equipment.some((entry) => entry.venue_id === venue.id) ? "done" : ""} onClick={onEquipment}><i>{venue && snapshot.equipment.some((entry) => entry.venue_id === venue.id) ? "✓" : "3"}</i><span><b>真实器材</b><small>{venue ? `${snapshot.equipment.filter((entry) => entry.venue_id === venue.id).length} 条记录` : "器材与重量档位"}</small></span></button></div></section>}
     {error && <p className="sl-inline-error" role="alert">{error}</p>}
-    {active ? <><section className="sl-program-summary"><div><span>ACTIVE VERSION · V{active.version}</span><h2>{active.name}</h2><p>{goalLabels[active.goal]} · {active.split === "full_body" ? "全身" : active.split === "upper_lower" ? "上下肢" : active.split === "push_pull_legs" ? "推拉腿" : "自适应分化"} · {snapshot.venues.find((entry) => entry.id === active.venue_id)?.name}</p></div><aside><span>生成依据</span><p>{active.assumptions[0] || "来自当前场地、时间与身体边界。"}</p></aside><button onClick={() => onSchedule(active)}>放入接下来一周</button></section><div className="sl-program-days">{days.map((day) => <ProgramDayCard key={day.id} day={day} items={snapshot.programItems.filter((item) => item.program_day_id === day.id)} equipment={snapshot.equipment} unit={snapshot.profile?.unit ?? snapshot.settings.unit} />)}</div></> : ready && <div className="sl-empty-card"><i>划</i><h3>还没有启用的计划</h3><p>本地规则可以离线生成；AI 只生成待核对草稿，最终仍要通过同一器材校验。</p><div><button className="sl-primary" onClick={onGenerate}>用本地规则生成</button><button disabled={!snapshot.settings.ai_enabled} onClick={onAi}>让 AI 提一个草稿</button></div></div>}
+    {ready && <p className="sl-ai-privacy"><b>AI 输入边界</b>只发送器材类型、数量、状态、明确重量、训练频次与能力数字。场地名、器材备注、偏好备注和身体边界文字都留在本地；避用动作会先由本地规则移出动作池。</p>}
+    {active ? <><section className={`sl-program-summary${hasBoundaryConflict ? " conflict" : ""}`}><div><span>ACTIVE VERSION · V{active.version}</span><h2>{active.name}</h2><p>{goalLabels[active.goal]} · {active.split === "full_body" ? "全身" : active.split === "upper_lower" ? "上下肢" : active.split === "push_pull_legs" ? "推拉腿" : "自适应分化"} · {snapshot.venues.find((entry) => entry.id === active.venue_id)?.name}</p></div><aside><span>{hasBoundaryConflict ? "身体边界已更新" : "生成依据"}</span><p>{hasBoundaryConflict ? `这版包含现在避用的动作：${conflictNames.join("、")}` : active.assumptions[0] || "来自当前场地、时间与身体边界。"}</p></aside><button disabled={busy || hasBoundaryConflict} onClick={() => onSchedule(active)}>{hasBoundaryConflict ? "先生成适用版本" : "放入接下来一周"}</button></section>{hasBoundaryConflict && <p className="sl-plan-conflict" role="status">旧版会原样保留作参考，也不会计作失败；重新生成后才会允许排期。</p>}<div className="sl-program-days">{days.map((day) => <ProgramDayCard key={day.id} day={day} items={snapshot.programItems.filter((item) => item.program_day_id === day.id)} equipment={snapshot.equipment} unit={snapshot.profile?.unit ?? snapshot.settings.unit} conflictingExerciseIds={conflictingExerciseIds} />)}</div></> : ready && <div className="sl-empty-card"><i>划</i><h3>还没有启用的计划</h3><p>本地规则可以离线生成；AI 只生成待核对草稿，最终仍要通过同一器材校验。</p><div><button className="sl-primary" onClick={onGenerate}>用本地规则生成</button><button disabled={!snapshot.settings.ai_enabled} onClick={onAi}>让 AI 提一个草稿</button></div></div>}
   </div>;
 }
 
-function ProgramDayCard({ day, items, equipment, unit }: { day: FitnessProgramDay; items: readonly FitnessProgramItem[]; equipment: readonly FitnessEquipment[]; unit: "kg" | "lb" }) {
-  return <article><header><div><span>{day.weekday === null ? `第 ${day.day_index + 1} 天` : weekdayNames[day.weekday]}</span><h3>{day.name}</h3><p>{day.focus}</p></div><strong>{day.estimated_minutes}<small> 分钟</small></strong></header><div>{items.map((item, index) => { const exercise = getFitnessExercise(item.exercise_id); const primary = equipment.find((entry) => entry.id === item.equipment_id); const load = item.equipment_id === null ? "自重" : item.load_grams === null ? "现场确认重量" : displayLoad(item.load_grams, unit); return <div className="sl-program-item" key={item.id}><i>{index + 1}</i><span><b>{exercise?.name_zh ?? item.exercise_id}</b><small>{primary?.name ?? "自重"} · {item.duration_seconds !== null ? `${Number((item.duration_seconds / 60).toFixed(1))} 分钟` : `${item.sets} 组 × ${item.rep_min ?? "自定"}${item.rep_max && item.rep_max !== item.rep_min ? `–${item.rep_max}` : ""}`} · RIR {item.target_rir ?? "自定"}</small></span><em>{load}</em></div>; })}</div></article>;
+function ProgramDayCard({ day, items, equipment, unit, conflictingExerciseIds }: { day: FitnessProgramDay; items: readonly FitnessProgramItem[]; equipment: readonly FitnessEquipment[]; unit: "kg" | "lb"; conflictingExerciseIds: ReadonlySet<string> }) {
+  return <article><header><div><span>{day.weekday === null ? `第 ${day.day_index + 1} 天` : weekdayNames[day.weekday]}</span><h3>{day.name}</h3><p>{day.focus}</p></div><strong>{day.estimated_minutes}<small> 分钟</small></strong></header><div>{items.map((item, index) => { const exercise = getFitnessExercise(item.exercise_id); const primary = equipment.find((entry) => entry.id === item.equipment_id); const load = item.equipment_id === null ? "自重" : item.load_grams === null ? "现场确认重量" : displayLoad(item.load_grams, unit); const conflicts = conflictingExerciseIds.has(item.exercise_id); return <div className={`sl-program-item${conflicts ? " conflict" : ""}`} key={item.id}><i>{index + 1}</i><span><b>{exercise?.name_zh ?? item.exercise_id}</b><small>{primary?.name ?? "自重"} · {item.duration_seconds !== null ? `${Number((item.duration_seconds / 60).toFixed(1))} 分钟` : `${item.sets} 组 × ${item.rep_min ?? "自定"}${item.rep_max && item.rep_max !== item.rep_min ? `–${item.rep_max}` : ""}`} · RIR {item.target_rir ?? "自定"}</small></span><em>{conflicts ? "当前边界避用" : load}</em></div>; })}</div></article>;
 }
 
 function calendarEventCopy(event: FitnessCalendarEvent): string {
@@ -573,7 +597,7 @@ function MonthCalendar({ events }: { events: readonly FitnessCalendarEvent[] }) 
   const first = new Date(anchor.getFullYear(), anchor.getMonth(), 1);
   const start = new Date(first); start.setDate(first.getDate() - first.getDay());
   const days = Array.from({ length: 42 }, (_, index) => { const date = new Date(start); date.setDate(start.getDate() + index); return date; });
-  return <div className="sl-month" aria-label={`${anchor.getFullYear()}年${anchor.getMonth() + 1}月`}><header>{weekdayNames.map((day) => <span key={day}>{day.slice(1)}</span>)}</header><div>{days.map((date) => { const begin = dayStart(date.getTime()); const rows = events.filter((event) => event.status !== "cancelled" && event.starts_at >= begin && event.starts_at < begin + 86_400_000); return <article key={date.toISOString()} className={date.getMonth() === anchor.getMonth() ? "" : "muted"}><time>{date.getDate()}</time>{rows.map((event) => <span key={event.id} className={event.kind}>{event.status === "completed" ? "已练" : event.status === "not_performed" ? "未进行" : event.kind === "cardio" ? "心肺" : event.kind === "rest" ? "休息" : "力量"}</span>)}</article>; })}</div></div>;
+  return <div className="sl-month" aria-label={`${anchor.getFullYear()}年${anchor.getMonth() + 1}月`}><header>{weekdayNames.map((day) => <span key={day}>{day.slice(1)}</span>)}</header><div>{days.map((date) => { const bounds = localDayBounds(date.getTime()); const rows = events.filter((event) => event.status !== "cancelled" && event.starts_at >= bounds.start && event.starts_at < bounds.end); return <article key={date.toISOString()} className={date.getMonth() === anchor.getMonth() ? "" : "muted"}><time>{date.getDate()}</time>{rows.map((event) => <span key={event.id} className={event.kind}>{event.status === "completed" ? "已练" : event.status === "not_performed" ? "未进行" : event.kind === "cardio" ? "心肺" : event.kind === "rest" ? "休息" : "力量"}</span>)}</article>; })}</div></div>;
 }
 
 function HistoryView({ snapshot, onStart }: { snapshot: FitnessSnapshot; onStart: () => void }) {
@@ -596,14 +620,32 @@ function ExercisesView({ equipment, equipmentLoads, venue }: { equipment: readon
   return <div className="sl-page"><header className="sl-page-title"><div><span>MOVEMENT LIBRARY</span><h1>动作库</h1><p>{venue ? `默认只显示能在「${venue.name}」完成的动作。` : "选择场地后才能判断动作是否真实可执行。"}</p></div></header><div className="sl-filterbar"><label><span aria-hidden="true">⌕</span><input aria-label="搜索动作或肌群" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索动作或肌群" /></label><button aria-pressed={showOther} className={showOther ? "active" : ""} onClick={() => setShowOther((value) => !value)}>{showOther ? "正在查看所有动作" : "查看其他场地动作"}</button></div>{visible.length ? <div className="sl-exercise-grid">{visible.map((exercise) => { const fits = exerciseFitsEquipment(exercise, equipment, equipmentLoads); return <article key={exercise.id}><header><i>{MOVEMENT_PATTERN_LABELS[exercise.pattern].slice(0, 1)}</i><span>{MOVEMENT_PATTERN_LABELS[exercise.pattern]}</span></header><h2>{exercise.name_zh}</h2><p>{exercise.name_en}</p><dl><div><dt>主要</dt><dd>{exercise.primary_muscles.join("、")}</dd></div><div><dt>需要</dt><dd><EquipmentRequirementList kinds={exercise.requirements.map((entry) => entry.kind)} /></dd></div></dl><footer><span className={fits ? "available" : "other"}>{fits ? `可在${venue ? `「${venue.name}」` : "当前场地"}完成` : "当前场地缺少器材或成对档位"}</span></footer></article>; })}</div> : <div className="sl-empty-card"><i>动</i><h3>当前场地没有符合条件的动作</h3><p>补充器材清单、换一个搜索词，或显式查看其他场地动作。</p></div>}</div>;
 }
 
-function ProfileView({ snapshot, onProfile, onConstraint }: { snapshot: FitnessSnapshot; onProfile: () => void; onConstraint: () => void }) {
-  return <div className="sl-page"><header className="sl-page-title"><div><span>TIME, GOALS & BOUNDARIES</span><h1>身体与偏好</h1><p>只记录真正影响规划的内容；身体状态不会被压成一个分数。</p></div><button className="sl-primary" onClick={onProfile}>{snapshot.profile ? "编辑偏好" : "建立偏好"}</button></header>{snapshot.profile ? <section className="sl-profile-card"><div><span>规划输入</span><h2>{snapshot.profile.goals.map((goal) => goalLabels[goal]).join(" · ")}</h2><p>{snapshot.profile.resistance_days_per_week} 次力量 · {snapshot.profile.cardio_days_per_week} 次有氧 · 单次约 {snapshot.profile.session_minutes} 分钟</p></div><dl><div><dt>经验</dt><dd>{snapshot.profile.experience === "new" ? "刚开始" : snapshot.profile.experience === "returning" ? "重新开始" : snapshot.profile.experience === "consistent" ? "稳定训练" : "自主规划"}</dd></div><div><dt>训练日</dt><dd>{snapshot.profile.preferred_weekdays.map((day) => weekdayNames[day]).join("、") || "随时调整"}</dd></div><div><dt>默认余力</dt><dd>RIR {snapshot.profile.preferred_rir}</dd></div></dl></section> : <div className="sl-empty-card"><i>人</i><h3>偏好还是空的</h3><p>没有填写的内容就是未知，适练不会用默认值冒充你的选择。</p><button className="sl-primary" onClick={onProfile}>保存第一组偏好</button></div>}<section className="sl-constraint-head"><div><span>身体边界</span><p>硬边界会过滤未来计划；提醒不会自动变成诊断。</p></div><button onClick={onConstraint}>＋ 记录一条</button></section>{snapshot.constraints.length ? <div className="sl-constraint-list">{snapshot.constraints.map((entry) => <article key={entry.id}><i className={entry.severity}>{entry.severity === "avoid" ? "避" : entry.severity === "modify" ? "调" : "注"}</i><span><h3>{entry.label}</h3><p>{entry.note || `${entry.movement_patterns.map((pattern) => MOVEMENT_PATTERN_LABELS[pattern]).join("、") || "全部训练"}需要${entry.severity === "avoid" ? "避开" : entry.severity === "modify" ? "调整" : "留意"}`}</p></span><strong>{entry.active ? "生效中" : "已结束"}</strong></article>)}</div> : <p className="sl-empty-copy padded">没有记录身体边界不等于系统确认“没有限制”；规划只会按已知信息工作。</p>}</div>;
+function constraintScopeText(entry: FitnessConstraint) {
+  const patterns = entry.movement_patterns.map((pattern) => MOVEMENT_PATTERN_LABELS[pattern]);
+  const exercises = entry.exercise_ids.map((id) => getFitnessExercise(id)?.name_zh ?? id);
+  const scope = [...patterns, ...exercises];
+  return scope.length ? scope.join("、") : "范围待补充，当前不参与规划";
+}
+
+function ProfileView({ snapshot, busy, onProfile, onConstraint, onToggleConstraint }: {
+  snapshot: FitnessSnapshot;
+  busy: boolean;
+  onProfile: () => void;
+  onConstraint: (constraint: FitnessConstraint | null) => void;
+  onToggleConstraint: (constraint: FitnessConstraint) => void;
+}) {
+  return <div className="sl-page">
+    <header className="sl-page-title"><div><span>TIME, GOALS & BOUNDARIES</span><h1>身体与偏好</h1><p>只记录真正影响规划的内容；身体状态不会被压成一个分数。</p></div><button className="sl-primary" onClick={onProfile}>{snapshot.profile ? "编辑偏好" : "建立偏好"}</button></header>
+    {snapshot.profile ? <section className="sl-profile-card"><div><span>规划输入</span><h2>{snapshot.profile.goals.map((goal) => goalLabels[goal]).join(" · ")}</h2><p>{snapshot.profile.resistance_days_per_week} 次力量 · {snapshot.profile.cardio_days_per_week} 次有氧 · 单次约 {snapshot.profile.session_minutes} 分钟</p></div><dl><div><dt>经验</dt><dd>{snapshot.profile.experience === "new" ? "刚开始" : snapshot.profile.experience === "returning" ? "重新开始" : snapshot.profile.experience === "consistent" ? "稳定训练" : "自主规划"}</dd></div><div><dt>训练日</dt><dd>{snapshot.profile.preferred_weekdays.map((day) => weekdayNames[day]).join("、") || "随时调整"}</dd></div><div><dt>默认余力</dt><dd>RIR {snapshot.profile.preferred_rir}</dd></div></dl></section> : <div className="sl-empty-card"><i>人</i><h3>偏好还是空的</h3><p>没有填写的内容就是未知，适练不会用默认值冒充你的选择。</p><button className="sl-primary" onClick={onProfile}>保存第一组偏好</button></div>}
+    <section className="sl-constraint-head"><div><span>身体边界</span><p>硬边界会过滤未来草稿；提醒不会自动变成诊断。</p></div><button onClick={() => onConstraint(null)}>＋ 记录一条</button></section>
+    {snapshot.constraints.length ? <div className="sl-constraint-list">{snapshot.constraints.map((entry) => <article key={entry.id} className={entry.active ? "" : "inactive"}><i className={entry.severity}>{entry.severity === "avoid" ? "避" : entry.severity === "modify" ? "调" : "注"}</i><span><h3>{entry.label}</h3><p>{constraintScopeText(entry)}</p>{entry.note && <small>{entry.note}</small>}</span><div className="sl-constraint-controls"><strong>{entry.active ? "生效中" : "已结束"}</strong><button onClick={() => onConstraint(entry)}>编辑</button><button disabled={busy} onClick={() => onToggleConstraint(entry)}>{entry.active ? "暂时结束" : "重新启用"}</button></div></article>)}</div> : <p className="sl-empty-copy padded">没有记录身体边界不等于系统确认“没有限制”；规划只会按已知信息工作。</p>}
+  </div>;
 }
 
 function SettingsView({ snapshot, storage, onPersist, onChange, onRestored }: { snapshot: FitnessSnapshot; storage: LocalStorageEstimate | null; onPersist: () => void; onChange: (settings: FitnessSnapshot["settings"]) => void; onRestored: () => Promise<void> }) {
   const settings = snapshot.settings;
   return <div className="sl-page"><header className="sl-page-title"><div><span>PRIVACY & DATA</span><h1>设置</h1><p>训练和身体资料留在当前浏览器；AI 只在你点击时收到最小草稿上下文。</p></div></header><div className="sl-settings">
-    <section><header><h2>AI 与隐私</h2><p>没有 AI 时，器材、计划、日历与训练记录仍可使用。</p></header><SettingSwitch label="允许 AI 草稿" copy="只在主动点击后发送场地约束与当前场地可执行动作池" checked={settings.ai_enabled} onChange={(value) => onChange({ ...settings, ai_enabled: value })}/><div className="sl-privacy-fact"><i/><span><b>DeepSeek Key 只在服务端</b><small>不会进入 SQLite、完整备份或浏览器资源</small></span></div></section>
+    <section><header><h2>AI 与隐私</h2><p>没有 AI 时，器材、计划、日历与训练记录仍可使用。</p></header><SettingSwitch label="允许 AI 草稿" copy="只发送结构化器材、频次与能力数字；不发送用户填写的自由文本" checked={settings.ai_enabled} onChange={(value) => onChange({ ...settings, ai_enabled: value })}/><div className="sl-privacy-fact"><i/><span><b>DeepSeek Key 只在服务端</b><small>不会进入 SQLite、完整备份或浏览器资源</small></span></div></section>
     <section><header><h2>当前浏览器</h2><p>OPFS 与 SQLite 都绑定当前 origin 和浏览器 profile。</p></header><div className={`sl-storage ${storage?.persisted ? "persisted" : ""}`}><i/><span><b>{storage?.persisted ? "已获浏览器持久化保护" : "仍可能被浏览器清理"}</b><small>{storage ? `当前使用约 ${Math.max(1, Math.round(storage.usage / 1024))} KB` : "正在读取存储状态"}</small></span>{!storage?.persisted && <button onClick={onPersist}>请求保护</button>}</div><p className="sl-data-note">持久化授权不是备份；清理站点数据仍可能删除当前浏览器资料。</p></section>
     <section><header><h2>完整备份与恢复</h2><p>SQLite 与器材照片一起校验；失败时不会原位覆盖当前版本。</p></header><FitnessDataControls onRestored={onRestored}/></section>
   </div></div>;
@@ -622,7 +664,7 @@ function AiDraftPreview({ draft, busy, onApply }: { draft: AiPlanDraft; busy: bo
 }
 
 function RescheduleForm({ event, onClose, onSave }: { event: FitnessCalendarEvent; onClose: () => void; onSave: (startsAt: number) => void }) {
-  const localValue = new Date(event.starts_at - new Date().getTimezoneOffset() * 60_000).toISOString().slice(0, 16);
+  const localValue = toLocalDateTimeInputValue(event.starts_at);
   return <form className="sl-form" onSubmit={(formEvent: FormEvent<HTMLFormElement>) => { formEvent.preventDefault(); const data = new FormData(formEvent.currentTarget); onSave(new Date(String(data.get("startsAt"))).getTime()); }}><p className="sl-safety-copy">改期只移动计划，不会制造一条“漏练”记录。</p><label><span>新的日期与时间</span><input required name="startsAt" type="datetime-local" defaultValue={localValue}/></label><footer><button type="button" onClick={onClose}>取消</button><button className="sl-primary">确认改期</button></footer></form>;
 }
 
@@ -646,7 +688,11 @@ function LiveSession({ snapshot, sessionId, now, onRefresh, onToast, toast, erro
   const sessionEquipment = snapshot.equipment.filter((entry) => entry.venue_id === session.venue_id);
   const sessionEquipmentIds = new Set(sessionEquipment.map((entry) => entry.id));
   const sessionLoads = snapshot.equipmentLoads.filter((entry) => sessionEquipmentIds.has(entry.equipment_id));
-  const availableExercises = exercisesForVenue(sessionEquipment, sessionLoads);
+  const availableExercises = exercisesForVenue(sessionEquipment, sessionLoads).filter((exercise) =>
+    !snapshot.constraints.some((constraint) =>
+      constraint.active && constraint.severity === "avoid" &&
+      (constraint.exercise_ids.includes(exercise.id) || constraint.movement_patterns.includes(exercise.pattern))),
+  );
   const currentExercise = current ? getFitnessExercise(current.exercise_id) : null;
   const isTimed = currentExercise?.pattern === "cardio" || planned?.duration_seconds !== null && planned?.duration_seconds !== undefined;
   const relevantConstraints = currentExercise ? snapshot.constraints.filter((constraint) =>
@@ -681,8 +727,8 @@ function LiveSession({ snapshot, sessionId, now, onRefresh, onToast, toast, erro
         loadGrams: weight ? Math.round(Number(weight) * (unit === "kg" ? 1_000 : 453.59237)) : null,
         reps: isTimed ? null : String(data.get("reps") ?? "") ? Number(data.get("reps")) : null,
         durationSeconds: isTimed && durationMinutes ? Math.round(Number(durationMinutes) * 60) : null,
-        rir: String(data.get("rir") ?? "") ? Number(data.get("rir")) : null,
-        rpe: null,
+        rir: !isTimed && String(data.get("rir") ?? "") ? Number(data.get("rir")) : null,
+        rpe: isTimed && String(data.get("rpe") ?? "") ? Number(data.get("rpe")) : null,
         painNote: String(data.get("pain") ?? ""),
         clientMutationId: crypto.randomUUID(),
       });
@@ -719,11 +765,11 @@ function LiveSession({ snapshot, sessionId, now, onRefresh, onToast, toast, erro
           {relevantConstraints.length > 0 && <aside className="sl-live-boundaries" aria-label="与当前动作相关的身体边界"><span>本场提醒</span><div>{relevantConstraints.map((constraint) => <p key={constraint.id}><b>{constraint.severity === "avoid" ? "停止并换动作" : constraint.severity === "modify" ? "按记录调整" : "留意"}</b>{constraint.label}{constraint.note ? `：${constraint.note}` : ""}</p>)}</div></aside>}
           <form className="sl-set-form" onSubmit={(event) => void record(event)}>
             {isTimed ? <label><span>实际时长 <small>分钟</small></span><input required inputMode="decimal" name="durationMinutes" type="number" min="0.5" max="1440" step="0.5" defaultValue={sets.at(-1)?.duration_seconds ? Number((sets.at(-1)!.duration_seconds! / 60).toFixed(1)) : Math.max(1, Math.round((planned?.duration_seconds ?? 60) / 60))}/></label> : <><label><span>重量 <small>{unit}</small></span><input inputMode="decimal" name="weight" type="number" min="0" step="0.01" defaultValue={sets.at(-1)?.load_grams ? Number((sets.at(-1)!.load_grams! / (unit === "kg" ? 1_000 : 453.59237)).toFixed(2)) : ""} placeholder="可留空"/></label><label><span>次数</span><input required inputMode="numeric" name="reps" type="number" min="0" max="1000" defaultValue={sets.at(-1)?.reps ?? planned?.rep_min ?? ""}/></label></>}
-            <label><span>{isTimed ? "结束时余力" : "还可做几次"} <small>RIR</small></span><input inputMode="numeric" name="rir" type="number" min="0" max="5" defaultValue={snapshot.profile?.preferred_rir ?? ""} placeholder="可跳过"/></label>
+            {isTimed ? <label><span>主观强度 <small>RPE</small></span><input inputMode="numeric" name="rpe" type="number" min="1" max="10" defaultValue={sets.at(-1)?.rpe ?? ""} placeholder="1–10，可跳过"/></label> : <label><span>还可做几次 <small>RIR</small></span><input inputMode="numeric" name="rir" type="number" min="0" max="5" defaultValue={snapshot.profile?.preferred_rir ?? ""} placeholder="可跳过"/></label>}
             <label className="sl-pain-field"><span>有不适？（可选）</span><input name="pain" placeholder="出现疼痛时先停下，不用完成这条记录"/></label>
             <button className="sl-live-record" disabled={mutationBusy}>{mutationBusy ? "正在保存…" : isTimed ? "记录这段时长" : "记录这一组"}</button>
           </form>
-          {sets.length > 0 && <div className="sl-set-history"><header><span>这次已经记录</span><small>撤销只删除对应这一条</small></header>{sets.map((set) => <div key={set.id}><i>{set.set_index + 1}</i><span><b>{set.duration_seconds !== null ? `${Number((set.duration_seconds / 60).toFixed(1))} 分钟` : displayLoad(set.load_grams, unit)}</b><small>{set.duration_seconds !== null ? "计时记录" : `${set.reps ?? "—"} 次`} · RIR {set.rir ?? "—"}</small></span>{set.pain_note && <em>已记不适</em>}<button disabled={mutationBusy} aria-label={`撤销第${set.set_index + 1}条记录`} onClick={() => void mutate(() => undoFitnessSet(set.id), "已撤销这一条记录")}>↶</button></div>)}</div>}
+          {sets.length > 0 && <div className="sl-set-history"><header><span>这次已经记录</span><small>撤销只删除对应这一条</small></header>{sets.map((set) => <div key={set.id}><i>{set.set_index + 1}</i><span><b>{set.duration_seconds !== null ? `${Number((set.duration_seconds / 60).toFixed(1))} 分钟` : displayLoad(set.load_grams, unit)}</b><small>{set.duration_seconds !== null ? `计时记录 · RPE ${set.rpe ?? "—"}` : `${set.reps ?? "—"} 次 · RIR ${set.rir ?? "—"}`}</small></span>{set.pain_note && <em>已记不适</em>}<button disabled={mutationBusy} aria-label={`撤销第${set.set_index + 1}条记录`} onClick={() => void mutate(() => undoFitnessSet(set.id), "已撤销这一条记录")}>↶</button></div>)}</div>}
           <footer className="sl-live-actions"><button disabled={mutationBusy} onClick={() => { setSelectedExerciseId(current.id); setDialog("substitution"); }}>器材被占 / 换动作</button><button disabled={mutationBusy} onClick={() => void mutate(() => completeSessionExercise(current.id, true), "已跳过这个动作，不会变成欠账")}>今天不做这个动作</button><button disabled={mutationBusy} className="sl-primary" onClick={() => void mutate(() => completeSessionExercise(current.id), "动作已保存到这里")}>完成这个动作</button></footer>
         </article>
       </section> : <section className="sl-live-done"><span>THIS SESSION, SO FAR</span><h1>本场动作已到这里。</h1><p>没有新的记录表单。你可以结束保存，或按当前场地再加一个动作。</p><button disabled={mutationBusy} onClick={() => setDialog("exercise-picker")}>＋ 再加一个动作</button></section>}

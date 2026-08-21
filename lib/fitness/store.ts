@@ -301,10 +301,14 @@ function exerciseIsAvoided(
   );
 }
 
-async function assertExerciseIsAllowed(exercise: FitnessExercise): Promise<void> {
-  const constraints = (await rawQuery<Row>(
+async function loadActiveAvoidConstraints(): Promise<FitnessConstraint[]> {
+  return (await rawQuery<Row>(
     "SELECT * FROM fitness_constraints WHERE active=1 AND severity='avoid'",
   )).map(mapConstraint);
+}
+
+async function assertExerciseIsAllowed(exercise: FitnessExercise): Promise<void> {
+  const constraints = await loadActiveAvoidConstraints();
   if (exerciseIsAvoided(exercise, constraints)) {
     throw new Error(`动作「${exercise.name_zh}」与当前避用限制冲突`);
   }
@@ -499,6 +503,21 @@ export async function archiveVenue(id: string) {
   });
 }
 
+export async function restoreVenue(id: string) {
+  return write("venue-restored", async () => {
+    const venue = (await rawQuery<{ status: FitnessVenue["status"] }>(
+      "SELECT status FROM fitness_venues WHERE id=?",
+      [id],
+    ))[0];
+    if (!venue) throw new Error("场地不存在");
+    if (venue.status !== "archived") throw new Error("只能恢复已归档的场地");
+    await rawBatch([{
+      sql: "UPDATE fitness_venues SET status='active',updated_at=? WHERE id=? AND status='archived'",
+      params: [Date.now(), id],
+    }]);
+  });
+}
+
 export type SaveEquipmentInput = Omit<FitnessEquipment, "id" | "created_at" | "updated_at"> & {
   id?: string;
   loads: readonly Omit<FitnessEquipmentLoad, "id" | "equipment_id" | "created_at">[];
@@ -597,6 +616,13 @@ export async function saveConstraint(input: SaveConstraintInput): Promise<string
     const label = requireNonEmpty(input.label, "身体限制名称");
     requireUniqueStrings(input.movement_patterns, "受影响动作模式");
     requireUniqueStrings(input.exercise_ids, "受影响动作");
+    if (
+      input.active &&
+      input.movement_patterns.length === 0 &&
+      input.exercise_ids.length === 0
+    ) {
+      throw new TypeError("启用的身体边界必须至少包含一个受影响的动作模式或动作");
+    }
     if (input.movement_patterns.some((pattern) => !MOVEMENT_PATTERNS.has(pattern))) {
       throw new TypeError("身体限制包含未知的动作模式");
     }
@@ -616,6 +642,41 @@ export async function saveConstraint(input: SaveConstraintInput): Promise<string
       params: [id, label, input.body_area.trim(), input.severity, JSON.stringify(input.movement_patterns), JSON.stringify(input.exercise_ids), input.note.trim(), Number(input.active), now, now],
     }]);
     return id;
+  });
+}
+
+export async function setFitnessConstraintActive(
+  constraintId: string,
+  active: boolean,
+): Promise<void> {
+  return write(active ? "constraint-activated" : "constraint-deactivated", async () => {
+    const id = requireNonEmpty(constraintId, "身体边界标识");
+    if (typeof active !== "boolean") throw new TypeError("身体边界状态必须是布尔值");
+    const constraint = (await rawQuery<{
+      active: number;
+      movement_patterns_json: string;
+      exercise_ids_json: string;
+    }>(
+      `SELECT active,movement_patterns_json,exercise_ids_json
+        FROM fitness_constraints WHERE id=?`,
+      [id],
+    ))[0];
+    if (!constraint) throw new Error("身体边界不存在");
+    const current = asBoolean(constraint.active);
+    if (current === active) {
+      throw new Error(active ? "身体边界已经处于启用状态" : "身体边界已经处于暂停状态");
+    }
+    if (
+      active &&
+      parseArray(constraint.movement_patterns_json).length === 0 &&
+      parseArray(constraint.exercise_ids_json).length === 0
+    ) {
+      throw new Error("这条身体边界没有受影响范围，补充范围后才能启用");
+    }
+    await rawBatch([{
+      sql: "UPDATE fitness_constraints SET active=?,updated_at=? WHERE id=? AND active=?",
+      params: [Number(active), Date.now(), id, Number(current)],
+    }]);
   });
 }
 
@@ -972,6 +1033,30 @@ export async function scheduleProgramWeek(programId: string, from = new Date()):
     ))[0];
     if (!program) throw new Error("只能安排当前启用的计划");
     const days = await rawQuery<FitnessProgramDay>("SELECT * FROM fitness_program_days WHERE program_id=? ORDER BY day_index", [programId]);
+    const [items, constraints] = await Promise.all([
+      rawQuery<{ exercise_id: string }>(
+        `SELECT i.exercise_id
+          FROM fitness_program_items i
+          JOIN fitness_program_days d ON d.id=i.program_day_id
+          WHERE d.program_id=?`,
+        [programId],
+      ),
+      loadActiveAvoidConstraints(),
+    ]);
+    const conflicts = items.flatMap(({ exercise_id: exerciseId }) => {
+      const exercise = getFitnessExercise(exerciseId);
+      if (!exercise) throw new Error(`计划包含当前版本不识别的动作：${exerciseId}`);
+      return exerciseIsAvoided(exercise, constraints) ? [exercise.name_zh] : [];
+    });
+    if (conflicts.length > 0) {
+      throw new Error(`身体边界已更新，这版计划含有需要避开的动作「${[...new Set(conflicts)].join("、")}」；计划会保留，请生成适用版本后再排期`);
+    }
+    const windowStartDate = new Date(from);
+    windowStartDate.setHours(0, 0, 0, 0);
+    const windowEndDate = new Date(windowStartDate);
+    windowEndDate.setDate(windowEndDate.getDate() + 7);
+    const windowStart = windowStartDate.getTime();
+    const windowEnd = windowEndDate.getTime();
     const now = Date.now();
     const ids: string[] = [];
     const statements: SqlStatement[] = [];
@@ -984,9 +1069,10 @@ export async function scheduleProgramWeek(programId: string, from = new Date()):
           JOIN fitness_program_days d ON d.id=e.program_day_id
           WHERE d.program_id=? AND e.program_day_id=?
             AND e.status IN ('planned','in_progress')
+            AND e.starts_at>=? AND e.starts_at<?
           ORDER BY CASE e.status WHEN 'in_progress' THEN 0 ELSE 1 END,e.updated_at DESC
           LIMIT 1`,
-        [programId, day.id],
+        [programId, day.id, windowStart, windowEnd],
       ))[0];
       if (duplicate) {
         ids.push(duplicate.id);
@@ -1368,7 +1454,8 @@ export async function finishFitnessSession(id: string, input: { endedEarly?: boo
        FROM fitness_sets s
        JOIN fitness_session_exercises se ON se.id=s.session_exercise_id
        WHERE se.session_id=? AND s.completed=1 AND s.set_kind='work'
-         AND s.pain_note='' AND s.completed_at IS NOT NULL`,
+         AND s.pain_note='' AND s.completed_at IS NOT NULL
+         AND (s.reps IS NOT NULL OR s.load_grams IS NOT NULL)`,
       [id],
     );
     const statements: SqlStatement[] = [{

@@ -550,6 +550,16 @@ test("constraint-aware program persistence uses canonical equipment snapshots an
       /避用限制冲突/,
     );
     assert.equal(Number(database.selectValue("SELECT COUNT(*) FROM fitness_programs")), 1);
+    const eventCountBeforeConflict = Number(database.selectValue("SELECT COUNT(*) FROM fitness_calendar_events"));
+    await assert.rejects(
+      store.scheduleProgramWeek(programId, new Date(2026, 7, 31, 9, 0, 0, 0)),
+      /身体边界已更新.*生成适用版本后再排期/,
+    );
+    assert.equal(
+      Number(database.selectValue("SELECT COUNT(*) FROM fitness_calendar_events")),
+      eventCountBeforeConflict,
+      "a newly avoided action must block rescheduling an old plan without changing history",
+    );
     await assert.rejects(
       store.startFitnessSession({ eventId: first[0], venueId }),
       /避用限制冲突/,
@@ -565,6 +575,375 @@ test("constraint-aware program persistence uses canonical equipment snapshots an
       "cancelled",
     );
     await assert.rejects(store.scheduleProgramWeek(programId, from), /当前启用的计划/);
+  } finally {
+    database.close();
+  }
+});
+
+test("body boundaries can be edited, paused, and restored without rewriting plans or history", async () => {
+  const { database, state } = await databaseFixture();
+  try {
+    await store.initializeFitnessDatabase();
+    const venueId = await store.saveVenue(venueInput);
+    const equipmentId = await store.saveEquipmentWithLoads(
+      dumbbellInput(venueId, [load(10000), load(12500)]),
+    );
+    const programId = await store.saveProgramDraft(draftFor(venueId, equipmentId));
+    const [eventId] = await store.scheduleProgramWeek(
+      programId,
+      new Date(2026, 7, 24, 9, 0, 0, 0),
+    );
+    const sessionId = await store.startFitnessSession({ eventId, venueId });
+    const sessionExerciseId = String(database.selectValue(
+      "SELECT id FROM fitness_session_exercises WHERE session_id=?",
+      [sessionId],
+    ));
+    await store.recordFitnessSet({
+      sessionExerciseId,
+      setIndex: 0,
+      loadGrams: 10000,
+      reps: 8,
+      rir: 3,
+      clientMutationId: "constraint-lifecycle-history",
+    });
+    await store.finishFitnessSession(sessionId);
+
+    const factTables = [
+      "fitness_programs",
+      "fitness_program_days",
+      "fitness_program_items",
+      "fitness_calendar_events",
+      "fitness_sessions",
+      "fitness_session_exercises",
+      "fitness_sets",
+      "fitness_capabilities",
+    ];
+    const factsBefore = Object.fromEntries(factTables.map((table) => [
+      table,
+      database.selectObjects(`SELECT * FROM ${table} ORDER BY id`).map((row) => ({ ...row })),
+    ]));
+
+    const constraintId = await store.saveConstraint({
+      label: "训练时留意下背",
+      body_area: "下背",
+      severity: "monitor",
+      movement_patterns: ["hinge"],
+      exercise_ids: [],
+      note: "只记录自己的感受",
+      active: true,
+    });
+    const createdAt = Number(database.selectValue(
+      "SELECT created_at FROM fitness_constraints WHERE id=?",
+      [constraintId],
+    ));
+    await store.saveConstraint({
+      id: constraintId,
+      label: "暂时避开髋铰链",
+      body_area: "下背",
+      severity: "avoid",
+      movement_patterns: ["hinge"],
+      exercise_ids: [],
+      note: "按已知边界暂停这类动作",
+      active: true,
+    });
+    assert.deepEqual(
+      database.selectObjects(
+        `SELECT label,severity,movement_patterns_json,exercise_ids_json,note,active,created_at
+          FROM fitness_constraints WHERE id=?`,
+        [constraintId],
+      ).map((row) => ({ ...row })),
+      [{
+        label: "暂时避开髋铰链",
+        severity: "avoid",
+        movement_patterns_json: '["hinge"]',
+        exercise_ids_json: "[]",
+        note: "按已知边界暂停这类动作",
+        active: 1,
+        created_at: createdAt,
+      }],
+      "editing reuses the original record and creation fact",
+    );
+
+    const beforeEmptyEdit = database.selectObjects(
+      "SELECT * FROM fitness_constraints WHERE id=?",
+      [constraintId],
+    ).map((row) => ({ ...row }));
+    let batchCount = state.operations.filter(([operation]) => operation === "batch").length;
+    let broadcastCount = globalThis.__fitnessLockState.broadcasts.length;
+    await assert.rejects(
+      store.saveConstraint({
+        id: constraintId,
+        label: "范围不能丢失",
+        body_area: "下背",
+        severity: "avoid",
+        movement_patterns: [],
+        exercise_ids: [],
+        note: "无范围",
+        active: true,
+      }),
+      /至少包含一个受影响的动作模式或动作/,
+    );
+    assert.equal(
+      state.operations.filter(([operation]) => operation === "batch").length,
+      batchCount,
+      "an invalid active edit must not reach SQLite writes",
+    );
+    assert.equal(globalThis.__fitnessLockState.broadcasts.length, broadcastCount);
+    assert.deepEqual(
+      database.selectObjects("SELECT * FROM fitness_constraints WHERE id=?", [constraintId])
+        .map((row) => ({ ...row })),
+      beforeEmptyEdit,
+      "an invalid active edit is atomic",
+    );
+
+    const beforePause = beforeEmptyEdit[0];
+    const { active: beforePauseActive, updated_at: beforePauseUpdatedAt, ...stableBeforePause } = beforePause;
+    assert.equal(beforePauseActive, 1);
+    let writes = globalThis.__fitnessLockState.writes;
+    broadcastCount = globalThis.__fitnessLockState.broadcasts.length;
+    await store.setFitnessConstraintActive(constraintId, false);
+    assert.equal(globalThis.__fitnessLockState.writes, writes + 1);
+    assert.deepEqual(
+      globalThis.__fitnessLockState.broadcasts.slice(broadcastCount),
+      ["constraint-deactivated"],
+    );
+    const paused = database.selectObjects(
+      "SELECT * FROM fitness_constraints WHERE id=?",
+      [constraintId],
+    ).map((row) => ({ ...row }))[0];
+    const { active: pausedActive, updated_at: pausedUpdatedAt, ...stablePaused } = paused;
+    assert.equal(pausedActive, 0);
+    assert.ok(Number(pausedUpdatedAt) >= Number(beforePauseUpdatedAt));
+    assert.deepEqual(stablePaused, stableBeforePause, "pausing changes only active and updated_at");
+
+    batchCount = state.operations.filter(([operation]) => operation === "batch").length;
+    broadcastCount = globalThis.__fitnessLockState.broadcasts.length;
+    writes = globalThis.__fitnessLockState.writes;
+    await assert.rejects(
+      store.setFitnessConstraintActive(constraintId, false),
+      /已经处于暂停状态/,
+    );
+    assert.equal(
+      globalThis.__fitnessLockState.writes,
+      writes + 1,
+      "even rejected transitions must inspect state under the exclusive lock",
+    );
+    assert.equal(
+      state.operations.filter(([operation]) => operation === "batch").length,
+      batchCount,
+      "a repeated state is a zero-write rejection",
+    );
+    assert.equal(globalThis.__fitnessLockState.broadcasts.length, broadcastCount);
+    assert.deepEqual(
+      database.selectObjects("SELECT * FROM fitness_constraints WHERE id=?", [constraintId])
+        .map((row) => ({ ...row }))[0],
+      paused,
+    );
+
+    broadcastCount = globalThis.__fitnessLockState.broadcasts.length;
+    writes = globalThis.__fitnessLockState.writes;
+    await store.setFitnessConstraintActive(constraintId, true);
+    assert.equal(globalThis.__fitnessLockState.writes, writes + 1);
+    assert.deepEqual(
+      globalThis.__fitnessLockState.broadcasts.slice(broadcastCount),
+      ["constraint-activated"],
+    );
+    const restored = database.selectObjects(
+      "SELECT * FROM fitness_constraints WHERE id=?",
+      [constraintId],
+    ).map((row) => ({ ...row }))[0];
+    const { active: restoredActive, updated_at: restoredUpdatedAt, ...stableRestored } = restored;
+    assert.equal(restoredActive, 1);
+    assert.ok(Number(restoredUpdatedAt) >= Number(pausedUpdatedAt));
+    assert.deepEqual(stableRestored, stablePaused, "restoring changes only active and updated_at");
+
+    assert.deepEqual(
+      Object.fromEntries(factTables.map((table) => [
+        table,
+        database.selectObjects(`SELECT * FROM ${table} ORDER BY id`).map((row) => ({ ...row })),
+      ])),
+      factsBefore,
+      "constraint lifecycle changes never rewrite old plan or training facts",
+    );
+  } finally {
+    database.close();
+  }
+});
+
+test("empty, unknown, and repeated body-boundary activation attempts are rejected without writes", async () => {
+  const { database, state } = await databaseFixture();
+  try {
+    await store.initializeFitnessDatabase();
+    let batchCount = state.operations.filter(([operation]) => operation === "batch").length;
+    let broadcastCount = globalThis.__fitnessLockState.broadcasts.length;
+    await assert.rejects(
+      store.saveConstraint({
+        label: "没有范围的生效边界",
+        body_area: "",
+        severity: "avoid",
+        movement_patterns: [],
+        exercise_ids: [],
+        note: "",
+        active: true,
+      }),
+      /至少包含一个受影响的动作模式或动作/,
+    );
+    assert.equal(Number(database.selectValue("SELECT COUNT(*) FROM fitness_constraints")), 0);
+    assert.equal(state.operations.filter(([operation]) => operation === "batch").length, batchCount);
+    assert.equal(globalThis.__fitnessLockState.broadcasts.length, broadcastCount);
+
+    const legacyId = await store.saveConstraint({
+      label: "待补范围的旧记录",
+      body_area: "",
+      severity: "monitor",
+      movement_patterns: [],
+      exercise_ids: [],
+      note: "从旧版本保留下来",
+      active: false,
+    });
+    const legacy = database.selectObjects(
+      "SELECT * FROM fitness_constraints WHERE id=?",
+      [legacyId],
+    ).map((row) => ({ ...row }))[0];
+    batchCount = state.operations.filter(([operation]) => operation === "batch").length;
+    broadcastCount = globalThis.__fitnessLockState.broadcasts.length;
+    await assert.rejects(
+      store.setFitnessConstraintActive(legacyId, true),
+      /没有受影响范围.*补充范围后才能启用/,
+    );
+    assert.equal(state.operations.filter(([operation]) => operation === "batch").length, batchCount);
+    assert.equal(globalThis.__fitnessLockState.broadcasts.length, broadcastCount);
+    assert.deepEqual(
+      database.selectObjects("SELECT * FROM fitness_constraints WHERE id=?", [legacyId])
+        .map((row) => ({ ...row }))[0],
+      legacy,
+    );
+
+    batchCount = state.operations.filter(([operation]) => operation === "batch").length;
+    broadcastCount = globalThis.__fitnessLockState.broadcasts.length;
+    const writes = globalThis.__fitnessLockState.writes;
+    await assert.rejects(
+      store.setFitnessConstraintActive("constraint-does-not-exist", true),
+      /身体边界不存在/,
+    );
+    assert.equal(globalThis.__fitnessLockState.writes, writes + 1);
+    assert.equal(state.operations.filter(([operation]) => operation === "batch").length, batchCount);
+    assert.equal(globalThis.__fitnessLockState.broadcasts.length, broadcastCount);
+
+    await assert.rejects(
+      store.setFitnessConstraintActive(legacyId, false),
+      /已经处于暂停状态/,
+    );
+    assert.equal(state.operations.filter(([operation]) => operation === "batch").length, batchCount);
+    assert.equal(globalThis.__fitnessLockState.broadcasts.length, broadcastCount);
+  } finally {
+    database.close();
+  }
+});
+
+test("an archived venue can be restored without reviving plans or rewriting history", async () => {
+  const { database } = await databaseFixture();
+  try {
+    await store.initializeFitnessDatabase();
+    const venueId = await store.saveVenue(venueInput);
+    const equipmentId = await store.saveEquipmentWithLoads(
+      dumbbellInput(venueId, [load(10000), load(12500)]),
+    );
+    const programId = await store.saveProgramDraft(draftFor(venueId, equipmentId));
+    const from = new Date(2026, 7, 24, 9, 0, 0, 0);
+    const [completedEventId] = await store.scheduleProgramWeek(programId, from);
+    const sessionId = await store.startFitnessSession({ eventId: completedEventId, venueId });
+    await store.finishFitnessSession(sessionId);
+    const followingWeek = new Date(from.getTime() + 7 * 86_400_000);
+    const [notPerformedEventId] = await store.scheduleProgramWeek(programId, followingWeek);
+    await store.markCalendarEventNotPerformed(notPerformedEventId, "当天休息");
+    const [cancelledEventId] = await store.scheduleProgramWeek(programId, followingWeek);
+
+    let broadcastCount = globalThis.__fitnessLockState.broadcasts.length;
+    await assert.rejects(store.restoreVenue("venue-does-not-exist"), /场地不存在/);
+    await assert.rejects(store.restoreVenue(venueId), /只能恢复已归档的场地/);
+    assert.equal(
+      globalThis.__fitnessLockState.broadcasts.length,
+      broadcastCount,
+      "failed restores must not broadcast",
+    );
+
+    await store.archiveVenue(venueId);
+    assert.deepEqual(
+      Object.fromEntries(database.selectObjects(
+        "SELECT id,status FROM fitness_calendar_events WHERE venue_id=?",
+        [venueId],
+      ).map(({ id, status }) => [id, status])),
+      {
+        [completedEventId]: "completed",
+        [notPerformedEventId]: "not_performed",
+        [cancelledEventId]: "cancelled",
+      },
+      "archiving only cancels the still-planned event",
+    );
+    const programsAfterArchive = database.selectObjects(
+      "SELECT * FROM fitness_programs WHERE venue_id=? ORDER BY id",
+      [venueId],
+    ).map((row) => ({ ...row }));
+    const eventsAfterArchive = database.selectObjects(
+      "SELECT * FROM fitness_calendar_events WHERE venue_id=? ORDER BY id",
+      [venueId],
+    ).map((row) => ({ ...row }));
+    const sessionsAfterArchive = database.selectObjects(
+      "SELECT * FROM fitness_sessions WHERE venue_id=? ORDER BY id",
+      [venueId],
+    ).map((row) => ({ ...row }));
+    broadcastCount = globalThis.__fitnessLockState.broadcasts.length;
+    const writesBeforeRestore = globalThis.__fitnessLockState.writes;
+
+    await store.restoreVenue(venueId);
+    assert.equal(
+      globalThis.__fitnessLockState.writes,
+      writesBeforeRestore + 1,
+      "restore must use the product's exclusive write lock",
+    );
+    assert.deepEqual(
+      database.selectObjects("SELECT status,is_default FROM fitness_venues WHERE id=?", [venueId])
+        .map((row) => ({ ...row })),
+      [{ status: "active", is_default: 0 }],
+      "restoring availability must not silently make the venue default",
+    );
+    assert.deepEqual(
+      database.selectObjects("SELECT * FROM fitness_programs WHERE venue_id=? ORDER BY id", [venueId])
+        .map((row) => ({ ...row })),
+      programsAfterArchive,
+      "old plans stay archived",
+    );
+    assert.deepEqual(
+      database.selectObjects("SELECT * FROM fitness_calendar_events WHERE venue_id=? ORDER BY id", [venueId])
+        .map((row) => ({ ...row })),
+      eventsAfterArchive,
+      "calendar facts stay completed, not performed, or cancelled",
+    );
+    assert.deepEqual(
+      database.selectObjects("SELECT * FROM fitness_sessions WHERE venue_id=? ORDER BY id", [venueId])
+        .map((row) => ({ ...row })),
+      sessionsAfterArchive,
+      "completed session facts stay byte-for-byte unchanged",
+    );
+    assert.deepEqual(
+      globalThis.__fitnessLockState.broadcasts.slice(broadcastCount),
+      ["venue-restored"],
+    );
+
+    const venueAfterRestore = database.selectObjects(
+      "SELECT * FROM fitness_venues WHERE id=?",
+      [venueId],
+    ).map((row) => ({ ...row }));
+    broadcastCount = globalThis.__fitnessLockState.broadcasts.length;
+    await assert.rejects(store.restoreVenue(venueId), /只能恢复已归档的场地/);
+    assert.deepEqual(
+      database.selectObjects("SELECT * FROM fitness_venues WHERE id=?", [venueId])
+        .map((row) => ({ ...row })),
+      venueAfterRestore,
+      "a repeated restore of an active venue is a rejected no-op",
+    );
+    assert.equal(globalThis.__fitnessLockState.broadcasts.length, broadcastCount);
   } finally {
     database.close();
   }
@@ -604,6 +983,34 @@ test("program versions advance within one logical venue plan and retain prior ve
       { id: separateId, name: "旅行前保守计划", status: "active", version: 1, source: "local" },
     ]);
     assert.equal(Number(database.selectValue("SELECT COUNT(*) FROM fitness_programs")), 4);
+  } finally {
+    database.close();
+  }
+});
+
+test("a planned event from an earlier rolling week never blocks the next week", async () => {
+  const { database } = await databaseFixture();
+  try {
+    await store.initializeFitnessDatabase();
+    const venueId = await store.saveVenue(venueInput);
+    const equipmentId = await store.saveEquipmentWithLoads(
+      dumbbellInput(venueId, [load(10000), load(12500)]),
+    );
+    const programId = await store.saveProgramDraft(draftFor(venueId, equipmentId));
+    const firstWeek = new Date(2026, 7, 24, 9, 0, 0, 0);
+    const secondWeek = new Date(2026, 7, 31, 9, 0, 0, 0);
+    const [firstId] = await store.scheduleProgramWeek(programId, firstWeek);
+    const [secondId] = await store.scheduleProgramWeek(programId, secondWeek);
+
+    assert.notEqual(secondId, firstId);
+    assert.equal(Number(database.selectValue("SELECT COUNT(*) FROM fitness_calendar_events")), 2);
+    assert.deepEqual(await store.scheduleProgramWeek(programId, firstWeek), [firstId]);
+    assert.deepEqual(await store.scheduleProgramWeek(programId, secondWeek), [secondId]);
+    assert.equal(
+      Number(database.selectValue("SELECT COUNT(*) FROM fitness_calendar_events")),
+      2,
+      "each rolling week is independently idempotent",
+    );
   } finally {
     database.close();
   }
@@ -901,6 +1308,12 @@ test("duration-only cardio sets persist without invented repetition counts", asy
       database.selectValue("SELECT status FROM fitness_session_exercises WHERE id=?", [exerciseId]),
       "active",
     );
+    await store.finishFitnessSession(sessionId);
+    assert.equal(
+      Number(database.selectValue("SELECT COUNT(*) FROM fitness_capabilities")),
+      0,
+      "a duration-only fact must not be flattened into a strength capability that cannot express duration",
+    );
   } finally {
     database.close();
   }
@@ -931,9 +1344,11 @@ test("store operations take product locks and broadcast only successful writes",
       "saveFitnessProfile",
       "saveVenue",
       "archiveVenue",
+      "restoreVenue",
       "saveEquipmentWithLoads",
       "setEquipmentStatus",
       "saveConstraint",
+      "setFitnessConstraintActive",
       "saveProgramDraft",
       "scheduleProgramWeek",
       "rescheduleCalendarEvent",

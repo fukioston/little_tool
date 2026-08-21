@@ -723,6 +723,70 @@
   color: var(--sl-muted);
 }
 
+.sl-archived-venues {
+  margin-top: 48px;
+  padding-top: 24px;
+  border-top: 1px solid var(--sl-line);
+}
+
+.sl-archived-venues > header,
+.sl-archived-venues > div > article {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.sl-archived-venues > header {
+  margin-bottom: 12px;
+}
+
+.sl-archived-venues > header span {
+  font-size: 15px;
+  font-weight: 680;
+}
+
+.sl-archived-venues > header p,
+.sl-archived-venues article small {
+  color: var(--sl-muted);
+  font-size: 12px;
+}
+
+.sl-archived-venues > header > strong {
+  display: grid;
+  min-width: 29px;
+  height: 29px;
+  place-items: center;
+  border-radius: 999px;
+  background: var(--sl-soft);
+  color: var(--sl-muted);
+  font-size: 12px;
+}
+
+.sl-archived-venues > div {
+  display: grid;
+  gap: 8px;
+}
+
+.sl-archived-venues > div > article {
+  min-height: 66px;
+  padding: 10px 12px 10px 16px;
+  border: 1px solid var(--sl-line);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.6);
+}
+
+.sl-archived-venues article > span {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.sl-archived-venues article button {
+  flex: 0 0 auto;
+  padding: 0 14px;
+}
+
 .sl-equipment-grid,
 .sl-exercise-grid {
   display: grid;
@@ -980,10 +1044,35 @@
   font-size: 13px;
 }
 
+.sl-ai-privacy {
+  margin: 0 0 18px;
+  padding: 11px 14px;
+  border-radius: 13px;
+  background: var(--sl-soft-blue);
+  color: var(--sl-muted);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.sl-ai-privacy b {
+  margin-right: 8px;
+  color: var(--sl-blue-dark);
+}
+
 .sl-program-summary > aside {
   padding: 15px;
   border-radius: 14px;
   background: rgba(255, 255, 255, 0.07);
+}
+
+.sl-program-summary.conflict > aside {
+  background: rgba(255, 233, 185, 0.13);
+}
+
+.sl-plan-conflict {
+  margin: 12px 2px 0;
+  color: var(--sl-muted);
+  font-size: 12px;
 }
 
 .sl-program-days,
@@ -1060,6 +1149,10 @@
   border-bottom: 0;
 }
 
+.sl-program-item.conflict {
+  background: var(--sl-warning-soft);
+}
+
 .sl-program-item > i {
   display: grid;
   flex: 0 0 auto;
@@ -1093,6 +1186,10 @@
   font-style: normal;
   font-weight: 660;
   white-space: nowrap;
+}
+
+.sl-program-item.conflict em {
+  color: var(--sl-warning);
 }
 
 .sl-segmented {
@@ -1418,6 +1515,10 @@
   background: rgba(255, 255, 255, 0.72);
 }
 
+.sl-constraint-list article.inactive {
+  background: rgba(255, 255, 255, 0.42);
+}
+
 .sl-constraint-list article > i {
   display: grid;
   width: 38px;
@@ -1444,9 +1545,40 @@
   font-size: 15px;
 }
 
+.sl-constraint-list article > span {
+  min-width: 0;
+}
+
 .sl-constraint-list p,
-.sl-constraint-list article > strong {
+.sl-constraint-list article > span > small,
+.sl-constraint-controls strong {
   color: var(--sl-muted);
+  font-size: 12px;
+}
+
+.sl-constraint-list article > span > small {
+  display: block;
+  margin-top: 3px;
+  overflow-wrap: anywhere;
+}
+
+.sl-constraint-controls {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.sl-constraint-controls strong {
+  margin-right: 4px;
+  white-space: nowrap;
+}
+
+.sl-constraint-controls button {
+  min-width: 58px;
+  padding: 0 11px;
+  border: 1px solid var(--sl-line);
+  background: #fff;
   font-size: 12px;
 }
 
@@ -3114,6 +3246,20 @@
     flex: 1;
   }
 
+  .sl-archived-venues > header {
+    align-items: flex-start;
+  }
+
+  .sl-archived-venues > div > article {
+    display: grid;
+    gap: 10px;
+    padding: 14px;
+  }
+
+  .sl-archived-venues article button {
+    width: 100%;
+  }
+
   .sl-equipment-head,
   .sl-constraint-head {
     align-items: flex-end;
@@ -3191,11 +3337,14 @@
   }
 
   .sl-constraint-list article {
+    grid-template-columns: auto minmax(0, 1fr);
     align-items: start;
   }
 
-  .sl-constraint-list article > strong {
+  .sl-constraint-controls {
     grid-column: 2;
+    flex-wrap: wrap;
+    justify-content: flex-start;
   }
 
   .sl-settings > section > header {

@@ -31,12 +31,17 @@ export function EquipmentPhotos({
   onChanged: () => Promise<void>;
 }) {
   const [previews, setPreviews] = useState<readonly Preview[]>([]);
+  const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const input = useRef<HTMLInputElement>(null);
   const previewUrls = useRef<string[]>([]);
+  const mounted = useRef(false);
+  const loadGeneration = useRef(0);
 
   const load = async () => {
+    const generation = loadGeneration.current;
+    if (mounted.current) setLoading(true);
     const rows = await listFitnessFiles({ entityType: "equipment", entityId: equipment.id });
     const next = await Promise.all(rows.map(async (record): Promise<Preview> => {
       if (record.status !== "ready" || !record.mime_type.startsWith("image/")) return { record, url: null };
@@ -47,18 +52,27 @@ export function EquipmentPhotos({
         return { record: { ...record, status: "missing" }, url: null };
       }
     }));
+    if (!mounted.current || generation !== loadGeneration.current) {
+      next.forEach((entry) => { if (entry.url) URL.revokeObjectURL(entry.url); });
+      return;
+    }
     previewUrls.current.forEach((url) => URL.revokeObjectURL(url));
     previewUrls.current = next.flatMap((entry) => entry.url ? [entry.url] : []);
     setPreviews(next);
+    setLoading(false);
   };
 
   useEffect(() => {
+    mounted.current = true;
+    loadGeneration.current += 1;
     let live = true;
     const timer = window.setTimeout(() => {
-      void load().catch((reason) => { if (live) setError(message(reason)); });
+      void load().catch((reason) => { if (live) { setLoading(false); setError(message(reason)); } });
     }, 0);
     return () => {
       live = false;
+      mounted.current = false;
+      loadGeneration.current += 1;
       window.clearTimeout(timer);
       previewUrls.current.forEach((url) => URL.revokeObjectURL(url));
       previewUrls.current = [];
@@ -75,9 +89,9 @@ export function EquipmentPhotos({
       await load();
       await onChanged();
     } catch (reason) {
-      setError(message(reason));
+      if (mounted.current) { setLoading(false); setError(message(reason)); }
     } finally {
-      setBusy(false);
+      if (mounted.current) setBusy(false);
       if (input.current) input.current.value = "";
     }
   };
@@ -90,16 +104,16 @@ export function EquipmentPhotos({
       await load();
       await onChanged();
     } catch (reason) {
-      setError(message(reason));
+      if (mounted.current) { setLoading(false); setError(message(reason)); }
     } finally {
-      setBusy(false);
+      if (mounted.current) setBusy(false);
     }
   };
 
-  return <div className="sl-file-panel">
+  return <div className="sl-file-panel" aria-busy={loading}>
     <p className="sl-safety-copy">照片只保存在当前浏览器的适练空间，用于辨认真实器材；不会发送给 AI。支持 JPEG、PNG、WebP、HEIC，单张不超过 20 MiB。</p>
-    <div className="sl-file-actions"><input ref={input} type="file" accept=".jpg,.jpeg,.png,.webp,.heic,image/jpeg,image/png,image/webp,image/heic" onChange={(event) => void add(event.target.files?.[0])}/><span>{busy ? "正在核验并保存…" : "选择一张器材照片"}</span></div>
-    {previews.length > 0 ? <div className="sl-file-grid">{previews.map(({ record, url }) => <article key={record.id}>{url ? <Image unoptimized width={640} height={420} src={url} alt={`${equipment.name}：${record.file_name}`}/> : <div className="sl-file-missing">{record.status === "pending" ? "正在恢复写入" : "原文件不可用"}</div>}<footer><span><b>{record.file_name}</b><small>{Math.max(1, Math.round(record.byte_size / 1024))} KB · {record.status === "ready" ? "已校验" : "需检查"}</small></span><button disabled={busy} onClick={() => void remove(record)}>删除</button></footer></article>)}</div> : <div className="sl-file-empty">还没有照片。没有照片不会影响器材规划。</div>}
+    <div className="sl-file-actions"><input ref={input} aria-label={`为${equipment.name}选择器材照片`} type="file" accept=".jpg,.jpeg,.png,.webp,.heic,image/jpeg,image/png,image/webp,image/heic" onChange={(event) => void add(event.target.files?.[0])}/><span>{busy ? "正在核验并保存…" : "选择一张器材照片"}</span></div>
+    {previews.length > 0 ? <div className="sl-file-grid">{previews.map(({ record, url }) => <article key={record.id}>{url ? <Image unoptimized width={640} height={420} src={url} alt={`${equipment.name}：${record.file_name}`}/> : <div className="sl-file-missing">{record.status === "pending" ? "正在恢复写入" : "原文件不可用"}</div>}<footer><span><b>{record.file_name}</b><small>{Math.max(1, Math.round(record.byte_size / 1024))} KB · {record.status === "ready" ? "已校验" : "需检查"}</small></span><button aria-label={`删除${record.file_name}的本地照片`} disabled={busy} onClick={() => void remove(record)}>删除</button></footer></article>)}</div> : <div className="sl-file-empty" role="status">{loading ? "正在读取本地照片…" : "还没有照片。没有照片不会影响器材规划。"}</div>}
     {error && <p className="sl-form-error" role="alert">{error}</p>}
   </div>;
 }
@@ -134,17 +148,21 @@ export function FitnessDataControls({ onRestored }: { onRestored: () => Promise<
     try {
       const complete = await isCompleteFitnessBackup(file);
       const confirmed = window.confirm(complete
-        ? "恢复这份适练完整备份吗？通过全部校验后才会一次切换；当前版本会保留为恢复快照。"
-        : "这是旧版适练 SQLite 备份。它不含器材照片，恢复时会清空失效的附件引用；当前版本会保留为恢复快照。继续吗？");
+        ? "恢复这份适练完整备份吗？通过全部校验后才会一次切换。系统不会为当前资料自动生成可下载的回滚副本；如需保留，请先取消并下载当前完整备份。"
+        : "这份文件不是适练完整备份。确认后会尝试把它作为旧版 SQLite 校验；不兼容时不会切换。旧版不含器材照片，恢复时会清空失效附件引用；如需保留当前资料，请先取消并下载完整备份。继续吗？");
       if (!confirmed) return;
       if (complete) {
         const result = await restoreCompleteFitnessBackup(file);
-        setStatus(`已切换到 ${result.exportedAt.slice(0, 10)} 的完整备份，${result.fileCount} 个附件已逐项校验；上一版本仍作为恢复快照保留。`);
+        setStatus(`已切换到 ${result.exportedAt.slice(0, 10)} 的完整备份，${result.fileCount} 个附件已逐项校验。`);
       } else {
         await restoreLegacyFitnessDatabase(file);
-        setStatus("旧版 SQLite 数据已恢复；它不包含附件，原附件引用未被伪装成可用文件。上一版本仍作为恢复快照保留。");
+        setStatus("旧版 SQLite 数据已恢复；它不包含附件，原附件引用未被伪装成可用文件。");
       }
-      await onRestored();
+      try {
+        await onRestored();
+      } catch {
+        setError("备份已经恢复，但页面没有重新读取成功。请刷新页面，不要重复恢复同一文件。");
+      }
     } catch (reason) {
       setError(message(reason));
     } finally {
