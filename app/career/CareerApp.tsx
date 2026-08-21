@@ -24,6 +24,7 @@ import {
 import {
   FormEvent, ReactNode, useCallback, useEffect, useId, useMemo, useRef, useState,
 } from "react";
+import Link from "next/link";
 import {
   addActivity, initializeCareerDb,
   loadCareerData, newId, runCareerBatch, runCareerSql,
@@ -686,7 +687,7 @@ function Sidebar({ sidebarRef, view, open, data, onNavigate, onClose }: { sideba
   const active = data.jobs.filter((job) => !["stage_accepted", "stage_rejected", "stage_withdrawn"].includes(job.stage_id)).length;
   const recentNotes = data.activities.filter((item) => CAREER_CLOCK - new Date(item.created_at).getTime() < 7 * 86_400_000).length;
   return <><button className={`career-scrim ${open ? "show" : ""}`} tabIndex={-1} aria-label="关闭导航" onClick={onClose} /><aside ref={sidebarRef} id="career-sidebar" className={`career-sidebar ${open ? "open" : ""}`} role={open ? "dialog" : undefined} aria-modal={open ? "true" : undefined} aria-label={open ? "职迹导航" : undefined} tabIndex={open ? -1 : undefined}>
-    <div className="career-brand"><span>职</span><div><b>职迹</b><small>每一步，都算数</small></div><button data-sidebar-close className="career-icon-button mobile-only" onClick={onClose} aria-label="关闭导航"><X size={18} /></button></div>
+    <Link href="/" className="career-brand" aria-label="返回私人工作台"><span>职</span><div><b>职迹</b><small>每一步，都算数</small></div></Link><button data-sidebar-close className="career-icon-button mobile-only" style={{ position: "absolute", insetBlockStart: 29, insetInlineEnd: 24 }} onClick={onClose} aria-label="关闭导航"><X size={18} /></button>
     <nav className="career-nav" aria-label="职迹主导航">{navItems.map((item) => <button key={item.id} aria-label={item.label} className={view === item.id ? "active" : ""} onClick={() => onNavigate(item.id)}><item.icon size={18} strokeWidth={1.8} /><span>{item.label}</span>{item.id === "calendar" && data.tasks.filter((task) => task.status === "todo").length > 0 && <em>{data.tasks.filter((task) => task.status === "todo").length}</em>}</button>)}</nav>
     <div className="career-sidebar-spacer" /><div className="career-goal-card calm"><div><span>近 7 天记录</span><b>{recentNotes}<small> 次变化</small></b></div><div className="career-no-score"><ShieldCheck size={14} /><span>不设目标，也不给你打分</span></div><p>{active} 个机会在工作台里，按自己的节奏来。</p></div><div className="career-privacy"><ShieldCheck size={15} /><span>资料保存在本地 SQLite</span><i /></div>
   </aside></>;

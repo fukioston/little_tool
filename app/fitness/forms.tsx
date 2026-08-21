@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState, type FormEvent, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import {
   EQUIPMENT_KIND_LABELS,
   EQUIPMENT_TEMPLATES,
@@ -55,6 +55,98 @@ function submitValues(event: FormEvent<HTMLFormElement>) {
   return new FormData(event.currentTarget);
 }
 
+export type FormBusyController = Readonly<{
+  begin: () => (() => void) | null;
+  dispose: () => void;
+  isBusy: () => boolean;
+}>;
+
+export function createFormBusyController(
+  onBusyChange: (busy: boolean) => void,
+): FormBusyController {
+  let activeToken: symbol | null = null;
+  let disposed = false;
+  let reportedBusy = false;
+  const report = (next: boolean) => {
+    if (reportedBusy === next) return;
+    reportedBusy = next;
+    onBusyChange(next);
+  };
+  return {
+    begin() {
+      if (disposed || activeToken !== null) return null;
+      const token = Symbol("fitness-form-save");
+      activeToken = token;
+      report(true);
+      let settled = false;
+      return () => {
+        if (settled) return;
+        settled = true;
+        if (disposed || activeToken !== token) return;
+        activeToken = null;
+        report(false);
+      };
+    },
+    dispose() {
+      if (disposed) return;
+      disposed = true;
+      activeToken = null;
+      report(false);
+    },
+    isBusy() {
+      return activeToken !== null;
+    },
+  };
+}
+
+export function runReportedFormPersistence(
+  beginBusy: () => (() => void) | null,
+  persistence: () => Promise<void>,
+  onError: (message: string) => void,
+  fallbackError: string,
+): Promise<void> | null {
+  const settle = beginBusy();
+  if (!settle) return null;
+  let result: Promise<void>;
+  try {
+    result = persistence();
+  } catch (reason) {
+    try {
+      onError(reason instanceof Error ? reason.message : fallbackError);
+    } finally {
+      settle();
+    }
+    return Promise.resolve();
+  }
+  return Promise.resolve(result)
+    .catch((reason) => onError(reason instanceof Error ? reason.message : fallbackError))
+    .finally(settle);
+}
+
+function useReportedFormBusy(onBusyChange?: (busy: boolean) => void) {
+  const [busy, setBusy] = useState(false);
+  const callback = useRef(onBusyChange);
+  const controllerRef = useRef<FormBusyController | null>(null);
+  useEffect(() => {
+    callback.current = onBusyChange;
+  }, [onBusyChange]);
+  useEffect(() => {
+    let mounted = true;
+    const controller = createFormBusyController((next) => {
+      if (mounted) setBusy(next);
+      callback.current?.(next);
+    });
+    controllerRef.current = controller;
+    return () => {
+      mounted = false;
+      controller.dispose();
+      if (controllerRef.current === controller) controllerRef.current = null;
+    };
+  }, []);
+  const beginBusy = useCallback(() => controllerRef.current?.begin() ?? null, []);
+  return { busy, beginBusy };
+}
+
 export function resolveVenueVerificationTimestamp(
   verifiedNow: boolean,
   previous: number | null | undefined,
@@ -67,17 +159,18 @@ export function VenueForm({
   venue,
   onClose,
   onSave,
+  onBusyChange,
 }: {
   venue?: FitnessVenue | null;
   onClose: () => void;
   onSave: (input: SaveVenueInput) => Promise<void>;
+  onBusyChange?: (busy: boolean) => void;
 }) {
-  const [busy, setBusy] = useState(false);
+  const { busy, beginBusy } = useReportedFormBusy(onBusyChange);
   const [error, setError] = useState("");
   return <form className="sl-form" onSubmit={(event) => {
     const data = submitValues(event);
-    setBusy(true); setError("");
-    void onSave({
+    const input: SaveVenueInput = {
       id: venue?.id,
       name: String(data.get("name") ?? "").trim(),
       venue_type: String(data.get("venueType") ?? "commercial") as FitnessVenue["venue_type"],
@@ -92,7 +185,9 @@ export function VenueForm({
         data.get("verifiedNow") === "on",
         venue?.last_verified_at,
       ),
-    }).catch((reason) => setError(reason instanceof Error ? reason.message : "场地没有保存")).finally(() => setBusy(false));
+    };
+    setError("");
+    void runReportedFormPersistence(beginBusy, () => onSave(input), setError, "场地没有保存");
   }}>
     <div className="sl-field-grid"><label><span>场地名称</span><input required name="name" defaultValue={venue?.name} placeholder="例如：公司楼下健身房" /></label><label><span>场地类型</span><select name="venueType" defaultValue={venue?.venue_type ?? "commercial"}><option value="commercial">商业健身房</option><option value="home">家中</option><option value="office">公司</option><option value="hotel">酒店</option><option value="outdoor">户外</option><option value="other">其他</option></select></label></div>
     <label><span>位置（可选）</span><input name="location" defaultValue={venue?.location} placeholder="只存在当前浏览器，不会发给 AI" /></label>
@@ -164,6 +259,7 @@ export function EquipmentForm({
   unit,
   onClose,
   onSave,
+  onBusyChange,
 }: {
   venueId: string;
   equipment?: FitnessEquipment | null;
@@ -171,10 +267,11 @@ export function EquipmentForm({
   unit: "kg" | "lb";
   onClose: () => void;
   onSave: (input: SaveEquipmentInput) => Promise<void>;
+  onBusyChange?: (busy: boolean) => void;
 }) {
   const initialTemplate = EQUIPMENT_TEMPLATES.find((entry) => entry.kind === equipment?.kind) ?? EQUIPMENT_TEMPLATES[0];
   const [templateKind, setTemplateKind] = useState<EquipmentKind>(initialTemplate.kind);
-  const [busy, setBusy] = useState(false);
+  const { busy, beginBusy } = useReportedFormBusy(onBusyChange);
   const [error, setError] = useState("");
   const template = EQUIPMENT_TEMPLATES.find((entry) => entry.kind === templateKind)!;
   const loadNeedsLiteralUnit = templateKind === "bands" || templateKind === "cable" || templateKind === "fixed_machine";
@@ -196,8 +293,7 @@ export function EquipmentForm({
       setError(reason instanceof Error ? reason.message : "器材档位无法识别");
       return;
     }
-    setBusy(true); setError("");
-    void onSave({
+    const input: SaveEquipmentInput = {
       id: equipment?.id,
       venue_id: venueId,
       name: String(data.get("name") ?? "").trim(),
@@ -219,7 +315,9 @@ export function EquipmentForm({
       attachments: String(data.get("attachments") ?? "").split(/[,，]+/).map((value) => value.trim()).filter(Boolean),
       notes: String(data.get("notes") ?? "").trim(),
       loads: parsedLoads,
-    }).catch((reason) => setError(reason instanceof Error ? reason.message : "器材没有保存")).finally(() => setBusy(false));
+    };
+    setError("");
+    void runReportedFormPersistence(beginBusy, () => onSave(input), setError, "器材没有保存");
   }}>
     <fieldset className="sl-template-picker"><legend>器材类型</legend>{EQUIPMENT_TEMPLATES.map((entry) => <button type="button" aria-pressed={templateKind === entry.kind} className={templateKind === entry.kind ? "active" : ""} key={entry.kind} onClick={() => setTemplateKind(entry.kind)}><i>{entry.label.slice(0, 1)}</i><span>{entry.label}</span></button>)}</fieldset>
     <p className="sl-form-hint">{templateKind === "bands"
@@ -249,19 +347,20 @@ export function ProfileForm({
   profile,
   onClose,
   onSave,
+  onBusyChange,
 }: {
   profile: FitnessProfile | null;
   onClose: () => void;
   onSave: (input: SaveFitnessProfileInput) => Promise<void>;
+  onBusyChange?: (busy: boolean) => void;
 }) {
   const [goals, setGoals] = useState<FitnessGoal[]>(profile ? [...profile.goals] : ["general_health"]);
   const [days, setDays] = useState<number[]>(profile ? [...profile.preferred_weekdays] : [1, 3, 5]);
-  const [busy, setBusy] = useState(false);
+  const { busy, beginBusy } = useReportedFormBusy(onBusyChange);
   const [error, setError] = useState("");
   return <form className="sl-form" onSubmit={(event) => {
     const data = submitValues(event);
-    setBusy(true); setError("");
-    void onSave({
+    const input: SaveFitnessProfileInput = {
       goals,
       experience: String(data.get("experience") ?? "new") as FitnessProfile["experience"],
       resistance_days_per_week: Number(data.get("resistanceDays") ?? 3),
@@ -273,7 +372,9 @@ export function ProfileForm({
       rest_seconds: Number(data.get("rest") ?? 90),
       unit: String(data.get("unit") ?? "kg") as FitnessProfile["unit"],
       notes: String(data.get("notes") ?? "").trim(),
-    }).catch((reason) => setError(reason instanceof Error ? reason.message : "偏好没有保存")).finally(() => setBusy(false));
+    };
+    setError("");
+    void runReportedFormPersistence(beginBusy, () => onSave(input), setError, "偏好没有保存");
   }}>
     <fieldset className="sl-chip-picker"><legend>这段时间更在意什么？</legend>{goalOptions.map(([id, label]) => <button type="button" aria-pressed={goals.includes(id)} className={goals.includes(id) ? "active" : ""} key={id} onClick={() => setGoals((current) => current.includes(id) ? current.filter((entry) => entry !== id) : [...current, id])}>{label}</button>)}</fieldset>
     <div className="sl-field-grid"><label><span>训练经验</span><select name="experience" defaultValue={profile?.experience ?? "new"}><option value="new">刚开始</option><option value="returning">重新开始</option><option value="consistent">有稳定训练经验</option><option value="advanced">熟悉自主规划</option></select></label><label><span>分化偏好</span><select name="split" defaultValue={profile?.split ?? "auto"}><option value="auto">根据频次给出候选</option><option value="full_body">全身</option><option value="upper_lower">上下肢</option><option value="push_pull_legs">推拉腿</option><option value="custom">自定义</option></select></label></div>
@@ -291,13 +392,15 @@ export function ConstraintForm({
   constraint,
   onClose,
   onSave,
+  onBusyChange,
 }: {
   constraint?: FitnessConstraint | null;
   onClose: () => void;
   onSave: (input: SaveConstraintInput) => Promise<void>;
+  onBusyChange?: (busy: boolean) => void;
 }) {
   const [patterns, setPatterns] = useState<MovementPattern[]>(constraint ? [...constraint.movement_patterns] : []);
-  const [busy, setBusy] = useState(false);
+  const { busy, beginBusy } = useReportedFormBusy(onBusyChange);
   const [error, setError] = useState("");
   const patternOptions = useMemo(() => Object.entries(MOVEMENT_PATTERN_LABELS) as Array<[MovementPattern, string]>, []);
   return <form className="sl-form" onSubmit={(event) => {
@@ -306,8 +409,7 @@ export function ConstraintForm({
       setError("请至少选择一个受影响的动作模式；未知范围不会被保存成“全部训练”。");
       return;
     }
-    setBusy(true); setError("");
-    void onSave({
+    const input: SaveConstraintInput = {
       id: constraint?.id,
       label: String(data.get("label") ?? "").trim(),
       body_area: String(data.get("bodyArea") ?? "").trim(),
@@ -316,7 +418,9 @@ export function ConstraintForm({
       exercise_ids: constraint?.exercise_ids ?? [],
       note: String(data.get("note") ?? "").trim(),
       active: constraint?.active ?? true,
-    }).catch((reason) => setError(reason instanceof Error ? reason.message : "身体边界没有保存")).finally(() => setBusy(false));
+    };
+    setError("");
+    void runReportedFormPersistence(beginBusy, () => onSave(input), setError, "身体边界没有保存");
   }}>
     <p className="sl-safety-copy strong">这里记录的是你的描述与专业人员建议，不是系统诊断。出现疼痛或异常不适时，先停止相关动作并寻求合格专业人士意见。</p>
     <div className="sl-field-grid"><label><span>怎样称呼这条边界</span><input required name="label" defaultValue={constraint?.label} placeholder="例如：右膝深屈时不舒服" /></label><label><span>身体部位（可选）</span><input name="bodyArea" defaultValue={constraint?.body_area} placeholder="右膝" /></label></div>

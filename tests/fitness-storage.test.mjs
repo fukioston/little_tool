@@ -1180,6 +1180,68 @@ test("manual sessions support added exercises, idempotent sets, undo, and truthf
   }
 });
 
+test("pain notes survive session finish as trimmed history facts without creating capabilities", async () => {
+  const { database } = await databaseFixture();
+  try {
+    await store.initializeFitnessDatabase();
+    const venueId = await store.saveVenue(venueInput);
+    const equipmentId = await store.saveEquipmentWithLoads(
+      dumbbellInput(venueId, [load(10000)]),
+    );
+    const sessionId = await store.startFitnessSession({ venueId });
+    const sessionExerciseId = await store.addSessionExercise(
+      sessionId,
+      "dumbbell-rdl",
+      equipmentId,
+    );
+    const setId = await store.recordFitnessSet({
+      sessionExerciseId,
+      setIndex: 0,
+      setKind: "work",
+      loadGrams: 10000,
+      reps: 8,
+      rir: 2,
+      painNote: "  右膝出现刺痛，已停止这一组。  ",
+      clientMutationId: "pain-note-history-fact",
+    });
+
+    await store.finishFitnessSession(sessionId);
+
+    assert.deepEqual(
+      database.selectObjects(
+        `SELECT s.id,s.pain_note,se.status exercise_status
+         FROM fitness_sets s
+         JOIN fitness_session_exercises se ON se.id=s.session_exercise_id
+         WHERE s.id=?`,
+        [setId],
+      ).map((row) => ({ ...row })),
+      [{
+        id: setId,
+        pain_note: "右膝出现刺痛，已停止这一组。",
+        exercise_status: "completed",
+      }],
+      "the user's trimmed note must remain attached to the completed historical set",
+    );
+    assert.equal(
+      Number(database.selectValue(
+        `SELECT COUNT(*) FROM fitness_capabilities
+         WHERE source_set_id=? OR exercise_id=?`,
+        [setId, "dumbbell-rdl"],
+      )),
+      0,
+      "a painful set and its exercise must not become a progression capability",
+    );
+    const snapshot = await store.loadFitnessSnapshot();
+    assert.equal(
+      snapshot.sets.find((set) => set.id === setId)?.pain_note,
+      "右膝出现刺痛，已停止这一组。",
+      "history reads must surface the same verbatim SQLite fact",
+    );
+  } finally {
+    database.close();
+  }
+});
+
 test("exercise substitution preserves live status and its original-exercise fact after finish", async () => {
   const { database } = await databaseFixture();
   try {

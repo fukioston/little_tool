@@ -1,5 +1,5 @@
 const CACHE_NAME = "private-ai-suite-v1";
-const APP_SHELL = ["/", "/career", "/vocab"];
+const APP_SHELL = ["/", "/career", "/vocab", "/fitness"];
 
 self.addEventListener("install", (event) => {
   event.waitUntil(caches.open(CACHE_NAME).then((cache) => cache.addAll(APP_SHELL)).then(() => self.skipWaiting()));

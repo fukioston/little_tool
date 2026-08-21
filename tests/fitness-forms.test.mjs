@@ -16,8 +16,10 @@ async function loadPureFormHelpers() {
     ts.ScriptKind.TSX,
   );
   const wanted = new Set([
+    "createFormBusyController",
     "parseEquipmentLoadText",
     "resolveVenueVerificationTimestamp",
+    "runReportedFormPersistence",
   ]);
   const helpers = sourceFile.statements
     .filter(
@@ -46,9 +48,98 @@ async function loadPureFormHelpers() {
 }
 
 const {
+  createFormBusyController,
   parseEquipmentLoadText,
   resolveVenueVerificationTimestamp,
+  runReportedFormPersistence,
 } = await loadPureFormHelpers();
+
+test("form busy lifecycle is synchronous, deduplicated, and ignores stale settles", () => {
+  const reports = [];
+  const controller = createFormBusyController((busy) => reports.push(busy));
+  const firstSettle = controller.begin();
+  assert.equal(typeof firstSettle, "function");
+  assert.equal(controller.isBusy(), true);
+  assert.deepEqual(reports, [true]);
+  assert.equal(controller.begin(), null, "a second persistence cannot start while busy");
+  assert.deepEqual(reports, [true]);
+
+  firstSettle();
+  firstSettle();
+  assert.equal(controller.isBusy(), false);
+  assert.deepEqual(reports, [true, false], "settling twice must not report twice");
+
+  const staleSettle = controller.begin();
+  assert.deepEqual(reports, [true, false, true]);
+  controller.dispose();
+  assert.equal(controller.isBusy(), false);
+  assert.deepEqual(reports, [true, false, true, false], "unmount disposal clears parent busy state");
+  staleSettle();
+  assert.deepEqual(reports, [true, false, true, false], "a stale async settle after unmount is ignored");
+  assert.equal(controller.begin(), null, "a disposed form cannot restart persistence");
+
+  const remounted = createFormBusyController((busy) => reports.push(busy));
+  const resumedSettle = remounted.begin();
+  assert.equal(typeof resumedSettle, "function");
+  resumedSettle();
+  assert.deepEqual(reports, [true, false, true, false, true, false]);
+});
+
+test("reported persistence starts busy before saving and clears it on every settlement", async () => {
+  const order = [];
+  const errors = [];
+  const controller = createFormBusyController((busy) => order.push(`busy:${busy}`));
+  let resolveSave;
+  const pendingSave = new Promise((resolve) => {
+    resolveSave = resolve;
+  });
+  const run = runReportedFormPersistence(
+    controller.begin,
+    () => {
+      order.push("save");
+      return pendingSave;
+    },
+    (message) => errors.push(message),
+    "fallback",
+  );
+  assert.deepEqual(order, ["busy:true", "save"]);
+  assert.equal(
+    runReportedFormPersistence(
+      controller.begin,
+      async () => order.push("duplicate-save"),
+      (message) => errors.push(message),
+      "fallback",
+    ),
+    null,
+  );
+  resolveSave();
+  await run;
+  assert.deepEqual(order, ["busy:true", "save", "busy:false"]);
+  assert.deepEqual(errors, []);
+
+  await runReportedFormPersistence(
+    controller.begin,
+    async () => {
+      throw new Error("保存失败");
+    },
+    (message) => errors.push(message),
+    "fallback",
+  );
+  assert.deepEqual(errors, ["保存失败"]);
+  assert.equal(controller.isBusy(), false);
+
+  await runReportedFormPersistence(
+    controller.begin,
+    () => {
+      throw "not-an-error";
+    },
+    (message) => errors.push(message),
+    "同步保存失败",
+  );
+  assert.deepEqual(errors, ["保存失败", "同步保存失败"]);
+  assert.equal(controller.isBusy(), false);
+  assert.doesNotMatch(order.join(" "), /duplicate-save/);
+});
 
 test("equipment load parser preserves explicit truthful values and allows unknown loads", () => {
   assert.deepEqual(parseEquipmentLoadText("  \n ", "kg", 2), []);
@@ -124,4 +215,42 @@ test("venue and relative-resistance UI state the truth boundary", () => {
   assert.match(source, /轻 \/ 中 \/ 重和阻力范围都是相对信息/);
   assert.match(source, /面板若只写 1 \/ 2 \/ 3 等无单位数字，它们不是公斤/);
   assert.match(source, /阻力范围或无单位面板数字请留空，并写进备注/);
+});
+
+test("all persistent Fitness forms expose one shared modal-busy contract", () => {
+  assert.equal(
+    (source.match(/onBusyChange\?: \(busy: boolean\) => void/g) ?? []).length,
+    5,
+    "four public form props plus the shared hook must use the same callback type",
+  );
+  assert.equal(
+    (source.match(/\n\s{2}onBusyChange,\n/g) ?? []).length,
+    4,
+    "venue, equipment, profile, and constraint forms must all receive the prop",
+  );
+  assert.equal(
+    (source.match(/useReportedFormBusy\(onBusyChange\)/g) ?? []).length,
+    4,
+  );
+  assert.equal(
+    (source.match(/runReportedFormPersistence\(beginBusy,/g) ?? []).length,
+    4,
+  );
+  assert.match(source, /return \(\) => \{[\s\S]*mounted = false;[\s\S]*controller\.dispose\(\);/);
+
+  const equipmentStart = source.indexOf("export function EquipmentForm");
+  const profileStart = source.indexOf("export function ProfileForm");
+  const constraintStart = source.indexOf("export function ConstraintForm");
+  const equipmentSource = source.slice(equipmentStart, profileStart);
+  const constraintSource = source.slice(constraintStart);
+  assert.ok(
+    equipmentSource.indexOf("parseEquipmentLoadText(") <
+      equipmentSource.indexOf("runReportedFormPersistence(beginBusy,"),
+    "equipment parsing must finish before busy is reported",
+  );
+  assert.ok(
+    constraintSource.indexOf("patterns.length === 0") <
+      constraintSource.indexOf("runReportedFormPersistence(beginBusy,"),
+    "invalid constraint scope must return before busy is reported",
+  );
 });
