@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import {
   EQUIPMENT_KIND_LABELS,
   FITNESS_EXERCISES,
@@ -295,6 +295,7 @@ export default function FitnessApp() {
   const [dialogMutationBusy, setDialogMutationBusy] = useState(false);
   const [elapsedNow, setElapsedNow] = useState(() => Date.now());
   const [firstRunDismissed, setFirstRunDismissed] = useState(false);
+  const dialogWasOpen = useRef(false);
 
   const refresh = useCallback(async () => {
     const next = await loadFitnessSnapshot();
@@ -350,6 +351,22 @@ export default function FitnessApp() {
     });
     return () => window.cancelAnimationFrame(frame);
   }, [firstRunDismissed, view]);
+  useEffect(() => {
+    if (dialog !== null) {
+      dialogWasOpen.current = true;
+      return;
+    }
+    if (!dialogWasOpen.current) return;
+    dialogWasOpen.current = false;
+    const frame = window.requestAnimationFrame(() => {
+      if (document.activeElement !== document.body) return;
+      const candidates = Array.from(document.querySelectorAll<HTMLButtonElement>(
+        ".sl-topbar nav button[aria-current='page'], .sl-mobile-tabs button[aria-current='page']",
+      ));
+      candidates.find((candidate) => candidate.getClientRects().length > 0)?.focus({ preventScroll: true });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [dialog]);
 
   const venue = snapshot.venues.find((entry) => entry.id === venueId && entry.status === "active") ?? null;
   const venueEquipment = snapshot.equipment.filter((entry) => entry.venue_id === venueId);
@@ -498,7 +515,7 @@ export default function FitnessApp() {
         await refresh();
         setToast("复盘已保存在这条训练记录里");
       } catch {
-        throw new Error("复盘已经保存在本地，但当前页面没有重新读取成功。请刷新页面，不要重复提交。");
+        setError("复盘已经保存在本地，但当前页面没有重新读取成功。请刷新页面，不要重复提交。");
       }
     }} />}</FitnessDialog>
     <MoreDialog open={dialog === "more"} current={view} onClose={closeDialog} onView={(next) => { setView(next); closeDialog(); }} />
@@ -652,6 +669,7 @@ function HistoryDetail({ snapshot, sessionId, unit, onSaveReflection }: {
   const session = snapshot.sessions.find((entry) => entry.id === sessionId) ?? null;
   const [editingReflection, setEditingReflection] = useState(false);
   const [reflectionDraft, setReflectionDraft] = useState(session?.reflection ?? "");
+  const [savedReflection, setSavedReflection] = useState(session?.reflection ?? "");
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState("");
   const [saved, setSaved] = useState(false);
@@ -665,6 +683,7 @@ function HistoryDetail({ snapshot, sessionId, unit, onSaveReflection }: {
     setSaving(true); setSaveError(""); setSaved(false);
     try {
       await onSaveReflection(session.id, reflectionDraft);
+      setSavedReflection(reflectionDraft.trim());
       setEditingReflection(false);
       setSaved(true);
     } catch (reason) {
@@ -687,7 +706,7 @@ function HistoryDetail({ snapshot, sessionId, unit, onSaveReflection }: {
       })}</ol> : <p className="sl-history-no-sets">这次保存了现场替代关系，但没有保存组数或时长；适练不会把它补成已完成数据。</p>}</article>;
     })}</section> : <p className="sl-empty-copy padded">这次只保存了训练时段，没有把计划动作算作实际完成。</p>}
     {unperformed > 0 && <p className="sl-history-unperformed">另有 {unperformed} 个计划动作没有实际记录，因此没有列在上面。</p>}
-    <section className="sl-history-reflection"><header><div><span>训练复盘</span><p>只保存在这条本地记录中；空白也可以。</p></div>{!editingReflection && <button type="button" onClick={() => { setReflectionDraft(session.reflection); setSaveError(""); setSaved(false); setEditingReflection(true); }}>{session.reflection ? "编辑" : "写一点"}</button>}</header>{editingReflection ? <><label><span className="sl-visually-hidden">训练复盘</span><textarea value={reflectionDraft} onChange={(event) => setReflectionDraft(event.target.value)} maxLength={4000} placeholder="例如：哪个动作更顺、下次想保留什么。无需做评价。" /></label><footer><button type="button" disabled={saving} onClick={() => { setReflectionDraft(session.reflection); setSaveError(""); setEditingReflection(false); }}>取消</button><button type="button" className="sl-primary" disabled={saving} onClick={() => void saveReflection()}>{saving ? "正在保存…" : "保存复盘"}</button></footer></> : <p>{session.reflection || "这次没有写复盘。"}</p>}{saveError && <p className="sl-inline-error" role="alert">{saveError}</p>}{saved && <p className="sl-inline-success" role="status">复盘已保存。</p>}</section>
+    <section className="sl-history-reflection"><header><div><span>训练复盘</span><p>只保存在这条本地记录中；空白也可以。</p></div>{!editingReflection && <button type="button" onClick={() => { setReflectionDraft(savedReflection); setSaveError(""); setSaved(false); setEditingReflection(true); }}>{savedReflection ? "编辑" : "写一点"}</button>}</header>{editingReflection ? <><label><span className="sl-visually-hidden">训练复盘</span><textarea value={reflectionDraft} onChange={(event) => setReflectionDraft(event.target.value)} maxLength={4000} placeholder="例如：哪个动作更顺、下次想保留什么。无需做评价。" /></label><footer><button type="button" disabled={saving} onClick={() => { setReflectionDraft(savedReflection); setSaveError(""); setEditingReflection(false); }}>取消</button><button type="button" className="sl-primary" disabled={saving} onClick={() => void saveReflection()}>{saving ? "正在保存…" : "保存复盘"}</button></footer></> : <p>{savedReflection || "这次没有写复盘。"}</p>}{saveError && <p className="sl-inline-error" role="alert">{saveError}</p>}{saved && <p className="sl-inline-success" role="status">复盘已保存。</p>}</section>
   </div>;
 }
 

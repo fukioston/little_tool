@@ -4,7 +4,7 @@ import OfflineRegistration from "./OfflineRegistration";
 
 export const metadata: Metadata = {
   title: { default: "私人工作台", template: "%s · 私人工作台" },
-  description: "职迹、拾词与适练，三个本地优先的私人智能空间。",
+  description: "职迹、拾词、适练，以及之后属于你的本地优先私人空间。",
 };
 
 export default function RootLayout({
