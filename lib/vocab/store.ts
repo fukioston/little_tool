@@ -151,6 +151,109 @@ export type VocabReviewCommitResult<Receipt extends VocabReviewReceipt> =
     receipt: Receipt;
   }>;
 
+export type VocabSettingKey = keyof VocabSettings;
+
+export type VocabSettingWriteRow<Key extends VocabSettingKey = VocabSettingKey> =
+  Readonly<{
+    key: Key;
+    value: string;
+    updated_at: number;
+  }>;
+
+export type VocabSettingsWriteRows = readonly [
+  VocabSettingWriteRow<"chinese_explanation"> | null,
+  VocabSettingWriteRow<"font_scale"> | null,
+  VocabSettingWriteRow<"line_height"> | null,
+  VocabSettingWriteRow<"local_lock"> | null,
+  VocabSettingWriteRow<"auto_follow"> | null,
+  VocabSettingWriteRow<"daily_new_limit"> | null,
+];
+
+export type VocabSettingsWriteSnapshot = Readonly<{
+  generationId: string;
+  generationSequence: number;
+  rows: VocabSettingsWriteRows;
+  settings: VocabSettings;
+}>;
+
+export type VocabSettingsSaveReceipt = Readonly<{
+  purpose: "vocab-settings-write";
+  version: 1;
+  kind: "settings-save";
+  operationId: string;
+  generationId: string;
+  generationSequence: number;
+  before: VocabSettingsWriteSnapshot;
+  after: VocabSettingsWriteSnapshot;
+  projectionSha256: string;
+}>;
+
+export type VocabSettingsWriteReceipt = VocabSettingsSaveReceipt;
+
+export type VocabSettingsWriteInspection =
+  | "exact_saved"
+  | "expected"
+  | "changed"
+  | "still_unknown"
+  | "invalid_receipt";
+
+export type VocabSettingsWriteResult =
+  | Readonly<{
+      outcome: "saved" | "already_saved";
+      receipt: VocabSettingsWriteReceipt;
+      entityId: "settings";
+      updatedAt: number;
+    }>
+  | Readonly<{
+      outcome: "changed";
+      receipt: VocabSettingsWriteReceipt;
+      entityId: "settings";
+      retryable: false;
+    }>
+  | Readonly<{
+      outcome: "outcome_uncertain";
+      receipt: VocabSettingsWriteReceipt;
+      entityId: "settings";
+      retryable: true;
+    }>;
+
+export type VocabSettingsMutationErrorCode =
+  | "invalid_input"
+  | "invalid_receipt"
+  | "changed"
+  | "inspect_failed"
+  | "write_failed";
+
+export class VocabSettingsMutationError extends Error {
+  readonly name = "VocabSettingsMutationError";
+
+  constructor(
+    readonly code: VocabSettingsMutationErrorCode,
+    message: string,
+    readonly receipt?: VocabSettingsWriteReceipt,
+  ) {
+    super(message);
+  }
+}
+
+type VocabSettingsQueryResult<Result extends object> = Readonly<{
+  rows: readonly Result[];
+}>;
+
+export type VocabSettingsStorageRuntime = Readonly<{
+  withReadLock?<Result>(operation: () => Promise<Result>): Promise<Result>;
+  withExclusiveLock<Result>(operation: () => Promise<Result>): Promise<Result>;
+  query<Result extends object>(
+    sql: string,
+    params?: SqlValue[],
+  ): Promise<VocabSettingsQueryResult<Result>>;
+  batch(statements: readonly Statement[]): Promise<unknown>;
+  currentGeneration(): Promise<Readonly<{ generationId: string; sequence: number }>>;
+  now(): number;
+  randomUUID(): string;
+  broadcast(reason: string): void;
+}>;
+
 export class VocabReviewConflictError extends Error {
   readonly code = "VOCAB_REVIEW_CONFLICT";
 
@@ -3224,6 +3327,650 @@ export async function undoReview(eventId: string): Promise<void> {
     throw error;
   }
 }
+
+const VOCAB_SETTING_KEYS = [
+  "chinese_explanation",
+  "font_scale",
+  "line_height",
+  "local_lock",
+  "auto_follow",
+  "daily_new_limit",
+] as const satisfies readonly VocabSettingKey[];
+const VOCAB_SETTINGS_MAX_JSON_BYTES = 1_048_576;
+const VOCAB_SETTINGS_OPERATION_ID_PATTERN =
+  /^vocab-settings-operation-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const VOCAB_SETTINGS_GENERATION_ID_PATTERN =
+  /^(?:legacy|[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/i;
+
+function vocabSettingsError(
+  code: VocabSettingsMutationErrorCode,
+  message: string,
+  receipt?: VocabSettingsWriteReceipt,
+): VocabSettingsMutationError {
+  return new VocabSettingsMutationError(code, message, receipt);
+}
+
+function settingsExactObjectKeys(
+  value: object,
+  keys: readonly string[],
+): boolean {
+  const actual = Object.keys(value).sort();
+  const expected = [...keys].sort();
+  return actual.length === expected.length &&
+    actual.every((key, index) => key === expected[index]);
+}
+
+function settingsSafeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function settingsJsonSafe(
+  value: unknown,
+  seen = new Set<object>(),
+): boolean {
+  if (
+    value === null || typeof value === "string" || typeof value === "boolean"
+  ) return true;
+  if (typeof value === "number") return Number.isFinite(value);
+  if (typeof value !== "object" || seen.has(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== Array.prototype && prototype !== null) {
+    return false;
+  }
+  seen.add(value);
+  const values = Array.isArray(value) ? value : Object.values(value);
+  const safe = values.every((entry) => settingsJsonSafe(entry, seen));
+  seen.delete(value);
+  return safe;
+}
+
+function settingsSnapshotInput(value: unknown): unknown {
+  if (!settingsJsonSafe(value)) {
+    throw new TypeError("设置写入内容必须是严格 JSON-safe 数据。");
+  }
+  const json = JSON.stringify(value);
+  if (
+    typeof json !== "string" ||
+    new TextEncoder().encode(json).byteLength > VOCAB_SETTINGS_MAX_JSON_BYTES
+  ) {
+    throw new TypeError("设置写入内容超过安全大小限制。");
+  }
+  return JSON.parse(json) as unknown;
+}
+
+function settingsCanonicalJson(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(settingsCanonicalJson).join(",")}]`;
+  }
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value).sort().map((key) =>
+      `${JSON.stringify(key)}:${settingsCanonicalJson(
+        (value as Record<string, unknown>)[key],
+      )}`
+    ).join(",")}}`;
+  }
+  const encoded = JSON.stringify(value);
+  if (encoded === undefined) throw new TypeError("设置写入内容不可序列化。");
+  return encoded;
+}
+
+function sameSettingsProjection(left: unknown, right: unknown): boolean {
+  return settingsCanonicalJson(left) === settingsCanonicalJson(right);
+}
+
+async function settingsSha256Hex(value: string): Promise<string> {
+  const digest = new Uint8Array(await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(value),
+  ));
+  return Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function isVocabSettingsObject(value: unknown): value is VocabSettings {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const settings = value as Partial<VocabSettings>;
+  return settingsExactObjectKeys(value, VOCAB_SETTING_KEYS) &&
+    typeof settings.chinese_explanation === "boolean" &&
+    typeof settings.font_scale === "number" &&
+    Number.isFinite(settings.font_scale) &&
+    settings.font_scale >= 0.88 && settings.font_scale <= 1.25 &&
+    typeof settings.line_height === "number" &&
+    Number.isFinite(settings.line_height) &&
+    settings.line_height >= 1.6 && settings.line_height <= 2.2 &&
+    typeof settings.local_lock === "boolean" &&
+    typeof settings.auto_follow === "boolean" &&
+    Number.isSafeInteger(settings.daily_new_limit) &&
+    Number(settings.daily_new_limit) >= 0 && Number(settings.daily_new_limit) <= 30;
+}
+
+function canonicalVocabSettingValue(
+  settings: VocabSettings,
+  key: VocabSettingKey,
+): string {
+  return String(settings[key]);
+}
+
+function canonicalStoredSettingValue(
+  key: VocabSettingKey,
+  value: unknown,
+): boolean {
+  if (typeof value !== "string") return false;
+  if (
+    key === "chinese_explanation" || key === "local_lock" ||
+    key === "auto_follow"
+  ) return value === "true" || value === "false";
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || String(parsed) !== value) return false;
+  if (key === "font_scale") return parsed >= 0.88 && parsed <= 1.25;
+  if (key === "line_height") return parsed >= 1.6 && parsed <= 2.2;
+  return Number.isSafeInteger(parsed) && parsed >= 0 && parsed <= 30;
+}
+
+function isVocabSettingWriteRow<Key extends VocabSettingKey>(
+  value: unknown,
+  key: Key,
+): value is VocabSettingWriteRow<Key> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const row = value as Partial<VocabSettingWriteRow>;
+  return settingsExactObjectKeys(value, ["key", "value", "updated_at"]) &&
+    row.key === key && canonicalStoredSettingValue(key, row.value) &&
+    settingsSafeInteger(row.updated_at);
+}
+
+function settingsFromWriteRows(rows: VocabSettingsWriteRows): VocabSettings {
+  const settings = defaultSettings();
+  for (const row of rows) {
+    if (!row) continue;
+    const value: boolean | number = row.value === "true"
+      ? true
+      : row.value === "false"
+        ? false
+        : Number(row.value);
+    (settings as unknown as Record<VocabSettingKey, boolean | number>)[row.key] = value;
+  }
+  return settings;
+}
+
+function isVocabSettingsWriteSnapshot(
+  value: unknown,
+): value is VocabSettingsWriteSnapshot {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const snapshot = value as Partial<VocabSettingsWriteSnapshot>;
+  if (
+    !settingsExactObjectKeys(value, [
+      "generationId", "generationSequence", "rows", "settings",
+    ]) ||
+    typeof snapshot.generationId !== "string" ||
+    !VOCAB_SETTINGS_GENERATION_ID_PATTERN.test(snapshot.generationId) ||
+    !settingsSafeInteger(snapshot.generationSequence) ||
+    !Array.isArray(snapshot.rows) || snapshot.rows.length !== VOCAB_SETTING_KEYS.length ||
+    !isVocabSettingsObject(snapshot.settings)
+  ) return false;
+  for (let index = 0; index < VOCAB_SETTING_KEYS.length; index += 1) {
+    const row = snapshot.rows[index];
+    if (row !== null && !isVocabSettingWriteRow(row, VOCAB_SETTING_KEYS[index])) {
+      return false;
+    }
+  }
+  return sameSettingsProjection(
+    snapshot.settings,
+    settingsFromWriteRows(snapshot.rows as VocabSettingsWriteRows),
+  );
+}
+
+function isVocabSettingsSaveTransition(
+  before: unknown,
+  after: unknown,
+): before is VocabSettingsWriteSnapshot {
+  if (!isVocabSettingsWriteSnapshot(before) || !isVocabSettingsWriteSnapshot(after)) {
+    return false;
+  }
+  if (
+    before.generationId !== after.generationId ||
+    before.generationSequence !== after.generationSequence ||
+    after.rows.some((row) => row === null)
+  ) return false;
+  const timestamp = after.rows[0]?.updated_at;
+  if (
+    !settingsSafeInteger(timestamp) ||
+    after.rows.some((row) => row?.updated_at !== timestamp)
+  ) return false;
+  const latestBefore = before.rows.reduce(
+    (latest, row) => row === null ? latest : Math.max(latest, row.updated_at),
+    -1,
+  );
+  return timestamp > latestBefore && after.rows.every((row) =>
+    row !== null && row.value === canonicalVocabSettingValue(after.settings, row.key)
+  );
+}
+
+function isVocabSettingsWriteReceiptUnchecked(
+  value: unknown,
+): value is VocabSettingsWriteReceipt {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const receipt = value as Partial<VocabSettingsWriteReceipt>;
+  return settingsExactObjectKeys(value, [
+    "purpose", "version", "kind", "operationId", "generationId",
+    "generationSequence", "before", "after", "projectionSha256",
+  ]) && receipt.purpose === "vocab-settings-write" && receipt.version === 1 &&
+    receipt.kind === "settings-save" &&
+    typeof receipt.operationId === "string" &&
+    VOCAB_SETTINGS_OPERATION_ID_PATTERN.test(receipt.operationId) &&
+    typeof receipt.generationId === "string" &&
+    VOCAB_SETTINGS_GENERATION_ID_PATTERN.test(receipt.generationId) &&
+    settingsSafeInteger(receipt.generationSequence) &&
+    isVocabSettingsSaveTransition(receipt.before, receipt.after) &&
+    receipt.generationId === receipt.before.generationId &&
+    receipt.generationSequence === receipt.before.generationSequence &&
+    typeof receipt.projectionSha256 === "string" &&
+    RECEIPT_HASH_PATTERN.test(receipt.projectionSha256) &&
+    new TextEncoder().encode(JSON.stringify(value)).byteLength <=
+      VOCAB_SETTINGS_MAX_JSON_BYTES;
+}
+
+export function isVocabSettingsWriteReceipt(
+  value: unknown,
+): value is VocabSettingsWriteReceipt {
+  try {
+    return settingsJsonSafe(value) && isVocabSettingsWriteReceiptUnchecked(value);
+  } catch {
+    return false;
+  }
+}
+
+async function sealVocabSettingsReceipt(
+  draft: Omit<VocabSettingsWriteReceipt, "projectionSha256">,
+): Promise<VocabSettingsWriteReceipt> {
+  const projectionSha256 = await settingsSha256Hex(settingsCanonicalJson(draft));
+  const receipt = { ...draft, projectionSha256 };
+  if (!isVocabSettingsWriteReceipt(receipt)) {
+    throw vocabSettingsError("invalid_input", "无法生成有效的设置写入回执。");
+  }
+  return receipt;
+}
+
+async function vocabSettingsReceiptHashIsValid(
+  receipt: VocabSettingsWriteReceipt,
+): Promise<boolean> {
+  const { projectionSha256, ...projection } = receipt;
+  return projectionSha256 === await settingsSha256Hex(settingsCanonicalJson(projection));
+}
+
+function cloneVocabSettingsChecked<Result>(
+  value: unknown,
+  guard: (candidate: unknown) => candidate is Result,
+  label: string,
+): Result {
+  let snapshot: unknown;
+  try {
+    snapshot = settingsSnapshotInput(value);
+  } catch (error) {
+    throw vocabSettingsError(
+      "invalid_input",
+      error instanceof Error ? error.message : `${label}格式不正确。`,
+    );
+  }
+  if (!guard(snapshot)) {
+    throw vocabSettingsError("invalid_input", `${label}格式不正确。`);
+  }
+  return snapshot;
+}
+
+async function readVocabSettingsGeneration(
+  runtime: VocabSettingsStorageRuntime,
+): Promise<Readonly<{ generationId: string; generationSequence: number }>> {
+  const current = await runtime.currentGeneration();
+  if (
+    !current || typeof current.generationId !== "string" ||
+    !VOCAB_SETTINGS_GENERATION_ID_PATTERN.test(current.generationId) ||
+    !settingsSafeInteger(current.sequence)
+  ) throw new Error("无法确认当前拾词数据库世代。");
+  return {
+    generationId: current.generationId,
+    generationSequence: current.sequence,
+  };
+}
+
+async function readVocabSettingsWriteSnapshot(
+  runtime: VocabSettingsStorageRuntime,
+  generation: Readonly<{ generationId: string; generationSequence: number }>,
+): Promise<VocabSettingsWriteSnapshot> {
+  const stored = (await runtime.query<{
+    key: string;
+    value: string;
+    updated_at: number;
+  }>(
+    "SELECT key,value,updated_at FROM vocab_settings WHERE key IN (?,?,?,?,?,?)",
+    [...VOCAB_SETTING_KEYS],
+  )).rows;
+  const byKey = new Map<string, unknown>();
+  for (const row of stored) {
+    if (byKey.has(row.key)) throw new Error("设置表包含重复的 canonical key。");
+    byKey.set(row.key, row);
+  }
+  const rows = VOCAB_SETTING_KEYS.map((key) => {
+    const row = byKey.get(key);
+    if (row === undefined) return null;
+    if (!isVocabSettingWriteRow(row, key)) {
+      throw new Error(`设置 ${key} 的存储值不符合 canonical 格式。`);
+    }
+    return { ...row };
+  }) as unknown as VocabSettingsWriteRows;
+  const snapshot: VocabSettingsWriteSnapshot = {
+    ...generation,
+    rows,
+    settings: settingsFromWriteRows(rows),
+  };
+  if (!isVocabSettingsWriteSnapshot(snapshot)) {
+    throw new Error("无法构造可信的设置读取快照。");
+  }
+  return snapshot;
+}
+
+function nextVocabSettingsTimestamp(latest: number, now: number): number {
+  if (!settingsSafeInteger(now)) {
+    throw vocabSettingsError("invalid_input", "设备时间不在可接受范围。");
+  }
+  const timestamp = Math.max(now, latest + 1);
+  if (!settingsSafeInteger(timestamp)) {
+    throw vocabSettingsError("invalid_input", "设置版本时间超出可接受范围。");
+  }
+  return timestamp;
+}
+
+function generatedVocabSettingsOperationId(runtime: VocabSettingsStorageRuntime): string {
+  const id = `vocab-settings-operation-${runtime.randomUUID()}`;
+  if (!VOCAB_SETTINGS_OPERATION_ID_PATTERN.test(id)) {
+    throw vocabSettingsError("invalid_input", "无法生成可靠的设置操作标识。");
+  }
+  return id;
+}
+
+function safeVocabSettingsBroadcast(
+  runtime: VocabSettingsStorageRuntime,
+  reason: string,
+): void {
+  try {
+    runtime.broadcast(reason);
+  } catch {
+    // A refresh hint is advisory and cannot reverse a durable commit.
+  }
+}
+
+function withRequiredVocabSettingsWriteLock<Result>(
+  operation: () => Promise<Result>,
+): Promise<Result> {
+  const locks = typeof navigator === "undefined"
+    ? null
+    : (navigator as Navigator & { locks?: unknown }).locks ?? null;
+  if (!locks) {
+    throw new Error(
+      "当前浏览器不支持安全的跨标签页写入锁，请使用最新版 Chrome、Edge 或 Safari。",
+    );
+  }
+  return withVocabWriteLock(operation);
+}
+
+export function createVocabSettingsStorageService(
+  runtime: VocabSettingsStorageRuntime = {
+    withReadLock: (operation) => withVocabReadLock(operation),
+    withExclusiveLock: withRequiredVocabSettingsWriteLock,
+    query: async <Result extends object>(sql: string, params?: SqlValue[]) => ({
+      rows: await rawQuery<Result>(sql, params),
+    }),
+    batch: (statements) => localDb.batch(DB, statements, { transaction: true }),
+    currentGeneration: () => localDb.currentGeneration(DB),
+    now: () => Date.now(),
+    randomUUID: () => crypto.randomUUID(),
+    broadcast: broadcastVocabChange,
+  },
+) {
+  async function readLocked<Result>(operation: () => Promise<Result>): Promise<Result> {
+    try {
+      return await (runtime.withReadLock
+        ? runtime.withReadLock(operation)
+        : runtime.withExclusiveLock(operation));
+    } catch (error) {
+      if (error instanceof VocabSettingsMutationError) throw error;
+      throw vocabSettingsError("inspect_failed", "暂时无法读取最新设置；没有开始写入。");
+    }
+  }
+
+  async function prepareLocked<Result>(operation: () => Promise<Result>): Promise<Result> {
+    try {
+      return await runtime.withExclusiveLock(operation);
+    } catch (error) {
+      if (error instanceof VocabSettingsMutationError) throw error;
+      throw vocabSettingsError("inspect_failed", "暂时无法核对最新设置；没有开始写入。");
+    }
+  }
+
+  async function loadExpectedState(): Promise<VocabSettingsWriteSnapshot> {
+    return readLocked(async () => {
+      const generation = await readVocabSettingsGeneration(runtime);
+      return settingsSnapshotInput(
+        await readVocabSettingsWriteSnapshot(runtime, generation),
+      ) as VocabSettingsWriteSnapshot;
+    });
+  }
+
+  async function prepareSave(
+    nextValue: VocabSettings,
+    expectedValue: VocabSettingsWriteSnapshot,
+  ): Promise<VocabSettingsWriteReceipt> {
+    const next = cloneVocabSettingsChecked(nextValue, isVocabSettingsObject, "拾词设置");
+    const expected = cloneVocabSettingsChecked(
+      expectedValue,
+      isVocabSettingsWriteSnapshot,
+      "拾词设置读取快照",
+    );
+    return prepareLocked(async () => {
+      const generation = await readVocabSettingsGeneration(runtime);
+      if (
+        expected.generationId !== generation.generationId ||
+        expected.generationSequence !== generation.generationSequence
+      ) {
+        throw vocabSettingsError("changed", "拾词设置所在数据库已经更换；没有准备写入。");
+      }
+      const current = await readVocabSettingsWriteSnapshot(runtime, generation);
+      if (!sameSettingsProjection(current, expected)) {
+        throw vocabSettingsError("changed", "拾词设置已在别处变化；没有准备写入。");
+      }
+      const latest = expected.rows.reduce(
+        (value, row) => row === null ? value : Math.max(value, row.updated_at),
+        -1,
+      );
+      const timestamp = nextVocabSettingsTimestamp(latest, runtime.now());
+      const rows = VOCAB_SETTING_KEYS.map((key) => ({
+        key,
+        value: canonicalVocabSettingValue(next, key),
+        updated_at: timestamp,
+      })) as unknown as VocabSettingsWriteRows;
+      const after: VocabSettingsWriteSnapshot = {
+        ...generation,
+        rows,
+        settings: next,
+      };
+      return sealVocabSettingsReceipt({
+        purpose: "vocab-settings-write",
+        version: 1,
+        kind: "settings-save",
+        operationId: generatedVocabSettingsOperationId(runtime),
+        ...generation,
+        before: expected,
+        after,
+      });
+    });
+  }
+
+  async function receiptStateUnlocked(
+    receipt: VocabSettingsWriteReceipt,
+  ): Promise<Exclude<
+    VocabSettingsWriteInspection,
+    "still_unknown" | "invalid_receipt"
+  >> {
+    const generation = await readVocabSettingsGeneration(runtime);
+    if (
+      generation.generationId !== receipt.generationId ||
+      generation.generationSequence !== receipt.generationSequence
+    ) return "changed";
+    const current = await readVocabSettingsWriteSnapshot(runtime, generation);
+    if (sameSettingsProjection(current, receipt.after)) return "exact_saved";
+    return sameSettingsProjection(current, receipt.before) ? "expected" : "changed";
+  }
+
+  function expectedSetPredicate(rows: VocabSettingsWriteRows): Readonly<{
+    sql: string;
+    params: SqlValue[];
+  }> {
+    const present = rows.filter(
+      (row): row is VocabSettingWriteRow => row !== null,
+    );
+    const fragments = [
+      `(SELECT COUNT(*) FROM vocab_settings WHERE key IN (?,?,?,?,?,?))=?`,
+      ...rows.map((row) => row === null
+        ? "NOT EXISTS(SELECT 1 FROM vocab_settings WHERE key=?)"
+        : `EXISTS(SELECT 1 FROM vocab_settings
+            WHERE key=? AND value=? AND updated_at=?)`),
+    ];
+    const params: SqlValue[] = [...VOCAB_SETTING_KEYS, present.length];
+    rows.forEach((row, index) => {
+      if (row === null) params.push(VOCAB_SETTING_KEYS[index]);
+      else params.push(row.key, row.value, row.updated_at);
+    });
+    return { sql: fragments.map((fragment) => `(${fragment})`).join(" AND "), params };
+  }
+
+  function receiptStatements(
+    receipt: VocabSettingsWriteReceipt,
+  ): Statement[] {
+    const predicate = expectedSetPredicate(receipt.before.rows);
+    const statements: Statement[] = [{
+      sql: `INSERT INTO vocab_settings(key,value,updated_at)
+        SELECT '__vocab_settings_cas_abort__',NULL,0 WHERE NOT (${predicate.sql})`,
+      params: predicate.params,
+    }];
+    for (const row of receipt.after.rows) {
+      if (!row) throw vocabSettingsError("invalid_receipt", "设置回执缺少目标行。", receipt);
+      statements.push({
+        sql: `INSERT INTO vocab_settings(key,value,updated_at) VALUES(?,?,?)
+          ON CONFLICT(key) DO UPDATE SET
+            value=excluded.value,updated_at=excluded.updated_at`,
+        params: [row.key, row.value, row.updated_at],
+      });
+    }
+    return statements;
+  }
+
+  async function inspectWrite(value: unknown): Promise<VocabSettingsWriteInspection> {
+    let receipt: VocabSettingsWriteReceipt;
+    try {
+      const stable = settingsSnapshotInput(value);
+      if (!isVocabSettingsWriteReceipt(stable)) return "invalid_receipt";
+      receipt = stable;
+      if (!await vocabSettingsReceiptHashIsValid(receipt)) return "invalid_receipt";
+    } catch {
+      return "invalid_receipt";
+    }
+    try {
+      return await runtime.withExclusiveLock(() => receiptStateUnlocked(receipt));
+    } catch {
+      return "still_unknown";
+    }
+  }
+
+  async function commitWrite(value: unknown): Promise<VocabSettingsWriteResult> {
+    let receipt: VocabSettingsWriteReceipt;
+    try {
+      const stable = settingsSnapshotInput(value);
+      if (!isVocabSettingsWriteReceipt(stable)) {
+        throw vocabSettingsError("invalid_receipt", "设置写入回执无效；没有改动资料。");
+      }
+      receipt = stable;
+      if (!await vocabSettingsReceiptHashIsValid(receipt)) {
+        throw vocabSettingsError("invalid_receipt", "设置写入回执无法验证；没有改动资料。");
+      }
+    } catch (error) {
+      if (
+        error instanceof VocabSettingsMutationError &&
+        error.code === "invalid_receipt"
+      ) throw error;
+      throw vocabSettingsError("invalid_receipt", "设置写入回执无法验证；没有改动资料。");
+    }
+    const updatedAt = receipt.after.rows[0]!.updated_at;
+    try {
+      return await runtime.withExclusiveLock(async () => {
+        const before = await receiptStateUnlocked(receipt);
+        if (before === "exact_saved") {
+          safeVocabSettingsBroadcast(runtime, "settings-saved");
+          return {
+            outcome: "already_saved",
+            receipt,
+            entityId: "settings",
+            updatedAt,
+          };
+        }
+        if (before === "changed") {
+          return {
+            outcome: "changed",
+            receipt,
+            entityId: "settings",
+            retryable: false,
+          };
+        }
+        try {
+          await runtime.batch(receiptStatements(receipt));
+        } catch {
+          // The transaction may have committed even though its response was lost.
+        }
+        const after = await receiptStateUnlocked(receipt);
+        if (after === "exact_saved") {
+          safeVocabSettingsBroadcast(runtime, "settings-saved");
+          return { outcome: "saved", receipt, entityId: "settings", updatedAt };
+        }
+        if (after === "expected") {
+          throw vocabSettingsError(
+            "write_failed",
+            "这次设置确定没有写入；保留原回执后可以重试。",
+            receipt,
+          );
+        }
+        return {
+          outcome: "changed",
+          receipt,
+          entityId: "settings",
+          retryable: false,
+        };
+      });
+    } catch (error) {
+      if (error instanceof VocabSettingsMutationError) throw error;
+      return {
+        outcome: "outcome_uncertain",
+        receipt,
+        entityId: "settings",
+        retryable: true,
+      };
+    }
+  }
+
+  return {
+    loadVocabSettingsExpectedState: loadExpectedState,
+    prepareVocabSettingsSave: prepareSave,
+    inspectVocabSettingsWrite: inspectWrite,
+    commitVocabSettingsWrite: commitWrite,
+  } as const;
+}
+
+const defaultVocabSettingsStorageService = createVocabSettingsStorageService();
+
+export const loadVocabSettingsExpectedState =
+  defaultVocabSettingsStorageService.loadVocabSettingsExpectedState;
+export const prepareVocabSettingsSave =
+  defaultVocabSettingsStorageService.prepareVocabSettingsSave;
+export const inspectVocabSettingsWrite =
+  defaultVocabSettingsStorageService.inspectVocabSettingsWrite;
+export const commitVocabSettingsWrite =
+  defaultVocabSettingsStorageService.commitVocabSettingsWrite;
 
 export async function saveSettings(settings: VocabSettings): Promise<void> {
   await withWrite("settings-saved", async () => {
