@@ -1649,3 +1649,172 @@
   .career-import-warning-groups { margin-inline: 12px; }
   .career-import-row-card { padding: 13px; }
 }
+
+/* A record of facts, never a scorecard. */
+.career-sidebar-calm {
+  padding: 15px;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  color: #4d6258;
+  border: 1px solid #dce5df;
+  border-radius: 16px;
+  background: linear-gradient(145deg, #fff, #f2f6f3);
+}
+.career-sidebar-calm > svg { margin-top: 1px; flex: 0 0 auto; color: #44705c; }
+.career-sidebar-calm > div { min-width: 0; }
+.career-sidebar-calm b { font-size: 13px; font-weight: 680; }
+.career-sidebar-calm p {
+  margin: 5px 0 0;
+  color: #68756f;
+  font-size: 12px;
+  line-height: 1.55;
+}
+.career-watch {
+  min-height: 28px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: #426b58;
+  font-size: 12px;
+  font-weight: 650;
+}
+.career-watch.quiet { color: #737d78; font-weight: 550; }
+.career-calm-empty {
+  min-width: 0;
+  margin: 0;
+  padding: 24px 16px;
+  color: #68756f;
+  font-size: 13px;
+  line-height: 1.65;
+  text-align: center;
+  overflow-wrap: anywhere;
+}
+.career-activity-row > .career-calm-empty { grid-column: 1 / -1; }
+.career-reflection-view { min-width: 0; }
+.career-reflection-grid {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1.15fr) minmax(300px, .85fr);
+  gap: 16px;
+}
+.career-reflection-facts,
+.career-reflection-next,
+.career-reflection-notes { min-width: 0; padding: 24px; }
+.career-reflection-notes { margin-top: 16px; }
+.career-reflection-facts > header,
+.career-reflection-next > header,
+.career-reflection-notes > header {
+  margin-bottom: 12px;
+  display: flex;
+  align-items: flex-start;
+  gap: 11px;
+}
+.career-reflection-facts > header > span,
+.career-reflection-next > header > span,
+.career-reflection-notes > header > span {
+  width: 38px;
+  height: 38px;
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  color: #4b725f;
+  border-radius: 12px;
+  background: #edf3ef;
+}
+.career-reflection-facts > header > div,
+.career-reflection-next > header > div,
+.career-reflection-notes > header > div { min-width: 0; }
+.career-reflection-facts h3,
+.career-reflection-next h3,
+.career-reflection-notes h3 { margin: 1px 0 0; font-size: 16px; letter-spacing: -.015em; }
+.career-reflection-facts header p,
+.career-reflection-next header p,
+.career-reflection-notes header p {
+  margin: 5px 0 0;
+  color: #66736d;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.career-reflection-facts > div,
+.career-reflection-next > div { display: grid; }
+.career-reflection-facts article,
+.career-reflection-next article {
+  min-width: 0;
+  min-height: 67px;
+  padding: 11px 2px;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 11px;
+  border-top: 1px solid #e9edea;
+}
+.career-reflection-facts article > div,
+.career-reflection-next article > div { min-width: 0; display: grid; gap: 4px; }
+.career-reflection-facts article b,
+.career-reflection-next article b {
+  overflow: hidden;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.career-reflection-facts article small,
+.career-reflection-next article small,
+.career-reflection-facts article time,
+.career-reflection-next article time { color: #68756f; font-size: 12px; }
+.career-reflection-facts article time,
+.career-reflection-next article time { text-align: right; white-space: nowrap; }
+.career-reflection-next article > span {
+  width: 36px;
+  height: 36px;
+  display: grid;
+  place-items: center;
+  color: #567566;
+  border-radius: 11px;
+  background: #f0f4f1;
+}
+.career-reflection-notes > div {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 11px;
+}
+.career-reflection-notes article {
+  min-width: 0;
+  padding: 17px;
+  border: 1px solid #e2e7e4;
+  border-radius: 15px;
+  background: #fafbfa;
+}
+.career-reflection-notes article > div { min-width: 0; display: grid; gap: 5px; }
+.career-reflection-notes article b { overflow-wrap: anywhere; font-size: 13px; }
+.career-reflection-notes article small { color: #68756f; font-size: 12px; line-height: 1.45; }
+.career-reflection-notes article p {
+  display: -webkit-box;
+  margin: 13px 0 0;
+  overflow: hidden;
+  color: #4e5d56;
+  font-size: 13px;
+  line-height: 1.65;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 4;
+}
+.career-reflection-notes > div > .career-calm-empty { grid-column: 1 / -1; }
+
+@media (max-width: 1100px) {
+  .career-sidebar-calm { display: none; }
+  .career-reflection-grid { grid-template-columns: minmax(0, 1fr); }
+  .career-reflection-notes > div { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+@media (max-width: 760px) {
+  .career-sidebar.open .career-sidebar-calm { display: flex; }
+  .career-reflection-facts,
+  .career-reflection-next,
+  .career-reflection-notes { padding: 18px; }
+  .career-reflection-facts article,
+  .career-reflection-next article { grid-template-columns: auto minmax(0, 1fr); }
+  .career-reflection-facts article time,
+  .career-reflection-next article time { grid-column: 2; text-align: left; }
+  .career-reflection-notes > div { grid-template-columns: minmax(0, 1fr); }
+}
