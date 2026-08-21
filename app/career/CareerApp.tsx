@@ -2624,7 +2624,7 @@ function SettingsView({ data, onRefresh, onExport, notify }: {
     if (backupOperationRef.current) return;
     const checkingTicket = candidateTicket(receipt, "activation-check");
     if (!persistBackupRecovery(checkingTicket)) {
-      setBackupFlow({ phase: "activation-check", receipt, message: "这台设备暂时不能保存继续信息，因此没有启用。恢复本机存储后，只会先核对当前版本。" });
+      setBackupFlow({ phase: "activation-check", receipt, message: "当前网址的浏览器存储暂时不能保存继续信息，因此没有启用。恢复存储后，只会先核对当前版本。" });
       return;
     }
     backupOperationRef.current = true;
@@ -2651,7 +2651,7 @@ function SettingsView({ data, onRefresh, onExport, notify }: {
     if (backupOperationRef.current) return;
     const cleanupTicket = candidateTicket(receipt, "discard-only");
     if (!persistBackupRecovery(cleanupTicket)) {
-      setBackupFlow({ phase: "discard-only", receipt, message: "这台设备暂时不能保存收尾信息，因此没有开始收尾。" });
+      setBackupFlow({ phase: "discard-only", receipt, message: "当前网址的浏览器存储暂时不能保存收尾信息，因此没有开始收尾。" });
       return;
     }
     backupOperationRef.current = true;
@@ -3309,7 +3309,7 @@ function InterviewDrawer({ interview, data, onClose, onRefresh, onAi, notify }: 
     };
     try {
       window.localStorage.setItem(interviewDraftKey(interview.id), JSON.stringify(localDraft));
-      notify("面经草稿仅保存在这台设备的此浏览器中", "info");
+      notify("面经草稿仅保存在当前完整网址与浏览器资料中", "info");
       onClose();
     } catch {
       notify("浏览器没能保存本机草稿，当前编辑仍为你保留", "error");
@@ -3382,7 +3382,7 @@ function InterviewDrawer({ interview, data, onClose, onRefresh, onAi, notify }: 
     </div>
     <form className="career-experience-form" onSubmit={save}>
       {pendingStaleDraft && <div className="career-stale-draft-note" role="status"><FileArchive size={17} /><div><b>发现一份基于较早面经的本机草稿</b><p>SQLite 里已有更新，因此没有自动覆盖。你可以先使用当前已保存内容，或明确载入旧草稿逐项核对。</p><div><button type="button" className="career-button ghost" onClick={() => setPendingStaleDraft(null)}>继续使用当前内容</button><button type="button" className="career-button secondary" onClick={loadPendingLocalDraft}>载入本机草稿核对</button><button type="button" className="career-button ghost danger" onClick={clearPendingLocalDraft}>清除旧草稿</button></div></div></div>}
-      {draftRestored && <div className="career-local-draft-note" role="status"><FileArchive size={17} /><span><b>已恢复这台设备上的本机草稿</b><small>{formatDate(draftRestored.savedAt, true)} 保存{draftRestored.basedOnOlderVersion ? " · 原面经之后有过更新，请核对再正式保存" : ""}。它不在 SQLite 或导出备份中。</small></span></div>}
+      {draftRestored && <div className="career-local-draft-note" role="status"><FileArchive size={17} /><span><b>已恢复当前网址下的本机草稿</b><small>{formatDate(draftRestored.savedAt, true)} 保存{draftRestored.basedOnOlderVersion ? " · 原面经之后有过更新，请核对再正式保存" : ""}。它不在 SQLite 或导出备份中。</small></span></div>}
       <div className="career-experience-toolbar">
         <select value={status} disabled={lifecyclePaused} onChange={(event) => setStatus(event.target.value as Interview["status"])} aria-label="面试状态"><option value="scheduled">待进行</option><option value="completed">已完成</option><option value="canceled">{lifecyclePaused ? "随职位暂停" : "已取消"}</option></select>
         <button type="button" className="career-button secondary career-ai-trigger" onClick={() => onAi(
@@ -4703,7 +4703,7 @@ function MaterialModal({ data, initialRecovery, otherRecoveryPending, onRecovery
     <div ref={phaseRootRef} className="career-material-modal-body" data-material-phase-focus tabIndex={-1}>
     <form className="career-form" hidden={phase !== "editing"} aria-hidden={phase !== "editing"} onChange={() => setDirty(true)} onSubmit={submit}><Field label="材料名称"><input name="name" data-dialog-initial defaultValue={initialSnapshot?.name ?? ""} required placeholder="产品设计主简历" /></Field><div className="career-form-row"><Field label="类型"><select name="kind" defaultValue={initialSnapshot?.kind ?? "简历"}>{initialSnapshot && !materialKinds.includes(initialSnapshot.kind as typeof materialKinds[number]) && <option value={initialSnapshot.kind}>{initialSnapshot.kind}（已恢复）</option>}{materialKinds.map((kind) => <option key={kind}>{kind}</option>)}</select></Field><Field label="版本"><input name="version" defaultValue={initialSnapshot?.version ?? "v1.0"} required /></Field></div><Field label="本地文件" hint="可选；SQLite 只保存文件索引，原件留在浏览器私有存储"><input name="attachment" type="file" accept=".pdf,.doc,.docx,.ppt,.pptx,.txt,.md,application/pdf" />{initialSnapshot?.attachment && <small className="career-field-recovery-note">上次选择过“{initialSnapshot.attachment.originalName}”。浏览器不会自动重新选取文件；若核对确认未保存，请重新选择。</small>}</Field><Field label="关联职位"><select name="linked_job_id" defaultValue={initialSnapshot?.linkedJobId ?? ""}><option value="">主材料 / 不关联</option>{initialLinkedJobUnavailable && <option value={initialSnapshot!.linkedJobId!}>原关联职位（当前列表不可用）</option>}{data.jobs.map((job) => <option key={job.id} value={job.id}>{job.company} · {job.role}</option>)}</select></Field><Field label="状态"><select name="status" defaultValue={initialSnapshot?.status ?? "ready"}><option value="ready">可使用</option><option value="draft">编辑中</option><option value="sent">已发送</option></select></Field><Field label="备注"><textarea name="notes" rows={4} defaultValue={initialSnapshot?.notes ?? ""} placeholder="这版材料做了哪些调整？" /></Field>{unboundRecoveryPending && <div className="career-inline-error" role="status"><ShieldCheck size={15} />另一份材料保存正在等待核对。当前输入会保留；请先关闭并处理已有收尾。</div>}{error && <div className="career-inline-error" role="alert"><X size={15} />{error}</div>}<div className="career-form-actions"><button type="button" className="career-button ghost" onClick={requestClose}>取消</button><button className="career-button primary" disabled={unboundRecoveryPending}><Upload size={16} />保存材料</button></div></form>
     {phase === "saving" && <div className="career-material-recovery" role="status"><LoaderCircle className="spin" size={23} /><h3>正在保存到本机</h3><p>先写入附件，再写入材料记录；完成前不会让重复提交。</p></div>}
-    {phase === "uncertain" && <div className="career-material-recovery uncertain" role="status" aria-live="polite"><ShieldCheck size={24} /><h3>需要核对保存结果</h3><p>{error}</p><div className="career-material-recovery-actions">{recoveryPersisted && <button className="career-button secondary" onClick={onClose}>稍后继续</button>}<button className="career-button primary" data-dialog-initial onClick={() => void inspectUncertainSave()}><Search size={16} />只读核对</button></div><small>{recoveryPersisted ? "核对线索已留在这台设备；核对只读取 SQLite 与附件校验值。" : "核对线索只在本次打开期间可用；请先不要刷新或关闭页面。"}</small></div>}
+    {phase === "uncertain" && <div className="career-material-recovery uncertain" role="status" aria-live="polite"><ShieldCheck size={24} /><h3>需要核对保存结果</h3><p>{error}</p><div className="career-material-recovery-actions">{recoveryPersisted && <button className="career-button secondary" onClick={onClose}>稍后继续</button>}<button className="career-button primary" data-dialog-initial onClick={() => void inspectUncertainSave()}><Search size={16} />只读核对</button></div><small>{recoveryPersisted ? "核对线索已留在当前网址的浏览器存储；核对只读取 SQLite 与附件校验值。" : "核对线索只在本次打开期间可用；请先不要刷新或关闭页面。"}</small></div>}
     {phase === "checking" && <div className="career-material-recovery" role="status"><LoaderCircle className="spin" size={23} /><h3>正在只读核对</h3><p>不会再次保存，也不会换一个材料标识。</p></div>}
     {phase === "cleanup-review" && <div className="career-material-recovery cleanup" role="status" aria-live="polite"><ShieldCheck size={24} /><h3>先核对这份暂存附件</h3><p>{error}</p><div className="career-material-recovery-actions">{recoveryPersisted && <button className="career-button secondary" onClick={onClose}>稍后继续</button>}<button className="career-button primary" data-dialog-initial onClick={() => void inspectAttachmentCleanup()}><Search size={16} />只读核对附件</button></div><small>这里只确认附件是否未被材料使用；还不会删除它。</small></div>}
     {phase === "cleanup-checking" && <div className="career-material-recovery" role="status"><LoaderCircle className="spin" size={23} /><h3>正在核对附件状态</h3><p>会再次确认数据版本、材料引用与原件校验值；不会写入材料。</p></div>}

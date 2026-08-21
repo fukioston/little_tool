@@ -519,7 +519,7 @@ export function VocabBackupFlow({
       const checkingEntry = await transitionOrExplain(
         candidateTicket(entry.ticket.receipt, "activation-check"),
         entry,
-        "这台设备暂时不能保存启用后的继续信息，因此没有启用。恢复浏览器存储后再试。",
+        "当前网址的浏览器存储暂时不能保存启用后的继续信息，因此没有启用。恢复存储后再试。",
       );
       if (!checkingEntry) return;
       present({ phase: "activating", entry: checkingEntry });
@@ -581,7 +581,7 @@ export function VocabBackupFlow({
         const next = await transitionOrExplain(
           candidateTicket(entry.ticket.receipt, "discard-only"),
           entry,
-          "这台设备暂时不能保存收尾信息，因此没有开始收尾。",
+          "当前网址的浏览器存储暂时不能保存收尾信息，因此没有开始收尾。",
         );
         if (!next) return;
         cleanupEntry = next;

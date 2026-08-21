@@ -12,7 +12,7 @@ export default function Home() {
       <section className="suite-intro">
         <p className="suite-kicker">PRIVATE · LOCAL · YOURS</p>
         <h1>你的空间，<br /><em>各自专注。</em></h1>
-        <p>不同目标互不打扰。你的资料留在当前浏览器，真实记录不被分数和完成率取代。</p>
+        <p>不同目标互不打扰。你的资料留在当前完整网址与浏览器资料中，真实记录不被分数和完成率取代。</p>
         <nav className="suite-shortcuts" aria-label="快速进入">
           {suiteSpaces.map((space) => (
             <Link href={space.href} key={space.id}>
@@ -37,7 +37,7 @@ export default function Home() {
         ))}
       </section>
       <StorageTrustCard spaceCount={suiteSpaces.length} />
-      <footer className="suite-trust"><span><i>LOCAL</i><b>{suiteSpaces.length} 个私人空间，各有自己的资料边界</b></span><p>资料默认保存在当前浏览器；只有你主动使用 AI 功能时，才会发送完成该次请求所需的最少上下文。清除站点数据仍会影响资料。</p></footer>
+      <footer className="suite-trust"><span><i>LOCAL</i><b>{suiteSpaces.length} 个私人空间，各有自己的资料边界</b></span><p>资料默认保存在当前完整网址与浏览器资料中；只有你主动使用 AI 功能时，才会发送完成该次请求所需的最少上下文。清除这个网址的站点数据仍会影响资料。</p></footer>
     </main>
   );
 }

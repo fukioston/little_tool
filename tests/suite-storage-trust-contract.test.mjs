@@ -40,6 +40,8 @@ test("landing renders the storage truth after the space choices", async () => {
   assert.ok(choices >= 0 && storage > choices);
   assert.equal((source.match(/<StorageTrustCard spaceCount=\{suiteSpaces\.length\} \/>/g) ?? []).length, 1);
   assert.match(source, /\{suiteSpaces\.length\} 个私人空间/);
+  assert.match(source, /资料默认保存在当前完整网址与浏览器资料中/);
+  assert.doesNotMatch(source, /资料默认保存在当前浏览器/);
 });
 
 test("storage truth remains calm, touchable, and bounded at 319px", async () => {
