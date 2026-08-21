@@ -154,7 +154,8 @@ test("a committed write with a failed refresh becomes recovery, never a write re
     "prepareFitnessLiveExerciseSubstitute",
   ]) assert.match(liveSource, new RegExp(`${safePrepare}\\(`));
   assert.doesNotMatch(liveSource, /addSessionExercise|completeSessionExercise|substituteSessionExercise/);
-  assert.match(liveSource, /interactionLocked = liveWrites\.writeLocked \|\| draftStale/);
+  assert.match(liveSource, /liveWriteLocked = liveWrites\.writeLocked \|\| planCalendarWrites\.writeLocked/);
+  assert.match(liveSource, /interactionLocked = liveWriteLocked \|\| draftStale/);
 });
 
 test("empty live sessions offer cancellation separately from an explicit empty save", () => {

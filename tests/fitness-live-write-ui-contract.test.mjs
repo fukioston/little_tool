@@ -312,7 +312,8 @@ test("dirty drafts and active operations survive reload, external refresh, and r
   assert.match(flowSource, /operationInProgress = useCallback\(\(\) => operationRef\.current !== null/);
   assert.match(flowSource, /disabled=\{controller\.busy\}/);
   assert.match(flowSource, /window\.addEventListener\("beforeunload", protect\)/);
-  assert.match(appSource, /disabled=\{liveWrites\.writeLocked\} inputMode/);
+  assert.match(appSource, /const liveWriteLocked = liveWrites\.writeLocked \|\| planCalendarWrites\.writeLocked/);
+  assert.match(appSource, /disabled=\{liveWriteLocked\} inputMode/);
   assert.match(appSource, /if \(!liveWrites\.operationInProgress\(\)\) setDialog\(null\)/);
 });
 
@@ -423,11 +424,11 @@ test("live error and operation controls render once per active branch", () => {
 });
 
 test("pending live tickets visibly disable every start CTA instead of creating dead buttons", () => {
-  assert.match(appSource, /startLocked=\{liveWrites\.writeLocked\}/);
+  assert.match(appSource, /startLocked=\{liveWrites\.writeLocked \|\| planCalendarWrites\.writeLocked\}/);
   assert.match(appSource, /const startDisabled = startBusy \|\| startLocked/);
   assert.match(appSource, /aria-describedby=\{startLocked \? "sl-today-start-locked" : undefined\} disabled=\{startDisabled\}/);
   assert.match(appSource, /aria-describedby=\{startLocked \? "sl-calendar-start-locked" : undefined\} disabled=\{startDisabled\}/);
-  assert.match(appSource, /先核对页面上方待处理的训练写入，再开始另一场训练/);
+  assert.match(appSource, /先核对页面上方待处理的写入，再开始另一场训练/);
   assert.match(css, /\.sl-live-start-locked/);
 });
 

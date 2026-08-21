@@ -59,6 +59,7 @@ function receiptLabel(receipt: FitnessConfigWriteReceipt): string {
     case "equipment-status": return "器材状态";
     case "constraint-save": return "身体边界";
     case "constraint-active": return "身体边界状态";
+    case "settings-save": return "本地设置";
   }
 }
 
@@ -828,6 +829,14 @@ function fitnessConfigReceiptDraftText(receipt: FitnessConfigWriteReceipt): stri
         "指定动作：",
         ...exerciseDraftValues(receipt.after.exercise_ids),
         line("说明或专业建议", receipt.after.note),
+      ].join("\n");
+    case "settings-save":
+      return [
+        "本地设置",
+        line("重量单位", receipt.after.settings.unit === "kg" ? "千克（kg）" : "磅（lb）"),
+        line("休息计时器", receipt.after.settings.rest_timer_enabled ? "开启" : "关闭"),
+        line("提示音", receipt.after.settings.sound_enabled ? "开启" : "关闭"),
+        line("允许 AI 草稿", receipt.after.settings.ai_enabled ? "开启" : "关闭"),
       ].join("\n");
   }
 }

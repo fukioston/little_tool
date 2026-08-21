@@ -276,7 +276,7 @@ test("all eight config mutations use frozen safe prepare APIs and no legacy writ
   assert.match(appSource, /saveFitnessSettings\(settings\)/, "settings is intentionally outside this slice");
 });
 
-test("all eight durable receipts expose complete calm user content without technical guards", () => {
+test("all nine durable receipts expose complete calm user content without technical guards", () => {
   const profile = { goals: ["strength"], experience: "new", resistance_days_per_week: 3, cardio_days_per_week: 1, session_minutes: 60, split: "auto", preferred_weekdays: [1, 3], preferred_rir: 3, rest_seconds: 90, unit: "kg", notes: "慢慢开始" };
   const venue = { name: "楼下", venue_type: "commercial", location: "二层", area_notes: "靠窗", busy_notes: "晚间忙", default_session_minutes: 55, supersets_allowed: false, is_default: true, last_verified_at: 1_787_300_000_000, status: "active" };
   const equipment = { name: "哑铃", kind: "dumbbell", area: "自由重量区", quantity: 2, status: "available", load_mode: "discrete", load_semantics: "per_hand", min_load_grams: 5000, max_load_grams: 7500, increment_grams: null, bar_weight_grams: null, unilateral: true, busy_level: "medium", attachments: ["防滑套"], notes: "握距自然" };
@@ -290,6 +290,19 @@ test("all eight durable receipts expose complete calm user content without techn
     { kind: "equipment-status", before: { ...equipment, status: "available" }, after: { ...equipment, status: "maintenance" } },
     { kind: "constraint-save", after: constraint },
     { kind: "constraint-active", before: { ...constraint, active: false }, after: constraint },
+    {
+      kind: "settings-save",
+      before: { rows: [null, null, null, null], settings: { unit: "kg", rest_timer_enabled: true, sound_enabled: true, ai_enabled: false } },
+      after: {
+        rows: [
+          { key: "unit", value: "lb", updated_at: 1_787_300_000_000 },
+          { key: "rest_timer_enabled", value: "false", updated_at: 1_787_300_000_000 },
+          { key: "sound_enabled", value: "true", updated_at: 1_787_300_000_000 },
+          { key: "ai_enabled", value: "true", updated_at: 1_787_300_000_000 },
+        ],
+        settings: { unit: "lb", rest_timer_enabled: false, sound_enabled: true, ai_enabled: true },
+      },
+    },
   ];
   const requiredUserFacts = [
     ["训练偏好", "慢慢开始"],
@@ -300,6 +313,7 @@ test("all eight durable receipts expose complete calm user content without techn
     ["器材状态", "临时停用"],
     ["身体边界", "先减小幅度", "徒手深蹲（Bodyweight squat）", "当前版本不识别的动作标识：legacy-unknown-action"],
     ["身体边界状态", "生效中", "徒手深蹲（Bodyweight squat）", "当前版本不识别的动作标识：legacy-unknown-action"],
+    ["本地设置", "重量单位：磅（lb）", "休息计时器：关闭", "提示音：开启", "允许 AI 草稿：开启"],
   ];
   receipts.forEach((value, index) => {
     const text = fitnessConfigReceiptDraftText({
@@ -312,6 +326,7 @@ test("all eight durable receipts expose complete calm user content without techn
     });
     for (const fact of requiredUserFacts[index]) assert.match(text, new RegExp(fact));
     assert.doesNotMatch(text, /fitness-operation-secret|generation-secret|sha-secret/i);
+    if (value.kind === "settings-save") assert.doesNotMatch(text, /updated_at|1787300000000|\brows\b/);
   });
 });
 
@@ -429,7 +444,7 @@ test("dirty close keeps the form mounted and restores deferred focus", () => {
   );
   assert.match(keep, /window\.requestAnimationFrame/);
   assert.match(keep, /target\?\.isConnected/);
-  assert.match(keep, /\.sl-dialog \.sl-form :is\(input, select, textarea, button\)/);
+  assert.match(keep, /\.sl-dialog :is\(\.sl-form, \.sl-draft, \.sl-calendar-not-performed\) :is\(input, select, textarea, button\)/);
   assert.match(appSource, /document\.addEventListener\("focusin", rememberFocus, true\)/);
   assert.match(appSource, /fitnessDirtyConfigDialogBlocksRouteChange\([\s\S]*?dialogDirtyRef\.current[\s\S]*?snapshotRef\.current\.sessions[\s\S]*?next\.sessions/);
   assert.match(appSource, /configDialogSnapshotPending && <ConfigDialogSnapshotNotice/);
