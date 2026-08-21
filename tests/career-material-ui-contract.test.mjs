@@ -77,7 +77,8 @@ test("material cards only claim states and file sizes that are known", () => {
   assert.equal(helpers.careerMaterialStatusText("legacy-unknown"), "状态待确认");
   assert.equal(helpers.careerMaterialFileDetails("resume.pdf", 0), "resume.pdf · 大小未记录");
   assert.equal(helpers.careerMaterialFileDetails("resume.pdf", null), "resume.pdf · 大小未记录");
-  assert.equal(helpers.careerMaterialFileDetails("resume.pdf", 1536), "resume.pdf · 2 KB");
+  assert.equal(helpers.careerMaterialFileDetails("resume.pdf", 512), "resume.pdf · 512 B");
+  assert.equal(helpers.careerMaterialFileDetails("resume.pdf", 1536), "resume.pdf · 1.5 KB");
   assert.match(materialsView, /已关联本机原件/);
   assert.doesNotMatch(materialsView, /Math\.max\(1,[\s\S]*?byte_size \?\? 0/);
 });

@@ -2125,9 +2125,11 @@ function careerMaterialStatusText(status: string) {
 }
 
 function careerMaterialFileDetails(fileName: string, byteSize: number | null | undefined) {
-  return Number.isFinite(byteSize) && Number(byteSize) > 0
-    ? `${fileName} · ${Math.max(1, Math.round(Number(byteSize) / 1024))} KB`
-    : `${fileName} · 大小未记录`;
+  if (!Number.isSafeInteger(byteSize) || Number(byteSize) <= 0) return `${fileName} · 大小未记录`;
+  const bytes = Number(byteSize);
+  if (bytes < 1024) return `${fileName} · ${bytes} B`;
+  const kilobytes = bytes / 1024;
+  return `${fileName} · ${kilobytes >= 10 ? Math.round(kilobytes) : Number(kilobytes.toFixed(1))} KB`;
 }
 
 function MaterialsView({ data, stale, refreshBusy, recoveryLoaded, recoveryCount, recoveryUnreadable, recoveryStorageUnavailable, onRefresh, onAdd, onRecover, onClearUnreadable, onRetryRecoveryStorage, onRemove, notify }: { data: CareerData; stale: boolean; refreshBusy: boolean; recoveryLoaded: boolean; recoveryCount: number; recoveryUnreadable: boolean; recoveryStorageUnavailable: boolean; onRefresh: () => Promise<void>; onAdd: () => void; onRecover: () => void; onClearUnreadable: () => void; onRetryRecoveryStorage: () => void; onRemove: (material: Material, opener: HTMLButtonElement) => void; notify: (text: string, tone?: Notice["tone"]) => void }) {
