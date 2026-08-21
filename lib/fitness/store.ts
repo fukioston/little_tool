@@ -4543,6 +4543,2222 @@ export const inspectFitnessLiveWrite =
 export const commitFitnessLiveWrite =
   defaultFitnessLiveStorageService.commitFitnessLiveWrite;
 
+export type PrepareFitnessLiveSessionStartInput = Readonly<{
+  eventId?: string | null;
+  venueId: string;
+  programDayId?: string | null;
+  availableMinutes?: number | null;
+  energyNote?: FitnessSession["energy_note"];
+  sorenessNote?: string;
+}>;
+
+export type PrepareFitnessLiveExerciseAddInput = Readonly<{
+  sessionId: string;
+  exerciseId: string;
+  equipmentId: string | null;
+  equipmentSnapshot?: string;
+}>;
+
+export type PrepareFitnessLiveExerciseCompleteInput = Readonly<{
+  sessionExerciseId: string;
+  skipped?: boolean;
+}>;
+
+export type PrepareFitnessLiveExerciseSubstituteInput = Readonly<{
+  sessionExerciseId: string;
+  exerciseId: string;
+  equipmentId: string | null;
+  equipmentSnapshot?: string;
+  reason: string;
+}>;
+
+export type FitnessLiveEquipmentContextExpectation = Readonly<{
+  venue: FitnessVenue;
+  equipment: readonly FitnessEquipment[];
+  equipmentLoads: readonly FitnessEquipmentLoad[];
+  avoidConstraints: readonly FitnessConstraint[];
+}>;
+
+export type FitnessLiveStartExpectation = FitnessLiveEquipmentContextExpectation & Readonly<{
+  activeSessions: readonly FitnessSession[];
+  event: FitnessCalendarEvent | null;
+  program: FitnessProgram | null;
+  programDay: FitnessProgramDay | null;
+  programItems: readonly FitnessProgramItem[];
+}>;
+
+export type FitnessLiveAddExpectation = FitnessLiveEquipmentContextExpectation & Readonly<{
+  projection: FitnessLiveSessionExpectation;
+  nextOrderIndex: number;
+}>;
+
+export type FitnessLiveSubstituteExpectation =
+  FitnessLiveEquipmentContextExpectation & Readonly<{
+    projection: FitnessLiveSessionExpectation;
+  }>;
+
+type FitnessLiveStructureReceiptBase<Kind extends string> = Readonly<{
+  purpose: "fitness-live-structure-write";
+  version: 1;
+  operationId: string;
+  generationId: string;
+  generationSequence: number;
+  preparedAt: number;
+  kind: Kind;
+  projectionSha256: string;
+}>;
+
+export type FitnessLiveSessionStartReceipt =
+  FitnessLiveStructureReceiptBase<"session-start"> & Readonly<{
+    context: FitnessLiveStartExpectation;
+    before: Readonly<{
+      activeSessions: readonly FitnessSession[];
+      event: FitnessCalendarEvent | null;
+    }>;
+    after: Readonly<{
+      session: FitnessSession;
+      exercises: readonly FitnessSessionExercise[];
+      event: FitnessCalendarEvent | null;
+    }>;
+  }>;
+
+export type FitnessLiveExerciseAddReceipt =
+  FitnessLiveStructureReceiptBase<"exercise-add"> & Readonly<{
+    context: FitnessLiveEquipmentContextExpectation;
+    before: FitnessLiveSessionProjection & Readonly<{ session: FitnessSession }>;
+    after: FitnessLiveSessionProjection & Readonly<{ session: FitnessSession }>;
+  }>;
+
+export type FitnessLiveExerciseCompleteReceipt =
+  FitnessLiveStructureReceiptBase<"exercise-complete"> & Readonly<{
+    before: FitnessLiveSessionProjection & Readonly<{ session: FitnessSession }>;
+    after: FitnessLiveSessionProjection & Readonly<{ session: FitnessSession }>;
+  }>;
+
+export type FitnessLiveExerciseSubstituteReceipt =
+  FitnessLiveStructureReceiptBase<"exercise-substitute"> & Readonly<{
+    context: FitnessLiveEquipmentContextExpectation;
+    before: FitnessLiveSessionProjection & Readonly<{ session: FitnessSession }>;
+    after: FitnessLiveSessionProjection & Readonly<{ session: FitnessSession }>;
+  }>;
+
+export type FitnessLiveSessionReflectionReceipt =
+  FitnessLiveStructureReceiptBase<"session-reflection"> & Readonly<{
+    before: FitnessSession;
+    after: FitnessSession;
+  }>;
+
+export type FitnessLiveStructureWriteReceipt =
+  | FitnessLiveSessionStartReceipt
+  | FitnessLiveExerciseAddReceipt
+  | FitnessLiveExerciseCompleteReceipt
+  | FitnessLiveExerciseSubstituteReceipt
+  | FitnessLiveSessionReflectionReceipt;
+
+export type FitnessLiveStructureWriteInspection = FitnessLiveWriteInspection;
+
+export type FitnessLiveStructureWriteResult =
+  | Readonly<{
+      outcome: "saved" | "already_saved";
+      receipt: FitnessLiveStructureWriteReceipt;
+      entityId: string;
+      updatedAt: number;
+    }>
+  | Readonly<{
+      outcome: "changed";
+      receipt: FitnessLiveStructureWriteReceipt;
+      entityId: string;
+      retryable: false;
+    }>
+  | Readonly<{
+      outcome: "outcome_uncertain";
+      receipt: FitnessLiveStructureWriteReceipt;
+      entityId: string;
+      retryable: true;
+    }>;
+
+export class FitnessLiveStructureMutationError extends Error {
+  readonly name = "FitnessLiveStructureMutationError";
+
+  constructor(
+    readonly code: FitnessLiveMutationErrorCode,
+    message: string,
+    readonly receipt?: FitnessLiveStructureWriteReceipt,
+  ) {
+    super(message);
+  }
+}
+
+const LIVE_STRUCTURE_OPERATION_ID_PATTERN =
+  /^fitness-live-structure-operation-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const LIVE_SESSION_ID_PATTERN =
+  /^session-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const LIVE_EXERCISE_ID_PATTERN =
+  /^session-exercise-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const LIVE_STRUCTURE_RECEIPT_MARKER_PREFIX =
+  "__fitness_live_structure_receipt__:";
+
+function structureError(
+  code: FitnessLiveMutationErrorCode,
+  message: string,
+  receipt?: FitnessLiveStructureWriteReceipt,
+): FitnessLiveStructureMutationError {
+  return new FitnessLiveStructureMutationError(code, message, receipt);
+}
+
+function sortedSessions(rows: readonly FitnessSession[]): FitnessSession[] {
+  return [...rows].sort((left, right) => compareLiveId(left.id, right.id));
+}
+
+function sortedEquipment(rows: readonly FitnessEquipment[]): FitnessEquipment[] {
+  return [...rows].sort((left, right) => compareLiveId(left.id, right.id));
+}
+
+function sortedEquipmentLoads(
+  rows: readonly FitnessEquipmentLoad[],
+): FitnessEquipmentLoad[] {
+  return [...rows].sort((left, right) =>
+    compareLiveId(left.equipment_id, right.equipment_id) ||
+    left.load_grams - right.load_grams || compareLiveId(left.id, right.id)
+  );
+}
+
+function sortedConstraints(rows: readonly FitnessConstraint[]): FitnessConstraint[] {
+  return [...rows].sort((left, right) => compareLiveId(left.id, right.id));
+}
+
+function sortedProgramItems(rows: readonly FitnessProgramItem[]): FitnessProgramItem[] {
+  return [...rows].sort((left, right) =>
+    left.order_index - right.order_index || compareLiveId(left.id, right.id)
+  );
+}
+
+function equipmentContextFromSnapshot(
+  snapshot: FitnessSnapshot,
+  venueId: string,
+): FitnessLiveEquipmentContextExpectation {
+  const venue = snapshot.venues.find(({ id }) => id === venueId);
+  if (!venue) throw structureError("invalid_input", "当前场地不在这份训练画面里。");
+  const equipment = sortedEquipment(snapshot.equipment.filter(
+    ({ venue_id }) => venue_id === venue.id,
+  ));
+  const equipmentIds = new Set(equipment.map(({ id }) => id));
+  const equipmentLoads = sortedEquipmentLoads(snapshot.equipmentLoads.filter(
+    ({ equipment_id }) => equipmentIds.has(equipment_id),
+  ));
+  const avoidConstraints = sortedConstraints(snapshot.constraints.filter(
+    ({ active, severity }) => active && severity === "avoid",
+  ));
+  return { venue, equipment, equipmentLoads, avoidConstraints };
+}
+
+export function fitnessLiveStartExpectationFromSnapshot(
+  snapshot: FitnessSnapshot,
+  input: PrepareFitnessLiveSessionStartInput,
+): FitnessLiveStartExpectation {
+  const eventId = input.eventId ?? null;
+  const event = eventId === null
+    ? null
+    : snapshot.events.find(({ id }) => id === eventId) ?? null;
+  const programDayId = input.programDayId ?? event?.program_day_id ?? null;
+  const programDay = programDayId === null
+    ? null
+    : snapshot.programDays.find(({ id }) => id === programDayId) ?? null;
+  const program = programDay === null
+    ? null
+    : snapshot.programs.find(({ id }) => id === programDay.program_id) ?? null;
+  const programItems = programDay === null
+    ? []
+    : sortedProgramItems(snapshot.programItems.filter(
+      ({ program_day_id }) => program_day_id === programDay.id,
+    ));
+  return snapshotLiveInput({
+    ...equipmentContextFromSnapshot(snapshot, input.venueId),
+    activeSessions: sortedSessions(snapshot.sessions.filter(({ status }) => status === "active")),
+    event,
+    program,
+    programDay,
+    programItems,
+  });
+}
+
+export function fitnessLiveAddExpectationFromSnapshot(
+  snapshot: FitnessSnapshot,
+  sessionId: string,
+): FitnessLiveAddExpectation {
+  const projection = fitnessLiveSessionExpectationFromSnapshot(snapshot, sessionId);
+  return snapshotLiveInput({
+    ...equipmentContextFromSnapshot(snapshot, projection.session.venue_id),
+    projection,
+    nextOrderIndex: projection.exercises.reduce(
+      (maximum, exercise) => Math.max(maximum, exercise.order_index + 1),
+      0,
+    ),
+  });
+}
+
+export function fitnessLiveSubstituteExpectationFromSnapshot(
+  snapshot: FitnessSnapshot,
+  sessionId: string,
+): FitnessLiveSubstituteExpectation {
+  const projection = fitnessLiveSessionExpectationFromSnapshot(snapshot, sessionId);
+  return snapshotLiveInput({
+    ...equipmentContextFromSnapshot(snapshot, projection.session.venue_id),
+    projection,
+  });
+}
+
+function isFitnessLiveProgram(value: unknown): value is FitnessProgram {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const row = value as Partial<FitnessProgram>;
+  return exactObjectKeys(value, [
+    "id", "name", "venue_id", "goal", "split", "status", "version", "source",
+    "assumptions", "created_at", "updated_at",
+  ]) && safeOpaqueId(row.id) && safeString(row.name, 160) && row.name.length > 0 &&
+    safeOpaqueId(row.venue_id) && FITNESS_GOALS.has(String(row.goal)) &&
+    ["auto", "full_body", "upper_lower", "push_pull_legs", "custom"].includes(String(row.split)) &&
+    ["draft", "active", "archived"].includes(String(row.status)) &&
+    liveInteger(row.version, 1, Number.MAX_SAFE_INTEGER) &&
+    ["local", "ai_draft", "manual"].includes(String(row.source)) &&
+    safeStringArray(row.assumptions, 100) && uniqueExactStrings(row.assumptions) &&
+    row.assumptions.every((assumption) => safeString(assumption, 500)) &&
+    safeTimestamp(row.created_at) && safeTimestamp(row.updated_at) &&
+    row.updated_at >= row.created_at;
+}
+
+function isFitnessLiveProgramDay(value: unknown): value is FitnessProgramDay {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const row = value as Partial<FitnessProgramDay>;
+  return exactObjectKeys(value, [
+    "id", "program_id", "day_index", "weekday", "kind", "name", "focus",
+    "estimated_minutes", "variant", "created_at",
+  ]) && safeOpaqueId(row.id) && safeOpaqueId(row.program_id) &&
+    liveInteger(row.day_index, 0, 100_000) &&
+    (row.weekday === null || liveInteger(row.weekday, 0, 6)) &&
+    ["resistance", "cardio", "rest"].includes(String(row.kind)) &&
+    safeString(row.name, 10_000) && safeString(row.focus, 10_000) &&
+    liveInteger(row.estimated_minutes, 0, 240) &&
+    ["standard", "short", "low_fatigue", "busy_gym"].includes(String(row.variant)) &&
+    safeTimestamp(row.created_at);
+}
+
+function isFitnessLiveProgramItem(value: unknown): value is FitnessProgramItem {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const row = value as Partial<FitnessProgramItem>;
+  return exactObjectKeys(value, [
+    "id", "program_day_id", "exercise_id", "equipment_id", "resource_equipment_ids",
+    "order_index", "sets", "rep_min", "rep_max", "duration_seconds", "target_rir",
+    "rest_seconds", "load_grams", "load_guidance", "rationale",
+    "substitution_exercise_ids", "equipment_snapshot", "created_at",
+  ]) && safeOpaqueId(row.id) && safeOpaqueId(row.program_day_id) &&
+    safeOpaqueId(row.exercise_id) && Boolean(getFitnessExercise(row.exercise_id)) &&
+    (row.equipment_id === null || safeOpaqueId(row.equipment_id)) &&
+    safeStringArray(row.resource_equipment_ids, 100) &&
+    uniqueExactStrings(row.resource_equipment_ids) &&
+    row.resource_equipment_ids.every(safeOpaqueId) &&
+    liveInteger(row.order_index, 0, 100_000) && liveInteger(row.sets, 1, 20) &&
+    liveNullableInteger(row.rep_min, 1, 1_000) &&
+    liveNullableInteger(row.rep_max, 1, 1_000) &&
+    (row.rep_min === null || row.rep_max === null || row.rep_max >= row.rep_min) &&
+    liveNullableInteger(row.duration_seconds, 1, 86_400) &&
+    (row.rep_min !== null || row.duration_seconds !== null) &&
+    liveNullableInteger(row.target_rir, 0, 5) && liveInteger(row.rest_seconds, 0, 1_200) &&
+    liveNullableInteger(row.load_grams, 0, 10_000_000) &&
+    safeString(row.load_guidance, 10_000) && safeString(row.rationale, 10_000) &&
+    safeStringArray(row.substitution_exercise_ids, 100) &&
+    uniqueExactStrings(row.substitution_exercise_ids) &&
+    row.substitution_exercise_ids.every((id) => safeOpaqueId(id) &&
+      id !== row.exercise_id && Boolean(getFitnessExercise(id))) &&
+    safeString(row.equipment_snapshot, 100_000) && safeTimestamp(row.created_at);
+}
+
+function isFitnessLiveEquipmentContext(
+  value: unknown,
+): value is FitnessLiveEquipmentContextExpectation {
+  if (!value || typeof value !== "object" || Array.isArray(value) || !exactObjectKeys(value, [
+    "venue", "equipment", "equipmentLoads", "avoidConstraints",
+  ])) return false;
+  const context = value as Partial<FitnessLiveEquipmentContextExpectation>;
+  if (!isFitnessVenueRow(context.venue) || !Array.isArray(context.equipment) ||
+      !Array.isArray(context.equipmentLoads) || !Array.isArray(context.avoidConstraints)) return false;
+  const total = context.equipment.length + context.equipmentLoads.length +
+    context.avoidConstraints.length;
+  if (total > LIVE_MAX_ATOMIC_ROWS || !uniqueIds(context.equipment) ||
+      !uniqueIds(context.equipmentLoads) || !uniqueIds(context.avoidConstraints) ||
+      !context.equipment.every((row) => isFitnessEquipmentRow(row) &&
+        row.venue_id === context.venue?.id) ||
+      !context.equipmentLoads.every(isFitnessEquipmentLoadRow) ||
+      !context.avoidConstraints.every((row) =>
+        isFitnessConstraintRow(row) && row.active && row.severity === "avoid") ||
+      !isSortedProjection(context.equipment, sortedEquipment) ||
+      !isSortedProjection(context.equipmentLoads, sortedEquipmentLoads) ||
+      !isSortedProjection(context.avoidConstraints, sortedConstraints)) return false;
+  const equipmentIds = new Set(context.equipment.map(({ id }) => id));
+  return context.equipmentLoads.every(({ equipment_id }) => equipmentIds.has(equipment_id));
+}
+
+function equipmentContextOnly(
+  value: FitnessLiveEquipmentContextExpectation,
+): FitnessLiveEquipmentContextExpectation {
+  return {
+    venue: value.venue,
+    equipment: value.equipment,
+    equipmentLoads: value.equipmentLoads,
+    avoidConstraints: value.avoidConstraints,
+  };
+}
+
+function isFitnessLiveStartExpectation(value: unknown): value is FitnessLiveStartExpectation {
+  if (!value || typeof value !== "object" || Array.isArray(value) ||
+      !jsonWithinUnits(value, LIVE_MAX_EXPECTATION_JSON_UNITS) || !exactObjectKeys(value, [
+        "venue", "equipment", "equipmentLoads", "avoidConstraints", "activeSessions",
+        "event", "program", "programDay", "programItems",
+      ])) return false;
+  const expected = value as Partial<FitnessLiveStartExpectation>;
+  if (!isFitnessLiveEquipmentContext(equipmentContextOnly(
+    expected as FitnessLiveEquipmentContextExpectation,
+  )) || !Array.isArray(expected.activeSessions) ||
+      !expected.activeSessions.every((session) =>
+        isFitnessLiveSession(session) && session.status === "active") ||
+      !uniqueIds(expected.activeSessions) ||
+      !isSortedProjection(expected.activeSessions, sortedSessions) ||
+      !(expected.event === null || isFitnessLiveEvent(expected.event)) ||
+      !(expected.program === null || isFitnessLiveProgram(expected.program)) ||
+      !(expected.programDay === null || isFitnessLiveProgramDay(expected.programDay)) ||
+      !Array.isArray(expected.programItems) ||
+      !expected.programItems.every(isFitnessLiveProgramItem) ||
+      !uniqueIds(expected.programItems) ||
+      new Set(expected.programItems.map(({ order_index }) => order_index)).size !==
+      expected.programItems.length ||
+      !isSortedProjection(expected.programItems, sortedProgramItems)) return false;
+  const complete = expected as FitnessLiveStartExpectation;
+  if (complete.activeSessions.length + complete.programItems.length + complete.equipment.length +
+      complete.equipmentLoads.length + complete.avoidConstraints.length > LIVE_MAX_ATOMIC_ROWS) {
+    return false;
+  }
+  if (complete.programDay === null) {
+    return complete.program === null && complete.programItems.length === 0;
+  }
+  return complete.program !== null && complete.programDay.program_id === complete.program.id &&
+    complete.program.venue_id === complete.venue.id &&
+    complete.programItems.every(({ program_day_id }) =>
+      program_day_id === complete.programDay?.id);
+}
+
+function isFitnessLiveAddExpectation(value: unknown): value is FitnessLiveAddExpectation {
+  if (!value || typeof value !== "object" || Array.isArray(value) ||
+      !jsonWithinUnits(value, LIVE_MAX_EXPECTATION_JSON_UNITS) || !exactObjectKeys(value, [
+        "venue", "equipment", "equipmentLoads", "avoidConstraints", "projection",
+        "nextOrderIndex",
+      ])) return false;
+  const expected = value as Partial<FitnessLiveAddExpectation>;
+  if (!isFitnessLiveEquipmentContext(equipmentContextOnly(
+    expected as FitnessLiveEquipmentContextExpectation,
+  )) || !isLiveSessionExpectation(expected.projection) ||
+      expected.projection.session.venue_id !== expected.venue?.id ||
+      !liveInteger(expected.nextOrderIndex, 0, 100_000)) return false;
+  return expected.nextOrderIndex === expected.projection.exercises.reduce(
+    (maximum, exercise) => Math.max(maximum, exercise.order_index + 1),
+    0,
+  );
+}
+
+function isFitnessLiveSubstituteExpectation(
+  value: unknown,
+): value is FitnessLiveSubstituteExpectation {
+  if (!value || typeof value !== "object" || Array.isArray(value) ||
+      !jsonWithinUnits(value, LIVE_MAX_EXPECTATION_JSON_UNITS) || !exactObjectKeys(value, [
+        "venue", "equipment", "equipmentLoads", "avoidConstraints", "projection",
+      ])) return false;
+  const expected = value as Partial<FitnessLiveSubstituteExpectation>;
+  return isFitnessLiveEquipmentContext(equipmentContextOnly(
+    expected as FitnessLiveEquipmentContextExpectation,
+  )) && isLiveSessionExpectation(expected.projection) &&
+    expected.projection.session.venue_id === expected.venue?.id;
+}
+
+async function readStructureEquipmentContext(
+  runtime: FitnessLiveStorageRuntime,
+  venueId: string,
+): Promise<FitnessLiveEquipmentContextExpectation | null> {
+  const [venueRows, equipmentRows, loadRows, constraintRows] = await Promise.all([
+    liveRows<Row>(runtime, "SELECT * FROM fitness_venues WHERE id=? LIMIT 1", [venueId]),
+    liveRows<Row>(runtime, "SELECT * FROM fitness_equipment WHERE venue_id=? ORDER BY id LIMIT ?", [
+      venueId,
+      LIVE_MAX_ATOMIC_ROWS + 1,
+    ]),
+    liveRows<Row>(runtime, `SELECT equipment_load.* FROM fitness_equipment_loads equipment_load
+      JOIN fitness_equipment equipment ON equipment.id=equipment_load.equipment_id
+      WHERE equipment.venue_id=? ORDER BY equipment_load.equipment_id,
+        equipment_load.load_grams,equipment_load.id LIMIT ?`, [
+      venueId,
+      LIVE_MAX_ATOMIC_ROWS + 1,
+    ]),
+    liveRows<Row>(runtime, `SELECT * FROM fitness_constraints
+      WHERE active=1 AND severity='avoid' ORDER BY id LIMIT ?`, [LIVE_MAX_ATOMIC_ROWS + 1]),
+  ]);
+  const venue = venueRows[0] ? mapVenue(venueRows[0]) : null;
+  if (!venue) return null;
+  return {
+    venue,
+    equipment: sortedEquipment(equipmentRows.map(mapEquipment)),
+    equipmentLoads: sortedEquipmentLoads(loadRows.map(mapEquipmentLoad)),
+    avoidConstraints: sortedConstraints(constraintRows.map(mapConstraint)),
+  };
+}
+
+async function readStructureStartExpectation(
+  runtime: FitnessLiveStorageRuntime,
+  input: Readonly<{ venueId: string; eventId: string | null; programDayId: string | null }>,
+): Promise<FitnessLiveStartExpectation | null> {
+  const context = await readStructureEquipmentContext(runtime, input.venueId);
+  if (!context) return null;
+  const [activeSessions, eventRows, dayRows] = await Promise.all([
+    liveRows<FitnessSession>(runtime,
+      "SELECT * FROM fitness_sessions WHERE status='active' ORDER BY id LIMIT ?",
+      [LIVE_MAX_ATOMIC_ROWS + 1]),
+    input.eventId === null
+      ? Promise.resolve([] as readonly FitnessCalendarEvent[])
+      : liveRows<FitnessCalendarEvent>(runtime,
+        "SELECT * FROM fitness_calendar_events WHERE id=? LIMIT 1", [input.eventId]),
+    input.programDayId === null
+      ? Promise.resolve([] as readonly FitnessProgramDay[])
+      : liveRows<FitnessProgramDay>(runtime,
+        "SELECT * FROM fitness_program_days WHERE id=? LIMIT 1", [input.programDayId]),
+  ]);
+  const programDay = dayRows[0] ?? null;
+  const [programRows, itemRows] = programDay === null
+    ? [[], []] as const
+    : await Promise.all([
+      liveRows<Row>(runtime, "SELECT * FROM fitness_programs WHERE id=? LIMIT 1", [
+        programDay.program_id,
+      ]),
+      liveRows<Row>(runtime, `SELECT * FROM fitness_program_items
+        WHERE program_day_id=? ORDER BY order_index,id LIMIT ?`, [
+        programDay.id,
+        LIVE_MAX_ATOMIC_ROWS + 1,
+      ]),
+    ]);
+  return {
+    ...context,
+    activeSessions: sortedSessions(activeSessions),
+    event: eventRows[0] ?? null,
+    program: programRows[0] ? mapProgram(programRows[0]) : null,
+    programDay,
+    programItems: sortedProgramItems(itemRows.map(mapProgramItem)),
+  };
+}
+
+function resolveStructureEquipmentSnapshot(
+  exercise: FitnessExercise,
+  context: FitnessLiveEquipmentContextExpectation,
+  equipmentId: string | null,
+  requestedSnapshot: string | undefined,
+): string {
+  if (exerciseIsAvoided(exercise, context.avoidConstraints)) {
+    throw structureError("changed", `动作「${exercise.name_zh}」与当前避用限制冲突。`);
+  }
+  const ids = [...new Set([
+    ...(equipmentId ? [equipmentId] : []),
+    ...snapshotResourceIds(requestedSnapshot),
+  ])];
+  if (ids.length === 0) {
+    if (exercise.requirements.some(({ optional }) => !optional)) {
+      throw structureError("invalid_input", "这个动作缺少当前场地的必需器材。");
+    }
+    return "[]";
+  }
+  const equipmentById = new Map(context.equipment.map((entry) => [entry.id, entry]));
+  const resources = ids.flatMap((id) => {
+    const equipment = equipmentById.get(id);
+    return equipment ? [equipment] : [];
+  });
+  if (resources.length !== ids.length || resources.some((equipment) =>
+    equipment.venue_id !== context.venue.id ||
+    !["available", "limited"].includes(equipment.status)
+  )) throw structureError("changed", "器材快照包含不属于当前场地或不可用的器材。");
+  const requirementKinds = new Set(exercise.requirements.map(({ kind }) => kind));
+  if (resources.some(({ kind }) => !requirementKinds.has(kind)) ||
+      exercise.requirements.some((requirement) =>
+        !requirement.optional && !resources.some(({ kind }) => kind === requirement.kind)
+      )) throw structureError("invalid_input", "这个动作缺少当前场地的完整器材资源。");
+  for (const resource of resources) {
+    if (!equipmentSupportsExercise(exercise, resource, context.equipmentLoads)) {
+      throw structureError("changed", `动作「${exercise.name_zh}」的器材数量不足。`);
+    }
+  }
+  return canonicalEquipmentSnapshot(resources, context.equipmentLoads);
+}
+
+function structureContextVersions(context: FitnessLiveEquipmentContextExpectation): number[] {
+  return [
+    context.venue.created_at,
+    context.venue.updated_at,
+    ...context.equipment.flatMap(({ created_at, updated_at }) => [created_at, updated_at]),
+    ...context.equipmentLoads.map(({ created_at }) => created_at),
+    ...context.avoidConstraints.flatMap(({ created_at, updated_at }) => [created_at, updated_at]),
+  ];
+}
+
+function startExpectationVersions(context: FitnessLiveStartExpectation): number[] {
+  return [
+    ...structureContextVersions(context),
+    ...context.activeSessions.flatMap(({ created_at, started_at, updated_at }) =>
+      [created_at, started_at, updated_at]),
+    ...(context.event === null ? [] : [context.event.created_at, context.event.updated_at]),
+    ...(context.program === null ? [] : [context.program.created_at, context.program.updated_at]),
+    ...(context.programDay === null ? [] : [context.programDay.created_at]),
+    ...context.programItems.map(({ created_at }) => created_at),
+  ];
+}
+
+function structureGeneratedId(
+  runtime: FitnessLiveStorageRuntime,
+  prefix: "session-" | "session-exercise-" | "fitness-live-structure-operation-",
+): string {
+  const uuid = runtime.randomUUID();
+  if (!LIVE_UUID_PATTERN.test(uuid)) {
+    throw structureError("invalid_input", "无法生成可靠的训练结构写入标识。");
+  }
+  return `${prefix}${uuid}`;
+}
+
+function sameStructureSessionClock(
+  before: FitnessSession,
+  after: FitnessSession,
+  preparedAt: number,
+): boolean {
+  return sameProjection(after, { ...before, updated_at: preparedAt });
+}
+
+function isStructureStartTransition(receipt: FitnessLiveSessionStartReceipt): boolean {
+  const { context, before, after, preparedAt } = receipt;
+  if (!isFitnessLiveStartExpectation(context) || !before || typeof before !== "object" ||
+      Array.isArray(before) || !exactObjectKeys(before, ["activeSessions", "event"]) ||
+      !after || typeof after !== "object" || Array.isArray(after) ||
+      !exactObjectKeys(after, ["session", "exercises", "event"]) ||
+      !sameProjection(before.activeSessions, context.activeSessions) ||
+      !sameProjection(before.event, context.event) || context.activeSessions.length !== 0 ||
+      context.venue.status !== "active" || !isFitnessLiveSession(after.session) ||
+      after.session.status !== "active" || !LIVE_SESSION_ID_PATTERN.test(after.session.id) ||
+      after.session.venue_id !== context.venue.id || after.session.started_at !== preparedAt ||
+      after.session.created_at !== preparedAt || after.session.updated_at !== preparedAt ||
+      after.session.ended_at !== null || !strictlyAfterEvery(preparedAt, startExpectationVersions(context)) ||
+      !Array.isArray(after.exercises) || !after.exercises.every(isFitnessLiveExercise) ||
+      !uniqueIds(after.exercises) || !isSortedProjection(after.exercises, sortedExercises) ||
+      after.exercises.length !== context.programItems.length) return false;
+  if (context.event === null) {
+    if (after.event !== null || after.session.event_id !== null) return false;
+  } else if (
+    context.event.status !== "planned" || after.event === null ||
+    context.event.venue_id !== null && context.event.venue_id !== context.venue.id ||
+    after.session.event_id !== context.event.id || !sameProjection(after.event, {
+      ...context.event,
+      status: "in_progress",
+      updated_at: preparedAt,
+    })
+  ) return false;
+  if (context.programDay === null) {
+    if (after.session.program_day_id !== null || context.program !== null ||
+        context.programItems.length !== 0) return false;
+  } else if (
+    context.program === null || context.program.venue_id !== context.venue.id ||
+    after.session.program_day_id !== context.programDay.id ||
+    context.event !== null && context.event.program_day_id !== null &&
+      context.event.program_day_id !== context.programDay.id
+  ) return false;
+  return after.exercises.every((exercise, index) => {
+    const item = context.programItems[index];
+    if (!item) return false;
+    const catalogExercise = getFitnessExercise(item.exercise_id);
+    if (!catalogExercise) return false;
+    let equipmentSnapshot: string;
+    try {
+      equipmentSnapshot = resolveStructureEquipmentSnapshot(
+        catalogExercise,
+        context,
+        item.equipment_id,
+        item.equipment_snapshot,
+      );
+    } catch {
+      return false;
+    }
+    return LIVE_EXERCISE_ID_PATTERN.test(exercise.id) &&
+      exercise.session_id === after.session.id && exercise.exercise_id === item.exercise_id &&
+      exercise.equipment_id === item.equipment_id && exercise.planned_item_id === item.id &&
+      exercise.order_index === index && exercise.status === (index === 0 ? "active" : "pending") &&
+      exercise.substituted_for_exercise_id === null && exercise.substitution_reason === "" &&
+      exercise.equipment_snapshot === equipmentSnapshot && exercise.note === "" &&
+      exercise.created_at === preparedAt && exercise.updated_at === preparedAt;
+  });
+}
+
+function addedStructureExercise(
+  before: readonly FitnessSessionExercise[],
+  after: readonly FitnessSessionExercise[],
+): FitnessSessionExercise | null {
+  const beforeIds = new Set(before.map(({ id }) => id));
+  const rows = after.filter(({ id }) => !beforeIds.has(id));
+  return rows.length === 1 ? rows[0]! : null;
+}
+
+function isStructureAddTransition(receipt: FitnessLiveExerciseAddReceipt): boolean {
+  const { context, before, after, preparedAt } = receipt;
+  if (!isFitnessLiveEquipmentContext(context) || !isLiveSessionProjection(before) ||
+      !isLiveSessionProjection(after) || before.session === null || after.session === null ||
+      before.session.status !== "active" || context.venue.id !== before.session.venue_id ||
+      !sameStructureSessionClock(before.session, after.session, preparedAt) ||
+      !strictlyAfterEvery(preparedAt, [
+        ...sessionProjectionVersions(before),
+        ...structureContextVersions(context),
+      ]) || !sameProjection(before.sets, after.sets) ||
+      !sameProjection(before.cardioEntries, after.cardioEntries) ||
+      !sameProjection(before.event, after.event) ||
+      !sameProjection(before.capabilities, after.capabilities) ||
+      after.exercises.length !== before.exercises.length + 1) return false;
+  const added = addedStructureExercise(before.exercises, after.exercises);
+  if (!added || !before.exercises.every((exercise) =>
+    sameProjection(after.exercises.find(({ id }) => id === exercise.id), exercise)
+  )) return false;
+  const catalogExercise = getFitnessExercise(added.exercise_id);
+  if (!catalogExercise) return false;
+  let equipmentSnapshot: string;
+  try {
+    equipmentSnapshot = resolveStructureEquipmentSnapshot(
+      catalogExercise,
+      context,
+      added.equipment_id,
+      added.equipment_snapshot,
+    );
+  } catch {
+    return false;
+  }
+  const nextOrder = before.exercises.reduce(
+    (maximum, exercise) => Math.max(maximum, exercise.order_index + 1),
+    0,
+  );
+  const unfinished = before.exercises.some(({ status }) => status === "active" || status === "pending");
+  return LIVE_EXERCISE_ID_PATTERN.test(added.id) &&
+    added.session_id === before.session.id && added.planned_item_id === null &&
+    added.order_index === nextOrder && added.status === (unfinished ? "pending" : "active") &&
+    added.substituted_for_exercise_id === null && added.substitution_reason === "" &&
+    added.equipment_snapshot === equipmentSnapshot && added.note === "" &&
+    added.created_at === preparedAt && added.updated_at === preparedAt;
+}
+
+function structureChangedExercises(
+  before: readonly FitnessSessionExercise[],
+  after: readonly FitnessSessionExercise[],
+): readonly Readonly<{ before: FitnessSessionExercise; after: FitnessSessionExercise }>[] {
+  if (before.length !== after.length) return [];
+  const afterById = new Map(after.map((exercise) => [exercise.id, exercise]));
+  return before.flatMap((prior) => {
+    const next = afterById.get(prior.id);
+    return next && !sameProjection(prior, next) ? [{ before: prior, after: next }] : [];
+  });
+}
+
+function isStructureCompleteTransition(receipt: FitnessLiveExerciseCompleteReceipt): boolean {
+  const { before, after, preparedAt } = receipt;
+  if (!isLiveSessionProjection(before) || !isLiveSessionProjection(after) ||
+      before.session === null || after.session === null || before.session.status !== "active" ||
+      !sameStructureSessionClock(before.session, after.session, preparedAt) ||
+      !strictlyAfterEvery(preparedAt, sessionProjectionVersions(before)) ||
+      !sameProjection(before.sets, after.sets) ||
+      !sameProjection(before.cardioEntries, after.cardioEntries) ||
+      !sameProjection(before.event, after.event) ||
+      !sameProjection(before.capabilities, after.capabilities)) return false;
+  const changed = structureChangedExercises(before.exercises, after.exercises);
+  const target = changed.find(({ after: row }) =>
+    (row.status === "completed" || row.status === "skipped") && row.updated_at === preparedAt
+  );
+  if (!target || target.before.status !== "active" ||
+      before.exercises.filter(({ status }) => status === "active").length !== 1 ||
+      !sameProjection(target.after, {
+        ...target.before,
+        status: target.after.status,
+        updated_at: preparedAt,
+      })) return false;
+  const targetSets = before.sets.filter(({ session_exercise_id }) =>
+    session_exercise_id === target.before.id);
+  if ((target.after.status === "completed" && targetSets.length === 0) ||
+      (target.after.status === "skipped" && targetSets.length !== 0)) return false;
+  const next = before.exercises
+    .filter(({ order_index, status }) =>
+      order_index > target.before.order_index && status === "pending")
+    .sort((left, right) => left.order_index - right.order_index || compareLiveId(left.id, right.id))[0];
+  const expectedChanged = next ? 2 : 1;
+  if (changed.length !== expectedChanged) return false;
+  return !next || changed.some(({ before: prior, after: current }) =>
+    prior.id === next.id && sameProjection(current, {
+      ...prior,
+      status: "active",
+      updated_at: preparedAt,
+    })
+  );
+}
+
+function isStructureSubstituteTransition(
+  receipt: FitnessLiveExerciseSubstituteReceipt,
+): boolean {
+  const { context, before, after, preparedAt } = receipt;
+  if (!isFitnessLiveEquipmentContext(context) || !isLiveSessionProjection(before) ||
+      !isLiveSessionProjection(after) || before.session === null || after.session === null ||
+      before.session.status !== "active" || context.venue.id !== before.session.venue_id ||
+      !sameStructureSessionClock(before.session, after.session, preparedAt) ||
+      !strictlyAfterEvery(preparedAt, [
+        ...sessionProjectionVersions(before),
+        ...structureContextVersions(context),
+      ]) || !sameProjection(before.sets, after.sets) ||
+      !sameProjection(before.cardioEntries, after.cardioEntries) ||
+      !sameProjection(before.event, after.event) ||
+      !sameProjection(before.capabilities, after.capabilities)) return false;
+  const changed = structureChangedExercises(before.exercises, after.exercises);
+  if (changed.length !== 1) return false;
+  const target = changed[0]!;
+  if (target.before.status !== "active" ||
+      before.exercises.filter(({ status }) => status === "active").length !== 1 ||
+      before.sets.some(({ session_exercise_id }) => session_exercise_id === target.before.id) ||
+      target.after.exercise_id === target.before.exercise_id ||
+      target.after.status !== target.before.status ||
+      target.after.substituted_for_exercise_id !==
+        (target.before.substituted_for_exercise_id ?? target.before.exercise_id) ||
+      target.after.created_at !== target.before.created_at ||
+      target.after.updated_at !== preparedAt || target.after.id !== target.before.id ||
+      target.after.session_id !== target.before.session_id ||
+      target.after.planned_item_id !== target.before.planned_item_id ||
+      target.after.order_index !== target.before.order_index ||
+      target.after.note !== target.before.note ||
+      !safeString(target.after.substitution_reason, 10_000)) return false;
+  const catalogExercise = getFitnessExercise(target.after.exercise_id);
+  if (!catalogExercise) return false;
+  try {
+    return target.after.equipment_snapshot === resolveStructureEquipmentSnapshot(
+      catalogExercise,
+      context,
+      target.after.equipment_id,
+      target.after.equipment_snapshot,
+    );
+  } catch {
+    return false;
+  }
+}
+
+function isStructureReflectionTransition(
+  receipt: FitnessLiveSessionReflectionReceipt,
+): boolean {
+  return isFitnessLiveSession(receipt.before) && isFitnessLiveSession(receipt.after) &&
+    receipt.before.id === receipt.after.id && receipt.before.reflection !== receipt.after.reflection &&
+    safeString(receipt.after.reflection, 4_000) &&
+    receipt.preparedAt > receipt.before.updated_at &&
+    sameProjection(receipt.after, {
+      ...receipt.before,
+      reflection: receipt.after.reflection,
+      updated_at: receipt.preparedAt,
+    });
+}
+
+function hasValidStructureReceiptBase(
+  value: object,
+  kind: FitnessLiveStructureWriteReceipt["kind"],
+  keys: readonly string[],
+): boolean {
+  const receipt = value as Partial<FitnessLiveStructureWriteReceipt>;
+  return exactObjectKeys(value, [
+    "purpose", "version", "operationId", "generationId", "generationSequence",
+    "preparedAt", "kind", "projectionSha256", ...keys,
+  ]) && receipt.purpose === "fitness-live-structure-write" && receipt.version === 1 &&
+    receipt.kind === kind && typeof receipt.operationId === "string" &&
+    LIVE_STRUCTURE_OPERATION_ID_PATTERN.test(receipt.operationId) &&
+    typeof receipt.generationId === "string" &&
+    CONFIG_GENERATION_ID_PATTERN.test(receipt.generationId) &&
+    liveInteger(receipt.generationSequence, 0, Number.MAX_SAFE_INTEGER) &&
+    liveInteger(receipt.preparedAt, 0, Number.MAX_SAFE_INTEGER) &&
+    typeof receipt.projectionSha256 === "string" &&
+    CONFIG_HASH_PATTERN.test(receipt.projectionSha256);
+}
+
+function isFitnessLiveStructureWriteReceiptUnchecked(
+  value: unknown,
+): value is FitnessLiveStructureWriteReceipt {
+  if (!value || typeof value !== "object" || Array.isArray(value) ||
+      !jsonWithinUnits(value, LIVE_MAX_RECEIPT_JSON_UNITS)) return false;
+  const receipt = value as Partial<FitnessLiveStructureWriteReceipt>;
+  switch (receipt.kind) {
+    case "session-start":
+      return hasValidStructureReceiptBase(value, receipt.kind, ["context", "before", "after"]) &&
+        isStructureStartTransition(receipt as FitnessLiveSessionStartReceipt);
+    case "exercise-add":
+      return hasValidStructureReceiptBase(value, receipt.kind, ["context", "before", "after"]) &&
+        isStructureAddTransition(receipt as FitnessLiveExerciseAddReceipt);
+    case "exercise-complete":
+      return hasValidStructureReceiptBase(value, receipt.kind, ["before", "after"]) &&
+        isStructureCompleteTransition(receipt as FitnessLiveExerciseCompleteReceipt);
+    case "exercise-substitute":
+      return hasValidStructureReceiptBase(value, receipt.kind, ["context", "before", "after"]) &&
+        isStructureSubstituteTransition(receipt as FitnessLiveExerciseSubstituteReceipt);
+    case "session-reflection":
+      return hasValidStructureReceiptBase(value, receipt.kind, ["before", "after"]) &&
+        isStructureReflectionTransition(receipt as FitnessLiveSessionReflectionReceipt);
+    default:
+      return false;
+  }
+}
+
+export function isFitnessLiveStructureWriteReceipt(
+  value: unknown,
+): value is FitnessLiveStructureWriteReceipt {
+  try {
+    return isFitnessLiveStructureWriteReceiptUnchecked(value);
+  } catch {
+    return false;
+  }
+}
+
+async function sealStructureReceipt<Receipt extends FitnessLiveStructureWriteReceipt>(
+  draft: Omit<Receipt, "projectionSha256">,
+): Promise<Receipt> {
+  const projectionSha256 = await sha256Hex(canonicalJson(draft));
+  return { ...draft, projectionSha256 } as Receipt;
+}
+
+async function structureReceiptHashIsValid(
+  receipt: FitnessLiveStructureWriteReceipt,
+): Promise<boolean> {
+  const { projectionSha256, ...projection } = receipt;
+  return projectionSha256 === await sha256Hex(canonicalJson(projection));
+}
+
+function snapshotStructureInput<Input>(value: Input): Input {
+  try {
+    return JSON.parse(JSON.stringify(value)) as Input;
+  } catch {
+    throw structureError("invalid_input", "训练结构写入内容不能安全复制。");
+  }
+}
+
+export function createFitnessLiveStructureStorageService(
+  runtime: FitnessLiveStorageRuntime = {
+    withExclusiveLock: (operation) => withFitnessWriteLock(operation, { requireSupport: true }),
+    query: async <Result extends object>(sql: string, params?: SqlParams) => ({
+      rows: await rawQuery<Result>(sql, params),
+    }),
+    batch: (statements) => rawBatch(statements),
+    currentGeneration: () => localDb.currentGeneration(DB),
+    now: () => Date.now(),
+    randomUUID: () => crypto.randomUUID(),
+    broadcast: broadcastFitnessChange,
+  },
+) {
+  async function prepareLocked<Result>(operation: () => Promise<Result>): Promise<Result> {
+    try {
+      return await runtime.withExclusiveLock(operation);
+    } catch (error) {
+      if (error instanceof FitnessLiveStructureMutationError) throw error;
+      if (error instanceof TypeError) throw structureError("invalid_input", error.message);
+      throw structureError("inspect_failed", "暂时无法核对训练结构；没有开始写入。");
+    }
+  }
+
+  async function prepareSessionStart(
+    input: PrepareFitnessLiveSessionStartInput,
+    expected: FitnessLiveStartExpectation,
+  ): Promise<FitnessLiveSessionStartReceipt> {
+    const stableInput = snapshotStructureInput(input);
+    const stableExpected = snapshotStructureInput(expected);
+    return prepareLocked(async () => {
+      if (!stableInput || typeof stableInput !== "object" || Array.isArray(stableInput) ||
+          !isFitnessLiveStartExpectation(stableExpected) ||
+          !safeOpaqueId(stableInput.venueId) ||
+          (stableInput.eventId !== undefined && stableInput.eventId !== null &&
+            !safeOpaqueId(stableInput.eventId)) ||
+          (stableInput.programDayId !== undefined && stableInput.programDayId !== null &&
+            !safeOpaqueId(stableInput.programDayId)) ||
+          (stableInput.availableMinutes !== undefined && stableInput.availableMinutes !== null &&
+            !liveInteger(stableInput.availableMinutes, 1, 1_440)) ||
+          (stableInput.energyNote !== undefined &&
+            !["", "lower", "usual", "higher"].includes(stableInput.energyNote)) ||
+          (stableInput.sorenessNote !== undefined &&
+            typeof stableInput.sorenessNote !== "string")) {
+        throw structureError("invalid_input", "开始训练的内容或画面快照无效。");
+      }
+      const eventId = stableInput.eventId ?? null;
+      const eventProgramDayId = stableExpected.event?.program_day_id ?? null;
+      const programDayId = stableInput.programDayId ?? eventProgramDayId;
+      if (stableExpected.venue.id !== stableInput.venueId ||
+          (eventId === null ? stableExpected.event !== null : stableExpected.event?.id !== eventId) ||
+          (programDayId === null
+            ? stableExpected.programDay !== null
+            : stableExpected.programDay?.id !== programDayId) ||
+          stableExpected.programItems.some((item, index) => item.order_index !== index)) {
+        throw structureError("invalid_input", "开始训练的目标与当前画面不一致。");
+      }
+      const current = await readStructureStartExpectation(runtime, {
+        venueId: stableInput.venueId,
+        eventId,
+        programDayId,
+      });
+      if (!current || !isFitnessLiveStartExpectation(current) ||
+          !sameProjection(current, stableExpected)) {
+        throw structureError("changed", "场地、计划或日历已在别处变化；没有准备开始训练。");
+      }
+      if (current.activeSessions.length !== 0) {
+        throw structureError("changed", "已有一场进行中的训练；没有准备另一场。");
+      }
+      if (current.venue.status !== "active" ||
+          current.event !== null && current.event.status !== "planned") {
+        throw structureError("changed", "场地或日历安排已不可开始。");
+      }
+      const sorenessNote = stableInput.sorenessNote?.trim() ?? "";
+      if (!safeString(sorenessNote, 20_000)) {
+        throw structureError("invalid_input", "身体感受过长；没有准备开始训练。");
+      }
+      const generation = await readConfigGeneration(runtime);
+      const preparedAt = nextLiveTimestamp(runtime.now(), startExpectationVersions(current));
+      const sessionId = structureGeneratedId(runtime, "session-");
+      const operationId = structureGeneratedId(runtime, "fitness-live-structure-operation-");
+      const session: FitnessSession = {
+        id: sessionId,
+        event_id: eventId,
+        venue_id: current.venue.id,
+        program_day_id: programDayId,
+        started_at: preparedAt,
+        ended_at: null,
+        status: "active",
+        available_minutes: stableInput.availableMinutes ?? null,
+        energy_note: stableInput.energyNote ?? "",
+        soreness_note: sorenessNote,
+        reflection: "",
+        created_at: preparedAt,
+        updated_at: preparedAt,
+      };
+      const exercises: FitnessSessionExercise[] = [];
+      for (const [index, item] of current.programItems.entries()) {
+        const exercise = getFitnessExercise(item.exercise_id);
+        if (!exercise) throw structureError("changed", "训练日包含当前版本不识别的动作。");
+        exercises.push({
+          id: structureGeneratedId(runtime, "session-exercise-"),
+          session_id: sessionId,
+          exercise_id: item.exercise_id,
+          equipment_id: item.equipment_id,
+          planned_item_id: item.id,
+          order_index: index,
+          status: index === 0 ? "active" : "pending",
+          substituted_for_exercise_id: null,
+          substitution_reason: "",
+          equipment_snapshot: resolveStructureEquipmentSnapshot(
+            exercise,
+            current,
+            item.equipment_id,
+            item.equipment_snapshot,
+          ),
+          note: "",
+          created_at: preparedAt,
+          updated_at: preparedAt,
+        });
+      }
+      const receipt = await sealStructureReceipt<FitnessLiveSessionStartReceipt>({
+        purpose: "fitness-live-structure-write",
+        version: 1,
+        operationId,
+        ...generation,
+        preparedAt,
+        kind: "session-start",
+        context: current,
+        before: { activeSessions: current.activeSessions, event: current.event },
+        after: {
+          session,
+          exercises,
+          event: current.event === null ? null : {
+            ...current.event,
+            status: "in_progress",
+            updated_at: preparedAt,
+          },
+        },
+      });
+      if (!isFitnessLiveStructureWriteReceipt(receipt)) {
+        throw structureError("invalid_input", "无法构造可靠的开始训练回执。");
+      }
+      return receipt;
+    });
+  }
+
+  async function prepareExerciseAdd(
+    input: PrepareFitnessLiveExerciseAddInput,
+    expected: FitnessLiveAddExpectation,
+  ): Promise<FitnessLiveExerciseAddReceipt> {
+    const stableInput = snapshotStructureInput(input);
+    const stableExpected = snapshotStructureInput(expected);
+    return prepareLocked(async () => {
+      if (!stableInput || typeof stableInput !== "object" || Array.isArray(stableInput) ||
+          !isFitnessLiveAddExpectation(stableExpected) ||
+          !safeOpaqueId(stableInput.sessionId) || !safeOpaqueId(stableInput.exerciseId) ||
+          (stableInput.equipmentId !== null && !safeOpaqueId(stableInput.equipmentId)) ||
+          (stableInput.equipmentSnapshot !== undefined &&
+            typeof stableInput.equipmentSnapshot !== "string")) {
+        throw structureError("invalid_input", "新增动作的内容或画面快照无效。");
+      }
+      if (stableExpected.projection.session.id !== stableInput.sessionId) {
+        throw structureError("invalid_input", "新增动作不属于当前训练画面。");
+      }
+      const [currentProjection, currentContext] = await Promise.all([
+        readLiveSessionProjection(
+          runtime,
+          stableInput.sessionId,
+          stableExpected.projection.session.event_id,
+        ),
+        readStructureEquipmentContext(runtime, stableExpected.venue.id),
+      ]);
+      if (!isLiveSessionProjection(currentProjection) || currentProjection.session === null ||
+          !currentContext || !isFitnessLiveEquipmentContext(currentContext) ||
+          !sameProjection(publicSessionExpectation(currentProjection), stableExpected.projection) ||
+          !sameProjection(currentContext, equipmentContextOnly(stableExpected)) ||
+          currentProjection.session.status !== "active") {
+        throw structureError("changed", "训练现场或器材已在别处变化；没有准备新增动作。");
+      }
+      const currentNext = currentProjection.exercises.reduce(
+        (maximum, exercise) => Math.max(maximum, exercise.order_index + 1),
+        0,
+      );
+      if (stableExpected.nextOrderIndex !== currentNext) {
+        throw structureError("changed", "动作顺序已变化；没有准备新增动作。");
+      }
+      const exercise = getFitnessExercise(stableInput.exerciseId);
+      if (!exercise) throw structureError("invalid_input", "要新增的动作不存在。");
+      const equipmentSnapshot = resolveStructureEquipmentSnapshot(
+        exercise,
+        currentContext,
+        stableInput.equipmentId,
+        stableInput.equipmentSnapshot,
+      );
+      const generation = await readConfigGeneration(runtime);
+      const preparedAt = nextLiveTimestamp(runtime.now(), [
+        ...sessionProjectionVersions(
+          currentProjection as FitnessLiveSessionProjection & Readonly<{ session: FitnessSession }>,
+        ),
+        ...structureContextVersions(currentContext),
+      ]);
+      const exerciseId = structureGeneratedId(runtime, "session-exercise-");
+      const operationId = structureGeneratedId(runtime, "fitness-live-structure-operation-");
+      const unfinished = currentProjection.exercises.some(({ status }) =>
+        status === "active" || status === "pending");
+      const added: FitnessSessionExercise = {
+        id: exerciseId,
+        session_id: currentProjection.session.id,
+        exercise_id: stableInput.exerciseId,
+        equipment_id: stableInput.equipmentId,
+        planned_item_id: null,
+        order_index: currentNext,
+        status: unfinished ? "pending" : "active",
+        substituted_for_exercise_id: null,
+        substitution_reason: "",
+        equipment_snapshot: equipmentSnapshot,
+        note: "",
+        created_at: preparedAt,
+        updated_at: preparedAt,
+      };
+      const receipt = await sealStructureReceipt<FitnessLiveExerciseAddReceipt>({
+        purpose: "fitness-live-structure-write",
+        version: 1,
+        operationId,
+        ...generation,
+        preparedAt,
+        kind: "exercise-add",
+        context: currentContext,
+        before: currentProjection as FitnessLiveSessionProjection & Readonly<{
+          session: FitnessSession;
+        }>,
+        after: {
+          ...currentProjection,
+          session: { ...currentProjection.session, updated_at: preparedAt },
+          exercises: sortedExercises([...currentProjection.exercises, added]),
+        },
+      });
+      if (!isFitnessLiveStructureWriteReceipt(receipt)) {
+        throw structureError("invalid_input", "无法构造可靠的新增动作回执。");
+      }
+      return receipt;
+    });
+  }
+
+  async function prepareExerciseComplete(
+    input: PrepareFitnessLiveExerciseCompleteInput,
+    expected: FitnessLiveSessionExpectation,
+  ): Promise<FitnessLiveExerciseCompleteReceipt> {
+    const stableInput = snapshotStructureInput(input);
+    const stableExpected = snapshotStructureInput(expected);
+    return prepareLocked(async () => {
+      if (!stableInput || typeof stableInput !== "object" || Array.isArray(stableInput) ||
+          !isLiveSessionExpectation(stableExpected) ||
+          !safeOpaqueId(stableInput.sessionExerciseId) ||
+          (stableInput.skipped !== undefined && typeof stableInput.skipped !== "boolean")) {
+        throw structureError("invalid_input", "更新动作的内容或画面快照无效。");
+      }
+      const targetExpected = stableExpected.exercises.find(
+        ({ id }) => id === stableInput.sessionExerciseId,
+      );
+      if (!targetExpected) throw structureError("invalid_input", "目标动作不在当前训练画面。");
+      const current = await readLiveSessionProjection(
+        runtime,
+        stableExpected.session.id,
+        stableExpected.session.event_id,
+      );
+      if (!isLiveSessionProjection(current) || current.session === null ||
+          !sameProjection(publicSessionExpectation(current), stableExpected) ||
+          current.session.status !== "active") {
+        throw structureError("changed", "训练现场已在别处变化；没有准备更新动作。");
+      }
+      const target = current.exercises.find(({ id }) => id === stableInput.sessionExerciseId);
+      if (!target || target.status !== "active" ||
+          current.exercises.filter(({ status }) => status === "active").length !== 1) {
+        throw structureError("changed", "这个动作已不是可完成或跳过的状态。");
+      }
+      const targetSets = current.sets.filter(({ session_exercise_id }) =>
+        session_exercise_id === target.id);
+      const skipped = stableInput.skipped ?? false;
+      if ((skipped && targetSets.length !== 0) || (!skipped && targetSets.length === 0)) {
+        throw structureError(
+          "changed",
+          skipped ? "这个动作已有组记录，不能改写成未做。" : "这个动作还没有组记录，不能标记完成。",
+        );
+      }
+      const generation = await readConfigGeneration(runtime);
+      const preparedAt = nextLiveTimestamp(runtime.now(), sessionProjectionVersions(
+        current as FitnessLiveSessionProjection & Readonly<{ session: FitnessSession }>,
+      ));
+      const next = current.exercises
+        .filter(({ order_index, status }) =>
+          order_index > target.order_index && status === "pending")
+        .sort((left, right) => left.order_index - right.order_index ||
+          compareLiveId(left.id, right.id))[0];
+      const exercises = current.exercises.map((exercise) => {
+        if (exercise.id === target.id) return {
+          ...exercise,
+          status: skipped ? "skipped" as const : "completed" as const,
+          updated_at: preparedAt,
+        };
+        if (next && exercise.id === next.id) return {
+          ...exercise,
+          status: "active" as const,
+          updated_at: preparedAt,
+        };
+        return exercise;
+      });
+      const operationId = structureGeneratedId(runtime, "fitness-live-structure-operation-");
+      const receipt = await sealStructureReceipt<FitnessLiveExerciseCompleteReceipt>({
+        purpose: "fitness-live-structure-write",
+        version: 1,
+        operationId,
+        ...generation,
+        preparedAt,
+        kind: "exercise-complete",
+        before: current as FitnessLiveSessionProjection & Readonly<{ session: FitnessSession }>,
+        after: {
+          ...current,
+          session: { ...current.session, updated_at: preparedAt },
+          exercises,
+        },
+      });
+      if (!isFitnessLiveStructureWriteReceipt(receipt)) {
+        throw structureError("invalid_input", "无法构造可靠的动作状态回执。");
+      }
+      return receipt;
+    });
+  }
+
+  async function prepareExerciseSubstitute(
+    input: PrepareFitnessLiveExerciseSubstituteInput,
+    expected: FitnessLiveSubstituteExpectation,
+  ): Promise<FitnessLiveExerciseSubstituteReceipt> {
+    const stableInput = snapshotStructureInput(input);
+    const stableExpected = snapshotStructureInput(expected);
+    return prepareLocked(async () => {
+      if (!stableInput || typeof stableInput !== "object" || Array.isArray(stableInput) ||
+          !isFitnessLiveSubstituteExpectation(stableExpected) ||
+          !safeOpaqueId(stableInput.sessionExerciseId) || !safeOpaqueId(stableInput.exerciseId) ||
+          (stableInput.equipmentId !== null && !safeOpaqueId(stableInput.equipmentId)) ||
+          (stableInput.equipmentSnapshot !== undefined &&
+            typeof stableInput.equipmentSnapshot !== "string") ||
+          typeof stableInput.reason !== "string") {
+        throw structureError("invalid_input", "替换动作的内容或画面快照无效。");
+      }
+      const reason = stableInput.reason.trim();
+      if (!safeString(reason, 10_000)) {
+        throw structureError("invalid_input", "替换原因过长；没有准备替换动作。");
+      }
+      const [current, currentContext] = await Promise.all([
+        readLiveSessionProjection(
+          runtime,
+          stableExpected.projection.session.id,
+          stableExpected.projection.session.event_id,
+        ),
+        readStructureEquipmentContext(runtime, stableExpected.venue.id),
+      ]);
+      if (!isLiveSessionProjection(current) || current.session === null ||
+          !currentContext || !isFitnessLiveEquipmentContext(currentContext) ||
+          !sameProjection(publicSessionExpectation(current), stableExpected.projection) ||
+          !sameProjection(currentContext, equipmentContextOnly(stableExpected)) ||
+          current.session.status !== "active") {
+        throw structureError("changed", "训练现场或器材已在别处变化；没有准备替换动作。");
+      }
+      const target = current.exercises.find(({ id }) => id === stableInput.sessionExerciseId);
+      if (!target || target.status !== "active" ||
+          current.exercises.filter(({ status }) => status === "active").length !== 1 ||
+          stableInput.exerciseId === target.exercise_id ||
+          current.sets.some(({ session_exercise_id }) => session_exercise_id === target.id)) {
+        throw structureError("changed", "只有零组记录且未结束的动作可以替换。");
+      }
+      const replacement = getFitnessExercise(stableInput.exerciseId);
+      if (!replacement) throw structureError("invalid_input", "替代动作不存在。");
+      const equipmentSnapshot = resolveStructureEquipmentSnapshot(
+        replacement,
+        currentContext,
+        stableInput.equipmentId,
+        stableInput.equipmentSnapshot,
+      );
+      const generation = await readConfigGeneration(runtime);
+      const preparedAt = nextLiveTimestamp(runtime.now(), [
+        ...sessionProjectionVersions(
+          current as FitnessLiveSessionProjection & Readonly<{ session: FitnessSession }>,
+        ),
+        ...structureContextVersions(currentContext),
+      ]);
+      const exercises = current.exercises.map((exercise) => exercise.id === target.id ? {
+        ...exercise,
+        exercise_id: stableInput.exerciseId,
+        equipment_id: stableInput.equipmentId,
+        substituted_for_exercise_id:
+          exercise.substituted_for_exercise_id ?? exercise.exercise_id,
+        substitution_reason: reason,
+        equipment_snapshot: equipmentSnapshot,
+        updated_at: preparedAt,
+      } : exercise);
+      const operationId = structureGeneratedId(runtime, "fitness-live-structure-operation-");
+      const receipt = await sealStructureReceipt<FitnessLiveExerciseSubstituteReceipt>({
+        purpose: "fitness-live-structure-write",
+        version: 1,
+        operationId,
+        ...generation,
+        preparedAt,
+        kind: "exercise-substitute",
+        context: currentContext,
+        before: current as FitnessLiveSessionProjection & Readonly<{ session: FitnessSession }>,
+        after: {
+          ...current,
+          session: { ...current.session, updated_at: preparedAt },
+          exercises,
+        },
+      });
+      if (!isFitnessLiveStructureWriteReceipt(receipt)) {
+        throw structureError("invalid_input", "无法构造可靠的替换动作回执。");
+      }
+      return receipt;
+    });
+  }
+
+  async function prepareSessionReflection(
+    sessionId: string,
+    reflection: string,
+    expected: FitnessSession,
+  ): Promise<FitnessLiveSessionReflectionReceipt> {
+    const stableSessionId = snapshotStructureInput(sessionId);
+    const stableReflection = snapshotStructureInput(reflection);
+    const stableExpected = snapshotStructureInput(expected);
+    return prepareLocked(async () => {
+      const targetReflection = typeof stableReflection === "string"
+        ? stableReflection.trim()
+        : stableReflection;
+      if (!safeOpaqueId(stableSessionId) || !isFitnessLiveSession(stableExpected) ||
+          stableExpected.id !== stableSessionId ||
+          !safeString(targetReflection, 4_000) || targetReflection === stableExpected.reflection) {
+        throw structureError("invalid_input", "训练感受没有变化或内容无效。");
+      }
+      const current = await readLiveSession(runtime, stableSessionId);
+      if (!current || !sameProjection(current, stableExpected)) {
+        throw structureError("changed", "这场训练已在别处变化；没有准备覆盖训练感受。");
+      }
+      const generation = await readConfigGeneration(runtime);
+      const preparedAt = nextLiveTimestamp(runtime.now(), [
+        current.created_at,
+        current.started_at,
+        current.updated_at,
+        ...(current.ended_at === null ? [] : [current.ended_at]),
+      ]);
+      const operationId = structureGeneratedId(runtime, "fitness-live-structure-operation-");
+      const receipt = await sealStructureReceipt<FitnessLiveSessionReflectionReceipt>({
+        purpose: "fitness-live-structure-write",
+        version: 1,
+        operationId,
+        ...generation,
+        preparedAt,
+        kind: "session-reflection",
+        before: current,
+        after: { ...current, reflection: targetReflection, updated_at: preparedAt },
+      });
+      if (!isFitnessLiveStructureWriteReceipt(receipt)) {
+        throw structureError("invalid_input", "无法构造可靠的训练感受回执。");
+      }
+      return receipt;
+    });
+  }
+
+  function startTargetMatches(
+    current: FitnessSession,
+    receipt: FitnessLiveSessionStartReceipt,
+  ): boolean {
+    const target = receipt.after.session;
+    return isFitnessLiveSession(current) && current.id === target.id &&
+      current.event_id === target.event_id &&
+      current.venue_id === target.venue_id && current.program_day_id === target.program_day_id &&
+      current.started_at === target.started_at &&
+      current.available_minutes === target.available_minutes &&
+      current.energy_note === target.energy_note && current.soreness_note === target.soreness_note &&
+      current.created_at === target.created_at && current.updated_at >= target.updated_at &&
+      structureSessionLifecycleCanAdvance(target, current);
+  }
+
+  function structureSessionLifecycleCanAdvance(
+    target: FitnessSession,
+    current: FitnessSession,
+  ): boolean {
+    if (current.status === target.status && current.ended_at === target.ended_at) return true;
+    return target.status === "active" && target.ended_at === null &&
+      (current.status === "completed" || current.status === "ended_early") &&
+      current.ended_at !== null && current.ended_at >= target.updated_at &&
+      current.updated_at >= current.ended_at;
+  }
+
+  function structureExerciseStatusCanAdvance(
+    target: FitnessSessionExercise["status"],
+    current: FitnessSessionExercise["status"],
+  ): boolean {
+    if (target === "pending") {
+      return current === "pending" || current === "active" ||
+        current === "completed" || current === "skipped";
+    }
+    if (target === "active") {
+      return current === "active" || current === "completed" || current === "skipped";
+    }
+    return current === target;
+  }
+
+  function startExerciseTargetMatches(
+    current: FitnessSessionExercise,
+    target: FitnessSessionExercise,
+  ): boolean {
+    if (!isFitnessLiveExercise(current) || current.id !== target.id ||
+        current.session_id !== target.session_id ||
+        current.planned_item_id !== target.planned_item_id ||
+        current.order_index !== target.order_index || current.created_at !== target.created_at ||
+        current.updated_at < target.updated_at ||
+        !structureExerciseStatusCanAdvance(target.status, current.status)) return false;
+    if (current.note !== target.note) return false;
+    if (current.substituted_for_exercise_id === null) {
+      return current.exercise_id === target.exercise_id &&
+        current.equipment_id === target.equipment_id &&
+        current.substitution_reason === target.substitution_reason &&
+        current.equipment_snapshot === target.equipment_snapshot;
+    }
+    return current.substituted_for_exercise_id === target.exercise_id &&
+      Boolean(getFitnessExercise(current.exercise_id));
+  }
+
+  function substituteTargetMatches(
+    current: FitnessSessionExercise,
+    target: FitnessSessionExercise,
+  ): boolean {
+    return isFitnessLiveExercise(current) && current.id === target.id &&
+      current.session_id === target.session_id &&
+      current.exercise_id === target.exercise_id && current.equipment_id === target.equipment_id &&
+      current.planned_item_id === target.planned_item_id &&
+      current.order_index === target.order_index &&
+      current.substituted_for_exercise_id === target.substituted_for_exercise_id &&
+      current.substitution_reason === target.substitution_reason &&
+      current.equipment_snapshot === target.equipment_snapshot && current.note === target.note &&
+      current.created_at === target.created_at && current.updated_at >= target.updated_at &&
+      (current.status === "active" || current.status === "completed" ||
+        current.status === "skipped");
+  }
+
+  function reflectionTargetMatches(
+    current: FitnessSession,
+    target: FitnessSession,
+  ): boolean {
+    if (!isFitnessLiveSession(current) || current.id !== target.id ||
+        current.event_id !== target.event_id || current.venue_id !== target.venue_id ||
+        current.program_day_id !== target.program_day_id ||
+        current.started_at !== target.started_at ||
+        current.available_minutes !== target.available_minutes ||
+        current.energy_note !== target.energy_note ||
+        current.soreness_note !== target.soreness_note ||
+        current.reflection !== target.reflection || current.created_at !== target.created_at ||
+        current.updated_at < target.updated_at) return false;
+    return structureSessionLifecycleCanAdvance(target, current);
+  }
+
+  function structureReceiptMarkerKey(
+    receipt: FitnessLiveStructureWriteReceipt,
+  ): string {
+    return `${LIVE_STRUCTURE_RECEIPT_MARKER_PREFIX}${receipt.operationId}`;
+  }
+
+  function structureReceiptMarkerValue(
+    receipt: FitnessLiveStructureWriteReceipt,
+  ): string {
+    return canonicalJson({
+      purpose: "fitness-live-structure-receipt-marker",
+      version: 1,
+      kind: receipt.kind,
+      generationId: receipt.generationId,
+      generationSequence: receipt.generationSequence,
+      projectionSha256: receipt.projectionSha256,
+    });
+  }
+
+  async function structureReceiptMarkerState(
+    receipt: FitnessLiveStructureWriteReceipt,
+  ): Promise<"absent" | "match" | "conflict"> {
+    const rows = await liveRows<Readonly<{ value: string; updated_at: number }>>(
+      runtime,
+      "SELECT value,updated_at FROM fitness_settings WHERE key=? LIMIT 1",
+      [structureReceiptMarkerKey(receipt)],
+    );
+    const row = rows[0];
+    if (!row) return "absent";
+    return row.value === structureReceiptMarkerValue(receipt) &&
+        row.updated_at === receipt.preparedAt
+      ? "match"
+      : "conflict";
+  }
+
+  async function receiptStateUnlocked(
+    receipt: FitnessLiveStructureWriteReceipt,
+  ): Promise<Exclude<FitnessLiveStructureWriteInspection, "still_unknown" | "invalid_receipt">> {
+    const generation = await readConfigGeneration(runtime);
+    if (generation.generationId !== receipt.generationId ||
+        generation.generationSequence !== receipt.generationSequence) return "changed";
+    const markerState = await structureReceiptMarkerState(receipt);
+    if (markerState === "conflict") return "changed";
+    switch (receipt.kind) {
+      case "session-start": {
+        const currentTarget = await readLiveSession(runtime, receipt.after.session.id);
+        const targetExercises = currentTarget && startTargetMatches(currentTarget, receipt)
+          ? await Promise.all(receipt.after.exercises.map(({ id }) =>
+            readLiveExercise(runtime, id)
+          ))
+          : [];
+        const targetMatches = Boolean(currentTarget) &&
+          targetExercises.length === receipt.after.exercises.length &&
+          targetExercises.every((exercise, index) => exercise &&
+            startExerciseTargetMatches(exercise, receipt.after.exercises[index]!));
+        if (markerState === "match") {
+          return targetMatches ? "exact_saved" : "changed";
+        }
+        if (currentTarget) return "changed";
+        const current = await readStructureStartExpectation(runtime, {
+          venueId: receipt.context.venue.id,
+          eventId: receipt.context.event?.id ?? null,
+          programDayId: receipt.context.programDay?.id ?? null,
+        });
+        return current && sameProjection(current, receipt.context) ? "expected" : "changed";
+      }
+      case "exercise-add": {
+        const target = addedStructureExercise(receipt.before.exercises, receipt.after.exercises);
+        if (!target) return "changed";
+        const currentTarget = await readLiveExercise(runtime, target.id);
+        const targetMatches = Boolean(currentTarget) &&
+          startExerciseTargetMatches(currentTarget!, target);
+        if (markerState === "match") {
+          return targetMatches ? "exact_saved" : "changed";
+        }
+        if (currentTarget) return "changed";
+        const [current, context] = await Promise.all([
+          readLiveSessionProjection(
+            runtime,
+            receipt.before.session.id,
+            receipt.before.event?.id ?? null,
+          ),
+          readStructureEquipmentContext(runtime, receipt.context.venue.id),
+        ]);
+        return sameProjection(current, receipt.before) && sameProjection(context, receipt.context)
+          ? "expected"
+          : "changed";
+      }
+      case "exercise-complete": {
+        const changed = structureChangedExercises(receipt.before.exercises, receipt.after.exercises);
+        const target = changed.find(({ after }) =>
+          after.status === "completed" || after.status === "skipped");
+        if (!target) return "changed";
+        const currentTarget = await readLiveExercise(runtime, target.after.id);
+        const targetMatches = sameProjection(currentTarget, target.after);
+        if (markerState === "match") {
+          return targetMatches ? "exact_saved" : "changed";
+        }
+        const current = await readLiveSessionProjection(
+          runtime,
+          receipt.before.session.id,
+          receipt.before.event?.id ?? null,
+        );
+        return sameProjection(current, receipt.before) ? "expected" : "changed";
+      }
+      case "exercise-substitute": {
+        const target = structureChangedExercises(
+          receipt.before.exercises,
+          receipt.after.exercises,
+        )[0];
+        if (!target) return "changed";
+        const currentTarget = await readLiveExercise(runtime, target.after.id);
+        const targetMatches = Boolean(currentTarget) &&
+          substituteTargetMatches(currentTarget!, target.after);
+        if (markerState === "match") {
+          return targetMatches ? "exact_saved" : "changed";
+        }
+        const [current, context] = await Promise.all([
+          readLiveSessionProjection(
+            runtime,
+            receipt.before.session.id,
+            receipt.before.event?.id ?? null,
+          ),
+          readStructureEquipmentContext(runtime, receipt.context.venue.id),
+        ]);
+        return sameProjection(current, receipt.before) && sameProjection(context, receipt.context)
+          ? "expected"
+          : "changed";
+      }
+      case "session-reflection": {
+        const current = await readLiveSession(runtime, receipt.before.id);
+        const targetMatches = Boolean(current) && reflectionTargetMatches(
+          current!,
+          receipt.after,
+        );
+        if (markerState === "match") {
+          return targetMatches ? "exact_saved" : "changed";
+        }
+        if (current && !sameProjection(current, receipt.before)) return "changed";
+        return sameProjection(current, receipt.before) ? "expected" : "changed";
+      }
+    }
+  }
+
+  type StructurePredicate = Readonly<{ sql: string; params: readonly unknown[] }>;
+
+  function joinedPredicate(predicates: readonly StructurePredicate[]): StructurePredicate {
+    return {
+      sql: predicates.length === 0
+        ? "1"
+        : predicates.map(({ sql }) => `(${sql})`).join(" AND "),
+      params: predicates.flatMap(({ params }) => [...params]),
+    };
+  }
+
+  function sessionPredicate(row: FitnessSession): StructurePredicate {
+    return {
+      sql: `EXISTS(SELECT 1 FROM fitness_sessions WHERE id=? AND event_id IS ?
+        AND venue_id IS ? AND program_day_id IS ? AND started_at IS ? AND ended_at IS ?
+        AND status IS ? AND available_minutes IS ? AND energy_note IS ?
+        AND soreness_note IS ? AND reflection IS ? AND created_at IS ? AND updated_at IS ?)`,
+      params: [
+        row.id, row.event_id, row.venue_id, row.program_day_id, row.started_at,
+        row.ended_at, row.status, row.available_minutes, row.energy_note,
+        row.soreness_note, row.reflection, row.created_at, row.updated_at,
+      ],
+    };
+  }
+
+  function exercisePredicate(row: FitnessSessionExercise): StructurePredicate {
+    return {
+      sql: `EXISTS(SELECT 1 FROM fitness_session_exercises WHERE id=? AND session_id IS ?
+        AND exercise_id IS ? AND equipment_id IS ? AND planned_item_id IS ?
+        AND order_index IS ? AND status IS ? AND substituted_for_exercise_id IS ?
+        AND substitution_reason IS ? AND equipment_snapshot IS ? AND note IS ?
+        AND created_at IS ? AND updated_at IS ?)`,
+      params: [
+        row.id, row.session_id, row.exercise_id, row.equipment_id, row.planned_item_id,
+        row.order_index, row.status, row.substituted_for_exercise_id,
+        row.substitution_reason, row.equipment_snapshot, row.note, row.created_at,
+        row.updated_at,
+      ],
+    };
+  }
+
+  function setPredicate(row: FitnessLiveSetSnapshot): StructurePredicate {
+    return {
+      sql: `EXISTS(SELECT 1 FROM fitness_sets WHERE id=? AND session_exercise_id IS ?
+        AND set_index IS ? AND set_kind IS ? AND load_grams IS ? AND reps IS ?
+        AND duration_seconds IS ? AND rir IS ? AND rpe IS ? AND completed IS ?
+        AND pain_note IS ? AND completed_at IS ? AND client_mutation_id IS ?
+        AND created_at IS ? AND updated_at IS ?)`,
+      params: [
+        row.id, row.session_exercise_id, row.set_index, row.set_kind, row.load_grams,
+        row.reps, row.duration_seconds, row.rir, row.rpe, Number(row.completed),
+        row.pain_note, row.completed_at, row.client_mutation_id, row.created_at,
+        row.updated_at,
+      ],
+    };
+  }
+
+  function cardioPredicate(row: FitnessCardioEntry): StructurePredicate {
+    return {
+      sql: `EXISTS(SELECT 1 FROM fitness_cardio_entries WHERE id=? AND session_id IS ?
+        AND equipment_id IS ? AND mode IS ? AND duration_seconds IS ?
+        AND distance_meters IS ? AND resistance IS ? AND average_heart_rate IS ?
+        AND effort IS ? AND note IS ? AND created_at IS ?)`,
+      params: [
+        row.id, row.session_id, row.equipment_id, row.mode, row.duration_seconds,
+        row.distance_meters, row.resistance, row.average_heart_rate, row.effort,
+        row.note, row.created_at,
+      ],
+    };
+  }
+
+  function eventPredicate(row: FitnessCalendarEvent): StructurePredicate {
+    return {
+      sql: `EXISTS(SELECT 1 FROM fitness_calendar_events WHERE id=?
+        AND program_day_id IS ? AND venue_id IS ? AND title IS ? AND kind IS ?
+        AND starts_at IS ? AND occurrence_key IS ? AND planned_minutes IS ?
+        AND status IS ? AND rescheduled_from_id IS ? AND note IS ?
+        AND created_at IS ? AND updated_at IS ?)`,
+      params: [
+        row.id, row.program_day_id, row.venue_id, row.title, row.kind, row.starts_at,
+        row.occurrence_key, row.planned_minutes, row.status, row.rescheduled_from_id,
+        row.note, row.created_at, row.updated_at,
+      ],
+    };
+  }
+
+  function capabilityPredicate(row: FitnessCapability): StructurePredicate {
+    return {
+      sql: `EXISTS(SELECT 1 FROM fitness_capabilities WHERE id=?
+        AND exercise_id IS ? AND equipment_id IS ? AND source_set_id IS ?
+        AND load_grams IS ? AND reps IS ? AND rir IS ? AND rpe IS ?
+        AND confidence IS ? AND recorded_at IS ? AND created_at IS ?)`,
+      params: [
+        row.id, row.exercise_id, row.equipment_id, row.source_set_id, row.load_grams,
+        row.reps, row.rir, row.rpe, row.confidence, row.recorded_at, row.created_at,
+      ],
+    };
+  }
+
+  function sessionProjectionPredicate(
+    projection: FitnessLiveSessionProjection & Readonly<{ session: FitnessSession }>,
+  ): StructurePredicate {
+    return joinedPredicate([
+      sessionPredicate(projection.session),
+      {
+        sql: "(SELECT COUNT(*) FROM fitness_session_exercises WHERE session_id=?)=?",
+        params: [projection.session.id, projection.exercises.length],
+      },
+      ...projection.exercises.map(exercisePredicate),
+      {
+        sql: `(SELECT COUNT(*) FROM fitness_sets recorded_set
+          JOIN fitness_session_exercises exercise
+            ON exercise.id=recorded_set.session_exercise_id
+          WHERE exercise.session_id=?)=?`,
+        params: [projection.session.id, projection.sets.length],
+      },
+      ...projection.sets.map(setPredicate),
+      {
+        sql: "(SELECT COUNT(*) FROM fitness_cardio_entries WHERE session_id=?)=?",
+        params: [projection.session.id, projection.cardioEntries.length],
+      },
+      ...projection.cardioEntries.map(cardioPredicate),
+      projection.event === null ? { sql: "1", params: [] } : eventPredicate(projection.event),
+      {
+        sql: `(SELECT COUNT(*) FROM fitness_capabilities capability
+          JOIN fitness_sets recorded_set ON recorded_set.id=capability.source_set_id
+          JOIN fitness_session_exercises exercise
+            ON exercise.id=recorded_set.session_exercise_id
+          WHERE exercise.session_id=?)=?`,
+        params: [projection.session.id, projection.capabilities.length],
+      },
+      ...projection.capabilities.map(capabilityPredicate),
+    ]);
+  }
+
+  function venuePredicate(row: FitnessVenue): StructurePredicate {
+    return {
+      sql: `EXISTS(SELECT 1 FROM fitness_venues WHERE id=? AND name IS ?
+        AND venue_type IS ? AND location IS ? AND area_notes IS ? AND busy_notes IS ?
+        AND default_session_minutes IS ? AND supersets_allowed IS ? AND is_default IS ?
+        AND status IS ? AND last_verified_at IS ? AND created_at IS ? AND updated_at IS ?)`,
+      params: [
+        row.id, row.name, row.venue_type, row.location, row.area_notes, row.busy_notes,
+        row.default_session_minutes, Number(row.supersets_allowed), Number(row.is_default),
+        row.status, row.last_verified_at, row.created_at, row.updated_at,
+      ],
+    };
+  }
+
+  function equipmentPredicate(row: FitnessEquipment): StructurePredicate {
+    return {
+      sql: `EXISTS(SELECT 1 FROM fitness_equipment WHERE id=? AND venue_id IS ?
+        AND name IS ? AND kind IS ? AND area IS ? AND quantity IS ? AND status IS ?
+        AND load_mode IS ? AND load_semantics IS ? AND min_load_grams IS ?
+        AND max_load_grams IS ? AND increment_grams IS ? AND bar_weight_grams IS ?
+        AND unilateral IS ? AND busy_level IS ? AND json(settings_json)=json(?)
+        AND json(attachments_json)=json(?) AND notes IS ? AND created_at IS ?
+        AND updated_at IS ?)`,
+      params: [
+        row.id, row.venue_id, row.name, row.kind, row.area, row.quantity, row.status,
+        row.load_mode, row.load_semantics, row.min_load_grams, row.max_load_grams,
+        row.increment_grams, row.bar_weight_grams, Number(row.unilateral), row.busy_level,
+        JSON.stringify(row.settings), JSON.stringify(row.attachments), row.notes,
+        row.created_at, row.updated_at,
+      ],
+    };
+  }
+
+  function loadPredicate(row: FitnessEquipmentLoad): StructurePredicate {
+    return {
+      sql: `EXISTS(SELECT 1 FROM fitness_equipment_loads WHERE id=?
+        AND equipment_id IS ? AND load_grams IS ? AND quantity IS ? AND label IS ?
+        AND available IS ? AND created_at IS ?)`,
+      params: [
+        row.id, row.equipment_id, row.load_grams, row.quantity, row.label,
+        Number(row.available), row.created_at,
+      ],
+    };
+  }
+
+  function constraintPredicate(row: FitnessConstraint): StructurePredicate {
+    return {
+      sql: `EXISTS(SELECT 1 FROM fitness_constraints WHERE id=? AND label IS ?
+        AND body_area IS ? AND severity IS ? AND json(movement_patterns_json)=json(?)
+        AND json(exercise_ids_json)=json(?) AND note IS ? AND active IS ?
+        AND created_at IS ? AND updated_at IS ?)`,
+      params: [
+        row.id, row.label, row.body_area, row.severity,
+        JSON.stringify(row.movement_patterns), JSON.stringify(row.exercise_ids), row.note,
+        Number(row.active), row.created_at, row.updated_at,
+      ],
+    };
+  }
+
+  function equipmentContextPredicate(
+    context: FitnessLiveEquipmentContextExpectation,
+  ): StructurePredicate {
+    return joinedPredicate([
+      venuePredicate(context.venue),
+      {
+        sql: "(SELECT COUNT(*) FROM fitness_equipment WHERE venue_id=?)=?",
+        params: [context.venue.id, context.equipment.length],
+      },
+      ...context.equipment.map(equipmentPredicate),
+      {
+        sql: `(SELECT COUNT(*) FROM fitness_equipment_loads equipment_load
+          JOIN fitness_equipment equipment ON equipment.id=equipment_load.equipment_id
+          WHERE equipment.venue_id=?)=?`,
+        params: [context.venue.id, context.equipmentLoads.length],
+      },
+      ...context.equipmentLoads.map(loadPredicate),
+      {
+        sql: `(SELECT COUNT(*) FROM fitness_constraints
+          WHERE active=1 AND severity='avoid')=?`,
+        params: [context.avoidConstraints.length],
+      },
+      ...context.avoidConstraints.map(constraintPredicate),
+    ]);
+  }
+
+  function programPredicate(row: FitnessProgram): StructurePredicate {
+    return {
+      sql: `EXISTS(SELECT 1 FROM fitness_programs WHERE id=? AND name IS ?
+        AND venue_id IS ? AND goal IS ? AND split IS ? AND status IS ? AND version IS ?
+        AND source IS ? AND json(assumptions_json)=json(?) AND created_at IS ?
+        AND updated_at IS ?)`,
+      params: [
+        row.id, row.name, row.venue_id, row.goal, row.split, row.status, row.version,
+        row.source, JSON.stringify(row.assumptions), row.created_at, row.updated_at,
+      ],
+    };
+  }
+
+  function programDayPredicate(row: FitnessProgramDay): StructurePredicate {
+    return {
+      sql: `EXISTS(SELECT 1 FROM fitness_program_days WHERE id=? AND program_id IS ?
+        AND day_index IS ? AND weekday IS ? AND kind IS ? AND name IS ? AND focus IS ?
+        AND estimated_minutes IS ? AND variant IS ? AND created_at IS ?)`,
+      params: [
+        row.id, row.program_id, row.day_index, row.weekday, row.kind, row.name,
+        row.focus, row.estimated_minutes, row.variant, row.created_at,
+      ],
+    };
+  }
+
+  function programItemPredicate(row: FitnessProgramItem): StructurePredicate {
+    return {
+      sql: `EXISTS(SELECT 1 FROM fitness_program_items WHERE id=?
+        AND program_day_id IS ? AND exercise_id IS ? AND equipment_id IS ?
+        AND json(resource_equipment_ids_json)=json(?) AND order_index IS ? AND sets IS ?
+        AND rep_min IS ? AND rep_max IS ? AND duration_seconds IS ? AND target_rir IS ?
+        AND rest_seconds IS ? AND load_grams IS ? AND load_guidance IS ?
+        AND rationale IS ? AND json(substitution_exercise_ids_json)=json(?)
+        AND equipment_snapshot IS ? AND created_at IS ?)`,
+      params: [
+        row.id, row.program_day_id, row.exercise_id, row.equipment_id,
+        JSON.stringify(row.resource_equipment_ids), row.order_index, row.sets, row.rep_min,
+        row.rep_max, row.duration_seconds, row.target_rir, row.rest_seconds, row.load_grams,
+        row.load_guidance, row.rationale, JSON.stringify(row.substitution_exercise_ids),
+        row.equipment_snapshot, row.created_at,
+      ],
+    };
+  }
+
+  function startContextPredicate(context: FitnessLiveStartExpectation): StructurePredicate {
+    const predicates: StructurePredicate[] = [
+      equipmentContextPredicate(context),
+      {
+        sql: "(SELECT COUNT(*) FROM fitness_sessions WHERE status='active')=?",
+        params: [context.activeSessions.length],
+      },
+      ...context.activeSessions.map(sessionPredicate),
+      context.event === null ? { sql: "1", params: [] } : eventPredicate(context.event),
+    ];
+    if (context.program !== null && context.programDay !== null) {
+      predicates.push(
+        programPredicate(context.program),
+        programDayPredicate(context.programDay),
+        {
+          sql: "(SELECT COUNT(*) FROM fitness_program_items WHERE program_day_id=?)=?",
+          params: [context.programDay.id, context.programItems.length],
+        },
+        ...context.programItems.map(programItemPredicate),
+      );
+    }
+    return joinedPredicate(predicates);
+  }
+
+  function absentPredicate(table: string, id: string): StructurePredicate {
+    return { sql: `NOT EXISTS(SELECT 1 FROM ${table} WHERE id=?)`, params: [id] };
+  }
+
+  function receiptMarkerAbsentPredicate(
+    receipt: FitnessLiveStructureWriteReceipt,
+  ): StructurePredicate {
+    return {
+      sql: "NOT EXISTS(SELECT 1 FROM fitness_settings WHERE key=?)",
+      params: [structureReceiptMarkerKey(receipt)],
+    };
+  }
+
+  function casSentinel(predicate: StructurePredicate): SqlStatement {
+    return {
+      sql: `INSERT INTO fitness_settings(key,value,updated_at)
+        SELECT '__fitness_live_structure_cas_abort__',NULL,0 WHERE NOT (${predicate.sql})`,
+      params: predicate.params,
+    };
+  }
+
+  function insertSession(row: FitnessSession): SqlStatement {
+    return {
+      sql: `INSERT INTO fitness_sessions(
+        id,event_id,venue_id,program_day_id,started_at,ended_at,status,available_minutes,
+        energy_note,soreness_note,reflection,created_at,updated_at
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      params: [
+        row.id, row.event_id, row.venue_id, row.program_day_id, row.started_at,
+        row.ended_at, row.status, row.available_minutes, row.energy_note,
+        row.soreness_note, row.reflection, row.created_at, row.updated_at,
+      ],
+    };
+  }
+
+  function insertExercise(row: FitnessSessionExercise): SqlStatement {
+    return {
+      sql: `INSERT INTO fitness_session_exercises(
+        id,session_id,exercise_id,equipment_id,planned_item_id,order_index,status,
+        substituted_for_exercise_id,substitution_reason,equipment_snapshot,note,
+        created_at,updated_at
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      params: [
+        row.id, row.session_id, row.exercise_id, row.equipment_id, row.planned_item_id,
+        row.order_index, row.status, row.substituted_for_exercise_id,
+        row.substitution_reason, row.equipment_snapshot, row.note, row.created_at,
+        row.updated_at,
+      ],
+    };
+  }
+
+  function insertReceiptMarker(
+    receipt: FitnessLiveStructureWriteReceipt,
+  ): SqlStatement {
+    return {
+      sql: "INSERT INTO fitness_settings(key,value,updated_at) VALUES(?,?,?)",
+      params: [
+        structureReceiptMarkerKey(receipt),
+        structureReceiptMarkerValue(receipt),
+        receipt.preparedAt,
+      ],
+    };
+  }
+
+  function receiptStatements(receipt: FitnessLiveStructureWriteReceipt): SqlStatement[] {
+    switch (receipt.kind) {
+      case "session-start": {
+        const predicate = joinedPredicate([
+          startContextPredicate(receipt.context),
+          absentPredicate("fitness_sessions", receipt.after.session.id),
+          ...receipt.after.exercises.map((exercise) =>
+            absentPredicate("fitness_session_exercises", exercise.id)),
+          receiptMarkerAbsentPredicate(receipt),
+        ]);
+        return [
+          casSentinel(predicate),
+          insertSession(receipt.after.session),
+          ...receipt.after.exercises.map(insertExercise),
+          ...(receipt.after.event === null ? [] : [{
+            sql: "UPDATE fitness_calendar_events SET status='in_progress',updated_at=? WHERE id=?",
+            params: [receipt.after.event.updated_at, receipt.after.event.id],
+          }]),
+          insertReceiptMarker(receipt),
+        ];
+      }
+      case "exercise-add": {
+        const target = addedStructureExercise(receipt.before.exercises, receipt.after.exercises);
+        if (!target) throw structureError("invalid_receipt", "新增动作回执缺少目标行。", receipt);
+        return [
+          casSentinel(joinedPredicate([
+            sessionProjectionPredicate(receipt.before),
+            equipmentContextPredicate(receipt.context),
+            absentPredicate("fitness_session_exercises", target.id),
+            receiptMarkerAbsentPredicate(receipt),
+          ])),
+          insertExercise(target),
+          {
+            sql: "UPDATE fitness_sessions SET updated_at=? WHERE id=?",
+            params: [receipt.preparedAt, receipt.before.session.id],
+          },
+          insertReceiptMarker(receipt),
+        ];
+      }
+      case "exercise-complete": {
+        const changed = structureChangedExercises(receipt.before.exercises, receipt.after.exercises);
+        return [
+          casSentinel(joinedPredicate([
+            sessionProjectionPredicate(receipt.before),
+            receiptMarkerAbsentPredicate(receipt),
+          ])),
+          ...changed.map(({ after }) => ({
+            sql: "UPDATE fitness_session_exercises SET status=?,updated_at=? WHERE id=?",
+            params: [after.status, after.updated_at, after.id],
+          })),
+          {
+            sql: "UPDATE fitness_sessions SET updated_at=? WHERE id=?",
+            params: [receipt.preparedAt, receipt.before.session.id],
+          },
+          insertReceiptMarker(receipt),
+        ];
+      }
+      case "exercise-substitute": {
+        const target = structureChangedExercises(receipt.before.exercises, receipt.after.exercises)[0];
+        if (!target) throw structureError("invalid_receipt", "替换动作回执缺少目标行。", receipt);
+        return [
+          casSentinel(joinedPredicate([
+            sessionProjectionPredicate(receipt.before),
+            equipmentContextPredicate(receipt.context),
+            receiptMarkerAbsentPredicate(receipt),
+          ])),
+          {
+            sql: `UPDATE fitness_session_exercises SET exercise_id=?,equipment_id=?,
+              substituted_for_exercise_id=?,substitution_reason=?,equipment_snapshot=?,
+              updated_at=? WHERE id=?`,
+            params: [
+              target.after.exercise_id, target.after.equipment_id,
+              target.after.substituted_for_exercise_id, target.after.substitution_reason,
+              target.after.equipment_snapshot, target.after.updated_at, target.after.id,
+            ],
+          },
+          {
+            sql: "UPDATE fitness_sessions SET updated_at=? WHERE id=?",
+            params: [receipt.preparedAt, receipt.before.session.id],
+          },
+          insertReceiptMarker(receipt),
+        ];
+      }
+      case "session-reflection":
+        return [
+          casSentinel(joinedPredicate([
+            sessionPredicate(receipt.before),
+            receiptMarkerAbsentPredicate(receipt),
+          ])),
+          {
+            sql: "UPDATE fitness_sessions SET reflection=?,updated_at=? WHERE id=?",
+            params: [receipt.after.reflection, receipt.after.updated_at, receipt.after.id],
+          },
+          insertReceiptMarker(receipt),
+        ];
+    }
+  }
+
+  function receiptEntity(receipt: FitnessLiveStructureWriteReceipt): {
+    id: string;
+    updatedAt: number;
+    reason: string;
+  } {
+    switch (receipt.kind) {
+      case "session-start":
+        return { id: receipt.after.session.id, updatedAt: receipt.preparedAt, reason: "session-started" };
+      case "exercise-add":
+        return {
+          id: addedStructureExercise(receipt.before.exercises, receipt.after.exercises)?.id ??
+            receipt.before.session.id,
+          updatedAt: receipt.preparedAt,
+          reason: "session-exercise-added",
+        };
+      case "exercise-complete": {
+        const target = structureChangedExercises(receipt.before.exercises, receipt.after.exercises)
+          .find(({ after }) => after.status === "completed" || after.status === "skipped");
+        return {
+          id: target?.after.id ?? receipt.before.session.id,
+          updatedAt: receipt.preparedAt,
+          reason: "session-exercise-updated",
+        };
+      }
+      case "exercise-substitute":
+        return {
+          id: structureChangedExercises(receipt.before.exercises, receipt.after.exercises)[0]
+            ?.after.id ?? receipt.before.session.id,
+          updatedAt: receipt.preparedAt,
+          reason: "exercise-substituted",
+        };
+      case "session-reflection":
+        return {
+          id: receipt.after.id,
+          updatedAt: receipt.after.updated_at,
+          reason: "session-reflection-updated",
+        };
+    }
+  }
+
+  function safeBroadcast(reason: string): void {
+    try {
+      runtime.broadcast(reason);
+    } catch {
+      // A refresh hint cannot reverse a durable commit.
+    }
+  }
+
+  async function inspectWrite(value: unknown): Promise<FitnessLiveStructureWriteInspection> {
+    if (!isFitnessLiveStructureWriteReceipt(value)) return "invalid_receipt";
+    let receipt: FitnessLiveStructureWriteReceipt;
+    try {
+      receipt = snapshotStructureInput(value);
+    } catch {
+      return "invalid_receipt";
+    }
+    if (!isFitnessLiveStructureWriteReceipt(receipt)) return "invalid_receipt";
+    try {
+      if (!await structureReceiptHashIsValid(receipt)) return "invalid_receipt";
+    } catch {
+      return "invalid_receipt";
+    }
+    try {
+      return await runtime.withExclusiveLock(() => receiptStateUnlocked(receipt));
+    } catch {
+      return "still_unknown";
+    }
+  }
+
+  async function commitWrite(value: unknown): Promise<FitnessLiveStructureWriteResult> {
+    if (!isFitnessLiveStructureWriteReceipt(value)) {
+      throw structureError("invalid_receipt", "训练结构写入回执无效；没有改动现场记录。");
+    }
+    let receipt: FitnessLiveStructureWriteReceipt;
+    try {
+      receipt = snapshotStructureInput(value);
+    } catch {
+      throw structureError("invalid_receipt", "训练结构写入回执无效；没有改动现场记录。");
+    }
+    if (!isFitnessLiveStructureWriteReceipt(receipt)) {
+      throw structureError("invalid_receipt", "训练结构写入回执无效；没有改动现场记录。");
+    }
+    try {
+      if (!await structureReceiptHashIsValid(receipt)) {
+        throw structureError("invalid_receipt", "训练结构写入回执无效；没有改动现场记录。");
+      }
+    } catch (error) {
+      if (error instanceof FitnessLiveStructureMutationError) throw error;
+      throw structureError("invalid_receipt", "训练结构写入回执无法验证；没有改动现场记录。");
+    }
+    const entity = receiptEntity(receipt);
+    try {
+      return await runtime.withExclusiveLock(async () => {
+        const before = await receiptStateUnlocked(receipt);
+        if (before === "exact_saved") {
+          safeBroadcast(entity.reason);
+          return {
+            outcome: "already_saved",
+            receipt,
+            entityId: entity.id,
+            updatedAt: entity.updatedAt,
+          };
+        }
+        if (before === "changed") {
+          return { outcome: "changed", receipt, entityId: entity.id, retryable: false };
+        }
+        try {
+          await runtime.batch(receiptStatements(receipt));
+        } catch {
+          // The transaction may have committed even when its response was lost.
+        }
+        const after = await receiptStateUnlocked(receipt);
+        if (after === "exact_saved") {
+          safeBroadcast(entity.reason);
+          return {
+            outcome: "saved",
+            receipt,
+            entityId: entity.id,
+            updatedAt: entity.updatedAt,
+          };
+        }
+        if (after === "expected") {
+          throw structureError(
+            "write_failed",
+            "这次训练结构确定没有写入；保留回执后可以重试。",
+            receipt,
+          );
+        }
+        return { outcome: "changed", receipt, entityId: entity.id, retryable: false };
+      });
+    } catch (error) {
+      if (error instanceof FitnessLiveStructureMutationError) throw error;
+      return {
+        outcome: "outcome_uncertain",
+        receipt,
+        entityId: entity.id,
+        retryable: true,
+      };
+    }
+  }
+
+  return {
+    prepareFitnessLiveSessionStart: prepareSessionStart,
+    prepareFitnessLiveExerciseAdd: prepareExerciseAdd,
+    prepareFitnessLiveExerciseComplete: prepareExerciseComplete,
+    prepareFitnessLiveExerciseSubstitute: prepareExerciseSubstitute,
+    prepareFitnessLiveSessionReflection: prepareSessionReflection,
+    inspectFitnessLiveStructureWrite: inspectWrite,
+    commitFitnessLiveStructureWrite: commitWrite,
+  } as const;
+}
+
+const defaultFitnessLiveStructureStorageService = createFitnessLiveStructureStorageService();
+
+export const prepareFitnessLiveSessionStart =
+  defaultFitnessLiveStructureStorageService.prepareFitnessLiveSessionStart;
+export const prepareFitnessLiveExerciseAdd =
+  defaultFitnessLiveStructureStorageService.prepareFitnessLiveExerciseAdd;
+export const prepareFitnessLiveExerciseComplete =
+  defaultFitnessLiveStructureStorageService.prepareFitnessLiveExerciseComplete;
+export const prepareFitnessLiveExerciseSubstitute =
+  defaultFitnessLiveStructureStorageService.prepareFitnessLiveExerciseSubstitute;
+export const prepareFitnessLiveSessionReflection =
+  defaultFitnessLiveStructureStorageService.prepareFitnessLiveSessionReflection;
+export const inspectFitnessLiveStructureWrite =
+  defaultFitnessLiveStructureStorageService.inspectFitnessLiveStructureWrite;
+export const commitFitnessLiveStructureWrite =
+  defaultFitnessLiveStructureStorageService.commitFitnessLiveStructureWrite;
+
 function canComposePlateLoadedWeight(
   targetGrams: number,
   primary: FitnessEquipment,
