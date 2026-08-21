@@ -11,6 +11,7 @@ import {
   SHILIAN_USER_VERSION,
 } from "@/lib/schemas/shilian";
 import {
+  equipmentSupportsExercise,
   getFitnessExercise,
   requiredEquipmentQuantity,
 } from "./catalog";
@@ -750,6 +751,11 @@ async function resolveSessionEquipmentSnapshot(
       WHERE equipment_id IN (${placeholders}) ORDER BY equipment_id,load_grams`,
     ids,
   )).map(mapEquipmentLoad);
+  for (const resource of resources) {
+    if (!equipmentSupportsExercise(exercise, resource, loads)) {
+      throw new Error(`动作「${exercise.name_zh}」的器材数量不足`);
+    }
+  }
   return canonicalEquipmentSnapshot(resources, loads);
 }
 
@@ -827,21 +833,7 @@ function assertDraftReferences(
         throw new Error(`动作「${exercise.name_zh}」缺少完整器材资源`);
       }
       for (const resource of availableResources) {
-        const requiredQuantity = requiredEquipmentQuantity(exercise, resource);
-        if (resource.load_mode !== "discrete" || requiredQuantity <= 1) continue;
-        const resourceLoads = loads.filter((load) => load.equipment_id === resource.id);
-        const loadGrams = [...new Set(resourceLoads.map((load) => load.load_grams))];
-        const availableQuantity = resourceLoads.length > 0
-          ? Math.max(
-            0,
-            ...loadGrams.map(
-              (grams) => resourceLoads
-                .filter((load) => load.available && load.load_grams === grams)
-                .reduce((sum, load) => sum + load.quantity, 0),
-            ),
-          )
-          : resource.quantity;
-        if (availableQuantity < requiredQuantity) {
+        if (!equipmentSupportsExercise(exercise, resource, loads)) {
           throw new Error(`动作「${exercise.name_zh}」没有数量足够的同档器材`);
         }
       }
@@ -1293,8 +1285,9 @@ export async function substituteSessionExercise(input: {
       exercise_id: string;
       venue_id: string;
       session_id: string;
+      status: FitnessSessionExercise["status"];
     }>(
-      `SELECT se.exercise_id,s.venue_id,s.id session_id
+      `SELECT se.exercise_id,se.status,s.venue_id,s.id session_id
        FROM fitness_session_exercises se
        JOIN fitness_sessions s ON s.id=se.session_id
        WHERE se.id=? AND s.status='active'`,
@@ -1302,6 +1295,9 @@ export async function substituteSessionExercise(input: {
     ))[0];
     const replacement = getFitnessExercise(input.exerciseId);
     if (!current || !replacement) throw new Error("替代动作不可用");
+    if (current.status !== "active" && current.status !== "pending") {
+      throw new Error("只能替换尚未结束的动作");
+    }
     await assertExerciseIsAllowed(replacement);
     const priorSet = (await rawQuery<{ present: number }>(
       "SELECT 1 present FROM fitness_sets WHERE session_exercise_id=? LIMIT 1",
@@ -1314,7 +1310,7 @@ export async function substituteSessionExercise(input: {
       input.equipmentId,
       input.equipmentSnapshot,
     );
-    await rawBatch([{ sql: "UPDATE fitness_session_exercises SET exercise_id=?,equipment_id=?,status='substituted',substituted_for_exercise_id=COALESCE(substituted_for_exercise_id,?),substitution_reason=?,equipment_snapshot=?,updated_at=? WHERE id=?", params: [input.exerciseId, input.equipmentId, current.exercise_id, input.reason.trim(), snapshot, Date.now(), input.sessionExerciseId] }]);
+    await rawBatch([{ sql: "UPDATE fitness_session_exercises SET exercise_id=?,equipment_id=?,substituted_for_exercise_id=COALESCE(substituted_for_exercise_id,?),substitution_reason=?,equipment_snapshot=?,updated_at=? WHERE id=?", params: [input.exerciseId, input.equipmentId, current.exercise_id, input.reason.trim(), snapshot, Date.now(), input.sessionExerciseId] }]);
   });
 }
 

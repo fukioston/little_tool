@@ -1,4 +1,8 @@
-import { FITNESS_EXERCISES } from "./catalog";
+import {
+  FITNESS_EXERCISES,
+  equipmentResourcesForExercise,
+  requiredEquipmentQuantity,
+} from "./catalog";
 import type {
   FitnessConstraint,
   FitnessEquipment,
@@ -152,31 +156,36 @@ function activeAvoidConstraints(
   );
 }
 
+function constraintAppliesToExercise(
+  constraint: FitnessConstraint,
+  exercise: FitnessExercise,
+): boolean {
+  return constraint.exercise_ids.includes(exercise.id) ||
+    constraint.movement_patterns.includes(exercise.pattern);
+}
+
 function exerciseIsAvoided(
   exercise: FitnessExercise,
   context: Pick<FitnessPlannerContext, "constraints">,
 ): boolean {
   return activeAvoidConstraints(context).some(
-    (constraint) =>
-      constraint.exercise_ids.includes(exercise.id) ||
-      constraint.movement_patterns.includes(exercise.pattern),
+    (constraint) => constraintAppliesToExercise(constraint, exercise),
   );
 }
 
-function requiredLoadQuantity(
-  exercise: FitnessExercise,
-  equipment: FitnessEquipment,
-): number {
-  if (equipment.unilateral) return 1;
-  if (equipment.kind === "kettlebell") return 1;
-  if (equipment.kind !== "dumbbell") return 1;
-  if (
-    exercise.id.includes("one-arm") ||
-    exercise.id.includes("goblet")
-  ) {
-    return 1;
-  }
-  return 2;
+function advisoryConstraintWarnings(
+  exercises: readonly FitnessExercise[],
+  context: Pick<FitnessPlannerContext, "constraints">,
+): string[] {
+  return context.constraints
+    .filter(
+      (constraint) =>
+        constraint.active && constraint.severity !== "avoid" &&
+        exercises.some((exercise) => constraintAppliesToExercise(constraint, exercise)),
+    )
+    .map((constraint) => constraint.severity === "modify"
+      ? `身体边界「${constraint.label}」与草稿动作相关；系统没有自动推断动作幅度或负荷，开始前请按记录说明确认。`
+      : `身体边界「${constraint.label}」与草稿动作相关；它只作为现场提醒，不会被系统解释为诊断。`);
 }
 
 function discreteLoadsForExercise(
@@ -184,7 +193,7 @@ function discreteLoadsForExercise(
   equipment: FitnessEquipment,
   loads: readonly FitnessEquipmentLoad[],
 ): number[] {
-  const requiredQuantity = requiredLoadQuantity(exercise, equipment);
+  const requiredQuantity = requiredEquipmentQuantity(exercise, equipment);
   return uniqueNumbers(
     loads
       .filter(
@@ -202,38 +211,17 @@ function discreteLoadsForExercise(
   );
 }
 
-function candidateSupportsExercise(
-  exercise: FitnessExercise,
-  equipment: FitnessEquipment,
-  loads: readonly FitnessEquipmentLoad[],
-): boolean {
-  if (equipment.load_mode !== "discrete") return true;
-  const recordedLoads = loads.filter((entry) => entry.equipment_id === equipment.id);
-  if (recordedLoads.length === 0) return true;
-  return discreteLoadsForExercise(exercise, equipment, loads).length > 0;
-}
-
 function resourcesForExercise(
   exercise: FitnessExercise,
   context: FitnessPlannerContext,
 ): FitnessEquipment[] | null {
   const venueEquipment = availableEquipment(context);
-  const chosen: FitnessEquipment[] = [];
-
-  for (const requirement of exercise.requirements) {
-    const candidate = venueEquipment.find(
-      (entry) =>
-        entry.kind === requirement.kind &&
-        candidateSupportsExercise(exercise, entry, context.equipmentLoads),
-    );
-    if (!candidate) {
-      if (requirement.optional) continue;
-      return null;
-    }
-    if (!chosen.some((entry) => entry.id === candidate.id)) chosen.push(candidate);
-  }
-
-  return chosen;
+  const resources = equipmentResourcesForExercise(
+    exercise,
+    venueEquipment,
+    context.equipmentLoads,
+  );
+  return resources ? [...resources] : null;
 }
 
 function primaryEquipment(resources: readonly FitnessEquipment[]): FitnessEquipment | null {
@@ -802,6 +790,13 @@ export function buildFitnessPlanDraft(input: FitnessPlannerInput): FitnessPlanDr
     }
   }
 
+  const plannedExercises = days.flatMap((day) =>
+    day.items
+      .map((item) => exerciseById(item.exercise_id, input))
+      .filter((exercise): exercise is FitnessExercise => exercise !== null),
+  );
+  warnings.push(...advisoryConstraintWarnings(plannedExercises, input));
+
   return {
     name: input.name?.trim() || `${GOAL_LABELS[goal]} · ${SPLIT_LABELS[split]}`,
     venue_id: input.venue.id,
@@ -818,14 +813,11 @@ function resourcesSatisfyExercise(
   resources: readonly FitnessEquipment[],
   context: FitnessPlannerContext,
 ): boolean {
-  return exercise.requirements.every((requirement) => {
-    if (requirement.optional) return true;
-    return resources.some(
-      (equipment) =>
-        equipment.kind === requirement.kind &&
-        candidateSupportsExercise(exercise, equipment, context.equipmentLoads),
-    );
-  });
+  return equipmentResourcesForExercise(
+    exercise,
+    resources,
+    context.equipmentLoads,
+  ) !== null;
 }
 
 function contextWithResources(
@@ -985,6 +977,13 @@ export function validateFitnessPlanDraft(
   if (cardioDays !== frequencies.cardio) {
     errors.push(`草稿包含 ${cardioDays} 个心肺训练日，与当前设定不一致。`);
   }
+
+  const plannedExercises = draft.days.flatMap((day) =>
+    day.items
+      .map((item) => exerciseById(item.exercise_id, context))
+      .filter((exercise): exercise is FitnessExercise => exercise !== null),
+  );
+  warnings.push(...advisoryConstraintWarnings(plannedExercises, context));
 
   return {
     valid: errors.length === 0,

@@ -250,6 +250,10 @@ export function ConstraintForm({
   const patternOptions = useMemo(() => Object.entries(MOVEMENT_PATTERN_LABELS) as Array<[MovementPattern, string]>, []);
   return <form className="sl-form" onSubmit={(event) => {
     const data = submitValues(event);
+    if (patterns.length === 0 && (constraint?.exercise_ids.length ?? 0) === 0) {
+      setError("请至少选择一个受影响的动作模式；未知范围不会被保存成“全部训练”。");
+      return;
+    }
     setBusy(true); setError("");
     void onSave({
       id: constraint?.id,
@@ -265,7 +269,7 @@ export function ConstraintForm({
     <p className="sl-safety-copy strong">这里记录的是你的描述与专业人员建议，不是系统诊断。出现疼痛或异常不适时，先停止相关动作并寻求合格专业人士意见。</p>
     <div className="sl-field-grid"><label><span>怎样称呼这条边界</span><input required name="label" defaultValue={constraint?.label} placeholder="例如：右膝深屈时不舒服" /></label><label><span>身体部位（可选）</span><input name="bodyArea" defaultValue={constraint?.body_area} placeholder="右膝" /></label></div>
     <label><span>规划时如何处理</span><select name="severity" defaultValue={constraint?.severity ?? "monitor"}><option value="monitor">只提醒我留意</option><option value="modify">需要调整动作或幅度</option><option value="avoid">不要安排这些模式</option></select></label>
-    <fieldset className="sl-chip-picker compact"><legend>影响哪些动作模式？</legend>{patternOptions.filter(([id]) => id !== "cardio").map(([id, label]) => <button type="button" aria-pressed={patterns.includes(id)} className={patterns.includes(id) ? "active" : ""} key={id} onClick={() => setPatterns((current) => current.includes(id) ? current.filter((entry) => entry !== id) : [...current, id])}>{label}</button>)}</fieldset>
+    <fieldset className="sl-chip-picker compact"><legend>影响哪些动作模式？（至少一项）</legend>{patternOptions.map(([id, label]) => <button type="button" aria-pressed={patterns.includes(id)} className={patterns.includes(id) ? "active" : ""} key={id} onClick={() => setPatterns((current) => current.includes(id) ? current.filter((entry) => entry !== id) : [...current, id])}>{label}</button>)}</fieldset>
     <label><span>具体说明或专业建议（可选）</span><textarea name="note" defaultValue={constraint?.note} placeholder="例如：康复师建议暂时避免负重深屈；复查日期由我自己决定" /></label>
     {error && <p className="sl-form-error" role="alert">{error}</p>}
     <footer><button type="button" onClick={onClose}>取消</button><button className="sl-primary" disabled={busy}>{busy ? "正在保存…" : "保存身体边界"}</button></footer>

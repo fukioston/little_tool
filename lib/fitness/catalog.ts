@@ -1,6 +1,7 @@
 import type {
   EquipmentKind,
   FitnessEquipment,
+  FitnessEquipmentLoad,
   FitnessExercise,
   MovementPattern,
 } from "./types";
@@ -151,22 +152,61 @@ export function requiredEquipmentQuantity(
     : 2;
 }
 
+export function equipmentSupportsExercise(
+  exerciseDefinition: FitnessExercise,
+  equipment: FitnessEquipment,
+  loads?: readonly FitnessEquipmentLoad[],
+): boolean {
+  if (equipment.status !== "available" && equipment.status !== "limited") return false;
+  const requiredQuantity = requiredEquipmentQuantity(exerciseDefinition, equipment);
+  if (equipment.quantity < requiredQuantity) return false;
+  if (equipment.load_mode !== "discrete" || loads === undefined) return true;
+
+  const recordedLoads = loads.filter((entry) => entry.equipment_id === equipment.id);
+  if (recordedLoads.length === 0) return true;
+  const quantityByLoad = new Map<number, number>();
+  for (const load of recordedLoads) {
+    if (!load.available) continue;
+    quantityByLoad.set(
+      load.load_grams,
+      (quantityByLoad.get(load.load_grams) ?? 0) + load.quantity,
+    );
+  }
+  return [...quantityByLoad.values()].some((quantity) => quantity >= requiredQuantity);
+}
+
+export function equipmentResourcesForExercise(
+  exerciseDefinition: FitnessExercise,
+  equipment: readonly FitnessEquipment[],
+  loads?: readonly FitnessEquipmentLoad[],
+): readonly FitnessEquipment[] | null {
+  const resources: FitnessEquipment[] = [];
+  for (const requirement of exerciseDefinition.requirements) {
+    const resource = equipment.find(
+      (entry) =>
+        entry.kind === requirement.kind &&
+        equipmentSupportsExercise(exerciseDefinition, entry, loads),
+    );
+    if (!resource) {
+      if (requirement.optional) continue;
+      return null;
+    }
+    if (!resources.some((entry) => entry.id === resource.id)) resources.push(resource);
+  }
+  return resources;
+}
+
 export function exerciseFitsEquipment(
   exerciseDefinition: FitnessExercise,
   equipment: readonly FitnessEquipment[],
+  loads?: readonly FitnessEquipmentLoad[],
 ): boolean {
-  const kinds = new Set(
-    equipment
-      .filter((entry) => entry.status === "available" || entry.status === "limited")
-      .map((entry) => entry.kind),
-  );
-  return exerciseDefinition.requirements.every((requirement) =>
-    requirement.optional || kinds.has(requirement.kind),
-  );
+  return equipmentResourcesForExercise(exerciseDefinition, equipment, loads) !== null;
 }
 
 export function exercisesForVenue(
   equipment: readonly FitnessEquipment[],
+  loads?: readonly FitnessEquipmentLoad[],
 ): readonly FitnessExercise[] {
-  return FITNESS_EXERCISES.filter((entry) => exerciseFitsEquipment(entry, equipment));
+  return FITNESS_EXERCISES.filter((entry) => exerciseFitsEquipment(entry, equipment, loads));
 }

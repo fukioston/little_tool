@@ -207,6 +207,29 @@ function dumbbellInput(venueId, loads) {
   };
 }
 
+function treadmillInput(venueId) {
+  return {
+    venue_id: venueId,
+    name: "靠窗跑步机",
+    kind: "treadmill",
+    area: "心肺区",
+    quantity: 4,
+    status: "available",
+    load_mode: "range",
+    load_semantics: "resistance_level",
+    min_load_grams: null,
+    max_load_grams: null,
+    increment_grams: null,
+    bar_weight_grams: null,
+    unilateral: false,
+    busy_level: "low",
+    settings: { max_speed_kph: 18, max_incline_percent: 15 },
+    attachments: [],
+    notes: "可记录速度与坡度",
+    loads: [],
+  };
+}
+
 function load(loadGrams, label = `${loadGrams / 1000} kg`) {
   return { load_grams: loadGrams, quantity: 2, label, available: true };
 }
@@ -316,6 +339,93 @@ test("equipment catalog covers every persisted kind without duplicate templates"
   );
   for (const { kind } of catalog.EQUIPMENT_TEMPLATES) {
     if (kind !== "other") assert.ok(exerciseKinds.has(kind), kind);
+  }
+
+  const singleDumbbell = {
+    ...dumbbellInput("venue-catalog", []),
+    id: "single-db",
+    quantity: 1,
+    created_at: 0,
+    updated_at: 0,
+  };
+  const bench = {
+    ...singleDumbbell,
+    id: "bench",
+    name: "训练凳",
+    kind: "bench",
+    load_mode: "none",
+    load_semantics: "total",
+  };
+  const dumbbellRdl = catalog.getFitnessExercise("dumbbell-rdl");
+  const dumbbellBench = catalog.getFitnessExercise("dumbbell-bench");
+  const oneArmRow = catalog.getFitnessExercise("one-arm-dumbbell-row");
+  const gobletSquat = catalog.getFitnessExercise("goblet-squat");
+  assert.equal(catalog.exerciseFitsEquipment(dumbbellRdl, [singleDumbbell]), false);
+  assert.equal(catalog.exerciseFitsEquipment(dumbbellBench, [singleDumbbell, bench]), false);
+  assert.equal(catalog.exerciseFitsEquipment(oneArmRow, [singleDumbbell, bench]), true);
+  assert.equal(catalog.exerciseFitsEquipment(gobletSquat, [singleDumbbell]), true);
+  assert.equal(
+    catalog.exerciseFitsEquipment(dumbbellRdl, [{ ...singleDumbbell, unilateral: true }]),
+    true,
+  );
+  assert.equal(
+    catalog.exercisesForVenue([singleDumbbell, bench]).some(({ id }) => id === "dumbbell-rdl"),
+    false,
+  );
+});
+
+test("direct live-session writes reject bilateral work with one ordinary dumbbell", async () => {
+  const { database } = await databaseFixture();
+  try {
+    await store.initializeFitnessDatabase();
+    const venueId = await store.saveVenue(venueInput);
+    const singleDumbbellId = await store.saveEquipmentWithLoads({
+      ...dumbbellInput(venueId, [{ ...load(10000), quantity: 1 }]),
+      quantity: 1,
+    });
+    const sessionId = await store.startFitnessSession({ venueId });
+
+    await assert.rejects(
+      store.addSessionExercise(sessionId, "dumbbell-rdl", singleDumbbellId),
+      /器材数量不足/,
+    );
+    assert.equal(Number(database.selectValue("SELECT COUNT(*) FROM fitness_session_exercises")), 0);
+    const gobletId = await store.addSessionExercise(
+      sessionId,
+      "goblet-squat",
+      singleDumbbellId,
+    );
+    await assert.rejects(
+      store.substituteSessionExercise({
+        sessionExerciseId: gobletId,
+        exerciseId: "dumbbell-rdl",
+        equipmentId: singleDumbbellId,
+        reason: "尝试双手动作",
+      }),
+      /器材数量不足/,
+    );
+    assert.equal(
+      database.selectValue("SELECT exercise_id FROM fitness_session_exercises WHERE id=?", [gobletId]),
+      "goblet-squat",
+    );
+
+    const unilateralDumbbellId = await store.saveEquipmentWithLoads({
+      ...dumbbellInput(venueId, [{ ...load(12000), quantity: 1 }]),
+      name: "明确单侧使用的可调哑铃",
+      quantity: 1,
+      unilateral: true,
+    });
+    const explicitlyUnilateralId = await store.addSessionExercise(
+      sessionId,
+      "dumbbell-rdl",
+      unilateralDumbbellId,
+    );
+    assert.equal(
+      database.selectValue("SELECT status FROM fitness_session_exercises WHERE id=?", [explicitlyUnilateralId]),
+      "pending",
+    );
+  } finally {
+    database.close();
   }
 });
 
@@ -553,6 +663,139 @@ test("manual sessions support added exercises, idempotent sets, undo, and truthf
       "短一些，也是真实训练。",
     );
     assert.deepEqual(database.selectObjects("PRAGMA foreign_key_check"), []);
+  } finally {
+    database.close();
+  }
+});
+
+test("exercise substitution preserves live status and its original-exercise fact after finish", async () => {
+  const { database } = await databaseFixture();
+  try {
+    await store.initializeFitnessDatabase();
+    const venueId = await store.saveVenue(venueInput);
+    const equipmentId = await store.saveEquipmentWithLoads(
+      dumbbellInput(venueId, [load(10000)]),
+    );
+    const sessionId = await store.startFitnessSession({ venueId });
+    const activeExerciseId = await store.addSessionExercise(
+      sessionId,
+      "dumbbell-rdl",
+      equipmentId,
+    );
+    const pendingExerciseId = await store.addSessionExercise(
+      sessionId,
+      "dumbbell-rdl",
+      equipmentId,
+    );
+
+    await store.substituteSessionExercise({
+      sessionExerciseId: activeExerciseId,
+      exerciseId: "goblet-squat",
+      equipmentId,
+      reason: "硬拉区临时拥挤",
+    });
+    await store.substituteSessionExercise({
+      sessionExerciseId: pendingExerciseId,
+      exerciseId: "goblet-squat",
+      equipmentId,
+      reason: "现场改用同一只哑铃",
+    });
+
+    assert.deepEqual(
+      database.selectObjects(
+        `SELECT id,status,exercise_id,substituted_for_exercise_id,substitution_reason
+         FROM fitness_session_exercises
+         WHERE id IN (?,?) ORDER BY order_index`,
+        [activeExerciseId, pendingExerciseId],
+      ).map((row) => ({ ...row })),
+      [{
+        id: activeExerciseId,
+        status: "active",
+        exercise_id: "goblet-squat",
+        substituted_for_exercise_id: "dumbbell-rdl",
+        substitution_reason: "硬拉区临时拥挤",
+      }, {
+        id: pendingExerciseId,
+        status: "pending",
+        exercise_id: "goblet-squat",
+        substituted_for_exercise_id: "dumbbell-rdl",
+        substitution_reason: "现场改用同一只哑铃",
+      }],
+    );
+
+    await store.recordFitnessSet({
+      sessionExerciseId: pendingExerciseId,
+      setIndex: 0,
+      setKind: "warmup",
+      loadGrams: 10000,
+      reps: 10,
+      clientMutationId: "substitution-remains-recordable",
+    });
+    await store.finishFitnessSession(sessionId);
+
+    assert.deepEqual(
+      database.selectObjects(
+        `SELECT id,status,substituted_for_exercise_id,substitution_reason
+         FROM fitness_session_exercises
+         WHERE id IN (?,?) ORDER BY order_index`,
+        [activeExerciseId, pendingExerciseId],
+      ).map((row) => ({ ...row })),
+      [{
+        id: activeExerciseId,
+        status: "skipped",
+        substituted_for_exercise_id: "dumbbell-rdl",
+        substitution_reason: "硬拉区临时拥挤",
+      }, {
+        id: pendingExerciseId,
+        status: "completed",
+        substituted_for_exercise_id: "dumbbell-rdl",
+        substitution_reason: "现场改用同一只哑铃",
+      }],
+    );
+  } finally {
+    database.close();
+  }
+});
+
+test("duration-only cardio sets persist without invented repetition counts", async () => {
+  const { database } = await databaseFixture();
+  try {
+    await store.initializeFitnessDatabase();
+    const venueId = await store.saveVenue(venueInput);
+    const treadmillId = await store.saveEquipmentWithLoads(treadmillInput(venueId));
+    const sessionId = await store.startFitnessSession({ venueId });
+    const exerciseId = await store.addSessionExercise(
+      sessionId,
+      "treadmill-steady",
+      treadmillId,
+    );
+
+    const setId = await store.recordFitnessSet({
+      sessionExerciseId: exerciseId,
+      setIndex: 0,
+      durationSeconds: 1_200,
+      rpe: 5,
+      clientMutationId: "cardio-duration-only",
+    });
+
+    assert.deepEqual(
+      database.selectObjects(
+        "SELECT id,reps,duration_seconds,load_grams,rpe,completed FROM fitness_sets WHERE id=?",
+        [setId],
+      ).map((row) => ({ ...row })),
+      [{
+        id: setId,
+        reps: null,
+        duration_seconds: 1_200,
+        load_grams: null,
+        rpe: 5,
+        completed: 1,
+      }],
+    );
+    assert.equal(
+      database.selectValue("SELECT status FROM fitness_session_exercises WHERE id=?", [exerciseId]),
+      "active",
+    );
   } finally {
     database.close();
   }

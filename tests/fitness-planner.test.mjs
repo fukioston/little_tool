@@ -127,6 +127,7 @@ function standardEquipment() {
     equipment("bench-a", "bench"),
     equipment("rack-a", "rack"),
     equipment("db-a", "dumbbell", "venue-a", {
+      quantity: 20,
       load_mode: "discrete",
       load_semantics: "per_hand",
       min_load_grams: 5000,
@@ -187,6 +188,47 @@ test("discrete loads never invent 8 kg and respect bilateral dumbbell quantity",
   );
   assert.equal(options.includes(8000), false);
   assert.equal(options.includes(12000), false, "one dumbbell is not a bilateral pair");
+});
+
+test("one ordinary dumbbell excludes bilateral work while one-arm work remains feasible", () => {
+  const bilateral = {
+    id: "test-dumbbell-rdl",
+    name_zh: "测试哑铃硬拉",
+    name_en: "Test dumbbell RDL",
+    pattern: "hinge",
+    primary_muscles: ["legs"],
+    secondary_muscles: [],
+    requirements: [{ kind: "dumbbell" }],
+    difficulty: "beginner",
+    setup_cues: [],
+    safety_note: "",
+  };
+  const oneArm = {
+    ...bilateral,
+    id: "test-one-arm-dumbbell-row",
+    name_zh: "测试单臂哑铃划船",
+    name_en: "Test one-arm dumbbell row",
+    pattern: "horizontal_pull",
+  };
+  const singleDumbbell = equipment("single-db", "dumbbell", "venue-a", {
+    quantity: 1,
+    load_mode: "discrete",
+    load_semantics: "per_hand",
+  });
+  const input = context({
+    exercises: [bilateral, oneArm],
+    equipment: [singleDumbbell],
+    equipmentLoads: [load("single-db-10", "single-db", 10, 1)],
+    profile: profile({ resistance_days_per_week: 1, cardio_days_per_week: 0 }),
+  });
+
+  const draft = planner.buildFitnessPlanDraft(input);
+  const exerciseIds = draft.days.flatMap((day) =>
+    day.items.map((item) => item.exercise_id)
+  );
+  assert.equal(exerciseIds.includes(bilateral.id), false);
+  assert.equal(exerciseIds.includes(oneArm.id), true);
+  assert.equal(planner.validateFitnessPlanDraft(draft, input).valid, true);
 });
 
 test("barbell totals use symmetric pairs without exceeding plate inventory", () => {
@@ -255,6 +297,34 @@ test("avoid constraints filter both primary and substitute exercises", () => {
   assert.equal(ids.includes("bodyweight-squat"), false);
   assert.equal(ids.some((id) => id.includes("push-up") || id.includes("press")), false);
   assert.equal(planner.validateFitnessPlanDraft(draft, input).valid, true);
+});
+
+test("modify and monitor boundaries stay visible without inventing an adjustment", () => {
+  const makeConstraint = (id, severity, pattern) => ({
+    id,
+    label: id === "modify-push" ? "肩部推举需调整" : "心肺时留意呼吸",
+    body_area: "",
+    severity,
+    movement_patterns: [pattern],
+    exercise_ids: [],
+    note: "按自己的已知边界确认",
+    active: true,
+    created_at: NOW,
+    updated_at: NOW,
+  });
+  const input = context({
+    constraints: [
+      makeConstraint("modify-push", "modify", "horizontal_push"),
+      makeConstraint("monitor-cardio", "monitor", "cardio"),
+    ],
+  });
+  const draft = planner.buildFitnessPlanDraft(input);
+  assert.match(draft.warnings.join(" "), /肩部推举需调整.*没有自动推断动作幅度或负荷/);
+  assert.match(draft.warnings.join(" "), /心肺时留意呼吸.*只作为现场提醒/);
+  const validation = planner.validateFitnessPlanDraft(draft, input);
+  assert.equal(validation.valid, true);
+  assert.match(validation.warnings.join(" "), /肩部推举需调整/);
+  assert.match(validation.warnings.join(" "), /心肺时留意呼吸/);
 });
 
 test("switching venue never reuses equipment from the previous venue", () => {
