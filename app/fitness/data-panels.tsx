@@ -4,9 +4,6 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Image from "next/image";
 import {
   exportCompleteFitnessBackup,
-  isCompleteFitnessBackup,
-  restoreCompleteFitnessBackup,
-  restoreLegacyFitnessDatabase,
 } from "@/lib/fitness/backup";
 import {
   deleteFitnessFileSafely,
@@ -38,6 +35,7 @@ import {
   type FitnessFileOperationJournal,
   type FitnessFileOperationToken,
 } from "./file-operation-journal";
+import { FitnessBackupFlow } from "./FitnessBackupFlow";
 
 function message(reason: unknown): string {
   return reason instanceof Error ? reason.message : "操作没有完成，现有数据未被静默覆盖。";
@@ -800,63 +798,28 @@ export function EquipmentPhotos({
 }
 
 export function FitnessDataControls({ onRestored }: { onRestored: () => Promise<void> }) {
-  const input = useRef<HTMLInputElement>(null);
-  const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState("");
-  const [error, setError] = useState("");
 
-  const exportBackup = async () => {
-    if (busy) return;
-    setBusy(true); setError(""); setStatus("");
-    try {
-      const result = await exportCompleteFitnessBackup();
-      const url = URL.createObjectURL(result.blob);
-      const anchor = document.createElement("a");
-      anchor.href = url; anchor.download = result.fileName;
-      document.body.append(anchor); anchor.click(); anchor.remove();
-      window.setTimeout(() => URL.revokeObjectURL(url), 10_000);
-      setStatus(`完整备份已交给浏览器下载，包含 ${result.fileCount} 个附件；请确认下载目录中出现文件。`);
-    } catch (reason) {
-      setError(message(reason));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const restore = async (file: File | undefined) => {
-    if (!file || busy) return;
-    setBusy(true); setError(""); setStatus("");
-    try {
-      const complete = await isCompleteFitnessBackup(file);
-      const confirmed = window.confirm(complete
-        ? "恢复这份适练完整备份吗？通过全部校验后才会一次切换。系统不会为当前资料自动生成可下载的回滚副本；如需保留，请先取消并下载当前完整备份。"
-        : "这份文件不是适练完整备份。确认后会尝试把它作为旧版 SQLite 校验；不兼容时不会切换。旧版不含器材照片，恢复时会清空失效附件引用；如需保留当前资料，请先取消并下载完整备份。继续吗？");
-      if (!confirmed) return;
-      if (complete) {
-        const result = await restoreCompleteFitnessBackup(file);
-        setStatus(`已切换到 ${result.exportedAt.slice(0, 10)} 的完整备份，${result.fileCount} 个附件已逐项校验。`);
-      } else {
-        await restoreLegacyFitnessDatabase(file);
-        setStatus("旧版 SQLite 数据已恢复；它不包含附件，原附件引用未被伪装成可用文件。");
-      }
-      try {
-        await onRestored();
-      } catch {
-        setError("备份已经恢复，但页面没有重新读取成功。请刷新页面，不要重复恢复同一文件。");
-      }
-    } catch (reason) {
-      setError(message(reason));
-    } finally {
-      setBusy(false);
-      if (input.current) input.current.value = "";
-    }
+  const exportBackup = async (): Promise<string> => {
+    const result = await exportCompleteFitnessBackup();
+    const url = URL.createObjectURL(result.blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = result.fileName;
+    document.body.append(anchor);
+    anchor.click();
+    anchor.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 10_000);
+    return `完整备份已交给浏览器下载，包含 ${result.fileCount} 个已校验附件；请确认下载目录中出现文件。`;
   };
 
   return <div className="sl-data-controls">
-    <div><button disabled={busy} onClick={() => void exportBackup()}>{busy ? "正在校验…" : "下载完整备份"}</button><button disabled={busy} onClick={() => input.current?.click()}>从备份恢复</button></div>
-    <input ref={input} hidden type="file" accept=".fitness-backup,.sqlite3,application/vnd.shilian.fitness-backup,application/x-sqlite3" onChange={(event) => void restore(event.target.files?.[0])}/>
-    <p>完整备份包含 SQLite 数据与已校验附件，不含 DeepSeek Key。恢复先写入候选版本，全部通过后才切换。</p>
+    <FitnessBackupFlow
+      onExport={exportBackup}
+      onRefreshActivated={onRestored}
+      onNotice={setStatus}
+    />
+    <p>完整备份是未加密的私人文件，包含 SQLite 数据与已校验附件，不含 DeepSeek Key。请保存在受信任的位置；选择恢复文件后，只有你确认启用才会切换。</p>
     {status && <p className="sl-data-status" role="status">{status}</p>}
-    {error && <p className="sl-form-error" role="alert">{error}</p>}
   </div>;
 }
