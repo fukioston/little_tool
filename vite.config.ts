@@ -66,6 +66,10 @@ export default defineConfig(async () => {
       cloudflare({
         viteEnvironment: { name: "rsc", childEnvironments: ["ssr"] },
         config: localBindingConfig,
+        // The private local preview does not need a remotely reachable Worker
+        // inspector. Disabling it also keeps the preview loopback-only inside
+        // constrained desktop environments.
+        inspectorPort: false,
       }),
     ],
   };
