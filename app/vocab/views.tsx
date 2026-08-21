@@ -4,6 +4,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type SyntheticEvent } from "react";
 import { createLocalFileObjectUrl, type LocalStorageEstimate } from "@/lib/local-db/files";
 import { adjacentSentence, formatDuration, formatShortDate, sentenceContext, wordAt, wordRanges } from "@/lib/vocab/content";
+import { resolveReviewRound, restoreUndoneCardToRound, startReviewRound } from "@/lib/vocab/review-round";
 import { getDueCards, recordStudySeconds } from "@/lib/vocab/store";
 import { scheduleReviewV2 } from "@/lib/vocab/srs";
 import type { ContentBlock, Lexeme, LibraryItem, Occurrence, ReviewCard, ReviewRating, SelectionTarget, TranscriptSegment, VocabSettings, VocabSnapshot, VocabView } from "@/lib/vocab/types";
@@ -61,10 +62,11 @@ export function TodayView({ snapshot, due, onOpen, onGo, onImport, onWord }: { s
   const today = localDayKey();
   const activity = snapshot.activity.find((entry) => entry.day === today);
   const minutes = Math.round(((activity?.read_seconds ?? 0) + (activity?.listen_seconds ?? 0)) / 60);
+  const hasDue = due > 0;
   return <div className="sc-page sc-today">
     <section className="sc-hero"><div><span className="sc-eyebrow">{new Intl.DateTimeFormat("zh-CN", { month: "long", day: "numeric", weekday: "long" }).format(new Date())}</span><h1>{greeting}。<br/><em>今天想拾起什么？</em></h1><p>从英文原文里理解词，也把它放回真正的语境里记住。</p></div><button className="sc-pick-orb" onClick={onImport}><i>＋</i><span>导入<br/>新内容</span></button></section>
     {resume ? <button className="sc-resume" onClick={() => onOpen(resume)}><div className={`sc-resume-art ${resume.kind}`}><span>{resume.kind === "article" ? "READ" : "LISTEN"}</span><strong>{resume.title.slice(0, 1)}</strong><i style={{ height: `${Math.max(8, resume.progress * 100)}%` }}/></div><div className="sc-resume-copy"><span>继续{resume.kind === "article" ? "阅读" : "收听"}</span><h2>{resume.title}</h2><p>{resume.description}</p><footer><b>{Math.round(resume.progress * 100)}%</b><i><em style={{ width: `${resume.progress * 100}%` }}/></i><strong>继续 →</strong></footer></div></button> : <EmptyState title="资料库还是空的" copy="导入一篇英文文章或一期播客，从第一个词开始。" action={<button onClick={onImport}>导入内容</button>} />}
-    <section className="sc-today-grid"><button className="sc-review-callout" onClick={() => onGo("review")}><header><span>回到语境</span><small>有空时再继续</small></header><div><strong>{due}</strong><span>{due ? "个词现在适合再看一遍" : "现在没有需要回看的词"}</span></div><footer>{due ? "开始这一轮" : "浏览词库"}<b>→</b></footer></button><article className="sc-focus-card"><header><span>今天的记录</span><small>只陈述真实发生的时间</small></header><div className="sc-focus-fact"><strong>{minutes}</strong><small>分钟</small></div><footer><span>阅读 {Math.round((activity?.read_seconds ?? 0) / 60)} 分</span><span>收听 {Math.round((activity?.listen_seconds ?? 0) / 60)} 分</span></footer></article></section>
+    <section className="sc-today-grid"><button className="sc-review-callout" onClick={() => onGo(hasDue ? "review" : "words")}><header><span>回到语境</span><small>有空时再继续</small></header><div><strong>{hasDue ? "一小轮" : "随时"}</strong><span>{hasDue ? "有词适合再看一遍" : "现在没有适合回看的词"}</span></div><footer>{hasDue ? "开始一小轮" : "浏览词库"}<b>→</b></footer></button><article className="sc-focus-card"><header><span>今天的记录</span><small>只陈述真实发生的时间</small></header><div className="sc-focus-fact"><strong>{minutes}</strong><small>分钟</small></div><footer><span>阅读 {Math.round((activity?.read_seconds ?? 0) / 60)} 分</span><span>收听 {Math.round((activity?.listen_seconds ?? 0) / 60)} 分</span></footer></article></section>
     <section className="sc-section-head"><div><span className="sc-eyebrow">RECENTLY PICKED</span><h2>最近拾起的词</h2></div><button onClick={() => onGo("words")}>查看全部 →</button></section>
     {snapshot.lexemes.length ? <div className="sc-word-ribbon">{snapshot.lexemes.slice(0, 4).map((word, index) => <button key={word.id} onClick={() => onWord(word.id)}><small>{String(index + 1).padStart(2, "0")}</small><strong>{word.headword}</strong><span>{word.pronunciation || "pronunciation pending"}</span><p>{word.gloss_en || "Explanation pending"}</p></button>)}</div> : <EmptyState title="词会从语境里自然留下" copy="读到想理解的词时点一下；是否保存，由你决定。" />}
   </div>;
@@ -306,20 +308,207 @@ export function WordsView({ lexemes, occurrences, onOpen, onStar }: { lexemes: L
   return <div className="sc-page sc-words-page"><header className="sc-page-title"><div><span className="sc-eyebrow">WORDS IN CONTEXT</span><h1>词库</h1><p>{lexemes.length} 个英文词，来自 {new Set(occurrences.map((item)=>item.item_id).filter(Boolean)).size} 份语境。</p></div></header><div className="sc-toolbar"><label className="sc-search">⌕<input value={query} onChange={(event)=>setQuery(event.target.value)} placeholder="搜索单词、发音或英文释义"/></label><div className="sc-segmented">{([['all','全部'],['learning','学习中'],['known','已掌握'],['starred','收藏']] as const).map(([id,label])=><button aria-pressed={filter===id} key={id} className={filter===id?"active":""} onClick={()=>setFilter(id)}>{label}</button>)}</div></div>{visible.length?<div className="sc-word-table"><div className="sc-word-table-head"><span>单词</span><span>英文释义</span><span>出现</span><span>状态</span><span/></div>{visible.map((word)=><article key={word.id}><button className="sc-star" onClick={()=>onStar(word)} aria-label={word.starred?"取消收藏":"收藏单词"}>{word.starred?"◆":"◇"}</button><button className="sc-word-open" onClick={()=>onOpen(word.id)}><span className="sc-word-name"><strong>{word.headword}</strong><span>{word.pronunciation||"Pronunciation pending"}</span></span><span className="sc-word-gloss">{word.gloss_en||"No explanation yet"}</span><b>{word.occurrence_count}</b><i className={`status-${word.status}`}>{word.status==="learning"?"学习中":word.status==="known"?"已掌握":word.status==="ignored"?"已忽略":"已保存"}</i><span className="sc-row-arrow">→</span></button></article>)}</div>:<EmptyState title="没有符合条件的词" copy="试试别的搜索，或回到英文原文里拾起一个词。"/>}</div>;
 }
 
-export function ReviewView({ cards, onRate, onUndo }: { cards: ReviewCard[]; onRate: (card:ReviewCard,rating:ReviewRating)=>Promise<string>; onUndo:(id:string)=>Promise<void> }) {
-  const [reviewClock,setReviewClock]=useState(()=>Date.now()); const due=getDueCards(cards,reviewClock); const [revealed,setRevealed]=useState(false); const [busy,setBusy]=useState(false); const [reviewed,setReviewed]=useState(0); const [lastEvent,setLastEvent]=useState<string|null>(null); const card=due[0]??null;
-  const submit=useCallback(async(rating:ReviewRating)=>{if(!card||busy)return;setBusy(true);try{setLastEvent(await onRate(card,rating));setReviewed((n)=>n+1);setRevealed(false);setReviewClock(Date.now());}finally{setBusy(false);}},[busy,card,onRate]);
-  useEffect(()=>{const key=(event:KeyboardEvent)=>{if(isInteractiveTarget(event.target))return;if(event.key===" "&&card&&!revealed){event.preventDefault();setRevealed(true);}if(revealed&&["1","2","3","4"].includes(event.key)){const ratings:ReviewRating[]=["again","hard","good","easy"];void submit(ratings[Number(event.key)-1]);}};window.addEventListener("keydown",key);return()=>window.removeEventListener("keydown",key);},[card,revealed,submit]);
-  if(!card)return <div className="sc-page sc-review-complete"><span>✓</span><h1>这一轮到这里</h1><p>{reviewed?`刚刚回看了 ${reviewed} 个英文词。`:"现在没有适合回看的词，也可以去读一点新的内容。"}</p>{lastEvent&&<button onClick={async()=>{await onUndo(lastEvent);setLastEvent(null);setReviewed((n)=>Math.max(0,n-1));}}>↶ 撤销上次评分</button>}</div>;
-  const nextLabel=(rating:ReviewRating)=>{const delay=scheduleReviewV2(card,rating,reviewClock).due_at-reviewClock;if(delay<3_600_000)return`${Math.max(1,Math.round(delay/60_000))} 分钟`;if(delay<172_800_000)return`${Math.max(1,Math.round(delay/3_600_000))} 小时`;return`${Math.max(1,Math.round(delay/86_400_000))} 天`;};
-  const total=reviewed+due.length; return <div className="sc-page sc-review-page"><header><div><span className="sc-eyebrow">BACK TO CONTEXT</span><h1>回到语境</h1></div><div><strong>{reviewed}</strong><span>/ {total}</span></div></header><div className="sc-review-progress"><i style={{width:`${reviewed/Math.max(1,total)*100}%`}}/></div><section className={`sc-review-card ${revealed?"revealed":""}`}><span className="sc-card-label">{revealed?"解释":"还记得这个语境吗？"}</span><h2>{card.headword}</h2><p className="sc-pronunciation">{revealed?card.pronunciation:""}</p><div className="sc-cloze">“{card.cloze_sentence||`Recall “${card.headword}” in context.`}”</div>{!revealed?<button className="sc-reveal" onClick={()=>setRevealed(true)}>查看解释 <kbd>Space</kbd></button>:<div className="sc-answer"><strong>{card.gloss_en||"No definition yet"}</strong><p>{card.context_sentence}</p></div>}</section>{revealed&&<div className="sc-ratings">{([['again','再看一次','1'],['hard','有点难','2'],['good','记得','3'],['easy','很熟','4']] as const).map(([id,label,key])=><button key={id} className={id} disabled={busy} onClick={()=>void submit(id)}><span>{label}</span><small>{nextLabel(id)}</small><kbd>{key}</kbd></button>)}</div>}<footer className="sc-review-footer"><span>{Math.max(0,due.length-1)} 个词可以继续回看</span>{lastEvent&&<button onClick={async()=>{await onUndo(lastEvent);setLastEvent(null);setReviewed((n)=>Math.max(0,n-1));setReviewClock(Date.now());}}>↶ 撤销上一次</button>}</footer></div>;
+type ReviewViewProps = {
+  cards: ReviewCard[];
+  onRate: (card: ReviewCard, rating: ReviewRating) => Promise<string>;
+  onUndo: (id: string) => Promise<void>;
+  onGo: (view: VocabView) => void;
+};
+
+export function ReviewView({ cards, onRate, onUndo, onGo }: ReviewViewProps) {
+  const [reviewClock, setReviewClock] = useState(() => Date.now());
+  const due = getDueCards(cards, reviewClock);
+  const [roundIds, setRoundIds] = useState(() => startReviewRound(due));
+  const [revealed, setRevealed] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [reviewed, setReviewed] = useState(0);
+  const [lastEvent, setLastEvent] = useState<string | null>(null);
+  const [lastRatedCard, setLastRatedCard] = useState<ReviewCard | null>(null);
+  const [locallyRatedVersions, setLocallyRatedVersions] = useState<Record<string, number>>({});
+  const [locallyRestoredCard, setLocallyRestoredCard] = useState<ReviewCard | null>(null);
+  const [error, setError] = useState("");
+  const [announcement, setAnnouncement] = useState("");
+  const revealButton = useRef<HTMLButtonElement>(null);
+  const completeHeading = useRef<HTMLHeadingElement>(null);
+  const handOffFocus = useRef(false);
+  const focusAnnouncement = useRef("");
+  const availableDue = due.filter((dueCard) => {
+    const beforeVersion = locallyRatedVersions[dueCard.id];
+    return beforeVersion === undefined || dueCard.updated_at !== beforeVersion;
+  });
+  const roundSource = locallyRestoredCard && !availableDue.some(({ id }) => id === locallyRestoredCard.id)
+    ? [locallyRestoredCard, ...availableDue]
+    : availableDue;
+  const round = resolveReviewRound(roundSource, roundIds);
+  const card = round[0] ?? null;
+
+  const submit = useCallback(async (rating: ReviewRating) => {
+    if (!card || busy) return;
+    setBusy(true);
+    setError("");
+    try {
+      const eventId = await onRate(card, rating);
+      setLastEvent(eventId);
+      setLastRatedCard(card);
+      setLocallyRatedVersions((current) => ({ ...current, [card.id]: card.updated_at }));
+      setLocallyRestoredCard((current) => current?.id === card.id ? null : current);
+      setRoundIds((current) => current.filter((id) => id !== card.id));
+      setReviewed((count) => count + 1);
+      setRevealed(false);
+      setReviewClock(Date.now());
+      focusAnnouncement.current = "";
+      handOffFocus.current = true;
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "这次评分还没有保存，请保持当前选择后重试。");
+    } finally {
+      setBusy(false);
+    }
+  }, [busy, card, onRate]);
+
+  const undoLast = useCallback(async () => {
+    if (!lastEvent || busy) return;
+    setBusy(true);
+    setError("");
+    try {
+      await onUndo(lastEvent);
+      if (lastRatedCard) {
+        setRoundIds((current) => restoreUndoneCardToRound(current, lastRatedCard.id));
+        setLocallyRatedVersions((current) => {
+          const next = { ...current };
+          delete next[lastRatedCard.id];
+          return next;
+        });
+        setLocallyRestoredCard(lastRatedCard);
+      }
+      setLastEvent(null);
+      setLastRatedCard(null);
+      setReviewed((count) => Math.max(0, count - 1));
+      setRevealed(false);
+      setReviewClock(Date.now());
+      focusAnnouncement.current = "已撤销上一次评分。";
+      handOffFocus.current = true;
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "暂时无法撤销，上一次评分没有被改动。");
+    } finally {
+      setBusy(false);
+    }
+  }, [busy, lastEvent, lastRatedCard, onUndo]);
+
+  const startAnotherRound = () => {
+    setRoundIds(startReviewRound(roundSource));
+    setReviewed(0);
+    setRevealed(false);
+    setError("");
+    focusAnnouncement.current = "新的一小轮已经开始。";
+    handOffFocus.current = true;
+  };
+
+  useEffect(() => {
+    if (!handOffFocus.current || busy) return;
+    const frame = window.requestAnimationFrame(() => {
+      const target = card ? revealButton.current : completeHeading.current;
+      if (!target) return;
+      target.focus({ preventScroll: true });
+      setAnnouncement(
+        focusAnnouncement.current || (card
+          ? "已记录，下一张可以开始。"
+          : "已记录，这一小轮到这里。"),
+      );
+      focusAnnouncement.current = "";
+      handOffFocus.current = false;
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [busy, card]);
+
+  useEffect(() => {
+    const key = (event: KeyboardEvent) => {
+      if (isInteractiveTarget(event.target)) return;
+      if (event.key === " " && card && !revealed) {
+        event.preventDefault();
+        setRevealed(true);
+      }
+      if (revealed && ["1", "2", "3", "4"].includes(event.key)) {
+        const ratings: ReviewRating[] = ["again", "hard", "good", "easy"];
+        void submit(ratings[Number(event.key) - 1]);
+      }
+    };
+    window.addEventListener("keydown", key);
+    return () => window.removeEventListener("keydown", key);
+  }, [card, revealed, submit]);
+
+  if (!card) {
+    const startedEmpty = roundIds.length === 0 && reviewed === 0;
+    return <div className="sc-page sc-review-complete">
+      <span aria-hidden="true">{startedEmpty ? "○" : "✓"}</span>
+      <h1 ref={completeHeading} tabIndex={-1}>{startedEmpty ? "现在没有适合回看的词" : "这一小轮到这里"}</h1>
+      <p>{startedEmpty
+        ? "不需要凑数量。想读一点新的内容可以，先停在这里也可以。"
+        : `刚刚回看了 ${reviewed} 个词。${roundSource.length ? "其他词会留在原处，想继续时再来。" : "现在可以停下，合适的时候再回来。"}`}</p>
+      {error && <div className="sc-review-error" role="alert">{error}</div>}
+      <div className="sc-review-complete-actions">
+        <button onClick={() => onGo("today")}>{startedEmpty ? "回到今日" : "先停在这里"}</button>
+        {startedEmpty
+          ? <button className="primary" onClick={() => onGo("library")}>去资料库</button>
+          : roundSource.length > 0 && <button className="primary" onClick={startAnotherRound}>再来一小轮</button>}
+        {lastEvent && <button disabled={busy} onClick={() => void undoLast()}>↶ 撤销上次评分</button>}
+      </div>
+      <div className="sc-visually-hidden" role="status" aria-live="polite">{announcement}</div>
+    </div>;
+  }
+
+  const nextLabel = (rating: ReviewRating) => {
+    const delay = scheduleReviewV2(card, rating, reviewClock).due_at - reviewClock;
+    if (delay < 3_600_000) return `${Math.max(1, Math.round(delay / 60_000))} 分钟`;
+    if (delay < 172_800_000) return `${Math.max(1, Math.round(delay / 3_600_000))} 小时`;
+    return `${Math.max(1, Math.round(delay / 86_400_000))} 天`;
+  };
+
+  return <div className="sc-page sc-review-page">
+    <header><div><span className="sc-eyebrow">BACK TO CONTEXT</span><h1>这一小轮</h1></div><div className="sc-review-pause"><strong>随时停</strong><span>已记录的评分会留在本机</span></div></header>
+    <section className={`sc-review-card ${revealed ? "revealed" : ""}`}><span className="sc-card-label">{revealed ? "解释" : "还记得这个语境吗？"}</span><h2>{card.headword}</h2><p className="sc-pronunciation">{revealed ? card.pronunciation : ""}</p><div className="sc-cloze">“{card.cloze_sentence || `Recall “${card.headword}” in context.`}”</div>{!revealed ? <button ref={revealButton} className="sc-reveal" onClick={() => setRevealed(true)}>查看解释 <kbd>Space</kbd></button> : <div className="sc-answer"><strong>{card.gloss_en || "No definition yet"}</strong><p>{card.context_sentence}</p></div>}</section>
+    {revealed && <div className="sc-ratings">{([['again', '再看一次', '1'], ['hard', '有点难', '2'], ['good', '记得', '3'], ['easy', '很熟', '4']] as const).map(([id, label, key]) => <button key={id} className={id} disabled={busy} onClick={() => void submit(id)}><span>{label}</span><small>{nextLabel(id)}</small><kbd>{key}</kbd></button>)}</div>}
+    {error && <div className="sc-review-error" role="alert">{error}</div>}
+    <footer className="sc-review-footer"><span>随时停在这里，下次会从仍适合回看的词继续。</span>{lastEvent && <button disabled={busy} onClick={() => void undoLast()}>↶ 撤销上一次</button>}</footer>
+    <div className="sc-visually-hidden" role="status" aria-live="polite">{announcement}</div>
+  </div>;
 }
 
 export function StatsView({ snapshot }: { snapshot: VocabSnapshot }) {
   const [now] = useState(() => Date.now());
-  const days=Array.from({length:7},(_,index)=>{const date=new Date(now-(6-index)*86400000);const key=localDayKey(date);const row=snapshot.activity.find((item)=>item.day===key);return{key,label:"日一二三四五六"[date.getDay()],minutes:Math.round(((row?.read_seconds??0)+(row?.listen_seconds??0))/60),reviews:row?.review_count??0};});
-  const recentKeys=new Set(days.map((day)=>day.key)); const recent=snapshot.activity.filter((row)=>recentKeys.has(row.day)); const maximum=Math.max(1,...days.map((day)=>day.minutes)); const read=Math.round(recent.reduce((sum,row)=>sum+row.read_seconds,0)/60); const listen=Math.round(recent.reduce((sum,row)=>sum+row.listen_seconds,0)/60); const reviews=recent.reduce((sum,row)=>sum+row.review_count,0);
-  return <div className="sc-page sc-stats-page"><header className="sc-page-title"><div><span className="sc-eyebrow">A QUIET LOOK BACK</span><h1>最近的记录</h1><p>只呈现最近 7 天真实发生的阅读、收听与回看，不评价完成度。</p></div><div className="sc-date-chip">最近 7 天</div></header><section className="sc-stat-strip"><Metric value={read+listen} suffix="分钟" label="阅读与收听"/><Metric value={snapshot.lexemes.length} label="保存的词"/><Metric value={reviews} label="回到语境"/></section><section className="sc-stats-grid"><article className="sc-chart-card"><header><div><span>有记录的时间</span><strong>{read+listen}<small> 分钟</small></strong></div></header><div className="sc-bar-chart">{days.map((day)=><div key={day.key} aria-label={`${day.key}，${day.minutes} 分钟，回看 ${day.reviews} 次`}><span><i style={{height:`${Math.max(2,day.minutes/maximum*100)}%`}}/></span><small>周{day.label}</small></div>)}</div></article><article className="sc-balance-card"><span>阅读与收听</span><div className="sc-balance-ring" style={{"--read":`${read/Math.max(1,read+listen)*100}%`} as CSSProperties}><strong>{read+listen?Math.round(read/(read+listen)*100):0}%</strong><small>阅读</small></div><footer><span><i/>阅读 <b>{read} 分</b></span><span><i/>收听 <b>{listen} 分</b></span></footer></article></section><section className="sc-memory"><header><div><span>词语状态</span><p>帮助你决定想回到哪里，不是成绩。</p></div></header><div>{([['saved','已保存'],['learning','学习中'],['known','已掌握']] as const).map(([status,label])=>{const count=snapshot.lexemes.filter((word)=>word.status===status).length;return <span key={status}><b>{label}</b><i><em style={{width:`${count/Math.max(1,snapshot.lexemes.length)*100}%`}}/></i><strong>{count}</strong></span>;})}</div></section></div>;
+  const days = Array.from({ length: 7 }, (_, index) => {
+    const date = new Date(now - (6 - index) * 86_400_000);
+    const key = localDayKey(date);
+    const row = snapshot.activity.find((item) => item.day === key);
+    return {
+      key,
+      label: "日一二三四五六"[date.getDay()],
+      seconds: (row?.read_seconds ?? 0) + (row?.listen_seconds ?? 0),
+      reviews: row?.review_count ?? 0,
+    };
+  });
+  const recentKeys = new Set(days.map((day) => day.key));
+  const recent = snapshot.activity.filter((row) => recentKeys.has(row.day));
+  const maximumSeconds = Math.max(1, ...days.map((day) => day.seconds));
+  const readSeconds = recent.reduce((sum, row) => sum + row.read_seconds, 0);
+  const listenSeconds = recent.reduce((sum, row) => sum + row.listen_seconds, 0);
+  const totalSeconds = readSeconds + listenSeconds;
+  const reviews = recent.reduce((sum, row) => sum + row.review_count, 0);
+  const minuteValue = (seconds: number) => seconds === 0 ? "0" : seconds < 60 ? "<1" : String(Math.round(seconds / 60));
+  const durationLabel = (seconds: number) => seconds === 0 ? "无记录" : seconds < 60 ? "少于 1 分钟" : `${Math.round(seconds / 60)} 分钟`;
+
+  return <div className="sc-page sc-stats-page">
+    <header className="sc-page-title"><div><span className="sc-eyebrow">A QUIET LOOK BACK</span><h1>最近的记录</h1><p>只呈现最近 7 天真实发生的阅读、收听与回看，不评价完成度。</p></div><div className="sc-date-chip">最近 7 天</div></header>
+    <section className="sc-stat-strip"><Metric value={minuteValue(totalSeconds)} suffix="分钟" label="阅读与收听"/><Metric value={snapshot.lexemes.length} label="保存的词"/><Metric value={reviews} label="回到语境"/></section>
+    <section className="sc-stats-grid">
+      <article className="sc-chart-card"><header><div><span>有记录的时间</span><strong>{minuteValue(totalSeconds)}<small> 分钟</small></strong></div></header>{totalSeconds === 0
+        ? <div className="sc-chart-empty"><strong>这 7 天还没有时间记录</strong><p>空白只表示没有记录，不代表落后。</p></div>
+        : <div className="sc-bar-chart">{days.map((day) => <div key={day.key} aria-label={`${day.key}，${durationLabel(day.seconds)}，回看 ${day.reviews} 次`}><span>{day.seconds > 0 && <i style={{ height: `${Math.max(2, day.seconds / maximumSeconds * 100)}%` }}/>}</span><small>周{day.label}</small></div>)}</div>}</article>
+      <article className="sc-balance-card"><span>阅读与收听</span>{totalSeconds > 0
+        ? <div className="sc-balance-ring" style={{ "--read": `${readSeconds / totalSeconds * 100}%` } as CSSProperties}><strong>{Math.round(readSeconds / totalSeconds * 100)}%</strong><small>阅读</small></div>
+        : <div className="sc-balance-empty"><strong>暂无</strong><small>时间记录</small></div>}<footer><span><i/>阅读 <b>{durationLabel(readSeconds)}</b></span><span><i/>收听 <b>{durationLabel(listenSeconds)}</b></span></footer></article>
+    </section>
+    <section className="sc-memory"><header><div><span>词语状态</span><p>帮助你决定想回到哪里，不是成绩。</p></div></header><div>{([['saved', '已保存'], ['learning', '学习中'], ['known', '已掌握']] as const).map(([status, label]) => { const count = snapshot.lexemes.filter((word) => word.status === status).length; return <span key={status}><b>{label}</b><i><em style={{ width: `${count / Math.max(1, snapshot.lexemes.length) * 100}%` }}/></i><strong>{count}</strong></span>; })}</div></section>
+  </div>;
 }
 
 function formatStorageBytes(bytes: number | null | undefined) {
@@ -360,7 +549,7 @@ export function SettingsView({ settings, storage, persistenceSupported, onChange
         <Toggle label="字幕自动跟随" copy="播放时让当前句保持在视野中央" value={settings.auto_follow} onChange={(value)=>void onChange({auto_follow:value})}/>
       </section>
       <section id="ai"><header><h2>AI 与隐私</h2><p>选词后会先显示准确字段说明；只有再点“解释这个词”才会发送。</p></header><Toggle label="默认显示简体中文说明" copy="英文释义始终优先" value={settings.chinese_explanation} onChange={(value)=>void onChange({chinese_explanation:value})}/><Toggle label="本地锁" copy="阻止 URL、RSS、AI、转写与远程音频请求" value={settings.local_lock} onChange={(value)=>void onChange({local_lock:value})}/><div className="sc-endpoint"><span><i className={settings.local_lock?"locked":""}/><b>DeepSeek · OpenAI compatible</b><small>{settings.local_lock?"本地锁已开启":"由服务端安全配置"}</small></span><button disabled={busy||settings.local_lock} onClick={()=>void run(onTestAi,"检测到服务端 AI 配置；这次检查没有发送文章或词语内容。")}>检查配置</button></div></section>
-      <section id="review-settings"><header><h2>复习节奏</h2><p>新词依照上限加入每日队列。</p></header><div className="sc-setting-row"><label htmlFor="sc-daily-limit">每日新词<small>到期复习不受影响</small></label><input id="sc-daily-limit" type="range" min="1" max="30" value={settings.daily_new_limit} onChange={(event)=>void onChange({daily_new_limit:Number(event.target.value)})}/><b>{settings.daily_new_limit}</b></div></section>
+      <section id="review-settings"><header><h2>复习节奏</h2><p>这里只控制每天首次加入复习的新词，不会隐藏旧卡。</p></header><div className="sc-setting-row"><label htmlFor="sc-daily-limit">每日新词<small>0 只暂停新词；已到期、学习中和重新学习的词不受影响</small></label><input id="sc-daily-limit" type="range" min="0" max="30" value={settings.daily_new_limit} aria-valuetext={settings.daily_new_limit === 0 ? "暂停加入新词" : `每天最多 ${settings.daily_new_limit} 个新词`} onChange={(event)=>void onChange({daily_new_limit:Number(event.target.value)})}/><b>{settings.daily_new_limit === 0 ? "暂停" : `${settings.daily_new_limit} 个`}</b></div></section>
       <section id="data"><header><h2>数据与备份</h2><p>完整备份包含 SQLite 数据与实际保存在拾词里的本地音频。</p></header><div className={`sc-storage-fact ${storage?.persisted===true?"persisted":""}`}><span><i /><b>{storage?.persisted===true?"浏览器已授予持久化保护":!persistenceSupported?"当前浏览器未提供持久化保护接口":storage===null?"正在读取存储状态":storage.persisted===false?"仍可能被浏览器清理":"保护状态暂时未知"}</b><small>{storage?`当前占用 ${formatStorageBytes(storage.usage)} · 可用约 ${formatStorageBytes(storage.available)}`:"正在读取当前浏览器的容量信息"}</small></span>{persistenceSupported&&storage?.persisted!==true&&<button disabled={busy} onClick={()=>void run(async()=>{const result=await onPersist();return result===true?"已获得浏览器持久化保护。":result===false?"浏览器暂未授予持久化保护，请保持定期备份。":"保护请求已完成，但浏览器暂时无法复查状态。";},"")}>请求保护</button>}</div><div className="sc-data-actions"><button disabled={busy} onClick={()=>void run(onExport,"")}><i>↓</i><span><b>导出完整备份</b><small>内容、词语、复习与本地音频</small></span></button><button disabled={busy} onClick={()=>restore.current?.click()}><i>↑</i><span><b>恢复备份</b><small>先校验候选数据，再安全切换</small></span></button><input ref={restore} aria-label="选择拾词完整备份或旧版 SQLite" hidden type="file" accept=".vocab-backup,.sqlite,.sqlite3,.db" onChange={(event)=>{const file=event.target.files?.[0];if(file)void run(()=>onImport(file),"");event.currentTarget.value="";}}/></div><p className="sc-data-note">备份是未加密的私人文件，不含 AI 密钥。请把它保存在受信任的位置；旧版 SQLite 不包含本地音频。</p></section>
       {message&&<div className="sc-settings-message" role="status">{message}</div>}
     </div></div>

@@ -309,3 +309,35 @@
   .sc-storage-fact{align-items:stretch;flex-direction:column}
   .sc-storage-fact>button{margin-left:0;align-self:flex-start}
 }
+
+/* Review is a small, optional return to context rather than a debt meter. */
+.sc-review-callout>div strong{font-size:clamp(34px,4vw,48px);white-space:nowrap}
+.sc-review-card{margin-top:28px}
+.sc-review-pause{display:grid;justify-items:end;gap:5px;text-align:right}
+.sc-review-pause strong{font:650 var(--sc-text-footnote)/1.2 -apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC",sans-serif!important}
+.sc-review-pause span{max-width:210px;line-height:1.45}
+.sc-review-footer{align-items:center;gap:16px;line-height:1.5}
+.sc-review-footer button{flex:none;color:#4d5248;text-decoration:underline;text-underline-offset:3px}
+.sc-review-error{margin-top:14px;border:1px solid #e1c5bd;border-radius:13px;background:#f5e8e3;color:#70463d;padding:12px 14px;font-size:var(--sc-text-footnote);line-height:1.5}
+.sc-review-complete-actions{display:flex;flex-wrap:wrap;justify-content:center;gap:8px;margin-top:20px}
+.sc-review-complete-actions button{border:1px solid #d4d1c7;background:#fffefa;border-radius:22px;padding:0 16px;color:#4f514a}
+.sc-review-complete-actions button.primary{border-color:#22251f;background:#22251f;color:#fff}
+.sc-visually-hidden{position:absolute!important;width:1px!important;height:1px!important;padding:0!important;margin:-1px!important;overflow:hidden!important;clip:rect(0,0,0,0)!important;white-space:nowrap!important;border:0!important}
+
+/* A zero-duration day stays visually empty; sub-minute activity is real. */
+.sc-chart-empty{min-height:200px;margin-top:26px;border-bottom:1px solid #e3e0d6;display:grid;place-content:center;text-align:center;padding:24px}
+.sc-chart-empty strong{font-size:var(--sc-text-footnote);font-weight:650}
+.sc-chart-empty p{max-width:260px;margin:7px auto 0;color:#686a62;font-size:var(--sc-text-caption);line-height:1.5}
+.sc-balance-empty{width:135px;height:135px;border:12px solid #e7e4da;border-radius:50%;margin:24px auto;display:grid;place-content:center}
+.sc-balance-empty strong{font:500 22px Georgia,"Songti SC",serif}
+.sc-balance-empty small{margin-top:4px;color:#686a62;font-size:var(--sc-text-caption)}
+.sc-setting-row>b{min-width:60px;width:auto}
+
+@media(max-width:760px){
+  .sc-review-callout>div{align-items:flex-start;flex-direction:column;gap:8px}
+  .sc-review-page>header{align-items:flex-start;flex-direction:column;gap:16px}
+  .sc-review-pause{justify-items:start;text-align:left}
+  .sc-review-card{margin-top:22px}
+  .sc-review-footer{align-items:flex-start;flex-direction:column}
+  .sc-review-complete{padding-top:12vh}
+}

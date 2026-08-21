@@ -62,6 +62,22 @@ function selectionIdentity(target: SelectionTarget) {
   return [target.itemId, target.blockId ?? "", target.segmentId ?? "", target.startUtf16, target.endUtf16, target.surface, target.sentence].join("\u001f");
 }
 
+function useVocabMobileLayout() {
+  const [mobile, setMobile] = useState(false);
+  const [sideOpen, setSideOpen] = useState(false);
+  useEffect(() => {
+    const query = window.matchMedia("(max-width: 760px)");
+    const sync = () => {
+      setMobile(query.matches);
+      if (!query.matches) setSideOpen(false);
+    };
+    sync();
+    query.addEventListener("change", sync);
+    return () => query.removeEventListener("change", sync);
+  }, []);
+  return { mobile, sideOpen, setSideOpen };
+}
+
 const OCCURRENCE_RECOVERY_PREFIX = "vocab.pending-occurrence-write.v1:";
 
 function occurrenceRecoveryKey(receipt: VocabOccurrenceWriteReceipt): string {
@@ -127,6 +143,7 @@ type PendingOccurrenceWrite = Readonly<{
 }>;
 
 export default function VocabApp() {
+  const { mobile, sideOpen, setSideOpen } = useVocabMobileLayout();
   const [snapshot, setSnapshot] = useState<VocabSnapshot>(empty);
   const [ready, setReady] = useState(false);
   const [fatal, setFatal] = useState("");
@@ -140,7 +157,6 @@ export default function VocabApp() {
   const [importOpen, setImportOpen] = useState(false);
   const [wordId, setWordId] = useState<string | null>(null);
   const [toast, setToast] = useState("");
-  const [sideOpen, setSideOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const [storageStatus, setStorageStatus] = useState<LocalStorageEstimate | null>(null);
   const [wordSavePhase, setWordSavePhase] = useState<WordSavePhase>("idle");
@@ -156,7 +172,7 @@ export default function VocabApp() {
   const pendingOccurrenceRef = useRef<PendingOccurrenceWrite | null>(null);
   const occurrenceRecoveryRef = useRef<VocabOccurrenceWriteReceipt | null>(null);
   const committedOccurrenceRef = useRef<{ surface: string } | null>(null);
-  const sidebarDialog = useOverlayDialog<HTMLElement>(sideOpen, () => setSideOpen(false), "button");
+  const sidebarDialog = useOverlayDialog<HTMLElement>(mobile && sideOpen, () => setSideOpen(false), "button");
 
   const refresh = useCallback(async () => setSnapshot(await loadVocabSnapshot()), []);
 
@@ -259,7 +275,7 @@ export default function VocabApp() {
     if (next !== "reader" && next !== "podcast") clearSelection();
     const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     window.scrollTo({ top: 0, behavior: reducedMotion ? "auto" : "smooth" });
-  }, [clearSelection]);
+  }, [clearSelection, setSideOpen]);
 
   const openItem = useCallback((item: LibraryItem) => {
     setActiveItemId(item.id);
@@ -631,11 +647,12 @@ export default function VocabApp() {
 
   const pageLabel = navigation.find((entry) => entry.id === view)?.label ?? (view === "reader" ? "阅读" : view === "podcast" ? "收听" : "设置");
   const persistenceSupported = supportsPersistentLocalStorage();
+  const sidebarHidden = mobile && !sideOpen;
   return <main className="shici" style={{ "--reader-scale": snapshot.settings.font_scale, "--reader-leading": snapshot.settings.line_height } as CSSProperties}>
-    <aside ref={sidebarDialog} id="sc-navigation" className={`sc-sidebar ${sideOpen ? "open" : ""}`} role={sideOpen ? "dialog" : undefined} aria-modal={sideOpen ? true : undefined} aria-label="拾词导航" tabIndex={sideOpen ? -1 : undefined}>
-      <Link href="/" className="sc-brand" aria-label="返回私人工作台"><Logo /></Link>
-      <nav>{navigation.map((item) => <button key={item.id} aria-current={view === item.id ? "page" : undefined} className={view === item.id ? "active" : ""} onClick={() => go(item.id)}><i>{item.glyph}</i><span>{item.label}</span></button>)}</nav>
-      <div className="sc-side-foot"><button className={view === "settings" ? "active" : ""} onClick={() => go("settings")}><i>设</i><span>设置</span></button><div><i className={storageStatus?.persisted === true ? "persisted" : ""} /><span>当前浏览器<small>{storageStatus?.persisted === true ? "已获持久化保护" : !persistenceSupported ? "未提供持久化保护接口" : storageStatus?.persisted === false ? "请定期导出备份" : "保护状态暂时未知"}</small></span></div></div>
+    <aside ref={sidebarDialog} id="sc-navigation" className={`sc-sidebar ${sideOpen ? "open" : ""}`} role={mobile && sideOpen ? "dialog" : undefined} aria-modal={mobile && sideOpen ? true : undefined} aria-label="拾词导航" aria-hidden={sidebarHidden || undefined} inert={sidebarHidden || undefined} tabIndex={mobile && sideOpen ? -1 : undefined}>
+      <Link href="/" className="sc-brand" aria-label="返回私人工作台" tabIndex={sidebarHidden ? -1 : undefined}><Logo /></Link>
+      <nav>{navigation.map((item) => <button key={item.id} tabIndex={sidebarHidden ? -1 : undefined} aria-current={view === item.id ? "page" : undefined} className={view === item.id ? "active" : ""} onClick={() => go(item.id)}><i>{item.glyph}</i><span>{item.label}</span></button>)}</nav>
+      <div className="sc-side-foot"><button tabIndex={sidebarHidden ? -1 : undefined} className={view === "settings" ? "active" : ""} onClick={() => go("settings")}><i>设</i><span>设置</span></button><div><i className={storageStatus?.persisted === true ? "persisted" : ""} /><span>当前浏览器<small>{storageStatus?.persisted === true ? "已获持久化保护" : !persistenceSupported ? "未提供持久化保护接口" : storageStatus?.persisted === false ? "请定期导出备份" : "保护状态暂时未知"}</small></span></div></div>
     </aside>
     <section className="sc-main">
       <header className="sc-topbar"><button className="sc-menu" onClick={() => setSideOpen((value) => !value)} aria-expanded={sideOpen} aria-controls="sc-navigation" aria-label={sideOpen ? "关闭导航" : "打开导航"}>拾</button><div className="sc-crumb"><span>拾词</span><b>/</b><strong>{pageLabel}</strong></div><div className="sc-top-actions"><button className="sc-search-jump" aria-label="搜索资料、词和语境" onClick={() => setSearchOpen(true)}>⌕ <span>搜索</span><kbd>⌘ K</kbd></button><button className="sc-import" aria-label="导入内容" onClick={() => setImportOpen(true)}>＋ <span>导入内容</span></button></div></header>
@@ -645,7 +662,7 @@ export default function VocabApp() {
         {view === "reader" && <ReaderView item={activeItem?.kind === "article" ? activeItem : snapshot.items.find((item) => item.kind === "article") ?? null} blocks={snapshot.blocks} occurrences={snapshot.occurrences} bookmarks={snapshot.bookmarks} onSelect={selectText} onBack={() => go("library")} onProgress={recordReaderProgress} onFinish={async (item) => { await updateItemProgress(item.id, 1, true); await refresh(); setToast("已标记为读完，随时可以改回阅读中"); }} onBookmark={async (item, block) => { await createBookmark(item.id, block?.id ?? "top", block?.text.slice(0, 30) ?? item.title); await refresh(); setToast("已收藏当前位置"); }} />}
         {view === "podcast" && <PodcastView key={(activeItem?.kind === "podcast" ? activeItem : snapshot.items.find((item) => item.kind === "podcast"))?.id ?? "empty-podcast"} item={activeItem?.kind === "podcast" ? activeItem : snapshot.items.find((item) => item.kind === "podcast") ?? null} segments={snapshot.segments} occurrences={snapshot.occurrences} autoFollow={snapshot.settings.auto_follow} localLock={snapshot.settings.local_lock} onAutoFollow={(value) => void changeSettings({ auto_follow: value })} onSelect={selectText} onProgress={recordPodcastProgress} onBookmark={async (item, ms, label) => { await createBookmark(item.id, `t:${ms}`, label); await refresh(); setToast("已收藏此刻"); }} />}
         {view === "words" && <WordsView lexemes={snapshot.lexemes} occurrences={snapshot.occurrences} onOpen={setWordId} onStar={async (word) => { await toggleLexemeStar(word.id, !word.starred); await refresh(); }} />}
-        {view === "review" && <ReviewView cards={snapshot.reviewCards} onRate={async (card: ReviewCard, rating: ReviewRating) => { const id = await rateReview(card, rating); await refresh(); return id; }} onUndo={async (id) => { await undoReview(id); await refresh(); }} />}
+        {view === "review" && <ReviewView cards={snapshot.reviewCards} onRate={async (card: ReviewCard, rating: ReviewRating) => { const id = await rateReview(card, rating); try { await refresh(); } catch { setToast("评分已记录，页面暂未重读；这一小轮仍可继续"); } return id; }} onUndo={async (id) => { await undoReview(id); try { await refresh(); } catch { setToast("评分已撤销，页面暂未重读；数据库不会重复改写"); } }} onGo={go} />}
         {view === "stats" && <StatsView snapshot={snapshot} />}
         {view === "settings" && <SettingsView settings={snapshot.settings} storage={storageStatus} persistenceSupported={persistenceSupported} onChange={changeSettings} onExport={exportBackup} onImport={restoreBackup} onPersist={async () => { const granted = await requestPersistentLocalStorage(); const checked = await refreshStorageStatus(); return checked.persisted ?? granted; }} onTestAi={async () => { if (snapshot.settings.local_lock) throw new Error("请先关闭本地锁"); const response = await fetch("/api/health", { headers: { Accept: "application/json" } }); const health = await response.json() as { ai?: { configured?: boolean } }; if (!response.ok) throw new Error("无法检查 AI 服务状态"); if (!health.ai?.configured) throw new Error("DeepSeek API Key 尚未配置"); }} />}
       </div>
@@ -657,6 +674,6 @@ export default function VocabApp() {
     {searchOpen && <SearchPalette snapshot={snapshot} onClose={() => setSearchOpen(false)} onOpenItem={openItem} onOpenWord={(id) => { setWordId(id); }} />}
     {!selection && !toast && (occurrenceRecovery || (wordSavePhase === "refresh_failed" && committedOccurrence)) && <button className="sc-toast" disabled={wordSaveBusy} aria-label={wordSavePhase === "refresh_failed" ? "上次收词已保存，只刷新词库" : wordSavePhase === "conflict" ? "移除这条冲突提醒" : "只读核对上次收词结果"} onClick={() => void wordPrimaryAction()}><span>{wordSaveBusy ? "正在确认…" : wordSavePhase === "refresh_failed" ? "上次收词已保存" : wordSavePhase === "conflict" ? "发现冲突，不会改库" : "上次收词待核对"}</span>{wordSavePhase === "refresh_failed" ? "只刷新词库" : wordSavePhase === "conflict" ? "移除提醒" : "只读核对"}</button>}
     {toast && <div className="sc-toast" role="status"><span>✓</span>{toast}</div>}
-    {sideOpen && <button className="sc-nav-scrim" onClick={() => setSideOpen(false)} aria-label="关闭导航" />}
+    {mobile && sideOpen && <button className="sc-nav-scrim" onClick={() => setSideOpen(false)} aria-label="关闭导航" />}
   </main>;
 }
