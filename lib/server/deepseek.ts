@@ -56,6 +56,10 @@ async function requestCompletion(
       body: JSON.stringify({
         model: config.model,
         messages,
+        // These product routes need bounded JSON, not hidden reasoning. DeepSeek
+        // V4 enables thinking by default; explicitly disabling it keeps the
+        // output budget available for the final structured object.
+        thinking: { type: "disabled" },
         temperature: 0.15,
         max_tokens: 4_000,
         response_format: { type: "json_object" },
@@ -99,7 +103,19 @@ async function requestCompletion(
 }
 
 export async function runDeepSeekJson(prompt: PromptBundle): Promise<DeepSeekResult> {
-  const first = await requestCompletion(prompt);
+  let first: Awaited<ReturnType<typeof requestCompletion>>;
+  try {
+    first = await requestCompletion(prompt);
+  } catch (error) {
+    // DeepSeek documents an occasional empty response in JSON mode and
+    // recommends modifying the prompt. Retry once with an explicit repair
+    // instruction; never loop or silently accept an empty result.
+    if (!(error instanceof HttpError) || error.code !== "AI_EMPTY_RESPONSE") throw error;
+    first = await requestCompletion(prompt, {
+      invalid: "",
+      error: "the first JSON response was empty",
+    });
+  }
   let parsed: unknown;
   try {
     parsed = JSON.parse(stripJsonFence(first.content));

@@ -854,6 +854,9 @@ export function validateFitnessPlanDraft(
   if (context.venue.status !== "active") {
     errors.push("当前场地已归档，不能启用这份草稿。");
   }
+  if (draft.days.length === 0) {
+    errors.push("当前场地与身体边界下还没有可执行的训练日。");
+  }
 
   for (const day of draft.days) {
     if (day.weekday === null || day.weekday < 0 || day.weekday > 6) {

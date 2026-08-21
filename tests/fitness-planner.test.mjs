@@ -317,7 +317,14 @@ test("maintenance equipment is excluded while limited equipment remains explicit
     ),
     [],
   );
-  assert.equal(planner.buildFitnessPlanDraft(maintenanceInput).days.length, 0);
+  const unavailableDraft = planner.buildFitnessPlanDraft(maintenanceInput);
+  assert.equal(unavailableDraft.days.length, 0);
+  const unavailableValidation = planner.validateFitnessPlanDraft(
+    unavailableDraft,
+    maintenanceInput,
+  );
+  assert.equal(unavailableValidation.valid, false);
+  assert.match(unavailableValidation.errors.join(" "), /没有可执行的训练日/);
 
   const limitedInput = {
     ...maintenanceInput,

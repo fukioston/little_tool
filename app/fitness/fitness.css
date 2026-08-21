@@ -2301,17 +2301,19 @@
   display: none;
 }
 
-.sl-live > nav button {
+.sl-live > nav > span {
   display: flex;
   flex: 0 0 auto;
   align-items: center;
   gap: 8px;
+  min-height: 44px;
   padding: 0 13px;
   border: 1px solid rgba(255, 255, 255, 0.11);
+  border-radius: 12px;
   color: rgba(255, 255, 255, 0.64);
 }
 
-.sl-live > nav button i {
+.sl-live > nav > span i {
   display: grid;
   width: 25px;
   height: 25px;
@@ -2322,13 +2324,13 @@
   font-style: normal;
 }
 
-.sl-live > nav button.active {
+.sl-live > nav > span.active {
   border-color: rgba(149, 178, 226, 0.42);
   background: rgba(91, 124, 181, 0.2);
   color: #fff;
 }
 
-.sl-live > nav button.completed i {
+.sl-live > nav > span.completed i {
   background: #497a66;
   color: #fff;
 }
