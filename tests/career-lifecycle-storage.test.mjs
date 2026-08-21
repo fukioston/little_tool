@@ -93,6 +93,10 @@ const lockUrl = moduleUrl(`
     globalThis.__careerLifecycleLocks.writes += 1;
     return task({ token: Symbol("write"), mode: "exclusive" });
   }
+  export async function withCareerBackupLock(task) {
+    globalThis.__careerLifecycleLocks.writes += 1;
+    return task({ token: Symbol("backup"), mode: "exclusive" });
+  }
 `);
 const lifecycleJavaScript = rawLifecycleJavaScript
   .replaceAll('"@/lib/local-db/client"', `"${clientUrl}"`)
