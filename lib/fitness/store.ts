@@ -927,6 +927,7 @@ type FitnessConfigQueryResult<Result extends object> = Readonly<{
 }>;
 
 export type FitnessConfigStorageRuntime = Readonly<{
+  withReadLock?<Result>(operation: () => Promise<Result>): Promise<Result>;
   withExclusiveLock<Result>(operation: () => Promise<Result>): Promise<Result>;
   query<Result extends object>(
     sql: string,
@@ -2126,6 +2127,7 @@ function receiptEntity(receipt: FitnessConfigWriteReceipt): {
 
 export function createFitnessConfigStorageService(
   runtime: FitnessConfigStorageRuntime = {
+    withReadLock: (operation) => withFitnessReadLock(operation),
     withExclusiveLock: (operation) => withFitnessWriteLock(operation, { requireSupport: true }),
     query: async <Result extends object>(sql: string, params?: SqlParams) => ({
       rows: await rawQuery<Result>(sql, params),
@@ -2137,6 +2139,17 @@ export function createFitnessConfigStorageService(
     broadcast: broadcastFitnessChange,
   },
 ) {
+  async function readLocked<Result>(operation: () => Promise<Result>): Promise<Result> {
+    try {
+      return await (runtime.withReadLock
+        ? runtime.withReadLock(operation)
+        : runtime.withExclusiveLock(operation));
+    } catch (error) {
+      if (error instanceof FitnessConfigMutationError) throw error;
+      throw configError("inspect_failed", "暂时无法读取最新资料；没有开始写入。");
+    }
+  }
+
   async function prepareLocked<Result>(operation: () => Promise<Result>): Promise<Result> {
     try {
       return await runtime.withExclusiveLock(operation);
@@ -2155,7 +2168,7 @@ export function createFitnessConfigStorageService(
    * pair fresh peer state with stale UI values and is intentionally unsupported.
    */
   async function loadSettingsExpectedState(): Promise<FitnessSettingsWriteSnapshot> {
-    return prepareLocked(async () => {
+    return readLocked(async () => {
       const generation = await readConfigGeneration(runtime);
       return snapshotInput(await readConfigSettings(runtime, generation));
     });

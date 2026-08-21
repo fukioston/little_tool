@@ -40,15 +40,26 @@ const schemaUrl = moduleUrl(schemaJavaScript);
 const catalogUrl = moduleUrl(catalogJavaScript);
 const lockStubUrl = moduleUrl(`
   export async function withFitnessReadLock(task) { return task(); }
-  export async function withFitnessWriteLock(task) { return task(); }
+  export async function withFitnessWriteLock(task, options = {}) {
+    if (globalThis.__fitnessConfigNoWebLocks && options.requireSupport) {
+      throw new Error("Web Locks unavailable");
+    }
+    return task();
+  }
   export function broadcastFitnessChange() {}
 `);
 let storeJavaScript = rawStoreJavaScript;
 for (const [specifier, url] of Object.entries({
   "@/lib/local-db/client": moduleUrl(`
+    function runtime() {
+      const value = globalThis.__fitnessConfigDefaultRuntime;
+      if (!value) throw new Error("default localDb must not be used in config service tests");
+      return value;
+    }
     export const localDb = {
-      query() { throw new Error("default localDb must not be used in config service tests"); },
-      batch() { throw new Error("default localDb must not be used in config service tests"); },
+      query(_database, sql, params) { return runtime().query(sql, params); },
+      batch(_database, statements) { return runtime().batch(statements); },
+      currentGeneration() { return runtime().currentGeneration(); },
       init() { throw new Error("default localDb must not be used in config service tests"); }
     };
   `),
@@ -732,12 +743,74 @@ test("safe Web Lock option fails closed before invoking an operation", async () 
       /不支持安全的跨标签页写入锁/,
     );
     assert.equal(invoked, false);
+    let readInvoked = false;
+    assert.equal(
+      await lock.withFitnessReadLock(async () => {
+        readInvoked = true;
+        return "read-with-fallback";
+      }),
+      "read-with-fallback",
+    );
+    assert.equal(readInvoked, true);
   } finally {
     if (navigatorDescriptor) {
       Object.defineProperty(globalThis, "navigator", navigatorDescriptor);
     } else {
       delete globalThis.navigator;
     }
+  }
+});
+
+test("default settings loader reads without Web Locks while safe writes stay fail closed", async () => {
+  const { database, state, runtime, service } = await fixture({ now: 79_000 });
+  try {
+    for (const [key, value, updatedAt] of [
+      ["unit", "lb", 11],
+      ["rest_timer_enabled", "false", 22],
+      ["sound_enabled", "true", 33],
+      ["ai_enabled", "false", 44],
+    ]) {
+      executeRun(
+        database,
+        "INSERT INTO fitness_settings(key,value,updated_at) VALUES(?,?,?)",
+        [key, value, updatedAt],
+      );
+    }
+    const expected = await service.loadFitnessSettingsExpectedState();
+    const receipt = await service.prepareFitnessSettingsSave(defaultSettings, expected);
+    globalThis.__fitnessConfigDefaultRuntime = runtime;
+    globalThis.__fitnessConfigNoWebLocks = true;
+
+    const loaded = await store.loadFitnessSettingsExpectedState();
+    assert.deepEqual(loaded, expected);
+    const readsAfterLoader = state.queryCalls;
+    await assert.rejects(
+      store.prepareFitnessSettingsSave(defaultSettings, loaded),
+      (error) => error instanceof store.FitnessConfigMutationError &&
+        error.code === "inspect_failed",
+    );
+    assert.equal(await store.inspectFitnessConfigWrite(receipt), "still_unknown");
+    assert.equal(
+      (await store.commitFitnessConfigWrite(receipt)).outcome,
+      "outcome_uncertain",
+    );
+    assert.equal(state.queryCalls, readsAfterLoader);
+    assert.equal(state.batchCalls, 0);
+    assert.deepEqual(
+      database.selectObjects(
+        "SELECT key,value,updated_at FROM fitness_settings ORDER BY key",
+      ).map((row) => ({ ...row })),
+      [
+        { key: "ai_enabled", value: "false", updated_at: 44 },
+        { key: "rest_timer_enabled", value: "false", updated_at: 22 },
+        { key: "sound_enabled", value: "true", updated_at: 33 },
+        { key: "unit", value: "lb", updated_at: 11 },
+      ],
+    );
+  } finally {
+    delete globalThis.__fitnessConfigDefaultRuntime;
+    delete globalThis.__fitnessConfigNoWebLocks;
+    database.close();
   }
 });
 
