@@ -16,7 +16,7 @@ import {
   BriefcaseBusiness, CalendarDays, Check, CheckCircle2, ChevronRight,
   Circle, Clock3, Command, ContactRound, Download, ExternalLink,
   FileArchive, FileText, Filter, GripVertical, Import, Inbox,
-  LayoutDashboard, Link2, ListTodo, LoaderCircle, Menu, MessageSquareText,
+  LayoutDashboard, ListTodo, LoaderCircle, Menu, MessageSquareText,
   PanelTop, Pencil, Phone, Plus, RotateCcw, Search, Settings,
   ShieldCheck, Sparkles, Target, Trash2, Upload, UserRound, UsersRound,
   WandSparkles, X, Zap,
@@ -26,7 +26,7 @@ import {
 } from "react";
 import Link from "next/link";
 import {
-  addActivity, CAREER_LEGACY_DEMO_REVIEW_NEEDED, getCareerLegacyDemoResolution, initializeCareerDb,
+  CAREER_LEGACY_DEMO_REVIEW_NEEDED, getCareerLegacyDemoResolution, initializeCareerDb,
   loadCareerData, newId, runCareerBatch, runCareerSql,
 } from "@/lib/career/db";
 import {
@@ -62,6 +62,22 @@ import {
   careerTaskActions,
   type CareerTaskDetail,
 } from "@/lib/career/tasks";
+import {
+  CareerImportCommitUncertainError,
+  CareerImportError,
+  commitCareerJobImports,
+  createCareerJobImportPreview,
+  fingerprintCareerImportSource,
+  forkCareerJobImportPreview,
+  inspectCareerImportCommit,
+  parseCareerCsvImportPreview,
+  reviseCareerJobImportPreview,
+  type CareerImportCandidate,
+  type CareerImportCandidateField,
+  type CareerImportConfidenceLevel,
+  type CareerImportWarning,
+  type CareerJobImportPreview,
+} from "@/lib/career/imports";
 import { subscribeToCareerGenerationChanges, withCareerWriteLock } from "@/lib/career/lock";
 import { createLocalFileObjectUrl, deleteLocalFile, saveLocalFile } from "@/lib/local-db/files";
 import type {
@@ -292,77 +308,6 @@ function initials(value: string) {
 
 function safeLink(url: string) { return /^https?:\/\//i.test(url) ? url : undefined; }
 
-type JobImportDraft = {
-  company: string;
-  role: string;
-  location: string;
-  source: string;
-  sourceUrl: string;
-  salary: string;
-  workMode: string;
-  description: string;
-  keywords: string;
-  warnings: string[];
-};
-
-function stringList(value: unknown) {
-  return Array.isArray(value) ? value.map((item) => String(item).trim()).filter(Boolean) : [];
-}
-
-function normalizeWorkMode(value: unknown) {
-  const normalized = String(value ?? "").trim().toLowerCase();
-  if (["remote", "远程"].includes(normalized)) return "远程";
-  if (["hybrid", "混合", "混合办公"].includes(normalized)) return "混合办公";
-  if (["onsite", "on-site", "现场", "现场办公"].includes(normalized)) return "现场办公";
-  return String(value ?? "").trim();
-}
-
-function normalizeSalary(value: unknown) {
-  if (typeof value === "string") return value.trim();
-  if (!value || typeof value !== "object") return "";
-  const salary = value as Record<string, unknown>;
-  if (typeof salary.raw === "string" && salary.raw.trim()) return salary.raw.trim();
-  const min = typeof salary.min === "number" ? salary.min : null;
-  const max = typeof salary.max === "number" ? salary.max : null;
-  if (min === null && max === null) return "";
-  const currency = String(salary.currency ?? "").toUpperCase();
-  const currencyLabel = currency === "CNY" ? "¥" : currency === "USD" ? "$" : currency === "SGD" ? "S$" : currency ? `${currency} ` : "";
-  const compact = (amount: number) => amount >= 1_000 && amount % 1_000 === 0 ? `${amount / 1_000}K` : String(amount);
-  const range = min !== null && max !== null ? `${compact(min)}–${compact(max)}` : min !== null ? `${compact(min)} 起` : `最高 ${compact(max!)}`;
-  const period = salary.period === "month" ? " / 月" : salary.period === "year" ? " / 年" : salary.period === "day" ? " / 天" : salary.period === "hour" ? " / 小时" : "";
-  const months = typeof salary.months === "number" && salary.months !== 12 ? ` · ${salary.months} 薪` : "";
-  return `${currencyLabel}${range}${period}${months}`;
-}
-
-function createJobImportDraft(parsed: Record<string, unknown>, input: string, detectedSource: string): JobImportDraft {
-  const responsibilities = stringList(parsed.responsibilities);
-  const mustHave = stringList(parsed.must_have);
-  const niceToHave = stringList(parsed.nice_to_have);
-  const summary = String(parsed.summary ?? "").trim();
-  const sections = [
-    summary,
-    responsibilities.length ? `职位职责\n${responsibilities.map((item) => `• ${item}`).join("\n")}` : "",
-    mustHave.length ? `必需条件\n${mustHave.map((item) => `• ${item}`).join("\n")}` : "",
-    niceToHave.length ? `加分项\n${niceToHave.map((item) => `• ${item}`).join("\n")}` : "",
-    input.trim() ? `原始分享文本\n${input.trim()}` : "",
-  ].filter(Boolean);
-  const embeddedUrl = input.match(/https?:\/\/[^\s<>"']+/i)?.[0]?.replace(/[),，。]+$/, "") ?? "";
-  const parsedSource = String(parsed.source ?? "").toLowerCase();
-  const source = detectedSource !== "智能识别" ? detectedSource : parsedSource === "linkedin" ? "LinkedIn" : parsedSource === "boss" ? "BOSS直聘" : "智能导入";
-  return {
-    company: String(parsed.company ?? parsed.company_name ?? "").trim(),
-    role: String(parsed.role ?? parsed.title ?? "").trim(),
-    location: String(parsed.location ?? "").trim(),
-    source,
-    sourceUrl: String(parsed.url ?? parsed.original_url ?? embeddedUrl).trim(),
-    salary: normalizeSalary(parsed.salary),
-    workMode: normalizeWorkMode(parsed.work_mode),
-    description: sections.join("\n\n") || input.trim(),
-    keywords: stringList(parsed.keywords).join(", "),
-    warnings: stringList(parsed.warnings),
-  };
-}
-
 function parseAiContent(value: unknown): unknown {
   if (!value || typeof value !== "object") return value;
   const record = value as Record<string, unknown>;
@@ -399,10 +344,16 @@ async function copyText(value: string) {
   return copied;
 }
 
-function readCaptureParams() {
-  if (typeof window === "undefined") return "";
+type CareerCapturedSource = Readonly<{ url: string; selectedText: string }>;
+
+function readCaptureParams(): CareerCapturedSource | null {
+  if (typeof window === "undefined") return null;
   const params = new URL(window.location.href).searchParams;
-  return [params.get("capture")?.trim(), params.get("text")?.trim()].filter(Boolean).join("\n\n");
+  const capture = {
+    url: params.get("capture")?.trim() ?? "",
+    selectedText: params.get("text")?.trim() ?? "",
+  };
+  return capture.url || capture.selectedText ? capture : null;
 }
 
 const dialogFocusable = [
@@ -497,7 +448,7 @@ export default function CareerApp() {
   const [searchOpen, setSearchOpen] = useState(false);
   const [capturedDraft] = useState(readCaptureParams);
   const [modal, setModal] = useState<"job" | "task" | "interview" | "material" | "import" | null>(() => capturedDraft ? "import" : null);
-  const [importInitial, setImportInitial] = useState(capturedDraft);
+  const [importInitial, setImportInitial] = useState<CareerCapturedSource | null>(capturedDraft);
   const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
   const [selectedInterviewId, setSelectedInterviewId] = useState<string | null>(null);
   const [selectedContactId, setSelectedContactId] = useState<string | null>(null);
@@ -522,6 +473,8 @@ export default function CareerApp() {
   const scopeRequestRef = useRef(0);
   const uiReadRequestRef = useRef(0);
   const sidebarRef = useRef<HTMLElement | null>(null);
+  const importOpenerRef = useRef<HTMLButtonElement | null>(null);
+  const importFocusReturnPendingRef = useRef(false);
   const [refreshKey, setRefreshKey] = useState(0);
 
   const refresh = useCallback(async (requestedScope: CareerJobScope = jobScopeRef.current) => {
@@ -565,6 +518,17 @@ export default function CareerApp() {
   }, [refreshKey]);
 
   useEffect(() => () => aiRequestRef.current?.controller.abort(), []);
+
+  useEffect(() => {
+    if (modal === "import" || !importFocusReturnPendingRef.current) return;
+    importFocusReturnPendingRef.current = false;
+    const opener = importOpenerRef.current;
+    const focusFrame = window.requestAnimationFrame(() => {
+      if (opener?.isConnected) opener.focus({ preventScroll: true });
+      importOpenerRef.current = null;
+    });
+    return () => window.cancelAnimationFrame(focusFrame);
+  }, [modal]);
 
   useEffect(() => subscribeToCareerGenerationChanges(() => window.location.reload()), []);
 
@@ -950,6 +914,16 @@ export default function CareerApp() {
     const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     window.scrollTo({ top: 0, behavior: reducedMotion ? "auto" : "smooth" });
   }
+  function openCareerImport(opener: HTMLButtonElement) {
+    importOpenerRef.current = opener;
+    importFocusReturnPendingRef.current = false;
+    setModal("import");
+  }
+  function closeCareerImport() {
+    importFocusReturnPendingRef.current = true;
+    setModal(null);
+    setImportInitial(null);
+  }
   if (loading) return <CareerLoading />;
   if (loadError) return <CareerError message={loadError} onRetry={() => { setLoading(true); setLoadError(""); setRefreshKey((key) => key + 1); }} />;
 
@@ -961,7 +935,7 @@ export default function CareerApp() {
         {legacyReviewNeeded && <div className="career-legacy-review-note" role="status"><ShieldCheck size={19} /><div><b>旧版资料需要你看一眼</b><p>旧版可能含示例内容，未自动删除以保护你的编辑。我们不会替你判断哪些记录属于你，也不会自行清理。</p></div></div>}
         {view === "today" && <TodayView data={allData} now={careerClock} onNavigate={navigate} onSelectJob={setSelectedJobId} onSelectInterview={setSelectedInterviewId} onOpenTask={openTask} onCompleteTask={completeTask} onAddJob={() => setModal("job")} onAi={runAi} />}
         {view === "board" && <BoardView data={boardData} jobs={boardJobs} now={careerClock} query={query} sourceFilter={sourceFilter} priorityOnly={priorityOnly} onSourceFilter={setSourceFilter} onPriorityOnly={setPriorityOnly} onClear={() => { setQuery(""); setSourceFilter("all"); setPriorityOnly(false); }} onSelectJob={setSelectedJobId} onAddJob={() => setModal("job")} onMove={async (jobId, stageId) => { await requestLifecycleChange({ kind: "stage", jobId, nextStageId: stageId }); }} lifecycleLocked={lifecycleLocked} sensors={sensors} activeJob={activeJob} onDragStart={(event) => { if (!lifecycleWriteRef.current && !lifecycleRefreshOnlyRef.current) setActiveDragId(String(event.active.id)); }} onDragEnd={async (event) => { setActiveDragId(null); if (!event.over || lifecycleWriteRef.current || lifecycleRefreshOnlyRef.current) return; const stageId = String(event.over.id).replace(/^stage:/, ""); if (data.stages.some((stage) => stage.id === stageId)) await requestLifecycleChange({ kind: "stage", jobId: String(event.active.id), nextStageId: stageId }); }} />}
-        {view === "jobs" && <JobsView data={scopedData} jobs={scopedJobs} now={careerClock} scope={jobScope} scopeLoading={scopeLoading} scopeError={scopeError} stageFilter={stageFilter} sourceFilter={sourceFilter} priorityOnly={priorityOnly} onScope={(scope) => { void changeJobScope(scope); }} onStageFilter={setStageFilter} onSourceFilter={setSourceFilter} onPriorityOnly={setPriorityOnly} onSelectJob={setSelectedJobId} onImport={() => setModal("import")} />}
+        {view === "jobs" && <JobsView data={scopedData} jobs={scopedJobs} now={careerClock} scope={jobScope} scopeLoading={scopeLoading} scopeError={scopeError} stageFilter={stageFilter} sourceFilter={sourceFilter} priorityOnly={priorityOnly} onScope={(scope) => { void changeJobScope(scope); }} onStageFilter={setStageFilter} onSourceFilter={setSourceFilter} onPriorityOnly={setPriorityOnly} onSelectJob={setSelectedJobId} onImport={openCareerImport} />}
         {view === "calendar" && <CalendarView data={allData} now={careerClock} onOpenTask={openTask} onCompleteTask={completeTask} onAddTask={() => setModal("task")} onAddInterview={() => setModal("interview")} onSelectInterview={setSelectedInterviewId} />}
         {view === "interviews" && <InterviewsView data={data} now={careerClock} onAdd={() => setModal("interview")} onSelect={setSelectedInterviewId} onAi={runAi} />}
         {view === "contacts" && <ContactsView data={data} now={careerClock} revision={contactRevision} onAdd={() => setContactEditorId(null)} onSelect={setSelectedContactId} />}
@@ -1060,7 +1034,7 @@ export default function CareerApp() {
     {modal === "task" && <TaskModal data={data} initialJobId={selectedJobId} onClose={() => { setModal(null); setSelectedJobId(null); }} onSaved={async () => { await refreshTasks(); setModal(null); setSelectedJobId(null); notify("待办已创建"); }} />}
     {modal === "interview" && <InterviewModal data={data} onClose={() => setModal(null)} onSaved={async () => { setModal(null); await refresh(); notify("面试轮次已安排"); }} />}
     {modal === "material" && <MaterialModal data={data} onClose={() => setModal(null)} onSaved={async () => { setModal(null); await refresh(); notify("材料已保存"); }} />}
-    {modal === "import" && <SmartImportModal data={data} initialInput={importInitial} onClose={() => { setModal(null); setImportInitial(""); }} onSaved={async () => { setModal(null); setImportInitial(""); await refresh(); notify("职位已导入"); }} notify={notify} />}
+    {modal === "import" && <CareerImportModal data={allData} initialCapture={importInitial} onClose={closeCareerImport} onRefresh={refresh} notify={notify} />}
     {searchOpen && <CommandPalette data={data} onClose={() => setSearchOpen(false)} onNavigate={navigate} onSelectJob={(id) => { setSearchOpen(false); setSelectedJobId(id); }} onAdd={() => { setSearchOpen(false); setModal("job"); }} />}
     {contactEditorId !== undefined && <ContactModal
       contactId={contactEditorId}
@@ -1265,13 +1239,13 @@ function JobCard({ job, data, now, onSelect, onMove, overlay = false, pending = 
   return <article className={`career-job-card ${overlay ? "overlay" : ""}`}><div className="career-job-card-top"><CompanyMark company={job.company} small />{draggable && <span className="career-grip" {...dragProps} tabIndex={-1} aria-hidden="true"><GripVertical size={16} /></span>}</div><button className="career-job-card-open" onClick={onSelect} aria-label={`打开 ${job.company} ${job.role}`}><h3>{job.role}</h3><p>{job.company}</p><div className="career-card-meta"><span>{job.location || "地点待定"}</span>{job.work_mode && <span>{job.work_mode}</span>}</div><div className="career-card-tags">{job.tags.split(",").filter(Boolean).slice(0, 2).map((tag) => <i key={tag}>{tag}</i>)}</div><div className={`career-next ${nextTask?.due_at && new Date(nextTask.due_at).getTime() < now ? "late" : ""}`}><Clock3 size={13} /><span>{upcoming ? `${formatDate(upcoming.scheduled_at, true)} · ${upcoming.round_name}` : nextTask ? `${relativeDate(nextTask.due_at, now)} · ${nextTask.title}` : "还没有下一步"}</span></div></button><footer><SourceBadge source={job.source} />{onMove ? <select value={job.stage_id} disabled={pending} onChange={(event) => void onMove(job.id, event.target.value)} aria-label={`移动 ${job.company} ${job.role} 到阶段`}>{data.stages.filter((stage) => !stage.hidden).map((stage) => <option value={stage.id} key={stage.id}>{stage.name}</option>)}</select> : <span className="career-priority" aria-label={`优先级 ${job.priority}`}>{[1, 2, 3].map((dot) => <i key={dot} className={dot <= job.priority ? "active" : ""} />)}</span>}</footer></article>;
 }
 
-function JobsView({ data, jobs, now, scope, scopeLoading, scopeError, stageFilter, sourceFilter, priorityOnly, onScope, onStageFilter, onSourceFilter, onPriorityOnly, onSelectJob, onImport }: { data: CareerData; jobs: Job[]; now: number; scope: CareerJobScope; scopeLoading: boolean; scopeError: string; stageFilter: string; sourceFilter: string; priorityOnly: boolean; onScope: (value: CareerJobScope) => void; onStageFilter: (value: string) => void; onSourceFilter: (value: string) => void; onPriorityOnly: (value: boolean) => void; onSelectJob: (id: string) => void; onImport: () => void }) {
+function JobsView({ data, jobs, now, scope, scopeLoading, scopeError, stageFilter, sourceFilter, priorityOnly, onScope, onStageFilter, onSourceFilter, onPriorityOnly, onSelectJob, onImport }: { data: CareerData; jobs: Job[]; now: number; scope: CareerJobScope; scopeLoading: boolean; scopeError: string; stageFilter: string; sourceFilter: string; priorityOnly: boolean; onScope: (value: CareerJobScope) => void; onStageFilter: (value: string) => void; onSourceFilter: (value: string) => void; onPriorityOnly: (value: boolean) => void; onSelectJob: (id: string) => void; onImport: (opener: HTMLButtonElement) => void }) {
   const emptyCopy = scope === "active"
     ? { title: "没有匹配的进行中职位", text: "可以调整筛选，也可以在遇到合适机会时再记录。" }
     : scope === "ended"
       ? { title: "还没有已结束的记录", text: "结果只是一段经历的状态，不是对你的评分。" }
       : { title: "归档里很安静", text: "收起的职位仍保留记录，需要时可以再取回。" };
-  return <div className="career-view"><SectionHeading eyebrow="APPLICATIONS" title="职位" description="把进行中、已结束和收起的记录分开放，不让数量给你压力。" action={<button className="career-button secondary" onClick={onImport}><Import size={16} />智能导入</button>} />
+  return <div className="career-view"><SectionHeading eyebrow="APPLICATIONS" title="职位" description="把进行中、已结束和收起的记录分开放，不让数量给你压力。" action={<button className="career-button secondary" onClick={(event) => onImport(event.currentTarget)}><Import size={16} />从原文添加</button>} />
     <div className="career-job-scope" aria-label="职位范围">{([["active", "进行中"], ["ended", "已结束"], ["archived", "已归档"]] as const).map(([value, label]) => <button key={value} data-career-scope={value} className={scope === value ? "active" : ""} aria-pressed={scope === value} disabled={scopeLoading} onClick={() => onScope(value)}>{label}</button>)}</div>
     <div className="career-toolbar"><select className="career-select" value={stageFilter} onChange={(event) => onStageFilter(event.target.value)} aria-label="按阶段筛选"><option value="all">全部阶段</option>{data.stages.map((stage) => <option key={stage.id} value={stage.id}>{stage.name}</option>)}</select><select className="career-select" value={sourceFilter} onChange={(event) => onSourceFilter(event.target.value)} aria-label="按来源筛选"><option value="all">全部来源</option>{[...new Set(data.jobs.map((job) => job.source))].map((source) => <option key={source}>{source}</option>)}</select><button className={`career-chip ${priorityOnly ? "active" : ""}`} aria-pressed={priorityOnly} onClick={() => onPriorityOnly(!priorityOnly)}><Target size={14} />重点关注</button></div>
     {scopeLoading && <div className="career-scope-loading" role="status"><LoaderCircle className="spin" size={16} />正在打开这部分记录…</div>}
@@ -1391,7 +1365,7 @@ function SettingsView({ data, onRefresh, onExport, onImport, notify }: { data: C
     return () => { active = false; };
   }, []);
   async function rename(stage: Stage, name: string) { if (!name.trim() || name === stage.name) return; setSavingStage(stage.id); await runCareerSql("UPDATE career_stages SET name = ? WHERE id = ?", [name.trim(), stage.id]); await onRefresh(); setSavingStage(null); }
-  const bookmarklet = `javascript:(()=>{const t=window.getSelection()?.toString()||document.body.innerText.slice(0,12000);const u='http://localhost:3000/career?capture='+encodeURIComponent(location.href)+'&text='+encodeURIComponent(t);window.open(u,'_blank')})()`;
+  const bookmarklet = `javascript:(()=>{const t=window.getSelection()?.toString().trim()||'';const u='http://localhost:3000/career?capture='+encodeURIComponent(location.href)+'&text='+encodeURIComponent(t);window.open(u,'_blank')})()`;
   const aiStatusLabel = aiHealth.status === "checking" ? "正在检查" : aiHealth.status === "configured" ? "已配置" : aiHealth.status === "missing" ? "尚未配置" : "检查失败";
   async function copyHelper() { try { await navigator.clipboard.writeText(bookmarklet); notify("浏览器采集器已复制，可拖到书签栏保存", "info"); } catch { notify("浏览器不允许复制，请在安全页面重试", "error"); } }
   async function exportBackup() { setBackupBusy("export"); try { await onExport(); } finally { setBackupBusy(null); } }
@@ -1399,7 +1373,7 @@ function SettingsView({ data, onRefresh, onExport, onImport, notify }: { data: C
   return <div className="career-view"><SectionHeading eyebrow="PREFERENCES" title="设置" description="隐私、流程与数据，都由你掌控" /><div className="career-settings-layout"><nav><a href="#workflow">求职流程</a><a href="#privacy">AI 与隐私</a><a href="#data">数据与备份</a><a href="#capture">浏览器采集器</a></nav><div><section className="career-settings-card" id="workflow"><header><div><h3>看板阶段</h3><p>调整名称，保留一致的数据分析口径。</p></div></header><div className="career-stage-settings">{data.stages.map((stage) => <label key={stage.id}><i style={{ background: stage.color }} /><input defaultValue={stage.name} onBlur={(event) => void rename(stage, event.target.value)} aria-label={`${stage.name}阶段名称`} /><span>{savingStage === stage.id ? <LoaderCircle className="spin" size={14} /> : stage.is_terminal ? "终态" : "进行中"}</span></label>)}</div></section>
     <section className="career-settings-card" id="privacy"><header><div><h3>AI 与隐私</h3><p>只有你主动使用 AI 时，所选内容才会发送至配置的服务。</p></div><span className={aiHealth.status === "configured" ? "career-status-good" : "career-status-neutral"} aria-live="polite"><i />{aiStatusLabel}</span></header><div className="career-setting-row"><span><b>当前模型</b><small>由服务器环境安全配置</small></span><code>{aiHealth.model || "DeepSeek"}</code></div><div className="career-setting-row"><span><b>结果保留方式</b><small>关闭预览不会自动保存，也不会留下隐藏副本</small></span><code>核对后复制或填入草稿</code></div><div className="career-privacy-note"><ShieldCheck size={18} /><p>API 密钥不会进入浏览器、本地数据库或备份。职位描述和面试笔记会被当作不可信数据处理。</p></div></section>
     <section className="career-settings-card" id="data"><header><div><h3>数据与备份</h3><p>一个文件带走结构化职迹与已关联的材料原件。</p></div></header><div className="career-data-actions"><button disabled={backupBusy !== null} onClick={() => void exportBackup()}><span>{backupBusy === "export" ? <LoaderCircle className="spin" size={19} /> : <Download size={19} />}</span><div><b>{backupBusy === "export" ? "正在校验并打包…" : "导出完整备份"}</b><small>SQLite、简历、作品集与案例附件</small></div><ChevronRight size={17} /></button><label className={backupBusy !== null ? "disabled" : ""}><span>{backupBusy === "import" ? <LoaderCircle className="spin" size={19} /> : <Upload size={19} />}</span><div><b>{backupBusy === "import" ? "正在验证并恢复…" : "恢复备份"}</b><small>支持完整备份与旧版 SQLite</small></div><ChevronRight size={17} /><input aria-label="选择要恢复的职迹备份" disabled={backupBusy !== null} type="file" accept=".career-backup,.sqlite,.sqlite3,.db,application/x-sqlite3,application/octet-stream" onChange={(event) => { const file = event.target.files?.[0]; if (file) void importBackup(file); event.currentTarget.value = ""; }} /></label></div><p className="career-settings-footnote">完整备份是明文文件，请安全保管；导出前会校验每个附件。恢复会先建立并验证安全候选，上一版本会暂时保留作回退。旧版 SQLite 不包含附件原件。</p></section>
-    <section className="career-settings-card" id="capture"><header><div><h3>浏览器采集器</h3><p>把选中的 JD 文本带回本机职迹，不读取登录态，也不自动抓取。</p></div></header><div className="career-capture-steps"><span><b>1</b>复制下面的采集器</span><ArrowRight size={16} /><span><b>2</b>新建书签并粘贴到网址</span><ArrowRight size={16} /><span><b>3</b>选中 JD 后点击书签</span></div><button className="career-button secondary" onClick={() => void copyHelper()}><Command size={16} />复制采集器</button><p className="career-settings-footnote">采集器仅打开 localhost 职迹并附带当前页面 URL 与选中文字；不是 LinkedIn 或 BOSS直聘官方 API，也不会绕过登录或反爬限制。</p></section>
+    <section className="career-settings-card" id="capture"><header><div><h3>浏览器采集器</h3><p>把当前 URL 与你明确选中的 JD 文本带回本机职迹，不读取整页正文。</p></div></header><div className="career-capture-steps"><span><b>1</b>复制下面的采集器</span><ArrowRight size={16} /><span><b>2</b>新建书签并粘贴到网址</span><ArrowRight size={16} /><span><b>3</b>选中 JD 后点击书签</span></div><button className="career-button secondary" onClick={() => void copyHelper()}><Command size={16} />复制采集器</button><p className="career-settings-footnote">采集器仅附带当前页面 URL 与选中文字，不包含 Cookie、登录态或站内消息；不是任何招聘平台的官方 API，也不会自动投递。</p></section>
   </div></div></div>;
 }
 
@@ -2275,38 +2249,524 @@ function MaterialModal({ data, onClose, onSaved }: { data: CareerData; onClose: 
   return <Modal title="添加求职材料" description="记录版本与用途；可选文件会保存到本机 OPFS。" onClose={onClose}><form className="career-form" onSubmit={submit}><Field label="材料名称"><input name="name" required placeholder="产品设计主简历" /></Field><div className="career-form-row"><Field label="类型"><select name="kind"><option>简历</option><option>求职信</option><option>作品集</option><option>案例</option><option>其他</option></select></Field><Field label="版本"><input name="version" defaultValue="v1.0" required /></Field></div><Field label="本地文件" hint="可选；不会写入 SQLite"><input name="attachment" type="file" accept=".pdf,.doc,.docx,.ppt,.pptx,.txt,.md,application/pdf" /></Field><Field label="关联职位"><select name="linked_job_id"><option value="">主材料 / 不关联</option>{data.jobs.map((job) => <option key={job.id} value={job.id}>{job.company} · {job.role}</option>)}</select></Field><Field label="状态"><select name="status"><option value="ready">可使用</option><option value="draft">编辑中</option><option value="sent">已发送</option></select></Field><Field label="备注"><textarea name="notes" rows={4} placeholder="这版材料做了哪些调整？" /></Field>{error && <div className="career-inline-error"><X size={15} />{error}</div>}<div className="career-form-actions"><button type="button" className="career-button ghost" onClick={onClose}>取消</button><button className="career-button primary" disabled={saving}>{saving ? <LoaderCircle className="spin" size={16} /> : <Upload size={16} />}{saving ? "正在保存…" : "保存材料"}</button></div></form></Modal>;
 }
 
-function SmartImportModal({ data, initialInput, onClose, onSaved, notify }: { data: CareerData; initialInput: string; onClose: () => void; onSaved: () => Promise<void>; notify: (text: string, tone?: Notice["tone"]) => void }) {
-  const [mode, setMode] = useState<"smart" | "csv">("smart");
-  const [input, setInput] = useState(initialInput); const [loading, setLoading] = useState(false);
-  const [draft, setDraft] = useState<JobImportDraft | null>(null); const [error, setError] = useState("");
-  const source = /zhipin\.com|BOSS直聘/i.test(input) ? "BOSS直聘" : /linkedin\.com|LinkedIn/i.test(input) ? "LinkedIn" : "智能识别";
-  const duplicate = draft && data.jobs.find((job) => job.company.trim().toLowerCase() === draft.company.trim().toLowerCase() && job.role.trim().toLowerCase() === draft.role.trim().toLowerCase());
-  function updateDraft<K extends keyof JobImportDraft>(key: K, value: JobImportDraft[K]) { setDraft((current) => current ? { ...current, [key]: value } : current); }
-  async function parse() { if (!input.trim()) return; setLoading(true); setError(""); setDraft(null); try { const isUrl = /^https?:\/\/\S+$/i.test(input.trim()); const response = await fetch("/api/import/job", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ url: isUrl ? input.trim() : "", text: isUrl ? "" : input.trim() }) }); const body = await response.json().catch(() => null); if (!response.ok) throw new Error((body as { error?: string } | null)?.error || "职位解析失败"); const content = parseAiContent(body); if (!content || typeof content !== "object") throw new Error("服务没有返回可用的职位字段"); setDraft(createJobImportDraft(content as Record<string, unknown>, input, source)); } catch (requestError) { setError(requestError instanceof Error ? requestError.message : "解析失败"); } finally { setLoading(false); } }
-  async function saveDraft() { if (!draft) return; if (!draft.company.trim() || !draft.role.trim()) { notify("请先补全公司与职位", "error"); return; } const id = newId("job"); const now = new Date().toISOString(); await runCareerSql(`INSERT INTO career_jobs (id,company,role,location,source,source_url,stage_id,priority,salary,work_mode,description,applied_at,deadline,contact_name,note,tags,created_at,updated_at,archived,position) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,0)`, [id, draft.company.trim(), draft.role.trim(), draft.location.trim(), draft.source, safeLink(draft.sourceUrl.trim()) ?? "", "stage_saved", 2, draft.salary.trim(), draft.workMode, draft.description.trim(), null, null, "", "通过分享文本或链接导入，已由用户核对后保存。", draft.keywords, now, now]); await addActivity(id, "import", `从 ${draft.source} 导入 ${draft.company.trim()} · ${draft.role.trim()}`); await onSaved(); }
-  function csvImport(file: File) { const reader = new FileReader(); reader.onload = async () => { const text = String(reader.result ?? ""); const lines = text.split(/\r?\n/).filter(Boolean); if (lines.length < 2) { notify("CSV 没有可导入的数据", "error"); return; } const headers = lines[0].split(",").map((item) => item.replace(/^"|"$/g, "").trim().toLowerCase()); const companyIndex = headers.findIndex((item) => /company|公司/.test(item)); const roleIndex = headers.findIndex((item) => /title|position|职位/.test(item)); const urlIndex = headers.findIndex((item) => /url|link|链接/.test(item)); if (companyIndex < 0 || roleIndex < 0) { notify("CSV 需要包含公司和职位列", "error"); return; } const now = new Date().toISOString(); const statements = lines.slice(1).map((line) => { const cells = line.match(/("[^"]*(?:""[^"]*)*"|[^,]*)(?:,|$)/g)?.map((cell) => cell.replace(/,$/, "").replace(/^"|"$/g, "").replace(/""/g, '"')) ?? []; return { sql: `INSERT INTO career_jobs (id,company,role,location,source,source_url,stage_id,priority,salary,work_mode,description,applied_at,deadline,contact_name,note,tags,created_at,updated_at,archived,position) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,0)`, params: [newId("job"), cells[companyIndex] || "待确认公司", cells[roleIndex] || "待确认职位", "", "LinkedIn", urlIndex >= 0 ? cells[urlIndex] || "" : "", "stage_saved", 1, "", "", "", null, null, "", "从 Saved Jobs CSV 导入", "", now, now] }; }); await runCareerBatch(statements); notify(`已导入 ${statements.length} 个职位`); await onSaved(); }; reader.readAsText(file); }
-  return <Modal title="智能导入职位" description="把 LinkedIn 或 BOSS直聘的链接/分享文本整理为可核对的本地草稿。" onClose={onClose} wide>
-    <div className="career-import-tabs" role="group" aria-label="导入方式">
-      <button type="button" className={mode === "smart" ? "active" : ""} aria-pressed={mode === "smart"} onClick={() => setMode("smart")}><Link2 size={16} />链接 / 分享文本</button>
-      <button type="button" className={mode === "csv" ? "active" : ""} aria-pressed={mode === "csv"} onClick={() => setMode("csv")}><FileArchive size={16} />Saved Jobs CSV</button>
+type CareerImportMode = "paste" | "capture" | "csv";
+type CareerImportPhase = "input" | "fingerprinting" | "requesting-ai" | "preview" | "revising" | "committing" | "commit-check" | "refreshing" | "refresh-only" | "complete" | "conflict";
+type CareerImportEditableField = CareerImportCandidateField | "priority";
+type CareerImportUiRow = Readonly<{
+  id: string;
+  preview: CareerJobImportPreview;
+  included: boolean;
+  confirmedFields: ReadonlySet<CareerImportEditableField>;
+}>;
+
+export function selectCareerImportCommitRows(rows: readonly CareerImportUiRow[], allowedRowIds: ReadonlySet<string> | null = null) {
+  return rows.filter((row) => row.included && row.preview.duplicateOfRowNumber === undefined && (!allowedRowIds || allowedRowIds.has(row.id)));
+}
+
+export function partitionCareerImportInspectionRows<T>(
+  rows: readonly T[],
+  inspections: readonly { status: "exact_committed" | "absent" | "conflict" | "still_unknown" }[],
+) {
+  return {
+    absentRows: rows.filter((_, index) => inspections[index]?.status === "absent"),
+    exactRows: rows.filter((_, index) => inspections[index]?.status === "exact_committed"),
+  };
+}
+
+export function careerImportCsvFileIssue(size: number) {
+  if (size === 0) return "这个 CSV 是空文件，请选择包含表头和职位内容的文件。";
+  if (size > 16 * 1024 * 1024) return "这个 CSV 超过 16 MiB。为保护浏览器不卡顿，请拆成较小文件后再试；文件没有读取或写入职迹。";
+  return "";
+}
+
+export function careerImportAiSourceIssue(snapshot: string) {
+  if (new TextEncoder().encode(snapshot).byteLength > 160 * 1024) return "内容较长，请只保留职位正文或改用 CSV。";
+  return "";
+}
+
+const careerImportModes: ReadonlyArray<{ id: CareerImportMode; label: string; icon: typeof FileText }> = [
+  { id: "paste", label: "粘贴", icon: FileText },
+  { id: "capture", label: "浏览器采集", icon: Command },
+  { id: "csv", label: "CSV", icon: FileArchive },
+];
+const careerImportCandidateFields: readonly CareerImportCandidateField[] = [
+  "company", "role", "location", "source", "sourceUrl", "stageId", "salary", "workMode", "description", "tags",
+];
+
+export function careerImportSourceSnapshot(mode: CareerImportMode, values: { paste: string; capture: CareerCapturedSource; csv: string }) {
+  if (mode === "paste") return values.paste;
+  if (mode === "csv") return values.csv;
+  return JSON.stringify({ kind: "career-browser-capture-v1", url: values.capture.url.trim(), selectedText: values.capture.selectedText });
+}
+
+function sameCareerJobName(job: Pick<Job, "company" | "role">, candidate: Pick<CareerImportCandidate, "company" | "role">) {
+  const normalize = (value: string) => value.trim().toLocaleLowerCase();
+  return Boolean(normalize(candidate.company) && normalize(candidate.role)) &&
+    normalize(job.company) === normalize(candidate.company) && normalize(job.role) === normalize(candidate.role);
+}
+
+export function careerImportFieldNote(level: CareerImportConfidenceLevel, confirmed: boolean) {
+  if (confirmed) return "你已确认";
+  if (level === "high") return "原文较清楚";
+  if (level === "medium") return "建议核对";
+  if (level === "low") return "需要你确认";
+  return "原文未说明";
+}
+
+function CareerImportWarningGroup({ warnings }: { warnings: readonly CareerImportWarning[] }) {
+  const blocking = warnings.filter((warning) => warning.severity === "blocking" && warning.code !== "csv_duplicate_row");
+  const review = warnings.filter((warning) => warning.severity === "review" && warning.code !== "csv_duplicate_row");
+  if (blocking.length === 0 && review.length === 0) return null;
+  return <div className="career-import-warning-groups">
+    {blocking.length > 0 && <section className="blocking" aria-label="保存前需要补充"><b>补充后再保存</b><ul>{blocking.map((warning, index) => <li key={`${warning.code}:${warning.rowNumber ?? ""}:${index}`}>{warning.message}</li>)}</ul></section>}
+    {review.length > 0 && <section className="review" aria-label="建议核对"><b>建议看一眼</b><ul>{review.map((warning, index) => <li key={`${warning.code}:${warning.rowNumber ?? ""}:${index}`}>{warning.message}</li>)}</ul></section>}
+  </div>;
+}
+
+function CareerImportPreviewEditor({ row, draft, data, sameName, sameNameDecision, busy, csv, selectionLocked, onDraft, onApply, onInclude, onSameNameDecision }: {
+  row: CareerImportUiRow;
+  draft: CareerImportCandidate;
+  data: CareerData;
+  sameName: Job | undefined;
+  sameNameDecision: "pending" | "save" | "skip";
+  busy: boolean;
+  csv: boolean;
+  selectionLocked: boolean;
+  onDraft: (field: CareerImportEditableField, value: string | number) => void;
+  onApply: () => void;
+  onInclude: (included: boolean) => void;
+  onSameNameDecision: (decision: "save" | "skip") => void;
+}) {
+  const changedFields = careerImportCandidateFields.filter((field) => draft[field] !== row.preview.candidate[field]);
+  const priorityChanged = draft.priority !== row.preview.candidate.priority;
+  const hasDraftChanges = changedFields.length > 0 || priorityChanged;
+  const note = (field: CareerImportCandidateField) => careerImportFieldNote(row.preview.confidence.fields[field], row.confirmedFields.has(field));
+  return <article className={`career-import-row-card ${row.included ? "included" : "paused"}`}>
+    <header>
+      <div><span>{row.preview.rowNumber ? `CSV 第 ${row.preview.rowNumber} 行` : "保存前核对"}</span><h3>{draft.role || "职位待确认"}</h3><p>{draft.company || "公司待确认"}{draft.location ? ` · ${draft.location}` : ""}</p></div>
+      {csv && <label className={`career-import-row-toggle ${selectionLocked ? "locked" : ""}`}><input type="checkbox" checked={row.included} disabled={selectionLocked} onChange={(event) => onInclude(event.target.checked)} /><span>{selectionLocked ? "保持原选择" : row.included ? "保存这条" : "这次不保存"}</span></label>}
+    </header>
+    {row.included && <>
+      {sameName && <div className="career-import-same-name"><Bell size={17} /><div><b>本机已有同名记录</b><p>{sameName.company} · {sameName.role}。它可能是同一职位，也可能是不同批次；这里不替你判断。</p><div><button type="button" className={sameNameDecision === "save" ? "active" : ""} aria-pressed={sameNameDecision === "save"} onClick={() => onSameNameDecision("save")}>仍保存这份</button><button type="button" className={sameNameDecision === "skip" ? "active" : ""} aria-pressed={sameNameDecision === "skip"} onClick={() => { onSameNameDecision("skip"); if (csv) onInclude(false); }}>这次先不保存</button></div></div></div>}
+      <div className="career-import-edit-grid">
+        <Field label="公司" hint={note("company")}><input value={draft.company} onChange={(event) => onDraft("company", event.target.value)} required /></Field>
+        <Field label="职位" hint={note("role")}><input value={draft.role} onChange={(event) => onDraft("role", event.target.value)} required /></Field>
+        <Field label="地点" hint={note("location")}><input value={draft.location} onChange={(event) => onDraft("location", event.target.value)} /></Field>
+        <Field label="工作方式" hint={note("workMode")}><select value={draft.workMode} onChange={(event) => onDraft("workMode", event.target.value)}><option value="">待确认</option><option>现场办公</option><option>混合办公</option><option>远程</option></select></Field>
+        <Field label="薪资" hint={note("salary")}><input value={draft.salary} onChange={(event) => onDraft("salary", event.target.value)} placeholder="待确认" /></Field>
+        <Field label="来源" hint={note("source")}><input value={draft.source} onChange={(event) => onDraft("source", event.target.value)} /></Field>
+        <Field label="保存位置" hint={note("stageId")}><select value={draft.stageId} onChange={(event) => onDraft("stageId", event.target.value)}>{data.stages.filter((stage) => !stage.hidden).map((stage) => <option value={stage.id} key={stage.id}>{stage.name}{stage.id === "stage_saved" ? "（不代表已投递）" : ""}</option>)}</select></Field>
+        <Field label="关注程度"><select value={draft.priority} onChange={(event) => onDraft("priority", Number(event.target.value))}><option value="1">普通</option><option value="2">重点关注</option><option value="3">时间敏感</option></select></Field>
+      </div>
+      <Field label="关键词" hint={note("tags")}><input value={draft.tags} onChange={(event) => onDraft("tags", event.target.value)} placeholder="用逗号分隔" /></Field>
+      <Field label="原职位链接" hint={note("sourceUrl")}><input type="url" value={draft.sourceUrl} onChange={(event) => onDraft("sourceUrl", event.target.value)} placeholder="https://" /></Field>
+      <Field label="职位描述" hint={note("description")}><textarea rows={8} value={draft.description} onChange={(event) => onDraft("description", event.target.value)} /></Field>
+      {hasDraftChanges && <div className="career-import-unapplied" role="status"><Pencil size={16} /><span>修改还只在表单里，确认后才会更新这份预览。</span><button type="button" className="career-button secondary" disabled={busy} onClick={onApply}>{busy ? <LoaderCircle className="spin" size={16} /> : <Check size={16} />}{busy ? "正在确认…" : "确认这些修改"}</button></div>}
+      <CareerImportWarningGroup warnings={row.preview.warnings} />
+      {safeLink(draft.sourceUrl) && <a className="career-import-source-link" href={draft.sourceUrl} target="_blank" rel="noreferrer">打开原职位 <ExternalLink size={14} /></a>}
+    </>}
+  </article>;
+}
+
+function CareerImportModal({ data, initialCapture, onClose, onRefresh, notify }: { data: CareerData; initialCapture: CareerCapturedSource | null; onClose: () => void; onRefresh: () => Promise<void>; notify: (text: string, tone?: Notice["tone"]) => void }) {
+  const [mode, setMode] = useState<CareerImportMode>(initialCapture ? "capture" : "paste");
+  const [paste, setPaste] = useState("");
+  const [capture, setCapture] = useState<CareerCapturedSource>(initialCapture ?? { url: "", selectedText: "" });
+  const [csvText, setCsvText] = useState("");
+  const [csvName, setCsvName] = useState("");
+  const [phase, setPhase] = useState<CareerImportPhase>("input");
+  const [rows, setRowsState] = useState<CareerImportUiRow[]>([]);
+  const [drafts, setDrafts] = useState<Record<string, CareerImportCandidate>>({});
+  const [previewSource, setPreviewSource] = useState<{ mode: CareerImportMode; snapshot: string; fingerprint: string } | null>(null);
+  const [globalWarnings, setGlobalWarnings] = useState<readonly CareerImportWarning[]>([]);
+  const [sameNameDecisions, setSameNameDecisions] = useState<Record<string, "pending" | "save" | "skip">>({});
+  const [revisingRowId, setRevisingRowId] = useState<string | null>(null);
+  const [error, setError] = useState("");
+  const [message, setMessage] = useState("");
+  const [closeConfirm, setCloseConfirm] = useState(false);
+  const [checking, setChecking] = useState(false);
+  const [absentRowIds, setAbsentRowIds] = useState<ReadonlySet<string> | null>(null);
+  const [committedRowIds, setCommittedRowIds] = useState<ReadonlySet<string>>(new Set());
+  const tabRefs = useRef<Array<HTMLButtonElement | null>>([]);
+  const rowsRef = useRef<CareerImportUiRow[]>([]);
+  const commitRef = useRef(false);
+  const checkRef = useRef(false);
+  const uncertainRowsRef = useRef<CareerImportUiRow[]>([]);
+  const finalClosePendingRef = useRef(false);
+  const requestRef = useRef<{ token: number; controller: AbortController | null }>({ token: 0, controller: null });
+  const valuesRef = useRef({ paste: "", capture: initialCapture ?? { url: "", selectedText: "" }, csv: "" });
+  const modeRef = useRef<CareerImportMode>(initialCapture ? "capture" : "paste");
+
+  useEffect(() => () => {
+    requestRef.current.controller?.abort();
+    requestRef.current = { token: requestRef.current.token + 1, controller: null };
+  }, []);
+
+  useEffect(() => {
+    if (closeConfirm || !finalClosePendingRef.current) return;
+    finalClosePendingRef.current = false;
+    onClose();
+  }, [closeConfirm, onClose]);
+
+  function setRows(next: CareerImportUiRow[]) {
+    rowsRef.current = next;
+    setRowsState(next);
+  }
+  function currentSnapshot(targetMode: CareerImportMode) {
+    return careerImportSourceSnapshot(targetMode, valuesRef.current);
+  }
+  function cancelPendingRequest() {
+    requestRef.current.controller?.abort();
+    requestRef.current = { token: requestRef.current.token + 1, controller: null };
+    if (phase === "fingerprinting" || phase === "requesting-ai") setPhase(rowsRef.current.length > 0 ? "preview" : "input");
+  }
+  function changeMode(nextMode: CareerImportMode) {
+    if (absentRowIds) return;
+    if (nextMode === modeRef.current) return;
+    cancelPendingRequest();
+    modeRef.current = nextMode;
+    setMode(nextMode);
+    setError("");
+  }
+  function changePaste(value: string) {
+    if (absentRowIds) return;
+    valuesRef.current = { ...valuesRef.current, paste: value };
+    setPaste(value);
+    cancelPendingRequest();
+    setError("");
+  }
+  function changeCapture(patch: Partial<CareerCapturedSource>) {
+    if (absentRowIds) return;
+    const next = { ...valuesRef.current.capture, ...patch };
+    valuesRef.current = { ...valuesRef.current, capture: next };
+    setCapture(next);
+    cancelPendingRequest();
+    setError("");
+  }
+  function replacePreview(nextRows: CareerImportUiRow[], source: { mode: CareerImportMode; snapshot: string; fingerprint: string }, warnings: readonly CareerImportWarning[] = []) {
+    setRows(nextRows);
+    setDrafts(Object.fromEntries(nextRows.map((row) => [row.id, row.preview.candidate])));
+    setPreviewSource(source);
+    setGlobalWarnings(warnings);
+    setSameNameDecisions({});
+    setAbsentRowIds(null);
+    setCommittedRowIds(new Set());
+    setMessage("");
+    setError("");
+    setPhase("preview");
+  }
+  function requestIsCurrent(token: number, targetMode: CareerImportMode, snapshot: string) {
+    return requestRef.current.token === token && modeRef.current === targetMode && currentSnapshot(targetMode) === snapshot;
+  }
+
+  async function previewWithAi(targetMode: "paste" | "capture") {
+    if (absentRowIds) return;
+    const snapshot = currentSnapshot(targetMode);
+    const captureValue = valuesRef.current.capture;
+    if (targetMode === "paste" ? !snapshot.trim() : !captureValue.url.trim() && !captureValue.selectedText.trim()) return;
+    const sourceIssue = careerImportAiSourceIssue(snapshot);
+    if (sourceIssue) {
+      cancelPendingRequest();
+      setMessage("");
+      setError(sourceIssue);
+      return;
+    }
+    requestRef.current.controller?.abort();
+    const controller = new AbortController();
+    const token = requestRef.current.token + 1;
+    requestRef.current = { token, controller };
+    setError("");
+    setMessage("");
+    setPhase("fingerprinting");
+    try {
+      const fingerprint = await fingerprintCareerImportSource(snapshot);
+      if (!requestIsCurrent(token, targetMode, snapshot)) return;
+      setPhase("requesting-ai");
+      const trimmedPaste = valuesRef.current.paste.trim();
+      const isStandaloneUrl = targetMode === "paste" && /^https?:\/\/\S+$/i.test(trimmedPaste);
+      const requestBody = targetMode === "capture"
+        ? { url: captureValue.url.trim(), text: captureValue.selectedText }
+        : { url: isStandaloneUrl ? trimmedPaste : "", text: isStandaloneUrl ? "" : valuesRef.current.paste };
+      const response = await fetch("/api/import/job", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(requestBody),
+        signal: controller.signal,
+      });
+      const body = await response.json().catch(() => null);
+      if (!requestIsCurrent(token, targetMode, snapshot)) return;
+      if (!response.ok) throw new Error((body as { error?: string } | null)?.error || "这次没有整理成功，原文仍保留在这里。");
+      const parsed = parseAiContent(body);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("服务没有返回可核对的职位字段，原文仍保留在这里。");
+      const parsedCandidate = { ...(parsed as Record<string, unknown>) };
+      for (const untrustedSourceField of [
+        "source", "platform", "source_hint", "detected_source", "sourceUrl", "source_url", "url", "original_url",
+        "stageId", "stage_id", "stage", "status", "priority",
+      ]) {
+        delete parsedCandidate[untrustedSourceField];
+      }
+      const explicitUrl = targetMode === "capture" ? captureValue.url.trim() : isStandaloneUrl ? trimmedPaste : "";
+      if (explicitUrl) parsedCandidate.original_url = explicitUrl;
+      const previous = previewSource?.snapshot === snapshot && rowsRef.current.length === 1 ? rowsRef.current[0].preview : undefined;
+      const preview = await createCareerJobImportPreview({ sourceText: snapshot, parsedCandidate, importOperationId: previous?.importOperationId });
+      if (!requestIsCurrent(token, targetMode, snapshot)) return;
+      if (preview.sourceFingerprint !== fingerprint) throw new Error("原文核对结果不一致，请按当前内容重新预览。");
+      replacePreview([{ id: previous ? rowsRef.current[0].id : crypto.randomUUID(), preview, included: true, confirmedFields: new Set() }], { mode: targetMode, snapshot, fingerprint });
+    } catch (caught) {
+      if (controller.signal.aborted || requestRef.current.token !== token) return;
+      setPhase(rowsRef.current.length > 0 ? "preview" : "input");
+      setError(caught instanceof Error ? caught.message : "这次没有整理成功，原文仍保留在这里。");
+    } finally {
+      if (requestRef.current.token === token) requestRef.current.controller = null;
+    }
+  }
+
+  async function previewCsv(file: File) {
+    if (absentRowIds) return;
+    cancelPendingRequest();
+    const token = requestRef.current.token + 1;
+    requestRef.current = { token, controller: null };
+    setCsvName(file.name);
+    setError("");
+    setMessage("");
+    const fileIssue = careerImportCsvFileIssue(file.size);
+    if (fileIssue) {
+      setError(fileIssue);
+      setPhase(rowsRef.current.length > 0 ? "preview" : "input");
+      return;
+    }
+    setPhase("fingerprinting");
+    try {
+      const text = await file.text();
+      if (requestRef.current.token !== token) return;
+      valuesRef.current = { ...valuesRef.current, csv: text };
+      setCsvText(text);
+      const parsed = await parseCareerCsvImportPreview(text);
+      if (requestRef.current.token !== token || valuesRef.current.csv !== text || modeRef.current !== "csv") return;
+      const nextRows = parsed.rows.map((preview, index) => ({
+        id: `${preview.rowNumber ?? index}:${crypto.randomUUID()}`,
+        preview,
+        included: preview.duplicateOfRowNumber === undefined,
+        confirmedFields: new Set<CareerImportEditableField>(),
+      }));
+      replacePreview(nextRows, { mode: "csv", snapshot: text, fingerprint: parsed.sourceFingerprint }, parsed.warnings);
+    } catch (caught) {
+      if (requestRef.current.token !== token) return;
+      setPhase(rowsRef.current.length > 0 ? "preview" : "input");
+      setError(caught instanceof Error ? caught.message : "这个 CSV 暂时无法预览，文件没有写入职迹。");
+    }
+  }
+
+  function updateDraft(rowId: string, field: CareerImportEditableField, value: string | number) {
+    setDrafts((current) => ({ ...current, [rowId]: { ...current[rowId], [field]: value } }));
+  }
+  async function applyRowChanges(rowId: string) {
+    if (revisingRowId) return;
+    const row = rowsRef.current.find((item) => item.id === rowId);
+    const draft = drafts[rowId];
+    if (!row || !draft) return;
+    const patch = Object.fromEntries([...careerImportCandidateFields, "priority" as const]
+      .filter((field) => draft[field] !== row.preview.candidate[field])
+      .map((field) => [field, draft[field]]));
+    const changedFields = Object.keys(patch) as CareerImportEditableField[];
+    if (changedFields.length === 0) return;
+    setRevisingRowId(rowId);
+    setPhase("revising");
+    setError("");
+    try {
+      const revised = await reviseCareerJobImportPreview(row.preview, patch);
+      const nextRows = rowsRef.current.map((item) => item.id === rowId ? {
+        ...item,
+        preview: revised,
+        confirmedFields: new Set([...item.confirmedFields, ...changedFields]),
+      } : item);
+      setRows(nextRows);
+      setDrafts((current) => ({ ...current, [rowId]: revised.candidate }));
+      if (changedFields.includes("company") || changedFields.includes("role")) {
+        setSameNameDecisions((current) => ({ ...current, [rowId]: "pending" }));
+      }
+      setPhase("preview");
+    } catch (caught) {
+      setPhase("preview");
+      setError(caught instanceof Error ? caught.message : "这次修改没有更新预览，表单内容仍保留。");
+    } finally { setRevisingRowId(null); }
+  }
+  async function forkDuplicate(rowId: string) {
+    if (revisingRowId || absentRowIds) return;
+    const row = rowsRef.current.find((item) => item.id === rowId);
+    if (!row) return;
+    setRevisingRowId(rowId);
+    setPhase("revising");
+    setError("");
+    try {
+      const forked = await forkCareerJobImportPreview(row.preview);
+      const nextRows = rowsRef.current.map((item) => item.id === rowId ? { ...item, preview: forked, included: true } : item);
+      setRows(nextRows);
+      setDrafts((current) => ({ ...current, [rowId]: forked.candidate }));
+      setPhase("preview");
+    } catch (caught) {
+      setPhase("preview");
+      setError(caught instanceof Error ? caught.message : "这行仍保持合并，没有另存。");
+    } finally { setRevisingRowId(null); }
+  }
+  function setRowIncluded(rowId: string, included: boolean) {
+    if (absentRowIds && !absentRowIds.has(rowId)) return;
+    setRows(rowsRef.current.map((row) => row.id === rowId ? { ...row, included } : row));
+    if (included) setSameNameDecisions((current) => ({ ...current, [rowId]: "pending" }));
+  }
+  function setSameNameDecision(rowId: string, decision: "save" | "skip") {
+    setSameNameDecisions((current) => ({ ...current, [rowId]: decision }));
+  }
+
+  async function refreshAfterCommit() {
+    setPhase("refreshing");
+    setError("");
+    try {
+      await onRefresh();
+      setPhase("complete");
+      notify("职位已保存在本机");
+    } catch {
+      setPhase("refresh-only");
+      setError("职位可能已经保存在本机，只是画面还没重新读取。这里只会刷新画面，不会再次创建。");
+    }
+  }
+  async function commitPreview() {
+    if (commitRef.current || phase !== "preview" || !previewSource) return;
+    const selected = selectCareerImportCommitRows(rowsRef.current, absentRowIds);
+    if (selected.length === 0) return;
+    commitRef.current = true;
+    setPhase("committing");
+    setError("");
+    try {
+      const snapshot = currentSnapshot(previewSource.mode);
+      const fingerprint = await fingerprintCareerImportSource(snapshot);
+      if (modeRef.current !== previewSource.mode || snapshot !== previewSource.snapshot || fingerprint !== previewSource.fingerprint) {
+        throw new CareerImportError("source_changed", "原文或文件已经变化，请按当前内容重新预览；这次没有保存。");
+      }
+      await commitCareerJobImports({ items: selected.map((row) => ({ preview: row.preview, currentSourceFingerprint: fingerprint })) });
+      await refreshAfterCommit();
+    } catch (caught) {
+      if (caught instanceof CareerImportCommitUncertainError || (caught instanceof CareerImportError && caught.code === "commit_uncertain")) {
+        uncertainRowsRef.current = selected;
+        setMessage("本机是否完成写入暂时无法确认。接下来只核对已有记录，不会重新提交。");
+        setPhase("commit-check");
+      } else if (caught instanceof CareerImportError && caught.code === "operation_conflict") {
+        setMessage("这份导入标识对应了不同内容。这里已经停止写入，现有记录不会被覆盖。");
+        setPhase("conflict");
+      } else {
+        setPhase("preview");
+        setError(caught instanceof Error ? caught.message : "这次没有保存，预览仍保留在这里。");
+      }
+    } finally { commitRef.current = false; }
+  }
+  async function inspectUncertainCommit() {
+    if (checkRef.current || uncertainRowsRef.current.length === 0) return;
+    checkRef.current = true;
+    setChecking(true);
+    setError("");
+    try {
+      const inspections = await Promise.all(uncertainRowsRef.current.map((row) => inspectCareerImportCommit(row.preview)));
+      if (inspections.some((item) => item.status === "conflict")) {
+        setMessage("核对发现这份导入标识对应了不同内容。这里已经停止写入，现有记录不会被覆盖。");
+        setPhase("conflict");
+      } else if (inspections.some((item) => item.status === "still_unknown")) {
+        setMessage("本机暂时仍无法确认。可以稍后继续核对；这里不会重新提交或换一个标识。");
+      } else if (inspections.some((item) => item.status === "absent")) {
+        const { absentRows, exactRows } = partitionCareerImportInspectionRows(uncertainRowsRef.current, inspections);
+        const absentIds = new Set(absentRows.map((row) => row.id));
+        const exactIds = new Set(exactRows.map((row) => row.id));
+        setAbsentRowIds(absentIds);
+        setCommittedRowIds(exactIds);
+        setRows(rowsRef.current.map((row) => exactIds.has(row.id) ? { ...row, included: false } : row));
+        uncertainRowsRef.current = [];
+        setMessage(exactRows.length > 0
+          ? "核对完成：已保存的项目不会再次写入；未写入的原预览和原操作标识仍保留，只能修改并再次保存这些项目。"
+          : "核对确认这次没有写入。原预览和原操作标识都已保留；这次只能修改并再次保存原来的选择。");
+        setPhase("preview");
+      } else {
+        await refreshAfterCommit();
+      }
+    } catch {
+      setMessage("本机暂时仍无法确认。可以稍后继续核对；这里不会重新提交或换一个标识。");
+    } finally {
+      checkRef.current = false;
+      setChecking(false);
+    }
+  }
+  async function retryRefreshOnly() {
+    setPhase("refreshing");
+    setError("");
+    try {
+      await onRefresh();
+      setPhase("complete");
+      notify("职位已保存在本机");
+    } catch {
+      setPhase("refresh-only");
+      setError("记录仍保存在本机。可以稍后再重新读取；这里不会重复创建。");
+    }
+  }
+
+  const renderedSourceSnapshot = previewSource ? careerImportSourceSnapshot(previewSource.mode, { paste, capture, csv: csvText }) : "";
+  const sourceChanged = previewSource !== null && (mode !== previewSource.mode || renderedSourceSnapshot !== previewSource.snapshot);
+  const selectedRows = selectCareerImportCommitRows(rows, absentRowIds);
+  const hasGlobalBlocking = globalWarnings.some((warning) => warning.severity === "blocking");
+  const hasBlocking = selectedRows.some((row) => row.preview.warnings.some((warning) => warning.severity === "blocking"));
+  const hasUnappliedDraft = selectedRows.some((row) => {
+    const draft = drafts[row.id];
+    return draft && ([...careerImportCandidateFields, "priority" as const].some((field) => draft[field] !== row.preview.candidate[field]));
+  });
+  const sameNamePending = selectedRows.some((row) => data.jobs.some((job) => sameCareerJobName(job, row.preview.candidate)) && (sameNameDecisions[row.id] ?? "pending") === "pending");
+  const sameNameSkipped = selectedRows.some((row) => data.jobs.some((job) => sameCareerJobName(job, row.preview.candidate)) && sameNameDecisions[row.id] === "skip");
+  const originalRecoverySelection = absentRowIds === null || selectedRows.every((row) => absentRowIds.has(row.id));
+  const canCommit = phase === "preview" && selectedRows.length > 0 && originalRecoverySelection && !sourceChanged && !hasGlobalBlocking && !hasBlocking && !hasUnappliedDraft && !sameNamePending && !sameNameSkipped;
+  const dirty = Boolean(paste.trim() || capture.url.trim() || capture.selectedText.trim() || csvText || rows.length > 0);
+  const closeLocked = phase === "committing" || phase === "commit-check" || phase === "refreshing" || phase === "refresh-only";
+  const recoveryActive = closeLocked || phase === "conflict" || phase === "complete";
+  const statusText = phase === "fingerprinting" ? "正在核对当前原文…" : phase === "requesting-ai" ? "DeepSeek 正在整理你明确提供的内容…" : phase === "revising" ? "正在更新可核对的预览…" : "";
+  function requestClose() {
+    if (closeLocked) return;
+    cancelPendingRequest();
+    if (dirty && phase !== "complete" && phase !== "conflict") { setCloseConfirm(true); return; }
+    onClose();
+  }
+  function tabKeydown(event: React.KeyboardEvent<HTMLButtonElement>, index: number) {
+    let next = index;
+    if (event.key === "ArrowRight") next = (index + 1) % careerImportModes.length;
+    else if (event.key === "ArrowLeft") next = (index - 1 + careerImportModes.length) % careerImportModes.length;
+    else if (event.key === "Home") next = 0;
+    else if (event.key === "End") next = careerImportModes.length - 1;
+    else return;
+    event.preventDefault();
+    changeMode(careerImportModes[next].id);
+    tabRefs.current[next]?.focus();
+  }
+
+  return <><Modal title="从职位原文建立记录" description="所有方式都会先生成可编辑预览；只有你确认保存后，才会写入本机职迹。" onClose={requestClose} wide dismissible={!closeLocked} inertToasts={closeLocked}>
+    <div className="career-import-shell">
+      {!recoveryActive && <>
+      <div className="career-import-tabs" role="tablist" aria-label="选择原文来源">{careerImportModes.map((item, index) => <button ref={(element) => { tabRefs.current[index] = element; }} type="button" role="tab" id={`career-import-tab-${item.id}`} aria-controls={`career-import-panel-${item.id}`} aria-selected={mode === item.id} tabIndex={mode === item.id ? 0 : -1} disabled={absentRowIds !== null} className={mode === item.id ? "active" : ""} key={item.id} onClick={() => changeMode(item.id)} onKeyDown={(event) => tabKeydown(event, index)}><item.icon size={16} />{item.label}</button>)}</div>
+      <section className="career-import-input-panel" role="tabpanel" id={`career-import-panel-${mode}`} aria-labelledby={`career-import-tab-${mode}`}>
+        {mode === "paste" && <><Field label="职位原文或公开链接"><textarea data-dialog-initial rows={7} value={paste} disabled={absentRowIds !== null} onChange={(event) => changePaste(event.target.value)} placeholder="粘贴职位描述、分享文本，或一个公开职位链接…" /></Field><p className="career-import-privacy"><ShieldCheck size={16} />粘贴：只有你在这里明确输入的内容会经 DeepSeek 整理；不会自动投递。</p><button type="button" className="career-button primary import-button" disabled={absentRowIds !== null || !paste.trim() || phase === "fingerprinting" || phase === "requesting-ai"} onClick={() => void previewWithAi("paste")}><WandSparkles size={16} />按当前内容生成预览</button></>}
+        {mode === "capture" && <><Field label="当前页面 URL"><input type="url" value={capture.url} disabled={absentRowIds !== null} onChange={(event) => changeCapture({ url: event.target.value })} placeholder="https://…" /></Field><Field label="你选中的文字" hint="可以留空"><textarea rows={7} value={capture.selectedText} disabled={absentRowIds !== null} onChange={(event) => changeCapture({ selectedText: event.target.value })} placeholder="采集器只带回你主动选中的文字，不会读取整页正文。" /></Field><p className="career-import-privacy"><ShieldCheck size={16} />采集：只发送 URL 与选中文字，不包含 Cookie、登录态或站内消息；不会自动投递。</p><button type="button" className="career-button primary import-button" disabled={absentRowIds !== null || (!capture.url.trim() && !capture.selectedText.trim()) || phase === "fingerprinting" || phase === "requesting-ai"} onClick={() => void previewWithAi("capture")}><WandSparkles size={16} />按当前采集生成预览</button></>}
+        {mode === "csv" && <div className="career-csv-input"><div><FileArchive size={25} /><span><b>在本机预览 CSV</b><small>支持中英文表头、引号内换行与转义引号。</small></span></div><input className="career-import-file-input" aria-label="选择职位 CSV 文件" type="file" accept=".csv,text/csv" disabled={absentRowIds !== null} onChange={(event) => { const file = event.target.files?.[0]; if (file) void previewCsv(file); event.currentTarget.value = ""; }} />{csvName && <p>当前文件：<b>{csvName}</b></p>}<p className="career-import-privacy"><ShieldCheck size={16} />CSV 只在当前浏览器本机解析，不会发送给 AI。</p></div>}
+      </section>
+      {statusText && <div className="career-import-status" role="status" aria-live="polite"><LoaderCircle className="spin" size={17} /><span>{statusText}</span>{(phase === "fingerprinting" || phase === "requesting-ai") && <button type="button" className="career-button ghost" onClick={cancelPendingRequest}>停止整理</button>}</div>}
+      {error && <div className="career-inline-error" role="alert"><X size={16} /><span>{error}</span></div>}
+      {message && phase === "preview" && !absentRowIds && <div className="career-import-message" role="status"><ShieldCheck size={17} /><span>{message}</span></div>}
+      {absentRowIds && phase === "preview" && <div className="career-import-source-changed original-operation" role="status"><ShieldCheck size={17} /><div><b>{committedRowIds.size > 0 ? "已保存与未写入的项目已分开" : "核对确认这次没有写入"}</b><p>{committedRowIds.size > 0 ? "已保存的项目只显示核对结果，不会再次编辑、选择或写入。未写入项目保留原操作标识；这次不能更换原文、文件或新增选择。" : "原预览与操作标识已保留。为避免重复记录，这次不能更换原文、文件或新增选择；仍可修改并再次保存原来的预览。"}</p></div></div>}
+      {sourceChanged && rows.length > 0 && <div className="career-import-source-changed" role="status"><FileText size={17} /><div><b>原文已经变化</b><p>旧预览仍完整保留，但不能按新原文保存。请按当前内容重新生成预览。</p></div></div>}
+      {globalWarnings.length > 0 && previewSource?.mode === "csv" && <CareerImportWarningGroup warnings={globalWarnings} />}
+      {rows.length > 0 && <div className={`career-import-preview-list ${previewSource?.mode === "csv" ? "csv" : "single"}`}>{rows.map((row) => committedRowIds.has(row.id) ? <article className="career-import-folded-row committed" key={row.id}><div><CheckCircle2 size={17} /><span><b>{row.preview.candidate.company} · {row.preview.candidate.role} 已确认保存在本机</b><small>这条只显示核对结果，不会再次编辑、选择或写入。</small></span></div></article> : row.preview.duplicateOfRowNumber !== undefined ? <article className="career-import-folded-row" key={row.id}><div><FileArchive size={17} /><span><b>第 {row.preview.rowNumber} 行与第 {row.preview.duplicateOfRowNumber} 行内容相同</b><small>默认合并，只保存一条；这不是错误。</small></span></div><button type="button" className="career-button secondary" disabled={revisingRowId !== null || absentRowIds !== null} onClick={() => void forkDuplicate(row.id)}>仍另存</button></article> : <CareerImportPreviewEditor key={row.id} row={row} draft={drafts[row.id] ?? row.preview.candidate} data={data} sameName={data.jobs.find((job) => sameCareerJobName(job, row.preview.candidate))} sameNameDecision={sameNameDecisions[row.id] ?? "pending"} busy={revisingRowId === row.id} csv={previewSource?.mode === "csv"} selectionLocked={Boolean(absentRowIds && !absentRowIds.has(row.id))} onDraft={(field, value) => updateDraft(row.id, field, value)} onApply={() => void applyRowChanges(row.id)} onInclude={(included) => setRowIncluded(row.id, included)} onSameNameDecision={(decision) => setSameNameDecision(row.id, decision)} />)}</div>}
+      {rows.length > 0 && <footer className="career-import-actions"><div>{hasUnappliedDraft ? "先确认表单里的修改" : sameNamePending ? "请先决定同名记录是否保存" : sameNameSkipped ? "你选择了这次不保存；也可以改回“仍保存这份”" : hasGlobalBlocking || hasBlocking ? "补充必要信息后即可保存" : sourceChanged ? "请按当前原文重新生成预览" : selectedRows.length === 0 ? "可以选择要保存的预览" : "保存只会写入本机 SQLite"}</div><button type="button" className="career-button primary" disabled={!canCommit} onClick={() => void commitPreview()}><Check size={16} />{previewSource?.mode === "csv" ? "保存所选预览" : "保存到职迹"}</button></footer>}
+      </>}
+      {phase === "committing" && <section className="career-import-recovery" role="status" aria-live="polite"><LoaderCircle className="spin" size={25} /><h3>正在保存到本机</h3><p>这份预览正在以原操作标识写入。为了避免重复记录，完成前不会接受第二次提交。</p></section>}
+      {phase === "refreshing" && <section className="career-import-recovery" role="status" aria-live="polite"><LoaderCircle className="spin" size={25} /><h3>正在重新读取画面</h3><p>写入步骤已经结束。现在只更新画面，不会再创建职位。</p></section>}
+      {phase === "commit-check" && <section className="career-import-recovery" role="status" aria-live="polite"><ShieldCheck size={24} /><h3>先核对，不重复提交</h3><p>{message}</p><button type="button" className="career-button primary" data-dialog-initial disabled={checking} onClick={() => void inspectUncertainCommit()}>{checking ? <LoaderCircle className="spin" size={16} /> : <Search size={16} />}{checking ? "正在核对本机记录…" : "核对本机记录"}</button><small>这一步只读取原操作标识，不会创建新职位。</small></section>}
+      {phase === "refresh-only" && <section className="career-import-recovery" role="status"><RotateCcw size={24} /><h3>记录已交给本机保存</h3><p>{error}</p><button type="button" className="career-button primary" data-dialog-initial onClick={() => void retryRefreshOnly()}><RotateCcw size={16} />只重新读取</button><small>不会再次提交，也不会创建另一个操作标识。</small></section>}
+      {phase === "conflict" && <section className="career-import-recovery neutral" role="status"><ShieldCheck size={24} /><h3>已经停止写入</h3><p>{message}</p><button type="button" className="career-button secondary" data-dialog-initial onClick={onClose}>关闭并稍后核对</button></section>}
+      {phase === "complete" && <section className="career-import-recovery complete" role="status"><CheckCircle2 size={25} /><h3>职位已经安稳地留在职迹里</h3><p>预览已保存，画面也重新读取完成。没有自动投递或更改其他记录。</p><button type="button" className="career-button primary" data-dialog-initial onClick={onClose}>回到职位</button></section>}
     </div>
-    {mode === "smart" ? <div className="career-smart-import">
-      <div className="career-platform-strip"><span className="linkedin"><b>in</b>LinkedIn</span><span className="boss"><b>BOSS</b>直聘</span><small>优先使用平台的“分享职位”文本</small></div>
-      <label className="career-import-box"><textarea aria-label="职位链接或分享文本" value={input} onChange={(event) => { setInput(event.target.value); setDraft(null); }} rows={7} placeholder={"粘贴 LinkedIn / BOSS直聘职位链接\n或粘贴“分享职位”得到的完整文本…"} /><footer><span><ShieldCheck size={14} />只在你点击解析后发送</span><SourceBadge source={source} /></footer></label>
-      <button type="button" className="career-button primary import-button" onClick={() => void parse()} disabled={loading || !input.trim()}>{loading ? <LoaderCircle className="spin" size={16} /> : <WandSparkles size={16} />}{loading ? "正在整理职位…" : "解析为本地草稿"}</button>
-      {error && <div className="career-inline-error"><X size={15} />{error}<button type="button" onClick={() => void parse()}>重试</button></div>}
-      {draft && <div className="career-import-preview"><header><div><span>保存前核对</span><h3>{draft.role || "职位待确认"}</h3><p>{draft.company || "公司待确认"} · {draft.location || "地点待确认"}</p></div><CheckCircle2 size={21} /></header>
-        {duplicate && <div className="career-duplicate-warning"><Bell size={16} /><span><b>已有同名职位</b><small>{duplicate.company} · {duplicate.role}</small></span></div>}
-        <div className="career-import-edit-grid"><Field label="公司"><input value={draft.company} onChange={(event) => updateDraft("company", event.target.value)} required /></Field><Field label="职位"><input value={draft.role} onChange={(event) => updateDraft("role", event.target.value)} required /></Field><Field label="地点"><input value={draft.location} onChange={(event) => updateDraft("location", event.target.value)} /></Field><Field label="工作方式"><select value={draft.workMode} onChange={(event) => updateDraft("workMode", event.target.value)}><option value="">待确认</option><option>现场办公</option><option>混合办公</option><option>远程</option></select></Field><Field label="薪资"><input value={draft.salary} onChange={(event) => updateDraft("salary", event.target.value)} placeholder="待确认" /></Field><Field label="来源"><input value={draft.source} readOnly /></Field></div>
-        <Field label="关键词" hint="用逗号分隔"><input value={draft.keywords} onChange={(event) => updateDraft("keywords", event.target.value)} /></Field>
-        <Field label="原职位链接"><input type="url" value={draft.sourceUrl} onChange={(event) => updateDraft("sourceUrl", event.target.value)} placeholder="https://" /></Field>
-        <Field label="职位描述" hint="已保留原始分享文本"><textarea rows={9} value={draft.description} onChange={(event) => updateDraft("description", event.target.value)} /></Field>
-        {draft.warnings.length > 0 && <div className="career-import-warnings"><b>保存前留意</b><ul>{draft.warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul></div>}
-        <footer>{safeLink(draft.sourceUrl) && <a href={draft.sourceUrl} target="_blank" rel="noreferrer">打开原职位 <ExternalLink size={14} /></a>}<span /><button type="button" className="career-button primary" disabled={!draft.company.trim() || !draft.role.trim()} onClick={() => void saveDraft()}>{duplicate ? "保存一份副本" : "保存到收藏"}</button></footer>
-      </div>}
-      <div className="career-capture-helper"><span><Command size={17} /></span><div><b>安全的联动方式</b><p>在招聘平台点“分享”或复制链接，再回到这里粘贴。职迹不会读取登录态、站内消息或自动替你投递。</p></div></div>
-    </div> : <div className="career-csv-import"><span><FileArchive size={32} /></span><h3>导入 Saved Jobs CSV</h3><p>支持包含 Company / Title / URL 的 LinkedIn 导出，也识别“公司 / 职位 / 链接”中文列。</p><label className="career-button primary"><Upload size={16} />选择 CSV<input hidden type="file" accept=".csv,text/csv" onChange={(event) => { const file = event.target.files?.[0]; if (file) csvImport(file); }} /></label><small>导入前建议保留原始导出文件。重复职位会在“全部职位”中便于检查。</small></div>}
-  </Modal>;
+  </Modal>{closeConfirm && <Modal title="放弃这次导入吗？" description="原文、CSV 预览与尚未保存的修改只在当前窗口里。" onClose={() => setCloseConfirm(false)} inertToasts><div className="career-import-close-choice"><p>你可以继续核对；如果放弃，职迹里已经存在的记录不会受影响。</p><div><button type="button" className="career-button primary" data-dialog-initial onClick={() => setCloseConfirm(false)}>继续核对</button><button type="button" className="career-button danger" onClick={() => { cancelPendingRequest(); finalClosePendingRef.current = true; setCloseConfirm(false); }}>放弃这次输入</button></div></div></Modal>}</>;
 }
 
 function CommandPalette({ data, onClose, onNavigate, onSelectJob, onAdd }: { data: CareerData; onClose: () => void; onNavigate: (view: CareerView) => void; onSelectJob: (id: string) => void; onAdd: () => void }) {
