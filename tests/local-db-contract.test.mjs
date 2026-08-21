@@ -59,8 +59,22 @@ for (const contract of [
     name: "zhiji",
     filename: "zhiji.sqlite3",
     minimumTables: 12,
-    seedTable: "job_applications",
-    minimumSeedRows: 4,
+    seedTable: "career_stages",
+    minimumSeedRows: 6,
+    emptyTables: [
+      "app_meta",
+      "career_profiles",
+      "companies",
+      "job_applications",
+      "application_events",
+      "career_tasks",
+      "interviews",
+      "contacts",
+      "contact_interactions",
+      "career_documents",
+      "application_documents",
+      "career_notes",
+    ],
   },
   {
     path: "lib/schemas/shici.ts",
@@ -70,6 +84,7 @@ for (const contract of [
     minimumTables: 13,
     seedTable: "vocabulary_entries",
     minimumSeedRows: 6,
+    emptyTables: [],
   },
   {
     path: "lib/schemas/shilian.ts",
@@ -79,6 +94,7 @@ for (const contract of [
     minimumTables: 17,
     seedTable: null,
     minimumSeedRows: 0,
+    emptyTables: [],
   },
 ]) {
   test(`${contract.name} reference schema and seed policy are idempotent`, async () => {
@@ -110,6 +126,13 @@ for (const contract of [
 
         assert.ok(firstSeedCount >= contract.minimumSeedRows);
         assert.equal(secondSeedCount, firstSeedCount);
+        for (const table of contract.emptyTables) {
+          assert.equal(
+            Number(database.selectValue(`SELECT COUNT(*) FROM ${table}`)),
+            0,
+            `${contract.name}.${table} must not contain inferred personal data`,
+          );
+        }
       } else {
         assert.equal(schema.seedVersion, 0);
         assert.equal(schema.seedSql, "");
