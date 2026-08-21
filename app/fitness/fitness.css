@@ -2421,6 +2421,81 @@
   color: var(--sl-muted);
 }
 
+.sl-start-choice {
+  display: grid;
+  gap: 18px;
+  padding: 24px;
+}
+
+.sl-start-choice > p {
+  color: var(--sl-muted);
+  font-size: 14px;
+  line-height: 1.65;
+}
+
+.sl-start-choice-venues {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+  padding: 16px;
+  border: 1px solid var(--sl-line);
+  border-radius: 16px;
+  background: #fff;
+}
+
+.sl-start-choice-venues > span {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.sl-start-choice-venues small {
+  color: var(--sl-faint);
+  font-size: 11px;
+}
+
+.sl-start-choice-venues strong {
+  overflow: hidden;
+  font-size: 15px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sl-start-choice-venues > i {
+  color: var(--sl-faint);
+  font-style: normal;
+}
+
+.sl-start-choice-actions {
+  display: grid;
+  gap: 8px;
+}
+
+.sl-start-choice-actions button {
+  min-height: 50px;
+  padding: 0 16px;
+}
+
+.sl-start-choice-actions button:not(.sl-primary) {
+  border: 1px solid var(--sl-line);
+  background: #fff;
+  color: var(--sl-ink);
+}
+
+.sl-start-choice-actions button:last-child {
+  border-color: transparent;
+  background: transparent;
+  color: var(--sl-muted);
+}
+
+.sl-start-choice .sl-start-choice-note {
+  padding: 11px 13px;
+  border-radius: 12px;
+  background: var(--sl-soft);
+  font-size: 12px;
+}
+
 .sl-first-run {
   position: fixed;
   z-index: 70;
@@ -3258,6 +3333,16 @@
   font-weight: 650;
 }
 
+.sl-live-bottom-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.sl-live-bottom-actions button:first-child:not(:last-child) {
+  background: transparent;
+  color: rgba(255, 255, 255, 0.72);
+}
+
 @keyframes sl-spin {
   to { transform: rotate(360deg); }
 }
@@ -3883,6 +3968,11 @@
     padding-right: 14px;
     padding-left: 14px;
   }
+
+  .sl-live-bottom-actions button {
+    padding-right: 12px;
+    padding-left: 12px;
+  }
 }
 
 @media (max-width: 370px) {
@@ -3906,6 +3996,28 @@
   .sl-more {
     width: 44px;
     min-width: 44px;
+  }
+
+  .sl-live-bottom {
+    align-items: flex-start;
+    gap: 8px;
+  }
+
+  .sl-live-bottom > span {
+    max-width: 92px;
+    padding-top: 7px;
+  }
+
+  .sl-live-bottom-actions {
+    display: grid;
+    flex: 1;
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .sl-live-bottom-actions button {
+    min-width: 0;
+    padding: 0 8px;
+    font-size: 11px;
   }
 
   .sl-title-actions,
