@@ -807,3 +807,90 @@
   .career-contact-follow-fields { grid-template-columns: 1fr; }
   .career-contact-job-picker label { min-height: 52px; }
 }
+
+.career-focus-symbol,
+.career-focus-rest > span {
+  width: 48px;
+  height: 48px;
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  color: #406756;
+  border: 1px solid #dbe5df;
+  border-radius: 15px;
+  background: #edf3ef;
+}
+.career-focus-rest {
+  min-height: 148px;
+  padding: 26px 22px;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  border: 1px solid #e3e8e4;
+  border-radius: 16px;
+  background: linear-gradient(145deg, #fff, #f7f9f7);
+}
+.career-focus-rest h3 { margin: 0 0 7px; color: var(--career-ink); font-size: 16px; }
+.career-focus-rest p { max-width: 430px; margin: 0; color: var(--career-muted); font-size: 13px; line-height: 1.65; }
+.career-agenda-calm {
+  margin: 0;
+  padding: 24px 18px;
+  color: var(--career-muted);
+  font-size: 13px;
+  line-height: 1.65;
+  text-align: center;
+}
+.career-local-draft-note,
+.career-stale-draft-note,
+.career-legacy-review-note {
+  padding: 13px 15px;
+  display: flex;
+  align-items: flex-start;
+  gap: 11px;
+  color: #3f6555;
+  border: 1px solid #d4e1da;
+  border-radius: 14px;
+  background: #edf4f0;
+}
+.career-local-draft-note > svg,
+.career-stale-draft-note > svg,
+.career-legacy-review-note > svg { flex: 0 0 auto; margin-top: 1px; }
+.career-local-draft-note > span { display: grid; gap: 4px; }
+.career-local-draft-note b,
+.career-stale-draft-note b,
+.career-legacy-review-note b { color: #294c3e; font-size: 13px; }
+.career-local-draft-note small,
+.career-stale-draft-note p,
+.career-legacy-review-note p { color: #62786e; font-size: 12px; line-height: 1.55; }
+.career-stale-draft-note > div { min-width: 0; }
+.career-stale-draft-note p { margin: 5px 0 11px; }
+.career-stale-draft-note > div > div { display: flex; flex-wrap: wrap; gap: 7px; }
+.career-stale-draft-note .career-button { min-height: 44px; }
+.career-legacy-review-note { margin-bottom: 15px; }
+.career-legacy-review-note p { margin: 5px 0 0; }
+.career-draft-choice { padding: 21px 22px 23px; }
+.career-draft-choice > p { margin: 0 0 16px; color: var(--career-muted); font-size: 13px; line-height: 1.6; }
+.career-draft-choice > div { display: grid; gap: 8px; }
+.career-draft-choice .career-button { min-height: 44px; justify-content: center; }
+.career-draft-choice > small {
+  margin-top: 16px;
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  color: var(--career-faint);
+  font-size: 12px;
+  line-height: 1.55;
+}
+.career-draft-choice > small svg { flex: 0 0 auto; margin-top: 1px; }
+
+@media (max-width: 760px) {
+  .career-today-grid { grid-template-columns: minmax(0, 1fr); }
+  .career-today-grid > .career-panel { min-width: 0; }
+  .career-topbar .career-icon-button,
+  .career-topbar .career-avatar { width: 44px; height: 44px; }
+  .career-focus-actions .career-button,
+  .career-content .career-text-button { min-height: 44px; }
+  .career-focus-rest { min-height: 136px; padding: 20px 17px; align-items: flex-start; }
+  .career-local-draft-note { margin: 0; }
+  .career-legacy-review-note { margin-bottom: 12px; }
+}
