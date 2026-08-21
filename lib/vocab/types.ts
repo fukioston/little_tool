@@ -95,6 +95,13 @@ export interface ReviewCard {
   reps: number;
   lapses: number;
   last_review_at: number | null;
+  algorithm_version: number;
+  suspended_from_state: Exclude<ReviewCard["state"], "suspended"> | null;
+  suspended_reason: string | null;
+  updated_at: number;
+  context_surface: string;
+  cloze_sentence: string;
+  queue_eligible?: boolean;
 }
 
 export interface Bookmark {

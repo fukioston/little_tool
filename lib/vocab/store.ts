@@ -1,7 +1,23 @@
 import { localDb } from "@/lib/local-db/client";
 import { uid } from "./content";
+import {
+  broadcastVocabChange,
+  withVocabReadLock,
+  withVocabWriteLock,
+} from "./lock";
+import {
+  applyDailyNewLimit,
+  createContextCloze,
+  hasUsefulEnglishExplanation,
+  localDayBounds,
+  localDayKey,
+  reconcileReviewSuspension,
+  reviewEventStartedAsNew,
+  scheduleReviewV2,
+} from "./srs";
 import type {
   AiExplanation,
+  Lexeme,
   LibraryItem,
   ParsedArticle,
   ParsedPodcast,
@@ -13,11 +29,38 @@ import type {
 } from "./types";
 
 const DB = "vocab";
+export const VOCAB_APPLICATION_ID = 0x53484349;
+export const VOCAB_RUNTIME_VERSION = 2;
+const LEGACY_SEED_CLEANUP_MARKER = "__shici_system_legacy_seed_cleanup_v1";
+const LEGACY_SEED_IDS = {
+  items: ["seed_article_deliberate", "seed_podcast_market"],
+  blocks: Array.from({ length: 8 }, (_, index) => `seed_block_${index + 1}`),
+  segments: Array.from({ length: 6 }, (_, index) => `seed_segment_${index}`),
+  lexemes: [
+    "seed_lexeme_deliberate",
+    "seed_lexeme_restraint",
+    "seed_lexeme_bustle",
+    "seed_lexeme_fleeting",
+  ],
+  occurrences: [
+    "seed_occ_deliberate",
+    "seed_occ_restraint",
+    "seed_occ_bustle",
+    "seed_occ_fleeting",
+  ],
+  cards: [
+    "seed_card_deliberate",
+    "seed_card_restraint",
+    "seed_card_fleeting",
+  ],
+  activity: ["seed_activity_today", "seed_activity_prior"],
+} as const;
+
 type SqlValue = string | number | bigint | boolean | null | Uint8Array;
 type Statement = { sql: string; params?: SqlValue[] | Record<string, SqlValue> };
 
-const schema = [
-  `CREATE TABLE IF NOT EXISTS vocab_items (
+const legacySchemaStatements: readonly Statement[] = [
+  { sql: `CREATE TABLE vocab_items (
     id TEXT PRIMARY KEY,
     kind TEXT NOT NULL CHECK (kind IN ('article','podcast')),
     title TEXT NOT NULL,
@@ -32,16 +75,16 @@ const schema = [
     progress REAL NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
-  )`,
-  `CREATE TABLE IF NOT EXISTS vocab_blocks (
+  )` },
+  { sql: `CREATE TABLE vocab_blocks (
     id TEXT PRIMARY KEY,
     item_id TEXT NOT NULL REFERENCES vocab_items(id) ON DELETE CASCADE,
     ordinal INTEGER NOT NULL,
     kind TEXT NOT NULL DEFAULT 'paragraph',
     text TEXT NOT NULL,
     UNIQUE(item_id, ordinal)
-  )`,
-  `CREATE TABLE IF NOT EXISTS vocab_transcript_segments (
+  )` },
+  { sql: `CREATE TABLE vocab_transcript_segments (
     id TEXT PRIMARY KEY,
     item_id TEXT NOT NULL REFERENCES vocab_items(id) ON DELETE CASCADE,
     ordinal INTEGER NOT NULL,
@@ -50,8 +93,8 @@ const schema = [
     text TEXT NOT NULL,
     speaker TEXT,
     UNIQUE(item_id, ordinal)
-  )`,
-  `CREATE TABLE IF NOT EXISTS vocab_lexemes (
+  )` },
+  { sql: `CREATE TABLE vocab_lexemes (
     id TEXT PRIMARY KEY,
     headword TEXT NOT NULL,
     normalized_key TEXT NOT NULL UNIQUE,
@@ -65,8 +108,8 @@ const schema = [
     lookup_count INTEGER NOT NULL DEFAULT 1,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
-  )`,
-  `CREATE TABLE IF NOT EXISTS vocab_occurrences (
+  )` },
+  { sql: `CREATE TABLE vocab_occurrences (
     id TEXT PRIMARY KEY,
     lexeme_id TEXT NOT NULL REFERENCES vocab_lexemes(id) ON DELETE CASCADE,
     item_id TEXT REFERENCES vocab_items(id) ON DELETE SET NULL,
@@ -82,8 +125,8 @@ const schema = [
     note TEXT NOT NULL DEFAULT '',
     explanation_json TEXT NOT NULL DEFAULT '',
     created_at INTEGER NOT NULL
-  )`,
-  `CREATE TABLE IF NOT EXISTS vocab_review_cards (
+  )` },
+  { sql: `CREATE TABLE vocab_review_cards (
     id TEXT PRIMARY KEY,
     lexeme_id TEXT NOT NULL UNIQUE REFERENCES vocab_lexemes(id) ON DELETE CASCADE,
     state TEXT NOT NULL DEFAULT 'new',
@@ -93,8 +136,8 @@ const schema = [
     reps INTEGER NOT NULL DEFAULT 0,
     lapses INTEGER NOT NULL DEFAULT 0,
     last_review_at INTEGER
-  )`,
-  `CREATE TABLE IF NOT EXISTS vocab_review_events (
+  )` },
+  { sql: `CREATE TABLE vocab_review_events (
     id TEXT PRIMARY KEY,
     card_id TEXT NOT NULL REFERENCES vocab_review_cards(id) ON DELETE CASCADE,
     rating TEXT NOT NULL,
@@ -102,16 +145,16 @@ const schema = [
     before_json TEXT NOT NULL,
     after_json TEXT NOT NULL,
     undone_at INTEGER
-  )`,
-  `CREATE TABLE IF NOT EXISTS vocab_bookmarks (
+  )` },
+  { sql: `CREATE TABLE vocab_bookmarks (
     id TEXT PRIMARY KEY,
     item_id TEXT NOT NULL REFERENCES vocab_items(id) ON DELETE CASCADE,
     locator TEXT NOT NULL,
     label TEXT NOT NULL DEFAULT '',
     note TEXT NOT NULL DEFAULT '',
     created_at INTEGER NOT NULL
-  )`,
-  `CREATE TABLE IF NOT EXISTS vocab_activity (
+  )` },
+  { sql: `CREATE TABLE vocab_activity (
     id TEXT PRIMARY KEY,
     day TEXT NOT NULL,
     read_seconds INTEGER NOT NULL DEFAULT 0,
@@ -119,13 +162,13 @@ const schema = [
     review_count INTEGER NOT NULL DEFAULT 0,
     lookups INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL
-  )`,
-  `CREATE TABLE IF NOT EXISTS vocab_settings (
+  )` },
+  { sql: `CREATE TABLE vocab_settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL,
     updated_at INTEGER NOT NULL
-  )`,
-  `CREATE TABLE IF NOT EXISTS vocab_imports (
+  )` },
+  { sql: `CREATE TABLE vocab_imports (
     id TEXT PRIMARY KEY,
     method TEXT NOT NULL,
     label TEXT NOT NULL,
@@ -133,58 +176,137 @@ const schema = [
     error TEXT NOT NULL DEFAULT '',
     item_id TEXT,
     created_at INTEGER NOT NULL
-  )`,
-  "CREATE INDEX IF NOT EXISTS idx_vocab_items_kind_updated ON vocab_items(kind, updated_at DESC)",
-  "CREATE INDEX IF NOT EXISTS idx_vocab_blocks_item_ordinal ON vocab_blocks(item_id, ordinal)",
-  "CREATE INDEX IF NOT EXISTS idx_vocab_segments_item_start ON vocab_transcript_segments(item_id, start_ms)",
-  "CREATE INDEX IF NOT EXISTS idx_vocab_occurrences_lexeme ON vocab_occurrences(lexeme_id, created_at DESC)",
-  "CREATE INDEX IF NOT EXISTS idx_vocab_cards_due ON vocab_review_cards(due_at, state)",
+  )` },
+  { sql: "CREATE INDEX idx_vocab_items_kind_updated ON vocab_items(kind, updated_at DESC)" },
+  { sql: "CREATE INDEX idx_vocab_blocks_item_ordinal ON vocab_blocks(item_id, ordinal)" },
+  { sql: "CREATE INDEX idx_vocab_segments_item_start ON vocab_transcript_segments(item_id, start_ms)" },
+  { sql: "CREATE INDEX idx_vocab_occurrences_lexeme ON vocab_occurrences(lexeme_id, created_at DESC)" },
+  { sql: "CREATE INDEX idx_vocab_cards_due ON vocab_review_cards(due_at, state)" },
 ];
 
-const seedStatements = (now: number): Statement[] => {
-  const day = new Date(now).toISOString().slice(0, 10);
-  const prior = new Date(now - 86400000).toISOString().slice(0, 10);
-  const articleId = "seed_article_deliberate";
-  const podcastId = "seed_podcast_market";
-  const blocks = [
-    ["seed_block_1", 0, "paragraph", "Just after sunrise, the streets have not fully awakened. Steam drifts from a bakery doorway, a cyclist passes beneath the plane trees, and the city seems to lower its voice for a moment."],
-    ["seed_block_2", 1, "heading", "Making room for attention"],
-    ["seed_block_3", 2, "paragraph", "We have learned to treat speed as a virtue. Messages should be answered instantly, journeys compressed, and even rest is expected to produce a measurable result. Yet the moments worth remembering rarely cooperate with that rhythm."],
-    ["seed_block_4", 3, "paragraph", "Moving slowly is not the same as abandoning progress. It can be a deliberate choice: looking once more before deciding, exercising restraint before speaking, and allowing an experience to acquire a lingering resonance."],
-    ["seed_block_5", 4, "quote", "When every minute is assigned a purpose, attention loses the freedom to linger."],
-    ["seed_block_6", 5, "paragraph", "In the afternoon I walked through an old neighborhood without opening a map. A repairman arranged his tools in a careful row, a cat narrowed its eyes in a window, and a grocer removed one yellow leaf from a bundle of greens. Fleeting details made the city tangible again."],
-    ["seed_block_7", 6, "heading", "A more discerning pace"],
-    ["seed_block_8", 7, "paragraph", "Perhaps the goal is not to move slowly all the time, but to recover the ability to change pace: to know when quick action matters and when an unhurried moment deserves our full attention."],
-  ] as const;
-  const segments = [
-    [0, 0, 6200, "Today we are listening to a neighborhood market at six in the morning."],
-    [1, 6200, 13500, "Metal shutters rise one by one, and the first vegetables still carry the coolness of the night."],
-    [2, 13500, 21800, "Vendors arrange their stalls while finishing stories they began the day before."],
-    [3, 21800, 30200, "The bustle is not merely noise; it has the familiar rhythm of a community waking up."],
-    [4, 30200, 39200, "One customer bargains over a bunch of greens, while another stops only to ask how someone has been."],
-    [5, 39200, 48000, "By the time sunlight crosses the rooftops, the market has already staged the city's earliest reunion."],
-  ] as const;
-
-  return [
-    { sql: "INSERT INTO vocab_items VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", params: [articleId, "article", "The Quiet Value of Moving Slowly", "Speed is not the only measure of progress. An aimless walk reveals the details that urgency makes easy to miss.", "Field Notes", null, "Mara Ellison", "2026-08-18", 0, null, "in_progress", 0.46, now - 7200000, now - 900000] },
-    { sql: "INSERT INTO vocab_items VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", params: [podcastId, "podcast", "City Sounds: A Market Before Dawn", "A short field recording about the voices and rituals that wake a neighborhood.", "The Listening Room", null, "Noah Reed", "2026-08-16", 48000, null, "in_progress", 0.31, now - 172800000, now - 3600000] },
-    ...blocks.map(([id, ordinal, kind, text]) => ({ sql: "INSERT INTO vocab_blocks VALUES (?,?,?,?,?)", params: [id, articleId, ordinal, kind, text] })),
-    ...segments.map(([ordinal, start, end, text]) => ({ sql: "INSERT INTO vocab_transcript_segments VALUES (?,?,?,?,?,?,?)", params: [`seed_segment_${ordinal}`, podcastId, ordinal, start, end, text, null] })),
-    { sql: "INSERT INTO vocab_lexemes VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", params: ["seed_lexeme_deliberate", "deliberate", "deliberate", "/dɪˈlɪbərət/", "intentional and carefully considered", "Chosen consciously rather than done by accident or in a hurry.", "深思熟虑的；从容而有意识的。", "learning", 1, "Useful for describing careful choices.", 3, now - 604800000, now - 86400000] },
-    { sql: "INSERT INTO vocab_lexemes VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", params: ["seed_lexeme_restraint", "restraint", "restraint", "/rɪˈstreɪnt/", "self-control; moderation", "The ability to hold back an impulse, action, or expression.", "克制；节制；约束力。", "learning", 0, "", 2, now - 432000000, now - 172800000] },
-    { sql: "INSERT INTO vocab_lexemes VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", params: ["seed_lexeme_bustle", "bustle", "bustle", "/ˈbʌsəl/", "lively, busy activity", "Energetic movement and activity involving many people.", "熙熙攘攘的活动；忙碌景象。", "saved", 0, "", 1, now - 172800000, now - 172800000] },
-    { sql: "INSERT INTO vocab_lexemes VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", params: ["seed_lexeme_fleeting", "fleeting", "fleeting", "/ˈfliːtɪŋ/", "lasting for only a short time", "Passing so quickly that it can easily be missed.", "短暂的；转瞬即逝的。", "learning", 1, "", 2, now - 345600000, now - 86400000] },
-    { sql: "INSERT INTO vocab_occurrences VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", params: ["seed_occ_deliberate", "seed_lexeme_deliberate", articleId, "seed_block_4", null, "deliberate", "", blocks[3][3], "", 63, 73, null, "", "", now - 604800000] },
-    { sql: "INSERT INTO vocab_occurrences VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", params: ["seed_occ_restraint", "seed_lexeme_restraint", articleId, "seed_block_4", null, "restraint", "", blocks[3][3], "", 113, 122, null, "", "", now - 432000000] },
-    { sql: "INSERT INTO vocab_occurrences VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", params: ["seed_occ_fleeting", "seed_lexeme_fleeting", articleId, "seed_block_6", null, "Fleeting", "", blocks[5][3], "", 219, 227, null, "", "", now - 345600000] },
-    { sql: "INSERT INTO vocab_occurrences VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", params: ["seed_occ_bustle", "seed_lexeme_bustle", podcastId, null, "seed_segment_3", "bustle", "", segments[3][3], "", 4, 10, 21800, "", "", now - 172800000] },
-    { sql: "INSERT INTO vocab_review_cards VALUES (?,?,?,?,?,?,?,?,?)", params: ["seed_card_deliberate", "seed_lexeme_deliberate", "review", now - 3600000, 3, 2.5, 4, 0, now - 259200000] },
-    { sql: "INSERT INTO vocab_review_cards VALUES (?,?,?,?,?,?,?,?,?)", params: ["seed_card_restraint", "seed_lexeme_restraint", "learning", now - 120000, 1, 2.35, 2, 1, now - 86400000] },
-    { sql: "INSERT INTO vocab_review_cards VALUES (?,?,?,?,?,?,?,?,?)", params: ["seed_card_fleeting", "seed_lexeme_fleeting", "review", now + 10800000, 5, 2.6, 5, 0, now - 432000000] },
-    { sql: "INSERT INTO vocab_activity VALUES (?,?,?,?,?,?,?)", params: ["seed_activity_today", day, 1320, 780, 7, 4, now] },
-    { sql: "INSERT INTO vocab_activity VALUES (?,?,?,?,?,?,?)", params: ["seed_activity_prior", prior, 840, 1240, 11, 3, now - 86400000] },
-  ];
+const migrationLedgerStatement: Statement = {
+  sql: `CREATE TABLE vocab_schema_migrations (
+    version INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    applied_at INTEGER NOT NULL
+  )`,
 };
+
+const schemaV2Statements: readonly Statement[] = [
+  { sql: "ALTER TABLE vocab_review_cards ADD COLUMN algorithm_version INTEGER NOT NULL DEFAULT 2" },
+  { sql: "ALTER TABLE vocab_review_cards ADD COLUMN suspended_from_state TEXT" },
+  { sql: "ALTER TABLE vocab_review_cards ADD COLUMN suspended_reason TEXT" },
+  { sql: "ALTER TABLE vocab_review_cards ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0" },
+  { sql: "ALTER TABLE vocab_review_events ADD COLUMN activity_id TEXT REFERENCES vocab_activity(id) ON DELETE SET NULL" },
+  { sql: "UPDATE vocab_review_cards SET updated_at=COALESCE(last_review_at,due_at) WHERE updated_at=0" },
+];
+
+const legacyTableColumns = {
+  vocab_items: ["id", "kind", "title", "description", "source", "source_url", "author", "published_at", "duration_ms", "audio_url", "status", "progress", "created_at", "updated_at"],
+  vocab_blocks: ["id", "item_id", "ordinal", "kind", "text"],
+  vocab_transcript_segments: ["id", "item_id", "ordinal", "start_ms", "end_ms", "text", "speaker"],
+  vocab_lexemes: ["id", "headword", "normalized_key", "pronunciation", "gloss_en", "explanation_en", "explanation_zh", "status", "starred", "notes", "lookup_count", "created_at", "updated_at"],
+  vocab_occurrences: ["id", "lexeme_id", "item_id", "block_id", "segment_id", "surface", "context_before", "context_sentence", "context_after", "start_utf16", "end_utf16", "start_ms", "note", "explanation_json", "created_at"],
+  vocab_review_cards: ["id", "lexeme_id", "state", "due_at", "interval_days", "ease", "reps", "lapses", "last_review_at"],
+  vocab_review_events: ["id", "card_id", "rating", "reviewed_at", "before_json", "after_json", "undone_at"],
+  vocab_bookmarks: ["id", "item_id", "locator", "label", "note", "created_at"],
+  vocab_activity: ["id", "day", "read_seconds", "listen_seconds", "review_count", "lookups", "created_at"],
+  vocab_settings: ["key", "value", "updated_at"],
+  vocab_imports: ["id", "method", "label", "status", "error", "item_id", "created_at"],
+} as const;
+
+const ledgerColumns = ["version", "name", "applied_at"] as const;
+const v2CardColumns = [
+  ...legacyTableColumns.vocab_review_cards,
+  "algorithm_version",
+  "suspended_from_state",
+  "suspended_reason",
+  "updated_at",
+] as const;
+const v2EventColumns = [
+  ...legacyTableColumns.vocab_review_events,
+  "activity_id",
+] as const;
+
+type TableContract = Readonly<Record<string, readonly string[]>>;
+type SchemaObject = Readonly<{ type: string; name: string }>;
+type StoredReviewCard = Pick<
+  ReviewCard,
+  | "id"
+  | "state"
+  | "due_at"
+  | "interval_days"
+  | "ease"
+  | "reps"
+  | "lapses"
+  | "last_review_at"
+  | "algorithm_version"
+  | "suspended_from_state"
+  | "suspended_reason"
+  | "updated_at"
+>;
+type ReviewEligibilityCard = Pick<
+  ReviewCard,
+  | "id"
+  | "state"
+  | "suspended_from_state"
+  | "suspended_reason"
+  | "updated_at"
+>;
+
+function placeholders(values: readonly unknown[]): string {
+  return values.map(() => "?").join(",");
+}
+
+function newReviewCardStatement(
+  lexemeId: string,
+  status: Lexeme["status"],
+  hasExplanation: boolean,
+  now: number,
+): Statement {
+  const suspension = reconcileReviewSuspension({
+    state: "new",
+    suspended_from_state: null,
+    suspended_reason: null,
+  }, status, hasExplanation);
+  return {
+    sql: `INSERT INTO vocab_review_cards(
+      id,lexeme_id,state,due_at,interval_days,ease,reps,lapses,last_review_at,
+      algorithm_version,suspended_from_state,suspended_reason,updated_at
+    ) SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?
+      WHERE NOT EXISTS (SELECT 1 FROM vocab_review_cards WHERE lexeme_id=?)`,
+    params: [
+      uid("card"), lexemeId, suspension.state, now, 0, 2.5, 0, 0, null, 2,
+      suspension.suspended_from_state, suspension.suspended_reason, now, lexemeId,
+    ],
+  };
+}
+
+function reviewSuspensionUpdateStatement(
+  card: ReviewEligibilityCard,
+  status: Lexeme["status"],
+  hasExplanation: boolean,
+  now: number,
+): Statement | null {
+  const next = reconcileReviewSuspension(card, status, hasExplanation);
+  if (
+    next.state === card.state &&
+    next.suspended_from_state === card.suspended_from_state &&
+    next.suspended_reason === card.suspended_reason
+  ) return null;
+  return {
+    sql: `UPDATE vocab_review_cards
+      SET state=?,suspended_from_state=?,suspended_reason=?,updated_at=?
+      WHERE id=?`,
+    params: [
+      next.state,
+      next.suspended_from_state,
+      next.suspended_reason,
+      Math.max(now, card.updated_at + 1),
+      card.id,
+    ],
+  };
+}
 
 function rowsOf<T>(result: unknown): T[] {
   if (Array.isArray(result)) return result as T[];
@@ -195,22 +317,344 @@ function rowsOf<T>(result: unknown): T[] {
   return [];
 }
 
-async function query<T>(sql: string, params: SqlValue[] = []) {
+async function rawQuery<T>(sql: string, params: SqlValue[] = []): Promise<T[]> {
   return rowsOf<T>(await localDb.query(DB, sql, params));
 }
 
-async function run(sql: string, params: SqlValue[] = []) {
+async function rawRun(sql: string, params: SqlValue[] = []) {
   return localDb.run(DB, sql, params);
 }
 
-export async function initializeVocabDatabase() {
-  await localDb.init();
-  for (const statement of schema) await run(statement);
-  const count = await query<{ total: number }>("SELECT COUNT(*) AS total FROM vocab_items");
-  if (Number(count[0]?.total ?? 0) === 0) {
-    await localDb.batch(DB, seedStatements(Date.now()));
+async function rawBatch(statements: readonly Statement[]) {
+  return localDb.batch(DB, statements);
+}
+
+async function readPragma(name: "application_id" | "user_version"): Promise<number> {
+  const rows = await rawQuery<Record<string, number>>(`PRAGMA ${name}`);
+  return Number(rows[0]?.[name] ?? 0);
+}
+
+async function schemaObjects(): Promise<SchemaObject[]> {
+  return rawQuery<SchemaObject>(
+    "SELECT type,name FROM sqlite_schema WHERE type IN ('table','view','trigger') AND name NOT LIKE 'sqlite_%' ORDER BY type,name",
+  );
+}
+
+async function tableColumns(table: string): Promise<string[]> {
+  const escaped = table.replaceAll('"', '""');
+  const rows = await rawQuery<{ name: string }>(`PRAGMA table_info("${escaped}")`);
+  return rows.map((row) => row.name);
+}
+
+function sameStrings(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+async function matchesExactContract(
+  objects: readonly SchemaObject[],
+  contract: TableContract,
+): Promise<boolean> {
+  if (objects.some((object) => object.type !== "table")) return false;
+  const expectedNames = Object.keys(contract).sort();
+  const actualNames = objects.map((object) => object.name).sort();
+  if (!sameStrings(actualNames, expectedNames)) return false;
+  for (const [table, expectedColumns] of Object.entries(contract)) {
+    if (!sameStrings(await tableColumns(table), expectedColumns)) return false;
   }
-  await run("PRAGMA optimize");
+  return true;
+}
+
+function versionContract(version: 1 | 2): TableContract {
+  const base: Record<string, readonly string[]> = {
+    ...legacyTableColumns,
+    vocab_schema_migrations: ledgerColumns,
+  };
+  if (version === 2) {
+    base.vocab_review_cards = v2CardColumns;
+    base.vocab_review_events = v2EventColumns;
+  }
+  return base;
+}
+
+async function assertRuntimeContract(version: 1 | 2): Promise<void> {
+  const objects = await schemaObjects();
+  if (!await matchesExactContract(objects, versionContract(version))) {
+    throw new Error(`拾词数据库 v${version} 的表结构不完整或包含未知对象。`);
+  }
+  const ledger = await rawQuery<{ version: number }>(
+    "SELECT version FROM vocab_schema_migrations ORDER BY version",
+  );
+  const expected = Array.from({ length: version }, (_, index) => index + 1);
+  if (!sameStrings(ledger.map((row) => String(row.version)), expected.map(String))) {
+    throw new Error("拾词数据库迁移记录不完整。");
+  }
+}
+
+async function installSchemaV1(now: number): Promise<void> {
+  await rawBatch([
+    ...legacySchemaStatements,
+    migrationLedgerStatement,
+    {
+      sql: "INSERT INTO vocab_schema_migrations(version,name,applied_at) VALUES(?,?,?)",
+      params: [1, "formalize-runtime-schema", now],
+    },
+    { sql: `PRAGMA application_id=${VOCAB_APPLICATION_ID}` },
+    { sql: "PRAGMA user_version=1" },
+  ]);
+}
+
+async function adoptExactLegacySchema(now: number): Promise<void> {
+  await rawBatch([
+    migrationLedgerStatement,
+    {
+      sql: "INSERT INTO vocab_schema_migrations(version,name,applied_at) VALUES(?,?,?)",
+      params: [1, "adopt-exact-legacy-runtime", now],
+    },
+    { sql: `PRAGMA application_id=${VOCAB_APPLICATION_ID}` },
+    { sql: "PRAGMA user_version=1" },
+  ]);
+}
+
+async function migrateSchemaV2(now: number): Promise<void> {
+  await rawBatch([
+    ...schemaV2Statements,
+    {
+      sql: "INSERT INTO vocab_schema_migrations(version,name,applied_at) VALUES(?,?,?)",
+      params: [2, "srs-v2", now],
+    },
+    { sql: "PRAGMA user_version=2" },
+  ]);
+}
+
+async function migrateRuntimeSchema(): Promise<boolean> {
+  const now = Date.now();
+  let applicationId = await readPragma("application_id");
+  let version = await readPragma("user_version");
+  const objects = await schemaObjects();
+  let changed = false;
+
+  if (applicationId === 0 && version === 0) {
+    if (objects.length === 0) {
+      await installSchemaV1(now);
+    } else if (await matchesExactContract(objects, legacyTableColumns)) {
+      await adoptExactLegacySchema(now);
+    } else {
+      throw new Error("当前文件不是可识别的旧版拾词数据库，已停止迁移。");
+    }
+    applicationId = VOCAB_APPLICATION_ID;
+    version = 1;
+    changed = true;
+  }
+
+  if (applicationId !== VOCAB_APPLICATION_ID) {
+    throw new Error("当前 SQLite 文件不属于拾词，未执行任何迁移。");
+  }
+  if (!Number.isInteger(version) || version < 1 || version > VOCAB_RUNTIME_VERSION) {
+    throw new Error(`拾词数据库版本 ${version} 不受支持。`);
+  }
+
+  await assertRuntimeContract(version as 1 | 2);
+  if (version < 2) {
+    await migrateSchemaV2(now);
+    version = 2;
+    changed = true;
+  }
+
+  if (
+    await readPragma("application_id") !== VOCAB_APPLICATION_ID ||
+    await readPragma("user_version") !== VOCAB_RUNTIME_VERSION
+  ) {
+    throw new Error("拾词数据库身份写入未完成。");
+  }
+  await assertRuntimeContract(2);
+  await rawRun("PRAGMA optimize");
+  return changed;
+}
+
+async function cleanupLegacySeedData(now: number): Promise<boolean> {
+  const marked = await rawQuery<{ value: string }>(
+    "SELECT value FROM vocab_settings WHERE key=?",
+    [LEGACY_SEED_CLEANUP_MARKER],
+  );
+  if (marked.length > 0) return false;
+
+  const seedGroups = [
+    ["vocab_items", LEGACY_SEED_IDS.items],
+    ["vocab_blocks", LEGACY_SEED_IDS.blocks],
+    ["vocab_transcript_segments", LEGACY_SEED_IDS.segments],
+    ["vocab_lexemes", LEGACY_SEED_IDS.lexemes],
+    ["vocab_occurrences", LEGACY_SEED_IDS.occurrences],
+    ["vocab_review_cards", LEGACY_SEED_IDS.cards],
+    ["vocab_activity", LEGACY_SEED_IDS.activity],
+  ] as const;
+  const evidenceSql = seedGroups.map(([table, ids]) =>
+    `SELECT 1 AS present FROM ${table} WHERE id IN (${placeholders(ids)})`
+  ).join(" UNION ALL ");
+  const evidence = await rawQuery<{ present: number }>(
+    `${evidenceSql} LIMIT 1`,
+    seedGroups.flatMap(([, ids]) => [...ids]),
+  );
+  if (evidence.length === 0) return false;
+
+  const dependencies = await rawQuery<{
+    id: string;
+    status: Lexeme["status"];
+    gloss_en: string;
+    explanation_en: string;
+    card_id: string | null;
+    card_state: ReviewCard["state"] | null;
+    card_suspended_from_state: ReviewCard["suspended_from_state"];
+    card_suspended_reason: string | null;
+    card_updated_at: number | null;
+    user_occurrence_count: number;
+    review_event_count: number;
+  }>(
+    `SELECT l.id,l.status,l.gloss_en,l.explanation_en,
+            c.id AS card_id,c.state AS card_state,
+            c.suspended_from_state AS card_suspended_from_state,
+            c.suspended_reason AS card_suspended_reason,
+            c.updated_at AS card_updated_at,
+            (SELECT COUNT(*) FROM vocab_occurrences o
+             WHERE o.lexeme_id=l.id
+               AND o.id NOT IN (${placeholders(LEGACY_SEED_IDS.occurrences)}))
+              AS user_occurrence_count,
+            (SELECT COUNT(*) FROM vocab_review_events e WHERE e.card_id=c.id)
+              AS review_event_count
+     FROM vocab_lexemes l
+     LEFT JOIN vocab_review_cards c ON c.lexeme_id=l.id
+     WHERE l.id IN (${placeholders(LEGACY_SEED_IDS.lexemes)})`,
+    [...LEGACY_SEED_IDS.occurrences, ...LEGACY_SEED_IDS.lexemes],
+  );
+  const expectedCards = new Map<string, string>([
+    ["seed_lexeme_deliberate", "seed_card_deliberate"],
+    ["seed_lexeme_restraint", "seed_card_restraint"],
+    ["seed_lexeme_fleeting", "seed_card_fleeting"],
+  ]);
+  const statements: Statement[] = [
+    {
+      sql: `UPDATE vocab_imports SET item_id=NULL
+            WHERE item_id IN (${placeholders(LEGACY_SEED_IDS.items)})`,
+      params: [...LEGACY_SEED_IDS.items],
+    },
+    {
+      sql: `DELETE FROM vocab_occurrences
+            WHERE id IN (${placeholders(LEGACY_SEED_IDS.occurrences)})`,
+      params: [...LEGACY_SEED_IDS.occurrences],
+    },
+    {
+      sql: `DELETE FROM vocab_activity
+            WHERE id IN (${placeholders(LEGACY_SEED_IDS.activity)})`,
+      params: [...LEGACY_SEED_IDS.activity],
+    },
+  ];
+
+  for (const row of dependencies) {
+    const expectedCard = expectedCards.get(row.id);
+    const seedCardWithoutHistory = row.card_id !== null &&
+      row.card_id === expectedCard && row.review_event_count === 0;
+    const userCard = row.card_id !== null && row.card_id !== expectedCard;
+    const preserveLexeme = row.user_occurrence_count > 0 ||
+      row.review_event_count > 0 || userCard;
+    if (seedCardWithoutHistory && row.card_id) {
+      statements.push({
+        sql: "DELETE FROM vocab_review_cards WHERE id=? AND lexeme_id=?",
+        params: [row.card_id, row.id],
+      });
+    }
+    if (!preserveLexeme) {
+      statements.push({
+        sql: `DELETE FROM vocab_lexemes WHERE id=?
+              AND NOT EXISTS (SELECT 1 FROM vocab_occurrences WHERE lexeme_id=?)
+              AND NOT EXISTS (SELECT 1 FROM vocab_review_cards WHERE lexeme_id=?)`,
+        params: [row.id, row.id, row.id],
+      });
+    } else if (!row.card_id || seedCardWithoutHistory) {
+      statements.push(newReviewCardStatement(
+        row.id,
+        row.status,
+        hasUsefulEnglishExplanation(row.gloss_en, row.explanation_en),
+        now,
+      ));
+    }
+  }
+
+  statements.push(
+    {
+      sql: `DELETE FROM vocab_items
+            WHERE id IN (${placeholders(LEGACY_SEED_IDS.items)})`,
+      params: [...LEGACY_SEED_IDS.items],
+    },
+    {
+      sql: `DELETE FROM vocab_blocks
+            WHERE id IN (${placeholders(LEGACY_SEED_IDS.blocks)})`,
+      params: [...LEGACY_SEED_IDS.blocks],
+    },
+    {
+      sql: `DELETE FROM vocab_transcript_segments
+            WHERE id IN (${placeholders(LEGACY_SEED_IDS.segments)})`,
+      params: [...LEGACY_SEED_IDS.segments],
+    },
+    {
+      sql: `INSERT INTO vocab_settings(key,value,updated_at) VALUES(?,?,?)
+            ON CONFLICT(key) DO NOTHING`,
+      params: [LEGACY_SEED_CLEANUP_MARKER, "complete", now],
+    },
+  );
+  await rawBatch(statements);
+  return true;
+}
+
+async function reconcileExplanationEligibility(now: number): Promise<boolean> {
+  const rows = await rawQuery<ReviewEligibilityCard & {
+    status: Lexeme["status"];
+    gloss_en: string;
+    explanation_en: string;
+  }>(
+    `SELECT c.id,c.state,c.suspended_from_state,c.suspended_reason,c.updated_at,
+            l.status,l.gloss_en,l.explanation_en
+     FROM vocab_review_cards c JOIN vocab_lexemes l ON l.id=c.lexeme_id`,
+  );
+  const statements = rows.flatMap((row) => {
+    const statement = reviewSuspensionUpdateStatement(
+      row,
+      row.status,
+      hasUsefulEnglishExplanation(row.gloss_en, row.explanation_en),
+      now,
+    );
+    return statement ? [statement] : [];
+  });
+  if (statements.length === 0) return false;
+  await rawBatch(statements);
+  return true;
+}
+
+async function withWrite<Result>(
+  reason: string,
+  operation: () => Promise<Result>,
+): Promise<Result> {
+  return withVocabWriteLock(async () => {
+    const result = await operation();
+    broadcastVocabChange(reason);
+    return result;
+  });
+}
+
+export async function initializeVocabDatabase(): Promise<void> {
+  await withVocabWriteLock(async () => {
+    await localDb.init(DB);
+    const migrated = await migrateRuntimeSchema();
+    const cleaned = await cleanupLegacySeedData(Date.now());
+    const reconciled = await reconcileExplanationEligibility(Date.now());
+    if (migrated || cleaned || reconciled) {
+      broadcastVocabChange(
+        cleaned
+          ? "legacy-seed-cleaned"
+          : migrated
+            ? "schema-migrated"
+            : "review-eligibility-reconciled",
+      );
+    }
+  });
 }
 
 function defaultSettings(): VocabSettings {
@@ -224,185 +668,781 @@ function defaultSettings(): VocabSettings {
   };
 }
 
-export async function loadVocabSnapshot(): Promise<VocabSnapshot> {
-  const [items, blocks, segments, lexemes, occurrences, reviewCards, bookmarks, activity, settingRows] = await Promise.all([
-    query<VocabSnapshot["items"][number]>("SELECT * FROM vocab_items ORDER BY updated_at DESC"),
-    query<VocabSnapshot["blocks"][number]>("SELECT * FROM vocab_blocks ORDER BY item_id, ordinal"),
-    query<VocabSnapshot["segments"][number]>("SELECT * FROM vocab_transcript_segments ORDER BY item_id, ordinal"),
-    query<VocabSnapshot["lexemes"][number]>(`SELECT l.*, COUNT(o.id) AS occurrence_count FROM vocab_lexemes l LEFT JOIN vocab_occurrences o ON o.lexeme_id=l.id GROUP BY l.id ORDER BY l.updated_at DESC`),
-    query<VocabSnapshot["occurrences"][number]>(`SELECT o.*, i.title AS item_title FROM vocab_occurrences o LEFT JOIN vocab_items i ON i.id=o.item_id ORDER BY o.created_at DESC`),
-    query<ReviewCard>(`SELECT c.*, l.headword, l.pronunciation, l.gloss_en, COALESCE(o.context_sentence,'') AS context_sentence FROM vocab_review_cards c JOIN vocab_lexemes l ON l.id=c.lexeme_id LEFT JOIN vocab_occurrences o ON o.id=(SELECT id FROM vocab_occurrences WHERE lexeme_id=l.id ORDER BY created_at DESC LIMIT 1) WHERE c.state!='suspended' ORDER BY c.due_at`),
-    query<VocabSnapshot["bookmarks"][number]>("SELECT * FROM vocab_bookmarks ORDER BY created_at DESC"),
-    query<VocabSnapshot["activity"][number]>("SELECT day, SUM(read_seconds) AS read_seconds, SUM(listen_seconds) AS listen_seconds, SUM(review_count) AS review_count, SUM(lookups) AS lookups FROM vocab_activity GROUP BY day ORDER BY day"),
-    query<{ key: string; value: string }>("SELECT key,value FROM vocab_settings"),
-  ]);
+function settingsFromRows(rows: readonly { key: string; value: string }[]): VocabSettings {
   const settings = defaultSettings();
-  for (const row of settingRows) {
-    if (row.key in settings) {
-      const key = row.key as keyof VocabSettings;
-      const raw = row.value;
-      (settings as unknown as Record<string, unknown>)[key] = raw === "true" ? true : raw === "false" ? false : Number.isNaN(Number(raw)) ? raw : Number(raw);
+  for (const row of rows) {
+    if (!(row.key in settings)) continue;
+    const key = row.key as keyof VocabSettings;
+    const raw = row.value;
+    (settings as unknown as Record<string, unknown>)[key] = raw === "true"
+      ? true
+      : raw === "false"
+        ? false
+        : Number.isNaN(Number(raw))
+          ? raw
+          : Number(raw);
+  }
+  return settings;
+}
+
+export async function loadVocabSnapshot(): Promise<VocabSnapshot> {
+  return withVocabReadLock(async () => {
+    const now = Date.now();
+    const day = localDayBounds(now);
+    const [
+      items,
+      blocks,
+      segments,
+      lexemes,
+      occurrences,
+      rawCards,
+      bookmarks,
+      activity,
+      settingRows,
+      todayReviewEvents,
+    ] = await Promise.all([
+      rawQuery<VocabSnapshot["items"][number]>(
+        "SELECT * FROM vocab_items ORDER BY updated_at DESC",
+      ),
+      rawQuery<VocabSnapshot["blocks"][number]>(
+        "SELECT * FROM vocab_blocks ORDER BY item_id, ordinal",
+      ),
+      rawQuery<VocabSnapshot["segments"][number]>(
+        "SELECT * FROM vocab_transcript_segments ORDER BY item_id, ordinal",
+      ),
+      rawQuery<VocabSnapshot["lexemes"][number]>(
+        `SELECT l.*, COUNT(o.id) AS occurrence_count
+         FROM vocab_lexemes l
+         LEFT JOIN vocab_occurrences o ON o.lexeme_id=l.id
+         GROUP BY l.id ORDER BY l.updated_at DESC`,
+      ),
+      rawQuery<VocabSnapshot["occurrences"][number]>(
+        `SELECT o.*, i.title AS item_title
+         FROM vocab_occurrences o
+         LEFT JOIN vocab_items i ON i.id=o.item_id
+         ORDER BY o.created_at DESC`,
+      ),
+      rawQuery<ReviewCard & { definition_explanation_en: string }>(
+        `SELECT c.*, l.headword, l.pronunciation,
+                COALESCE(NULLIF(TRIM(l.gloss_en),''),l.explanation_en) AS gloss_en,
+                l.explanation_en AS definition_explanation_en,
+                COALESCE(o.context_sentence,'') AS context_sentence,
+                COALESCE(o.surface,l.headword) AS context_surface
+         FROM vocab_review_cards c
+         JOIN vocab_lexemes l ON l.id=c.lexeme_id
+         LEFT JOIN vocab_occurrences o ON o.id=(
+           SELECT id FROM vocab_occurrences
+           WHERE lexeme_id=l.id ORDER BY created_at DESC LIMIT 1
+         )
+         WHERE c.state!='suspended' AND l.status NOT IN ('known','ignored')
+         ORDER BY c.due_at`,
+      ),
+      rawQuery<VocabSnapshot["bookmarks"][number]>(
+        "SELECT * FROM vocab_bookmarks ORDER BY created_at DESC",
+      ),
+      rawQuery<VocabSnapshot["activity"][number]>(
+        `SELECT day,
+                SUM(read_seconds) AS read_seconds,
+                SUM(listen_seconds) AS listen_seconds,
+                SUM(review_count) AS review_count,
+                SUM(lookups) AS lookups
+         FROM vocab_activity GROUP BY day ORDER BY day`,
+      ),
+      rawQuery<{ key: string; value: string }>(
+        "SELECT key,value FROM vocab_settings",
+      ),
+      rawQuery<{ before_json: string }>(
+        `SELECT before_json FROM vocab_review_events
+         WHERE reviewed_at>=? AND reviewed_at<? AND undone_at IS NULL`,
+        [day.start, day.end],
+      ),
+    ]);
+    const settings = settingsFromRows(settingRows);
+    const reviewedNewToday = todayReviewEvents.filter((event) =>
+      reviewEventStartedAsNew(event.before_json)
+    ).length;
+    const cardsWithCloze = rawCards.flatMap((row) => {
+      const { definition_explanation_en: explanationEnglish, ...card } = row;
+      if (!hasUsefulEnglishExplanation(card.gloss_en, explanationEnglish)) return [];
+      return [{
+        ...card,
+        cloze_sentence: createContextCloze(
+          card.context_sentence,
+          card.context_surface || card.headword,
+        ),
+      }];
+    });
+    const reviewCards = applyDailyNewLimit(
+      cardsWithCloze,
+      settings.daily_new_limit,
+      reviewedNewToday,
+      now,
+    );
+    return {
+      items,
+      blocks,
+      segments,
+      lexemes,
+      occurrences,
+      reviewCards,
+      bookmarks,
+      activity,
+      settings,
+    };
+  });
+}
+
+export async function saveArticle(
+  article: ParsedArticle,
+  method: string,
+): Promise<string> {
+  return withWrite("article-saved", async () => {
+    const now = Date.now();
+    const id = uid("article");
+    const statements: Statement[] = [
+      {
+        sql: `INSERT INTO vocab_items(
+          id,kind,title,description,source,source_url,author,published_at,
+          duration_ms,audio_url,status,progress,created_at,updated_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        params: [
+          id,
+          "article",
+          article.title,
+          article.description,
+          article.source,
+          article.sourceUrl ?? null,
+          article.author,
+          localDayKey(now),
+          0,
+          null,
+          "unread",
+          0,
+          now,
+          now,
+        ],
+      },
+      ...article.blocks.map((block, ordinal) => ({
+        sql: `INSERT INTO vocab_blocks(id,item_id,ordinal,kind,text)
+              VALUES (?,?,?,?,?)`,
+        params: [uid("block"), id, ordinal, block.kind, block.text],
+      })),
+      {
+        sql: `INSERT INTO vocab_imports(
+          id,method,label,status,error,item_id,created_at
+        ) VALUES (?,?,?,?,?,?,?)`,
+        params: [uid("import"), method, article.title, "complete", "", id, now],
+      },
+    ];
+    await rawBatch(statements);
+    return id;
+  });
+}
+
+export async function savePodcast(
+  podcast: ParsedPodcast,
+  method: string,
+): Promise<string> {
+  return withWrite("podcast-saved", async () => {
+    const now = Date.now();
+    const id = uid("podcast");
+    const duration = podcast.durationMs || podcast.segments.at(-1)?.end_ms || 0;
+    const statements: Statement[] = [
+      {
+        sql: `INSERT INTO vocab_items(
+          id,kind,title,description,source,source_url,author,published_at,
+          duration_ms,audio_url,status,progress,created_at,updated_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        params: [
+          id,
+          "podcast",
+          podcast.title,
+          podcast.description,
+          podcast.source,
+          podcast.sourceUrl ?? null,
+          "",
+          localDayKey(now),
+          duration,
+          podcast.audioUrl ?? null,
+          "unread",
+          0,
+          now,
+          now,
+        ],
+      },
+      ...podcast.segments.map((segment, ordinal) => ({
+        sql: `INSERT INTO vocab_transcript_segments(
+          id,item_id,ordinal,start_ms,end_ms,text,speaker
+        ) VALUES (?,?,?,?,?,?,?)`,
+        params: [
+          uid("segment"),
+          id,
+          ordinal,
+          segment.start_ms,
+          segment.end_ms,
+          segment.text,
+          segment.speaker ?? null,
+        ],
+      })),
+      {
+        sql: `INSERT INTO vocab_imports(
+          id,method,label,status,error,item_id,created_at
+        ) VALUES (?,?,?,?,?,?,?)`,
+        params: [uid("import"), method, podcast.title, "complete", "", id, now],
+      },
+    ];
+    await rawBatch(statements);
+    return id;
+  });
+}
+
+export async function saveOccurrence(
+  target: SelectionTarget,
+  explanation: AiExplanation | null,
+): Promise<{ lexemeId: string; occurrenceId: string }> {
+  return withWrite("occurrence-saved", async () => {
+    const now = Date.now();
+    const normalized = target.surface
+      .normalize("NFC")
+      .trim()
+      .toLocaleLowerCase("en");
+    const existing = await rawQuery<{
+      id: string;
+      status: Lexeme["status"];
+      gloss_en: string;
+      explanation_en: string;
+      card_id: string | null;
+      card_state: ReviewCard["state"] | null;
+      card_suspended_from_state: ReviewCard["suspended_from_state"];
+      card_suspended_reason: string | null;
+      card_updated_at: number | null;
+    }>(
+      `SELECT l.id,l.status,l.gloss_en,l.explanation_en,
+              c.id AS card_id,c.state AS card_state,
+              c.suspended_from_state AS card_suspended_from_state,
+              c.suspended_reason AS card_suspended_reason,
+              c.updated_at AS card_updated_at
+       FROM vocab_lexemes l
+       LEFT JOIN vocab_review_cards c ON c.lexeme_id=l.id
+       WHERE l.normalized_key=?`,
+      [normalized],
+    );
+    const lexemeId = existing[0]?.id ?? uid("lexeme");
+    const canonical = explanation?.target?.canonical?.trim() || target.surface;
+    const pronunciation = explanation?.target?.pronunciation ||
+      explanation?.target?.ipa ||
+      "";
+    const rawGloss = explanation?.sense?.glosses_en?.join("; ") ||
+      explanation?.sense?.meaning_in_context_en ||
+      "";
+    const rawEnglish = explanation?.sense?.explanation_en ||
+      explanation?.sense?.meaning_in_context_en ||
+      "";
+    const gloss = rawGloss || rawEnglish;
+    const english = rawEnglish || rawGloss;
+    const chinese = explanation?.sense?.explanation_zh || "";
+    const hasExplanation = hasUsefulEnglishExplanation(
+      gloss,
+      english,
+      existing[0]?.gloss_en ?? "",
+      existing[0]?.explanation_en ?? "",
+    );
+    const occurrenceId = uid("occurrence");
+    const statements: Statement[] = [];
+    if (existing[0]) {
+      statements.push({
+        sql: `UPDATE vocab_lexemes
+          SET headword=?,
+              pronunciation=CASE WHEN ?!='' THEN ? ELSE pronunciation END,
+              gloss_en=CASE WHEN ?!='' THEN ? ELSE gloss_en END,
+              explanation_en=CASE WHEN ?!='' THEN ? ELSE explanation_en END,
+              explanation_zh=CASE WHEN ?!='' THEN ? ELSE explanation_zh END,
+              lookup_count=lookup_count+1, updated_at=?
+          WHERE id=?`,
+        params: [
+          canonical,
+          pronunciation,
+          pronunciation,
+          gloss,
+          gloss,
+          english,
+          english,
+          chinese,
+          chinese,
+          now,
+          lexemeId,
+        ],
+      });
+    } else {
+      statements.push({
+        sql: `INSERT INTO vocab_lexemes(
+          id,headword,normalized_key,pronunciation,gloss_en,explanation_en,
+          explanation_zh,status,starred,notes,lookup_count,created_at,updated_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        params: [
+          lexemeId,
+          canonical,
+          normalized,
+          pronunciation,
+          gloss,
+          english,
+          chinese,
+          "saved",
+          0,
+          "",
+          1,
+          now,
+          now,
+        ],
+      });
     }
-  }
-  return { items, blocks, segments, lexemes, occurrences, reviewCards, bookmarks, activity, settings };
+    const existingLexeme = existing[0];
+    if (existingLexeme?.card_id && existingLexeme.card_state) {
+      const cardUpdate = reviewSuspensionUpdateStatement({
+        id: existingLexeme.card_id,
+        state: existingLexeme.card_state,
+        suspended_from_state: existingLexeme.card_suspended_from_state,
+        suspended_reason: existingLexeme.card_suspended_reason,
+        updated_at: existingLexeme.card_updated_at ?? 0,
+      }, existingLexeme.status, hasExplanation, now);
+      if (cardUpdate) statements.push(cardUpdate);
+    } else {
+      statements.push(newReviewCardStatement(
+        lexemeId,
+        existingLexeme?.status ?? "saved",
+        hasExplanation,
+        now,
+      ));
+    }
+    statements.push({
+      sql: `INSERT INTO vocab_occurrences(
+        id,lexeme_id,item_id,block_id,segment_id,surface,context_before,
+        context_sentence,context_after,start_utf16,end_utf16,start_ms,note,
+        explanation_json,created_at
+      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      params: [
+        occurrenceId,
+        lexemeId,
+        target.itemId,
+        target.blockId ?? null,
+        target.segmentId ?? null,
+        target.surface,
+        target.before,
+        target.sentence,
+        target.after,
+        target.startUtf16,
+        target.endUtf16,
+        target.startMs ?? null,
+        "",
+        explanation ? JSON.stringify(explanation) : "",
+        now,
+      ],
+    });
+    statements.push({
+      sql: `INSERT INTO vocab_activity(
+        id,day,read_seconds,listen_seconds,review_count,lookups,created_at
+      ) VALUES (?,?,?,?,?,?,?)`,
+      params: [uid("activity"), localDayKey(now), 0, 0, 0, 1, now],
+    });
+    await rawBatch(statements);
+    return { lexemeId, occurrenceId };
+  });
 }
 
-export async function saveArticle(article: ParsedArticle, method: string) {
-  const now = Date.now();
-  const id = uid("article");
-  const statements: Statement[] = [
-    { sql: "INSERT INTO vocab_items VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", params: [id, "article", article.title, article.description, article.source, article.sourceUrl ?? null, article.author, new Date(now).toISOString().slice(0, 10), 0, null, "unread", 0, now, now] },
-    ...article.blocks.map((block, ordinal) => ({ sql: "INSERT INTO vocab_blocks VALUES (?,?,?,?,?)", params: [uid("block"), id, ordinal, block.kind, block.text] })),
-    { sql: "INSERT INTO vocab_imports VALUES (?,?,?,?,?,?,?)", params: [uid("import"), method, article.title, "complete", "", id, now] },
+export async function saveLexemeNote(
+  lexemeId: string,
+  note: string,
+): Promise<void> {
+  await withWrite("lexeme-note-saved", async () => {
+    await rawRun(
+      "UPDATE vocab_lexemes SET notes=?, updated_at=? WHERE id=?",
+      [note, Date.now(), lexemeId],
+    );
+  });
+}
+
+export async function saveOccurrenceNote(
+  occurrenceId: string,
+  note: string,
+): Promise<void> {
+  await withWrite("occurrence-note-saved", async () => {
+    await rawRun(
+      "UPDATE vocab_occurrences SET note=? WHERE id=?",
+      [note, occurrenceId],
+    );
+  });
+}
+
+export async function updateLexemeStatus(
+  lexemeId: string,
+  status: Lexeme["status"],
+): Promise<void> {
+  await withWrite("lexeme-status-changed", async () => {
+    const now = Date.now();
+    const row = (await rawQuery<{
+      gloss_en: string;
+      explanation_en: string;
+      card_id: string | null;
+      card_state: ReviewCard["state"] | null;
+      card_suspended_from_state: ReviewCard["suspended_from_state"];
+      card_suspended_reason: string | null;
+      card_updated_at: number | null;
+    }>(
+      `SELECT l.gloss_en,l.explanation_en,c.id AS card_id,c.state AS card_state,
+              c.suspended_from_state AS card_suspended_from_state,
+              c.suspended_reason AS card_suspended_reason,
+              c.updated_at AS card_updated_at
+       FROM vocab_lexemes l LEFT JOIN vocab_review_cards c ON c.lexeme_id=l.id
+       WHERE l.id=?`,
+      [lexemeId],
+    ))[0];
+    const statements: Statement[] = [
+      {
+        sql: "UPDATE vocab_lexemes SET status=?, updated_at=? WHERE id=?",
+        params: [status, now, lexemeId],
+      },
+    ];
+    if (row?.card_id && row.card_state) {
+      const cardUpdate = reviewSuspensionUpdateStatement({
+        id: row.card_id,
+        state: row.card_state,
+        suspended_from_state: row.card_suspended_from_state,
+        suspended_reason: row.card_suspended_reason,
+        updated_at: row.card_updated_at ?? 0,
+      }, status, hasUsefulEnglishExplanation(row.gloss_en, row.explanation_en), now);
+      if (cardUpdate) statements.push(cardUpdate);
+    } else if (row) {
+      statements.push(newReviewCardStatement(
+        lexemeId,
+        status,
+        hasUsefulEnglishExplanation(row.gloss_en, row.explanation_en),
+        now,
+      ));
+    }
+    await rawBatch(statements);
+  });
+}
+
+export async function toggleLexemeStar(
+  lexemeId: string,
+  starred: boolean,
+): Promise<void> {
+  await withWrite("lexeme-star-changed", async () => {
+    await rawRun(
+      "UPDATE vocab_lexemes SET starred=?, updated_at=? WHERE id=?",
+      [starred ? 1 : 0, Date.now(), lexemeId],
+    );
+  });
+}
+
+export async function createBookmark(
+  itemId: string,
+  locator: string,
+  label: string,
+): Promise<void> {
+  await withWrite("bookmark-created", async () => {
+    await rawRun(
+      `INSERT INTO vocab_bookmarks(
+        id,item_id,locator,label,note,created_at
+      ) SELECT ?,?,?,?,?,?
+        WHERE NOT EXISTS (
+          SELECT 1 FROM vocab_bookmarks WHERE item_id=? AND locator=?
+        )`,
+      [uid("bookmark"), itemId, locator, label, "", Date.now(), itemId, locator],
+    );
+  });
+}
+
+export async function updateItemProgress(
+  itemId: string,
+  progress: number,
+  complete = false,
+): Promise<void> {
+  await withWrite("item-progress-changed", async () => {
+    const bounded = Math.max(0, Math.min(1, progress));
+    await rawRun(
+      "UPDATE vocab_items SET progress=?, status=?, updated_at=? WHERE id=?",
+      [
+        bounded,
+        complete ? "complete" : bounded > 0 ? "in_progress" : "unread",
+        Date.now(),
+        itemId,
+      ],
+    );
+  });
+}
+
+export async function updateItemStatus(
+  itemId: string,
+  status: LibraryItem["status"],
+): Promise<void> {
+  await withWrite("item-status-changed", async () => {
+    await rawRun(
+      "UPDATE vocab_items SET status=?, updated_at=? WHERE id=?",
+      [status, Date.now(), itemId],
+    );
+  });
+}
+
+function storedReviewState(card: StoredReviewCard) {
+  return {
+    state: card.state,
+    due_at: card.due_at,
+    interval_days: card.interval_days,
+    ease: card.ease,
+    reps: card.reps,
+    lapses: card.lapses,
+    last_review_at: card.last_review_at,
+    algorithm_version: card.algorithm_version,
+    suspended_from_state: card.suspended_from_state,
+    suspended_reason: card.suspended_reason,
+    updated_at: card.updated_at,
+  };
+}
+
+function parseStoredReviewState(
+  value: string,
+): Omit<StoredReviewCard, "id"> {
+  let parsed: Partial<Omit<StoredReviewCard, "id">>;
+  try {
+    parsed = JSON.parse(value) as Partial<Omit<StoredReviewCard, "id">>;
+  } catch {
+    throw new Error("复习撤销记录无法验证。");
+  }
+  const validStates: readonly ReviewCard["state"][] = [
+    "new",
+    "learning",
+    "review",
+    "relearning",
+    "suspended",
   ];
-  await localDb.batch(DB, statements);
-  return id;
-}
-
-export async function savePodcast(podcast: ParsedPodcast, method: string) {
-  const now = Date.now();
-  const id = uid("podcast");
-  const duration = podcast.durationMs || podcast.segments.at(-1)?.end_ms || 0;
-  const statements: Statement[] = [
-    { sql: "INSERT INTO vocab_items VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", params: [id, "podcast", podcast.title, podcast.description, podcast.source, podcast.sourceUrl ?? null, "", new Date(now).toISOString().slice(0, 10), duration, podcast.audioUrl ?? null, "unread", 0, now, now] },
-    ...podcast.segments.map((segment, ordinal) => ({ sql: "INSERT INTO vocab_transcript_segments VALUES (?,?,?,?,?,?,?)", params: [uid("segment"), id, ordinal, segment.start_ms, segment.end_ms, segment.text, segment.speaker ?? null] })),
-    { sql: "INSERT INTO vocab_imports VALUES (?,?,?,?,?,?,?)", params: [uid("import"), method, podcast.title, "complete", "", id, now] },
-  ];
-  await localDb.batch(DB, statements);
-  return id;
-}
-
-export async function saveOccurrence(target: SelectionTarget, explanation: AiExplanation | null) {
-  const now = Date.now();
-  const normalized = target.surface.normalize("NFC").trim().toLocaleLowerCase("en");
-  const existing = await query<{ id: string }>("SELECT id FROM vocab_lexemes WHERE normalized_key=?", [normalized]);
-  const lexemeId = existing[0]?.id ?? uid("lexeme");
-  const canonical = explanation?.target?.canonical?.trim() || target.surface;
-  const pronunciation = explanation?.target?.pronunciation || explanation?.target?.ipa || "";
-  const gloss = explanation?.sense?.glosses_en?.join("; ") || explanation?.sense?.meaning_in_context_en || "";
-  const english = explanation?.sense?.explanation_en || explanation?.sense?.meaning_in_context_en || "";
-  const chinese = explanation?.sense?.explanation_zh || "";
-  const occurrenceId = uid("occurrence");
-  const statements: Statement[] = [];
-  if (existing[0]) {
-    statements.push({ sql: "UPDATE vocab_lexemes SET headword=?, pronunciation=CASE WHEN ?!='' THEN ? ELSE pronunciation END, gloss_en=CASE WHEN ?!='' THEN ? ELSE gloss_en END, explanation_en=CASE WHEN ?!='' THEN ? ELSE explanation_en END, explanation_zh=CASE WHEN ?!='' THEN ? ELSE explanation_zh END, lookup_count=lookup_count+1, updated_at=? WHERE id=?", params: [canonical, pronunciation, pronunciation, gloss, gloss, english, english, chinese, chinese, now, lexemeId] });
-  } else {
-    statements.push({ sql: "INSERT INTO vocab_lexemes VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", params: [lexemeId, canonical, normalized, pronunciation, gloss, english, chinese, "saved", 0, "", 1, now, now] });
-    statements.push({ sql: "INSERT INTO vocab_review_cards VALUES (?,?,?,?,?,?,?,?,?)", params: [uid("card"), lexemeId, "new", now, 0, 2.5, 0, 0, null] });
+  if (
+    !parsed ||
+    typeof parsed.state !== "string" ||
+    !validStates.includes(parsed.state as ReviewCard["state"]) ||
+    typeof parsed.due_at !== "number" ||
+    typeof parsed.interval_days !== "number" ||
+    typeof parsed.ease !== "number" ||
+    typeof parsed.reps !== "number" ||
+    typeof parsed.lapses !== "number"
+  ) {
+    throw new Error("复习撤销记录无法验证。");
   }
-  statements.push({ sql: "INSERT INTO vocab_occurrences VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", params: [occurrenceId, lexemeId, target.itemId, target.blockId ?? null, target.segmentId ?? null, target.surface, target.before, target.sentence, target.after, target.startUtf16, target.endUtf16, target.startMs ?? null, "", explanation ? JSON.stringify(explanation) : "", now] });
-  statements.push({ sql: "INSERT INTO vocab_activity VALUES (?,?,?,?,?,?,?)", params: [uid("activity"), new Date(now).toISOString().slice(0, 10), 0, 0, 0, 1, now] });
-  await localDb.batch(DB, statements);
-  return { lexemeId, occurrenceId };
+  return {
+    state: parsed.state as ReviewCard["state"],
+    due_at: parsed.due_at,
+    interval_days: parsed.interval_days,
+    ease: parsed.ease,
+    reps: parsed.reps,
+    lapses: parsed.lapses,
+    last_review_at: typeof parsed.last_review_at === "number"
+      ? parsed.last_review_at
+      : null,
+    algorithm_version: typeof parsed.algorithm_version === "number"
+      ? parsed.algorithm_version
+      : 1,
+    suspended_from_state: parsed.suspended_from_state ?? null,
+    suspended_reason: typeof parsed.suspended_reason === "string"
+      ? parsed.suspended_reason
+      : null,
+    updated_at: typeof parsed.updated_at === "number" ? parsed.updated_at : 0,
+  };
 }
 
-export async function saveLexemeNote(lexemeId: string, note: string) {
-  await run("UPDATE vocab_lexemes SET notes=?, updated_at=? WHERE id=?", [note, Date.now(), lexemeId]);
+export async function rateReview(
+  card: ReviewCard,
+  rating: ReviewRating,
+): Promise<string> {
+  return withWrite("review-rated", async () => {
+    const current = (await rawQuery<StoredReviewCard>(
+      `SELECT id,state,due_at,interval_days,ease,reps,lapses,last_review_at,
+              algorithm_version,suspended_from_state,suspended_reason,updated_at
+       FROM vocab_review_cards WHERE id=?`,
+      [card.id],
+    ))[0];
+    if (
+      !current ||
+      current.state === "suspended" ||
+      current.updated_at !== card.updated_at
+    ) {
+      throw new Error("这张复习卡已发生变化，请刷新后重试。");
+    }
+    const now = Date.now();
+    const changedAt = Math.max(now, current.updated_at + 1);
+    const schedule = scheduleReviewV2(current, rating, now);
+    const eventId = uid("review");
+    const activityId = uid("activity");
+    const after = {
+      ...schedule,
+      suspended_from_state: null,
+      suspended_reason: null,
+      updated_at: changedAt,
+    };
+    await rawBatch([
+      {
+        sql: `UPDATE vocab_review_cards
+          SET state=?,due_at=?,interval_days=?,ease=?,reps=?,lapses=?,
+              last_review_at=?,algorithm_version=?,suspended_from_state=NULL,
+              suspended_reason=NULL,updated_at=?
+          WHERE id=?`,
+        params: [
+          schedule.state,
+          schedule.due_at,
+          schedule.interval_days,
+          schedule.ease,
+          schedule.reps,
+          schedule.lapses,
+          schedule.last_review_at,
+          schedule.algorithm_version,
+          changedAt,
+          current.id,
+        ],
+      },
+      {
+        sql: `INSERT INTO vocab_activity(
+          id,day,read_seconds,listen_seconds,review_count,lookups,created_at
+        ) VALUES (?,?,?,?,?,?,?)`,
+        params: [activityId, localDayKey(now), 0, 0, 1, 0, now],
+      },
+      {
+        sql: `INSERT INTO vocab_review_events(
+          id,card_id,rating,reviewed_at,before_json,after_json,undone_at,activity_id
+        ) VALUES (?,?,?,?,?,?,?,?)`,
+        params: [
+          eventId,
+          current.id,
+          rating,
+          now,
+          JSON.stringify(storedReviewState(current)),
+          JSON.stringify(after),
+          null,
+          activityId,
+        ],
+      },
+    ]);
+    return eventId;
+  });
 }
 
-export async function saveOccurrenceNote(occurrenceId: string, note: string) {
-  await run("UPDATE vocab_occurrences SET note=? WHERE id=?", [note, occurrenceId]);
+export async function undoReview(eventId: string): Promise<void> {
+  await withWrite("review-undone", async () => {
+    const event = (await rawQuery<{
+      card_id: string;
+      before_json: string;
+      activity_id: string | null;
+    }>(
+      `SELECT e.card_id,e.before_json,e.activity_id
+       FROM vocab_review_events e
+       WHERE e.id=? AND e.undone_at IS NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM vocab_review_events later
+           WHERE later.card_id=e.card_id AND later.undone_at IS NULL
+             AND (
+               later.reviewed_at>e.reviewed_at OR
+               (later.reviewed_at=e.reviewed_at AND later.rowid>e.rowid)
+             )
+         )`,
+      [eventId],
+    ))[0];
+    if (!event) {
+      throw new Error("只能撤销这张卡最近一次尚未撤销的评分。");
+    }
+    const before = parseStoredReviewState(event.before_json);
+    const statements: Statement[] = [
+      {
+        sql: `UPDATE vocab_review_cards
+          SET state=?,due_at=?,interval_days=?,ease=?,reps=?,lapses=?,
+              last_review_at=?,algorithm_version=?,suspended_from_state=?,
+              suspended_reason=?,updated_at=?
+          WHERE id=?`,
+        params: [
+          before.state,
+          before.due_at,
+          before.interval_days,
+          before.ease,
+          before.reps,
+          before.lapses,
+          before.last_review_at,
+          before.algorithm_version,
+          before.suspended_from_state,
+          before.suspended_reason,
+          before.updated_at,
+          event.card_id,
+        ],
+      },
+      {
+        sql: "UPDATE vocab_review_events SET undone_at=? WHERE id=?",
+        params: [Date.now(), eventId],
+      },
+    ];
+    if (event.activity_id) {
+      statements.push({
+        sql: "DELETE FROM vocab_activity WHERE id=? AND review_count=1",
+        params: [event.activity_id],
+      });
+    }
+    await rawBatch(statements);
+  });
 }
 
-export async function updateLexemeStatus(lexemeId: string, status: string) {
-  await run("UPDATE vocab_lexemes SET status=?, updated_at=? WHERE id=?", [status, Date.now(), lexemeId]);
+export async function saveSettings(settings: VocabSettings): Promise<void> {
+  await withWrite("settings-saved", async () => {
+    const now = Date.now();
+    const statements = Object.entries(settings).map(([key, value]) => ({
+      sql: `INSERT INTO vocab_settings(key,value,updated_at) VALUES(?,?,?)
+            ON CONFLICT(key) DO UPDATE SET
+              value=excluded.value,updated_at=excluded.updated_at`,
+      params: [key, String(value), now],
+    }));
+    await rawBatch(statements);
+  });
 }
 
-export async function toggleLexemeStar(lexemeId: string, starred: boolean) {
-  await run("UPDATE vocab_lexemes SET starred=?, updated_at=? WHERE id=?", [starred ? 1 : 0, Date.now(), lexemeId]);
-}
-
-export async function createBookmark(itemId: string, locator: string, label: string) {
-  await run("INSERT INTO vocab_bookmarks VALUES (?,?,?,?,?,?)", [uid("bookmark"), itemId, locator, label, "", Date.now()]);
-}
-
-export async function updateItemProgress(itemId: string, progress: number, complete = false) {
-  await run("UPDATE vocab_items SET progress=?, status=?, updated_at=? WHERE id=?", [Math.max(0, Math.min(1, progress)), complete ? "complete" : progress > 0 ? "in_progress" : "unread", Date.now(), itemId]);
-}
-
-export async function updateItemStatus(itemId: string, status: LibraryItem["status"]) {
-  await run("UPDATE vocab_items SET status=?, updated_at=? WHERE id=?", [status, Date.now(), itemId]);
-}
-
-export async function rateReview(card: ReviewCard, rating: ReviewRating) {
-  const now = Date.now();
-  let interval = card.interval_days;
-  let ease = card.ease;
-  let state: ReviewCard["state"] = "review";
-  let lapses = card.lapses;
-  if (rating === "again") {
-    interval = 10 / 1440;
-    ease = Math.max(1.3, ease - 0.2);
-    state = card.reps ? "relearning" : "learning";
-    lapses += card.reps ? 1 : 0;
-  } else if (rating === "hard") {
-    interval = Math.max(1, interval * 1.2 || 1);
-    ease = Math.max(1.3, ease - 0.05);
-  } else if (rating === "good") {
-    interval = Math.max(1, interval ? interval * ease : 1);
-  } else {
-    interval = Math.max(4, interval ? interval * (ease + 0.35) : 4);
-    ease = Math.min(3.2, ease + 0.1);
-  }
-  const due = now + interval * 86400000;
-  const before = JSON.stringify(card);
-  const after = JSON.stringify({ state, due_at: due, interval_days: interval, ease, reps: card.reps + 1, lapses, last_review_at: now });
-  const eventId = uid("review");
-  await localDb.batch(DB, [
-    { sql: "UPDATE vocab_review_cards SET state=?, due_at=?, interval_days=?, ease=?, reps=?, lapses=?, last_review_at=? WHERE id=?", params: [state, due, interval, ease, card.reps + 1, lapses, now, card.id] },
-    { sql: "INSERT INTO vocab_review_events VALUES (?,?,?,?,?,?,?)", params: [eventId, card.id, rating, now, before, after, null] },
-    { sql: "INSERT INTO vocab_activity VALUES (?,?,?,?,?,?,?)", params: [uid("activity"), new Date(now).toISOString().slice(0, 10), 0, 0, 1, 0, now] },
-  ]);
-  return eventId;
-}
-
-export async function undoReview(eventId: string) {
-  const events = await query<{ card_id: string; before_json: string }>("SELECT card_id,before_json FROM vocab_review_events WHERE id=? AND undone_at IS NULL", [eventId]);
-  const event = events[0];
-  if (!event) return;
-  const card = JSON.parse(event.before_json) as ReviewCard;
-  await localDb.batch(DB, [
-    { sql: "UPDATE vocab_review_cards SET state=?, due_at=?, interval_days=?, ease=?, reps=?, lapses=?, last_review_at=? WHERE id=?", params: [card.state, card.due_at, card.interval_days, card.ease, card.reps, card.lapses, card.last_review_at, event.card_id] },
-    { sql: "UPDATE vocab_review_events SET undone_at=? WHERE id=?", params: [Date.now(), eventId] },
-  ]);
-}
-
-export async function saveSettings(settings: VocabSettings) {
-  const now = Date.now();
-  const statements = Object.entries(settings).map(([key, value]) => ({
-    sql: "INSERT INTO vocab_settings(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
-    params: [key, String(value), now],
-  }));
-  await localDb.batch(DB, statements);
-}
-
-export async function exportVocabDatabase() {
-  const result = await localDb.export(DB) as unknown;
-  if (result instanceof Uint8Array) return result;
-  if (result instanceof ArrayBuffer) return new Uint8Array(result);
-  if (result && typeof result === "object" && "data" in result) {
-    const data = (result as { data: Uint8Array | ArrayBuffer }).data;
-    return data instanceof Uint8Array ? data : new Uint8Array(data);
-  }
-  throw new Error("数据库导出没有返回有效文件");
-}
-
-export async function importVocabDatabase(bytes: Uint8Array) {
-  await localDb.import(DB, bytes);
-  await initializeVocabDatabase();
-}
-
-export async function recordStudySeconds(itemId: string, kind: "read" | "listen", seconds: number) {
+export async function recordStudySeconds(
+  itemId: string,
+  kind: "read" | "listen",
+  seconds: number,
+): Promise<void> {
   if (seconds < 1) return;
-  const now = Date.now();
-  await run("INSERT INTO vocab_activity VALUES (?,?,?,?,?,?,?)", [uid("activity"), new Date(now).toISOString().slice(0, 10), kind === "read" ? seconds : 0, kind === "listen" ? seconds : 0, 0, 0, now]);
-  await run("UPDATE vocab_items SET updated_at=? WHERE id=?", [now, itemId]);
+  await withWrite("study-time-recorded", async () => {
+    const now = Date.now();
+    await rawBatch([
+      {
+        sql: `INSERT INTO vocab_activity(
+          id,day,read_seconds,listen_seconds,review_count,lookups,created_at
+        ) VALUES (?,?,?,?,?,?,?)`,
+        params: [
+          uid("activity"),
+          localDayKey(now),
+          kind === "read" ? seconds : 0,
+          kind === "listen" ? seconds : 0,
+          0,
+          0,
+          now,
+        ],
+      },
+      {
+        sql: "UPDATE vocab_items SET updated_at=? WHERE id=?",
+        params: [now, itemId],
+      },
+    ]);
+  });
 }
 
-export function getDueCards(cards: ReviewCard[], now = Date.now()) {
-  return cards.filter((card) => card.due_at <= now && card.state !== "suspended");
+export function getDueCards(
+  cards: ReviewCard[],
+  now = Date.now(),
+): ReviewCard[] {
+  return cards.filter((card) =>
+    card.due_at <= now &&
+    card.state !== "suspended" &&
+    card.queue_eligible !== false
+  );
 }
 
-export function findItem(items: LibraryItem[], id: string | null) {
+export function findItem(
+  items: LibraryItem[],
+  id: string | null,
+): LibraryItem | null {
   return id ? items.find((item) => item.id === id) ?? null : null;
 }
