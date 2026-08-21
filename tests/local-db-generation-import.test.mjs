@@ -33,15 +33,19 @@ function section(source, start, end) {
   return source.slice(startIndex, endIndex);
 }
 
-test("Career generation ids, tokens, pointer payloads, and ranking are deterministic", async () => {
+test("Career compatibility and per-database generation identities remain deterministic", async () => {
   const types = await loadStandaloneTypeScriptModule("lib/local-db/types.ts");
   const generationId = "123e4567-e89b-42d3-a456-426614174000";
   const filename = `zhiji.${generationId}.sqlite3`;
+  const vocabFilename = `shici.${generationId}.sqlite3`;
 
+  assert.equal(types.isDatabaseGenerationId(generationId), true);
   assert.equal(types.isCareerGenerationId(generationId), true);
   assert.equal(types.isCareerGenerationId("../../zhiji.sqlite3"), false);
   assert.equal(types.isCareerGenerationId("123E4567-e89b-42d3-a456-426614174000"), false);
   assert.equal(types.careerGenerationFilename(generationId), filename);
+  assert.equal(types.databaseGenerationFilename("zhiji", generationId), filename);
+  assert.equal(types.databaseGenerationFilename("shici", generationId), vocabFilename);
   assert.throws(() => types.careerGenerationFilename("not-a-generation"));
 
   assert.equal(types.isCareerActivationToken("a".repeat(64)), true);
@@ -60,6 +64,15 @@ test("Career generation ids, tokens, pointer payloads, and ranking are determini
     ).then((digest) => Buffer.from(digest).toString("hex")),
     "891d1725fd9f26d9e511c7d3ffa393f6f51e6536e5a1ff8ca1254ed27bee8b15",
   );
+  const vocabPointer = { ...pointer, filename: vocabFilename };
+  assert.equal(
+    types.databaseGenerationPointerChecksumInput("shici", vocabPointer),
+    `private-ai-suite:vocab-pointer:v1\n7\n${vocabFilename}\n`,
+  );
+  assert.notEqual(
+    types.databaseGenerationPointerChecksumInput("zhiji", pointer),
+    types.databaseGenerationPointerChecksumInput("shici", vocabPointer),
+  );
 
   const ranked = types.rankCareerGenerationPointers([
     { ...pointer, sequence: 3, slot: "a", checksum: "1".repeat(64) },
@@ -73,7 +86,7 @@ test("Career generation ids, tokens, pointer payloads, and ranking are determini
   ]);
 });
 
-test("worker rejects corrupt newer pointers and falls back through older generations", async () => {
+test("worker rejects corrupt namespaced pointers and falls back through older generations", async () => {
   const worker = await readFile(
     new URL("lib/local-db/sqlite.worker.ts", projectRoot),
     "utf8",
@@ -83,7 +96,9 @@ test("worker rejects corrupt newer pointers and falls back through older generat
     "async function readGenerationPointer(",
     "async function readRankedGenerationPointers(",
   );
-  assert.match(pointerReader, /careerGenerationPointerChecksumInput\(pointer\)/);
+  assert.match(pointerReader, /GENERATION_FILES\[name\]\.pointerFiles\[slot\]/);
+  assert.match(pointerReader, /databaseGenerationPointerChecksumInput\(name, pointer\)/);
+  assert.match(pointerReader, /generationIdFromFilename\(name, parsed\.filename\) === null/);
   assert.match(pointerReader, /if \(!equalDigest\(checksum, parsed\.checksum\)\) return null/);
 
   const opener = section(
@@ -108,14 +123,14 @@ test("first activation preserves legacy, then commits the candidate to the other
   );
   const activation = section(
     worker,
-    "async function activateStagedCareerGeneration(",
-    "async function currentCareerGeneration(",
+    "async function activateStagedDatabaseGeneration(",
+    "async function currentDatabaseGeneration(",
   );
   const baselineGuard = activation.indexOf("if (active.pointerSlot === null)");
   const baselineWrite = activation.indexOf("const baseline = await writeGenerationPointer");
   const targetSelection = activation.indexOf("const targetSlot:");
   const candidateWrite = activation.indexOf("const committed = await writeGenerationPointer");
-  const stateSwitch = activation.indexOf('openDatabases.set("zhiji", nextState)');
+  const stateSwitch = activation.indexOf("openDatabases.set(name, nextState)");
   assert.ok(
     baselineGuard >= 0 &&
       baselineGuard < baselineWrite &&
@@ -134,19 +149,19 @@ test("stage failure only cleans its random candidate and never writes the live p
   );
   const staging = section(
     worker,
-    "async function stageCareerImport(",
+    "async function stageDatabaseImport(",
     "async function validateReadyCandidate(",
   );
-  assert.match(staging, /const filename = careerGenerationFilename\(generationId\)/);
+  assert.match(staging, /const filename = databaseGenerationFilename\(name, generationId\)/);
   assert.match(staging, /OpfsDb\.importDb\(`\/\$\{filename\}`, replacement\)/);
   assert.match(staging, /assertDatabaseContract\(candidate, requirements, "source"\)/);
   assert.match(staging, /executeBatch\(candidate, statements, true\)/);
   assert.match(staging, /assertDatabaseContract\(candidate, requirements, "canonical"\)/);
   assert.match(staging, /removeOpfsEntryIfPresent\(filename\)/);
-  assert.doesNotMatch(staging, /CAREER_LEGACY_FILENAME|DATABASE_FILES|openDatabases\.set/);
+  assert.doesNotMatch(staging, /DATABASE_FILES|openDatabases\.set/);
 });
 
-test("public RPC exposes staged activation without broadening Vocab imports", async () => {
+test("public RPC stages Career and Vocabulary independently without cross-product pointers", async () => {
   const [types, client, worker] = await Promise.all([
     readFile(new URL("lib/local-db/types.ts", projectRoot), "utf8"),
     readFile(new URL("lib/local-db/client.ts", projectRoot), "utf8"),
@@ -161,9 +176,16 @@ test("public RPC exposes staged activation without broadening Vocab imports", as
     assert.match(types, new RegExp(`\\| \\"${operation}\\"`));
     assert.match(client, new RegExp(`\\b${operation}\\(`));
   }
-  assert.match(client, /stageImport\(\s*database: "career"/);
-  assert.match(client, /activateStaged\(\s*database: "career"/);
-  assert.match(worker, /assertCareerOnly\(name, "Staged import"\)/);
-  assert.match(worker, /assertCareerOnly\(name, "Staged activation"\)/);
-  assert.match(worker, /assertActivationToken\(ready, activationToken\)/);
+  assert.match(client, /stageImport\(\s*database: LocalDatabaseId/);
+  assert.match(client, /activateStaged\(\s*database: LocalDatabaseId/);
+  assert.match(worker, /stageDatabaseImport\(\s*request\.database/);
+  assert.match(worker, /activateStagedDatabaseGeneration\(\s*request\.database/);
+  assert.match(worker, /assertActivationToken\(name, ready, activationToken\)/);
+  assert.match(worker, /zhiji\.active-a\.json/);
+  assert.match(worker, /zhiji\.active-b\.json/);
+  assert.match(worker, /shici\.active-a\.json/);
+  assert.match(worker, /shici\.active-b\.json/);
+  assert.match(worker, /rawPointerReferences\(\s*name,/);
+  assert.match(worker, /generationIdFromFilename\(name, filename\)/);
+  assert.doesNotMatch(worker, /assertCareerOnly/);
 });

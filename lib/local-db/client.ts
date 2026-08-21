@@ -185,7 +185,7 @@ export class LocalDatabaseClient {
     data: Uint8Array | ArrayBuffer,
     statements: readonly SqlStatement[],
     requirements: DatabaseSchemaRequirements,
-  ): Promise<StagedDatabaseImportResult> {
+  ): Promise<StagedDatabaseImportResult<typeof this.database>> {
     const transferable =
       data instanceof Uint8Array
         ? data.slice().buffer
@@ -205,7 +205,7 @@ export class LocalDatabaseClient {
   activateStaged(
     generationId: string,
     activationToken: string,
-  ): Promise<ActivatedDatabaseGeneration> {
+  ): Promise<ActivatedDatabaseGeneration<typeof this.database>> {
     return rpc.request({
       operation: "activateStaged",
       database: this.database,
@@ -214,7 +214,7 @@ export class LocalDatabaseClient {
     });
   }
 
-  currentGeneration(): Promise<CurrentDatabaseGeneration> {
+  currentGeneration(): Promise<CurrentDatabaseGeneration<typeof this.database>> {
     return rpc.request({
       operation: "currentGeneration",
       database: this.database,
@@ -224,7 +224,7 @@ export class LocalDatabaseClient {
   discardStaged(
     generationId: string,
     activationToken: string,
-  ): Promise<DiscardedDatabaseGeneration> {
+  ): Promise<DiscardedDatabaseGeneration<typeof this.database>> {
     return rpc.request({
       operation: "discardStaged",
       database: this.database,
@@ -295,7 +295,7 @@ export const localDb = {
   },
 
   stageImport(
-    database: "career",
+    database: LocalDatabaseId,
     data: Uint8Array | ArrayBuffer,
     statements: readonly SqlStatement[],
     requirements: DatabaseSchemaRequirements,
@@ -304,7 +304,7 @@ export const localDb = {
   },
 
   activateStaged(
-    database: "career",
+    database: LocalDatabaseId,
     generationId: string,
     activationToken: string,
   ): Promise<ActivatedDatabaseGeneration> {
@@ -312,13 +312,13 @@ export const localDb = {
   },
 
   currentGeneration(
-    database: "career",
+    database: LocalDatabaseId,
   ): Promise<CurrentDatabaseGeneration> {
     return getLocalDatabase(database).currentGeneration();
   },
 
   discardStaged(
-    database: "career",
+    database: LocalDatabaseId,
     generationId: string,
     activationToken: string,
   ): Promise<DiscardedDatabaseGeneration> {

@@ -39,5 +39,5 @@ export function AnnotatedText({ text, ranges, activeRange }: { text: string; ran
 }
 
 export function Toggle({ label, copy, value, onChange }: { label: string; copy: string; value: boolean; onChange: (value: boolean) => void }) {
-  return <div className="sc-toggle-row"><label>{label}<small>{copy}</small></label><button type="button" role="switch" aria-checked={value} className={value ? "on" : ""} onClick={() => onChange(!value)}><i /></button></div>;
+  return <div className="sc-toggle-row"><label>{label}<small>{copy}</small></label><button type="button" role="switch" aria-label={label} aria-checked={value} className={value ? "on" : ""} onClick={() => onChange(!value)}><i /></button></div>;
 }

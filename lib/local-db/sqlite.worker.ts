@@ -5,15 +5,15 @@ import sqlite3InitModule, {
 } from "@sqlite.org/sqlite-wasm";
 
 import {
-  careerGenerationFilename,
-  careerGenerationPointerChecksumInput,
+  databaseGenerationFilename,
+  databaseGenerationPointerChecksumInput,
   DATABASE_FILES,
-  isCareerActivationToken,
-  isCareerGenerationId,
-  rankCareerGenerationPointers,
+  isDatabaseActivationToken,
+  isDatabaseGenerationId,
+  rankDatabaseGenerationPointers,
   type ActivatedDatabaseGeneration,
   type BatchResult,
-  type CareerGenerationPointerCore,
+  type DatabaseGenerationPointerCore,
   type CurrentDatabaseGeneration,
   type DatabaseExportResult,
   type DatabaseImportResult,
@@ -24,7 +24,7 @@ import {
   type LocalDbWorkerRequest,
   type LocalDbWorkerResponse,
   type QueryResult,
-  type RankedCareerGenerationPointer,
+  type RankedDatabaseGenerationPointer,
   type RunResult,
   type SerializedWorkerError,
   type SqlParams,
@@ -66,13 +66,13 @@ type NormalizedSchemaRequirements = Readonly<{
   allowedTriggers: readonly string[];
 }>;
 
-type StoredGenerationPointer = CareerGenerationPointerCore &
+type StoredGenerationPointer = DatabaseGenerationPointerCore &
   Readonly<{ checksum: string }>;
 
 type StagedGenerationReadyCore = Readonly<{
   version: 1;
   generationId: string;
-  filename: `zhiji.${string}.sqlite3`;
+  filename: `${string}.sqlite3`;
   tokenSha256: string;
   databaseSha256: string;
   importedBytes: number;
@@ -98,11 +98,31 @@ const MAX_IMPORT_BYTES = 512 * 1024 * 1024;
 const MAX_MAPPING_STATEMENTS = 10_000;
 const MAX_MAPPING_SQL_CHARACTERS = 1024 * 1024;
 const MAX_POINTER_BYTES = 16 * 1024;
-const CAREER_POINTER_FILES = {
-  a: "zhiji.active-a.json",
-  b: "zhiji.active-b.json",
-} as const;
-const CAREER_LEGACY_FILENAME = DATABASE_FILES.zhiji;
+const GENERATION_FILES = {
+  zhiji: {
+    label: "Career",
+    pointerFiles: {
+      a: "zhiji.active-a.json",
+      b: "zhiji.active-b.json",
+    },
+    legacyFilename: DATABASE_FILES.zhiji,
+  },
+  shici: {
+    label: "Vocabulary",
+    pointerFiles: {
+      a: "shici.active-a.json",
+      b: "shici.active-b.json",
+    },
+    legacyFilename: DATABASE_FILES.shici,
+  },
+} as const satisfies Record<
+  LocalDatabaseName,
+  {
+    label: string;
+    pointerFiles: Record<"a" | "b", string>;
+    legacyFilename: `${string}.sqlite3`;
+  }
+>;
 const IDENTIFIER_PATTERN = /^[A-Za-z_][A-Za-z0-9_]{0,62}$/;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 let sqlitePromise: Promise<Sqlite3Static> | undefined;
@@ -179,27 +199,28 @@ function equalDigest(left: string, right: string): boolean {
   return difference === 0;
 }
 
-function generationIdFromFilename(filename: string): string | null {
-  if (filename === CAREER_LEGACY_FILENAME) return "legacy";
-  const match = /^zhiji\.([^.]+)\.sqlite3$/.exec(filename);
-  return match && isCareerGenerationId(match[1]) ? match[1] : null;
+function generationIdFromFilename(
+  name: LocalDatabaseName,
+  filename: string,
+): string | null {
+  if (filename === GENERATION_FILES[name].legacyFilename) return "legacy";
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = new RegExp(`^${escaped}\\.([^.]+)\\.sqlite3$`).exec(filename);
+  return match && isDatabaseGenerationId(match[1]) ? match[1] : null;
 }
 
-function stagedReadyFilename(generationId: string): string {
-  return `zhiji.${generationId}.ready.json`;
+function stagedReadyFilename(
+  name: LocalDatabaseName,
+  generationId: string,
+): string {
+  return `${name}.${generationId}.ready.json`;
 }
 
-function activatedGenerationFilename(generationId: string): string {
-  return `zhiji.${generationId}.activated.json`;
-}
-
-function assertCareerOnly(name: LocalDatabaseName, operation: string): void {
-  if (name !== "zhiji") {
-    throw new LocalDbWorkerError(
-      `${operation} is only available for the Career database.`,
-      "CAREER_GENERATION_REQUIRED",
-    );
-  }
+function activatedGenerationFilename(
+  name: LocalDatabaseName,
+  generationId: string,
+): string {
+  return `${name}.${generationId}.activated.json`;
 }
 
 function assertIntegerInRange(
@@ -247,7 +268,7 @@ function normalizeTableRequirements(
 ): Array<{ name: string; columns: string[] }> {
   if (!Array.isArray(value) || value.length === 0) {
     throw new LocalDbWorkerError(
-      `${label} must declare at least one Career table.`,
+      `${label} must declare at least one database table.`,
       "INVALID_SCHEMA_REQUIREMENTS",
     );
   }
@@ -435,9 +456,10 @@ async function removeOpfsEntryIfPresent(filename: string): Promise<boolean> {
 }
 
 async function readGenerationPointer(
+  name: LocalDatabaseName,
   slot: "a" | "b",
-): Promise<RankedCareerGenerationPointer | null> {
-  const file = await readOptionalFile(CAREER_POINTER_FILES[slot]);
+): Promise<RankedDatabaseGenerationPointer | null> {
+  const file = await readOptionalFile(GENERATION_FILES[name].pointerFiles[slot]);
   if (!file || file.size > MAX_POINTER_BYTES) return null;
 
   let parsed: unknown;
@@ -454,41 +476,54 @@ async function readGenerationPointer(
     !Number.isSafeInteger(parsed.sequence) ||
     parsed.sequence < 1 ||
     typeof parsed.filename !== "string" ||
-    generationIdFromFilename(parsed.filename) === null ||
+    generationIdFromFilename(name, parsed.filename) === null ||
     typeof parsed.checksum !== "string" ||
     !SHA256_PATTERN.test(parsed.checksum)
   ) {
     return null;
   }
-  const pointer: CareerGenerationPointerCore = {
+  const pointer: DatabaseGenerationPointerCore = {
     version: 1,
     sequence: parsed.sequence,
     filename: parsed.filename as `${string}.sqlite3`,
   };
-  const checksum = await sha256Text(careerGenerationPointerChecksumInput(pointer));
+  const checksum = await sha256Text(
+    databaseGenerationPointerChecksumInput(name, pointer),
+  );
   if (!equalDigest(checksum, parsed.checksum)) return null;
   return { ...pointer, slot, checksum };
 }
 
-async function readRankedGenerationPointers(): Promise<RankedCareerGenerationPointer[]> {
+async function readRankedGenerationPointers(
+  name: LocalDatabaseName,
+): Promise<RankedDatabaseGenerationPointer[]> {
   const [a, b] = await Promise.all([
-    readGenerationPointer("a"),
-    readGenerationPointer("b"),
+    readGenerationPointer(name, "a"),
+    readGenerationPointer(name, "b"),
   ]);
-  return rankCareerGenerationPointers([a, b].filter(
-    (pointer): pointer is RankedCareerGenerationPointer => pointer !== null,
+  return rankDatabaseGenerationPointers([a, b].filter(
+    (pointer): pointer is RankedDatabaseGenerationPointer => pointer !== null,
   ));
 }
 
 async function writeGenerationPointer(
+  name: LocalDatabaseName,
   slot: "a" | "b",
   sequence: number,
   filename: `${string}.sqlite3`,
-): Promise<RankedCareerGenerationPointer> {
-  const core: CareerGenerationPointerCore = { version: 1, sequence, filename };
-  const checksum = await sha256Text(careerGenerationPointerChecksumInput(core));
+): Promise<RankedDatabaseGenerationPointer> {
+  if (generationIdFromFilename(name, filename) === null) {
+    throw new LocalDbWorkerError(
+      `The ${GENERATION_FILES[name].label} generation pointer targets another database.`,
+      "GENERATION_DATABASE_MISMATCH",
+    );
+  }
+  const core: DatabaseGenerationPointerCore = { version: 1, sequence, filename };
+  const checksum = await sha256Text(
+    databaseGenerationPointerChecksumInput(name, core),
+  );
   const stored: StoredGenerationPointer = { ...core, checksum };
-  await writeJsonFile(CAREER_POINTER_FILES[slot], stored);
+  await writeJsonFile(GENERATION_FILES[name].pointerFiles[slot], stored);
   // createWritable() commits atomically when close() resolves. Do not add an
   // awaited verification read here: an error after that durable commit would
   // leave the running worker on the old handle while recovery selects new.
@@ -499,19 +534,26 @@ function stagedReadyChecksumInput(value: StagedGenerationReadyCore): string {
   return JSON.stringify(value);
 }
 
-async function writeStagedReady(value: StagedGenerationReadyCore): Promise<void> {
+async function writeStagedReady(
+  name: LocalDatabaseName,
+  value: StagedGenerationReadyCore,
+): Promise<void> {
   const checksum = await sha256Text(stagedReadyChecksumInput(value));
-  await writeJsonFile(stagedReadyFilename(value.generationId), {
+  await writeJsonFile(stagedReadyFilename(name, value.generationId), {
     ...value,
     checksum,
   } satisfies StagedGenerationReady);
 }
 
-async function readStagedReady(generationId: string): Promise<StagedGenerationReady> {
-  const file = await readOptionalFile(stagedReadyFilename(generationId));
+async function readStagedReady(
+  name: LocalDatabaseName,
+  generationId: string,
+): Promise<StagedGenerationReady> {
+  const label = GENERATION_FILES[name].label;
+  const file = await readOptionalFile(stagedReadyFilename(name, generationId));
   if (!file || file.size > 512 * 1024) {
     throw new LocalDbWorkerError(
-      "The staged Career generation is not READY.",
+      `The staged ${label} generation is not READY.`,
       "STAGED_GENERATION_NOT_READY",
     );
   }
@@ -520,7 +562,7 @@ async function readStagedReady(generationId: string): Promise<StagedGenerationRe
     parsed = JSON.parse(await file.text());
   } catch {
     throw new LocalDbWorkerError(
-      "The staged Career generation READY record is corrupt.",
+      `The staged ${label} generation READY record is corrupt.`,
       "STAGED_GENERATION_NOT_READY",
     );
   }
@@ -538,7 +580,7 @@ async function readStagedReady(generationId: string): Promise<StagedGenerationRe
     ]) ||
     parsed.version !== 1 ||
     parsed.generationId !== generationId ||
-    parsed.filename !== careerGenerationFilename(generationId) ||
+    parsed.filename !== databaseGenerationFilename(name, generationId) ||
     typeof parsed.tokenSha256 !== "string" ||
     !SHA256_PATTERN.test(parsed.tokenSha256) ||
     typeof parsed.databaseSha256 !== "string" ||
@@ -551,14 +593,14 @@ async function readStagedReady(generationId: string): Promise<StagedGenerationRe
     !SHA256_PATTERN.test(parsed.checksum)
   ) {
     throw new LocalDbWorkerError(
-      "The staged Career generation READY record is invalid.",
+      `The staged ${label} generation READY record is invalid.`,
       "STAGED_GENERATION_NOT_READY",
     );
   }
   const core: StagedGenerationReadyCore = {
     version: 1,
     generationId,
-    filename: parsed.filename as `zhiji.${string}.sqlite3`,
+    filename: parsed.filename as `${string}.sqlite3`,
     tokenSha256: parsed.tokenSha256,
     databaseSha256: parsed.databaseSha256,
     importedBytes: parsed.importedBytes,
@@ -567,7 +609,7 @@ async function readStagedReady(generationId: string): Promise<StagedGenerationRe
   const checksum = await sha256Text(stagedReadyChecksumInput(core));
   if (!equalDigest(checksum, parsed.checksum)) {
     throw new LocalDbWorkerError(
-      "The staged Career generation READY checksum is invalid.",
+      `The staged ${label} generation READY checksum is invalid.`,
       "STAGED_GENERATION_NOT_READY",
     );
   }
@@ -575,19 +617,21 @@ async function readStagedReady(generationId: string): Promise<StagedGenerationRe
 }
 
 async function assertActivationToken(
+  name: LocalDatabaseName,
   ready: StagedGenerationReady,
   activationToken: string,
 ): Promise<void> {
-  if (!isCareerActivationToken(activationToken)) {
+  const label = GENERATION_FILES[name].label;
+  if (!isDatabaseActivationToken(activationToken)) {
     throw new LocalDbWorkerError(
-      "The staged Career activation token is invalid.",
+      `The staged ${label} activation token is invalid.`,
       "INVALID_ACTIVATION_TOKEN",
     );
   }
   const digest = await sha256Text(activationToken);
   if (!equalDigest(digest, ready.tokenSha256)) {
     throw new LocalDbWorkerError(
-      "The staged Career activation token does not match.",
+      `The staged ${label} activation token does not match.`,
       "INVALID_ACTIVATION_TOKEN",
     );
   }
@@ -600,31 +644,29 @@ async function openDatabase(
   if (existing?.db.isOpen()) return { state: existing, opened: false };
 
   const sqlite3 = await getSqlite();
-  if (name === "zhiji") {
-    const pointers = await readRankedGenerationPointers();
-    for (const pointer of pointers) {
-      let db: Database | undefined;
-      try {
-        db = new sqlite3.oo1.OpfsDb(`/${pointer.filename}`, "w");
-        configureDatabase(db);
-        assertIntegrity(db);
-        const generationId = generationIdFromFilename(pointer.filename);
-        if (!generationId) throw new Error("Invalid generation filename.");
-        const state = {
-          db,
-          name,
-          filename: pointer.filename,
-          generationId,
-          sequence: pointer.sequence,
-          pointerSlot: pointer.slot,
-        } satisfies OpenDatabase;
-        openDatabases.set(name, state);
-        return { state, opened: true };
-      } catch {
-        db?.close();
-        // A corrupt or missing newer generation must not mask the older valid
-        // pointer. The legacy path below remains the final recovery anchor.
-      }
+  const pointers = await readRankedGenerationPointers(name);
+  for (const pointer of pointers) {
+    let db: Database | undefined;
+    try {
+      db = new sqlite3.oo1.OpfsDb(`/${pointer.filename}`, "w");
+      configureDatabase(db);
+      assertIntegrity(db);
+      const generationId = generationIdFromFilename(name, pointer.filename);
+      if (!generationId) throw new Error("Invalid generation filename.");
+      const state = {
+        db,
+        name,
+        filename: pointer.filename,
+        generationId,
+        sequence: pointer.sequence,
+        pointerSlot: pointer.slot,
+      } satisfies OpenDatabase;
+      openDatabases.set(name, state);
+      return { state, opened: true };
+    } catch {
+      db?.close();
+      // A corrupt or missing newer generation must not mask the older valid
+      // pointer. The legacy path below remains the final recovery anchor.
     }
   }
 
@@ -637,7 +679,7 @@ async function openDatabase(
       db,
       name,
       filename,
-      generationId: name === "zhiji" ? "legacy" : name,
+      generationId: "legacy",
       sequence: 0,
       pointerSlot: null,
     } satisfies OpenDatabase;
@@ -802,13 +844,13 @@ function assertDatabaseContract(
 
   if (!allowedApplicationIds.includes(applicationId)) {
     throw new LocalDbWorkerError(
-      `The ${phase} Career database application_id is not allowed.`,
+      `The ${phase} database application_id is not allowed.`,
       "IMPORT_IDENTITY_MISMATCH",
     );
   }
   if (userVersion < minimumUserVersion || userVersion > maximumUserVersion) {
     throw new LocalDbWorkerError(
-      `The ${phase} Career database user_version is unsupported.`,
+      `The ${phase} database user_version is unsupported.`,
       "IMPORT_SCHEMA_VERSION_UNSUPPORTED",
     );
   }
@@ -823,7 +865,7 @@ function assertDatabaseContract(
     );
     if (tableType !== "table") {
       throw new LocalDbWorkerError(
-        `The Career import is missing required table ${table.name}.`,
+        `The import is missing required table ${table.name}.`,
         "IMPORT_SCHEMA_MISMATCH",
       );
     }
@@ -855,7 +897,7 @@ function assertDatabaseContract(
       !allowedObjects[object.type].has(object.name)
     ) {
       throw new LocalDbWorkerError(
-        "The Career import contains an unknown view or trigger.",
+        "The import contains an unknown view or trigger.",
         "IMPORT_UNSAFE_SCHEMA_OBJECT",
       );
     }
@@ -870,26 +912,26 @@ function newActivationToken(): string {
   return hex(crypto.getRandomValues(new Uint8Array(32)));
 }
 
-async function stageCareerImport(
+async function stageDatabaseImport(
   name: LocalDatabaseName,
   replacement: Uint8Array,
   statements: readonly SqlStatement[],
   rawRequirements: DatabaseSchemaRequirements,
 ): Promise<StagedDatabaseImportResult> {
-  assertCareerOnly(name, "Staged import");
+  const label = GENERATION_FILES[name].label;
   assertSQLiteFile(replacement);
   assertMappingStatements(statements);
   const requirements = normalizeSchemaRequirements(rawRequirements);
   const sqlite3 = await getSqlite();
   const generationId = crypto.randomUUID().toLowerCase();
-  if (!isCareerGenerationId(generationId)) {
+  if (!isDatabaseGenerationId(generationId)) {
     throw new LocalDbWorkerError(
-      "The browser could not create a safe Career generation id.",
+      `The browser could not create a safe ${label} generation id.`,
       "GENERATION_ID_UNAVAILABLE",
     );
   }
-  const filename = careerGenerationFilename(generationId);
-  const readyFilename = stagedReadyFilename(generationId);
+  const filename = databaseGenerationFilename(name, generationId);
+  const readyFilename = stagedReadyFilename(name, generationId);
   const activationToken = newActivationToken();
   let canonicalSchemaVersion = requirements.minimumUserVersion;
   let candidate: Database | undefined;
@@ -897,11 +939,11 @@ async function stageCareerImport(
   const [existingCandidate, existingReady, existingActivation] = await Promise.all([
     readOptionalFile(filename),
     readOptionalFile(readyFilename),
-    readOptionalFile(activatedGenerationFilename(generationId)),
+    readOptionalFile(activatedGenerationFilename(name, generationId)),
   ]);
   if (existingCandidate || existingReady || existingActivation) {
     throw new LocalDbWorkerError(
-      "The random Career generation id already exists; retry the staged import.",
+      `The random ${label} generation id already exists; retry the staged import.`,
       "GENERATION_ID_COLLISION",
     );
   }
@@ -931,7 +973,7 @@ async function stageCareerImport(
     candidate.close();
     candidate = undefined;
 
-    await writeStagedReady({
+    await writeStagedReady(name, {
       version: 1,
       generationId,
       filename,
@@ -942,7 +984,7 @@ async function stageCareerImport(
     });
 
     return {
-      database: "zhiji",
+      database: name,
       generationId,
       filename,
       activationToken,
@@ -953,7 +995,7 @@ async function stageCareerImport(
     candidate?.close();
     await Promise.allSettled([
       removeOpfsEntryIfPresent(readyFilename),
-      removeOpfsEntryIfPresent(activatedGenerationFilename(generationId)),
+      removeOpfsEntryIfPresent(activatedGenerationFilename(name, generationId)),
       removeOpfsEntryIfPresent(filename),
     ]);
     throw error;
@@ -961,6 +1003,7 @@ async function stageCareerImport(
 }
 
 async function validateReadyCandidate(
+  name: LocalDatabaseName,
   ready: StagedGenerationReady,
 ): Promise<void> {
   const sqlite3 = await getSqlite();
@@ -973,7 +1016,7 @@ async function validateReadyCandidate(
     const digest = await sha256Bytes(exportUnmodifiedBytes(sqlite3, candidate));
     if (!equalDigest(digest, ready.databaseSha256)) {
       throw new LocalDbWorkerError(
-        "The staged Career database changed after it became READY.",
+        `The staged ${GENERATION_FILES[name].label} database changed after it became READY.`,
         "STAGED_GENERATION_CHANGED",
       );
     }
@@ -982,28 +1025,28 @@ async function validateReadyCandidate(
   }
 }
 
-async function activateStagedCareerGeneration(
+async function activateStagedDatabaseGeneration(
   name: LocalDatabaseName,
   generationId: string,
   activationToken: string,
 ): Promise<ActivatedDatabaseGeneration> {
-  assertCareerOnly(name, "Staged activation");
-  if (!isCareerGenerationId(generationId)) {
+  const label = GENERATION_FILES[name].label;
+  if (!isDatabaseGenerationId(generationId)) {
     throw new LocalDbWorkerError(
-      "The staged Career generation id is invalid.",
+      `The staged ${label} generation id is invalid.`,
       "INVALID_GENERATION_ID",
     );
   }
-  const ready = await readStagedReady(generationId);
-  await assertActivationToken(ready, activationToken);
-  const { state: active } = await openDatabase("zhiji");
+  const ready = await readStagedReady(name, generationId);
+  await assertActivationToken(name, ready, activationToken);
+  const { state: active } = await openDatabase(name);
   const sqlite3 = await getSqlite();
 
   // Idempotent retry: the caller may have lost the successful response after
   // the durable pointer commit.
   if (active.filename === ready.filename) {
     return {
-      database: "zhiji",
+      database: name,
       filename: active.filename,
       persistent: true,
       sqliteVersion: sqlite3.version.libVersion,
@@ -1014,13 +1057,13 @@ async function activateStagedCareerGeneration(
     };
   }
 
-  await validateReadyCandidate(ready);
+  await validateReadyCandidate(name, ready);
   let candidate: Database | undefined;
   try {
     candidate = new sqlite3.oo1.OpfsDb(`/${ready.filename}`, "w");
     configureDatabase(candidate);
 
-    let pointers = await readRankedGenerationPointers();
+    let pointers = await readRankedGenerationPointers(name);
     if (active.pointerSlot === null) {
       const presentSlots = new Set(pointers.map((pointer) => pointer.slot));
       const baselineSlot: "a" | "b" = !presentSlots.has("a")
@@ -1030,13 +1073,14 @@ async function activateStagedCareerGeneration(
           : pointers.at(-1)?.slot ?? "a";
       const baselineSequence = Math.max(0, ...pointers.map((pointer) => pointer.sequence)) + 1;
       const baseline = await writeGenerationPointer(
+        name,
         baselineSlot,
         baselineSequence,
         active.filename,
       );
       active.pointerSlot = baseline.slot;
       active.sequence = baseline.sequence;
-      pointers = await readRankedGenerationPointers();
+      pointers = await readRankedGenerationPointers(name);
     }
 
     const targetSlot: "a" | "b" = active.pointerSlot === "a" ? "b" : "a";
@@ -1046,12 +1090,13 @@ async function activateStagedCareerGeneration(
     // retain a candidate if the next write fails, but it guarantees discard
     // can never delete a generation which was active in the past after both
     // pointer slots have subsequently rotated.
-    await writeJsonFile(activatedGenerationFilename(generationId), {
+    await writeJsonFile(activatedGenerationFilename(name, generationId), {
       version: 1,
       generationId,
       filename: ready.filename,
     });
     const committed = await writeGenerationPointer(
+      name,
       targetSlot,
       nextSequence,
       ready.filename,
@@ -1061,14 +1106,14 @@ async function activateStagedCareerGeneration(
     // from this instruction onward the in-memory handle mirrors disk state.
     const nextState: OpenDatabase = {
       db: candidate,
-      name: "zhiji",
+      name,
       filename: ready.filename,
       generationId,
       sequence: committed.sequence,
       pointerSlot: committed.slot,
     };
     candidate = undefined;
-    openDatabases.set("zhiji", nextState);
+    openDatabases.set(name, nextState);
     try {
       active.db.close();
     } catch {
@@ -1076,7 +1121,7 @@ async function activateStagedCareerGeneration(
     }
 
     return {
-      database: "zhiji",
+      database: name,
       filename: nextState.filename,
       persistent: true,
       sqliteVersion: sqlite3.version.libVersion,
@@ -1090,22 +1135,24 @@ async function activateStagedCareerGeneration(
   }
 }
 
-async function currentCareerGeneration(
+async function currentDatabaseGeneration(
   name: LocalDatabaseName,
 ): Promise<CurrentDatabaseGeneration> {
-  assertCareerOnly(name, "Generation inspection");
-  const { state } = await openDatabase("zhiji");
+  const { state } = await openDatabase(name);
   return {
-    database: "zhiji",
+    database: name,
     generationId: state.generationId,
     filename: state.filename,
     sequence: state.sequence,
-    legacy: state.filename === CAREER_LEGACY_FILENAME,
+    legacy: state.filename === GENERATION_FILES[name].legacyFilename,
   };
 }
 
-async function rawPointerReferences(filename: string): Promise<boolean> {
-  for (const pointerFilename of Object.values(CAREER_POINTER_FILES)) {
+async function rawPointerReferences(
+  name: LocalDatabaseName,
+  filename: string,
+): Promise<boolean> {
+  for (const pointerFilename of Object.values(GENERATION_FILES[name].pointerFiles)) {
     const file = await readOptionalFile(pointerFilename);
     if (!file || file.size > MAX_POINTER_BYTES) continue;
     try {
@@ -1118,38 +1165,38 @@ async function rawPointerReferences(filename: string): Promise<boolean> {
   return false;
 }
 
-async function discardStagedCareerGeneration(
+async function discardStagedDatabaseGeneration(
   name: LocalDatabaseName,
   generationId: string,
   activationToken: string,
 ): Promise<DiscardedDatabaseGeneration> {
-  assertCareerOnly(name, "Staged discard");
-  if (!isCareerGenerationId(generationId)) {
+  const label = GENERATION_FILES[name].label;
+  if (!isDatabaseGenerationId(generationId)) {
     throw new LocalDbWorkerError(
-      "The staged Career generation id is invalid.",
+      `The staged ${label} generation id is invalid.`,
       "INVALID_GENERATION_ID",
     );
   }
-  const ready = await readStagedReady(generationId);
-  await assertActivationToken(ready, activationToken);
-  const active = openDatabases.get("zhiji");
+  const ready = await readStagedReady(name, generationId);
+  await assertActivationToken(name, ready, activationToken);
+  const active = openDatabases.get(name);
   const activationMarker = await readOptionalFile(
-    activatedGenerationFilename(generationId),
+    activatedGenerationFilename(name, generationId),
   );
   if (
     activationMarker !== null ||
     active?.filename === ready.filename ||
-    await rawPointerReferences(ready.filename)
+    await rawPointerReferences(name, ready.filename)
   ) {
     throw new LocalDbWorkerError(
-      "An activated Career generation cannot be discarded.",
+      `An activated ${label} generation cannot be discarded.`,
       "GENERATION_ALREADY_ACTIVATED",
     );
   }
 
   await removeOpfsEntryIfPresent(ready.filename);
-  await removeOpfsEntryIfPresent(stagedReadyFilename(generationId));
-  return { database: "zhiji", generationId, discarded: true };
+  await removeOpfsEntryIfPresent(stagedReadyFilename(name, generationId));
+  return { database: name, generationId, discarded: true };
 }
 
 async function replaceDatabase(
@@ -1251,22 +1298,22 @@ async function handleRequest(request: LocalDbWorkerRequest): Promise<unknown> {
       return { ...result, importedBytes: data.byteLength } satisfies DatabaseImportResult;
     }
     case "stageImport":
-      return stageCareerImport(
+      return stageDatabaseImport(
         request.database,
         new Uint8Array(request.data),
         request.statements,
         request.requirements,
       );
     case "activateStaged":
-      return activateStagedCareerGeneration(
+      return activateStagedDatabaseGeneration(
         request.database,
         request.generationId,
         request.activationToken,
       );
     case "currentGeneration":
-      return currentCareerGeneration(request.database);
+      return currentDatabaseGeneration(request.database);
     case "discardStaged":
-      return discardStagedCareerGeneration(
+      return discardStagedDatabaseGeneration(
         request.database,
         request.generationId,
         request.activationToken,

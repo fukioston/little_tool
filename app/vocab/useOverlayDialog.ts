@@ -19,12 +19,12 @@ export function useOverlayDialog<T extends HTMLElement>(
     if (!dialog) return;
     const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     const shell = dialog.closest<HTMLElement>(".shici");
-    const changed: Array<{ element: HTMLElement; inert: boolean; ariaHidden: string | null }> = [];
+    const changed: Array<{ element: HTMLElement; hadInert: boolean; ariaHidden: string | null }> = [];
     if (shell) {
       Array.from(shell.children).forEach((child) => {
         if (!(child instanceof HTMLElement) || child === dialog || child.contains(dialog) || /scrim/.test(child.className)) return;
-        changed.push({ element: child, inert: child.inert, ariaHidden: child.getAttribute("aria-hidden") });
-        child.inert = true;
+        changed.push({ element: child, hadInert: child.hasAttribute("inert"), ariaHidden: child.getAttribute("aria-hidden") });
+        child.setAttribute("inert", "");
         child.setAttribute("aria-hidden", "true");
       });
     }
@@ -61,8 +61,8 @@ export function useOverlayDialog<T extends HTMLElement>(
       cancelAnimationFrame(focusFrame);
       document.removeEventListener("keydown", keydown, true);
       document.body.style.overflow = previousOverflow;
-      changed.forEach(({ element, inert, ariaHidden }) => {
-        element.inert = inert;
+      changed.forEach(({ element, hadInert, ariaHidden }) => {
+        if (!hadInert) element.removeAttribute("inert");
         if (ariaHidden === null) element.removeAttribute("aria-hidden");
         else element.setAttribute("aria-hidden", ariaHidden);
       });

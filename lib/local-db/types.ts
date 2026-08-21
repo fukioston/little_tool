@@ -101,86 +101,134 @@ export type DatabaseSchemaRequirements = Readonly<{
   allowedTriggers?: readonly string[];
 }>;
 
-export type StagedDatabaseImportResult = Readonly<{
-  database: "zhiji";
+export type StagedDatabaseImportResult<
+  DatabaseName extends LocalDatabaseName = LocalDatabaseName,
+> = Readonly<{
+  database: DatabaseName;
   generationId: string;
-  filename: `zhiji.${string}.sqlite3`;
+  filename: `${DatabaseName}.${string}.sqlite3`;
   activationToken: string;
   importedBytes: number;
   schemaVersion: number;
 }>;
 
-export type ActivatedDatabaseGeneration = DatabaseInitResult &
+export type ActivatedDatabaseGeneration<
+  DatabaseName extends LocalDatabaseName = LocalDatabaseName,
+> = DatabaseInitResult &
   Readonly<{
-    database: "zhiji";
+    database: DatabaseName;
     generationId: string;
     sequence: number;
   }>;
 
-export type CurrentDatabaseGeneration = Readonly<{
-  database: "zhiji";
+export type CurrentDatabaseGeneration<
+  DatabaseName extends LocalDatabaseName = LocalDatabaseName,
+> = Readonly<{
+  database: DatabaseName;
   generationId: string;
   filename: `${string}.sqlite3`;
   sequence: number;
   legacy: boolean;
 }>;
 
-export type DiscardedDatabaseGeneration = Readonly<{
-  database: "zhiji";
+export type DiscardedDatabaseGeneration<
+  DatabaseName extends LocalDatabaseName = LocalDatabaseName,
+> = Readonly<{
+  database: DatabaseName;
   generationId: string;
   discarded: true;
 }>;
 
-export const CAREER_GENERATION_ID_PATTERN =
+export const DATABASE_GENERATION_ID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
-export const CAREER_ACTIVATION_TOKEN_PATTERN = /^[0-9a-f]{64}$/;
+export const DATABASE_ACTIVATION_TOKEN_PATTERN = /^[0-9a-f]{64}$/;
 
-export type CareerGenerationPointerCore = Readonly<{
+// Backward-compatible aliases retained for callers and recovery tests that
+// predate staged generations for the Vocabulary database.
+export const CAREER_GENERATION_ID_PATTERN = DATABASE_GENERATION_ID_PATTERN;
+export const CAREER_ACTIVATION_TOKEN_PATTERN = DATABASE_ACTIVATION_TOKEN_PATTERN;
+
+export type DatabaseGenerationPointerCore = Readonly<{
   version: 1;
   sequence: number;
   filename: `${string}.sqlite3`;
 }>;
 
-export type RankedCareerGenerationPointer = CareerGenerationPointerCore &
+export type RankedDatabaseGenerationPointer = DatabaseGenerationPointerCore &
   Readonly<{
     slot: "a" | "b";
     checksum: string;
   }>;
 
+export type CareerGenerationPointerCore = DatabaseGenerationPointerCore;
+export type RankedCareerGenerationPointer = RankedDatabaseGenerationPointer;
+
+export function isDatabaseGenerationId(value: string): boolean {
+  return DATABASE_GENERATION_ID_PATTERN.test(value);
+}
+
+export function isDatabaseActivationToken(value: string): boolean {
+  return DATABASE_ACTIVATION_TOKEN_PATTERN.test(value);
+}
+
 export function isCareerGenerationId(value: string): boolean {
-  return CAREER_GENERATION_ID_PATTERN.test(value);
+  return isDatabaseGenerationId(value);
 }
 
 export function isCareerActivationToken(value: string): boolean {
-  return CAREER_ACTIVATION_TOKEN_PATTERN.test(value);
+  return isDatabaseActivationToken(value);
+}
+
+export function databaseGenerationFilename<
+  DatabaseName extends LocalDatabaseName,
+>(
+  database: DatabaseName,
+  generationId: string,
+): `${DatabaseName}.${string}.sqlite3` {
+  if (!isDatabaseGenerationId(generationId)) {
+    throw new TypeError("Invalid database generation id.");
+  }
+  return `${database}.${generationId}.sqlite3`;
 }
 
 export function careerGenerationFilename(
   generationId: string,
 ): `zhiji.${string}.sqlite3` {
-  if (!isCareerGenerationId(generationId)) {
-    throw new TypeError("Invalid Career database generation id.");
-  }
-  return `zhiji.${generationId}.sqlite3`;
+  return databaseGenerationFilename("zhiji", generationId);
+}
+
+/** Stable byte-for-byte checksum input, namespaced per product database. */
+export function databaseGenerationPointerChecksumInput(
+  database: LocalDatabaseName,
+  pointer: DatabaseGenerationPointerCore,
+): string {
+  const product = database === "zhiji" ? "career" : "vocab";
+  return `private-ai-suite:${product}-pointer:v${pointer.version}\n${pointer.sequence}\n${pointer.filename}\n`;
 }
 
 /** Stable byte-for-byte checksum input. Do not replace with object JSON order. */
 export function careerGenerationPointerChecksumInput(
   pointer: CareerGenerationPointerCore,
 ): string {
-  return `private-ai-suite:career-pointer:v${pointer.version}\n${pointer.sequence}\n${pointer.filename}\n`;
+  return databaseGenerationPointerChecksumInput("zhiji", pointer);
 }
 
 /** Highest sequence wins; the slot tie-break keeps recovery deterministic. */
-export function rankCareerGenerationPointers(
-  pointers: readonly RankedCareerGenerationPointer[],
-): RankedCareerGenerationPointer[] {
+export function rankDatabaseGenerationPointers(
+  pointers: readonly RankedDatabaseGenerationPointer[],
+): RankedDatabaseGenerationPointer[] {
   return [...pointers].sort(
     (left, right) =>
       right.sequence - left.sequence ||
       right.slot.localeCompare(left.slot) ||
       right.filename.localeCompare(left.filename),
   );
+}
+
+export function rankCareerGenerationPointers(
+  pointers: readonly RankedCareerGenerationPointer[],
+): RankedCareerGenerationPointer[] {
+  return rankDatabaseGenerationPointers(pointers);
 }
 
 export type InitAllResult = Readonly<{

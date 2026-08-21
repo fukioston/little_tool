@@ -4,10 +4,19 @@ import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { errorMessage, explainInChinese, explainSelection } from "@/lib/vocab/api";
 import {
+  exportCompleteVocabBackup,
+  isCompleteVocabBackup,
+  restoreCompleteVocabBackup,
+  restoreLegacyVocabDatabase,
+} from "@/lib/vocab/backup";
+import {
+  estimateLocalStorage,
+  requestPersistentLocalStorage,
+  type LocalStorageEstimate,
+} from "@/lib/local-db/files";
+import {
   createBookmark,
-  exportVocabDatabase,
   getDueCards,
-  importVocabDatabase,
   initializeVocabDatabase,
   loadVocabSnapshot,
   rateReview,
@@ -22,6 +31,7 @@ import {
   updateLexemeStatus,
 } from "@/lib/vocab/store";
 import type { AiExplanation, LibraryItem, ReviewCard, ReviewRating, SelectionTarget, VocabSettings, VocabSnapshot, VocabView } from "@/lib/vocab/types";
+import { subscribeVocabChanges } from "@/lib/vocab/lock";
 import { ContextPanel, ImportWizard, WordDetail } from "./overlays";
 import { LibraryView, PodcastView, ReaderView, ReviewView, SettingsView, StatsView, TodayView, WordsView } from "./views";
 import { Loader, Logo } from "./ui";
@@ -61,6 +71,7 @@ export default function VocabApp() {
   const [toast, setToast] = useState("");
   const [sideOpen, setSideOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
+  const [storageStatus, setStorageStatus] = useState<LocalStorageEstimate | null>(null);
   const selectionRef = useRef<SelectionTarget | null>(null);
   const aiSequence = useRef(0);
   const aiRequest = useRef<{ id: number; key: string; controller: AbortController } | null>(null);
@@ -68,6 +79,13 @@ export default function VocabApp() {
   const sidebarDialog = useOverlayDialog<HTMLElement>(sideOpen, () => setSideOpen(false), "button");
 
   const refresh = useCallback(async () => setSnapshot(await loadVocabSnapshot()), []);
+
+  const refreshStorageStatus = useCallback(async (requestPersistence = false) => {
+    if (requestPersistence) await requestPersistentLocalStorage();
+    const next = await estimateLocalStorage();
+    setStorageStatus(next);
+    return next;
+  }, []);
 
   useEffect(() => {
     let live = true;
@@ -80,12 +98,23 @@ export default function VocabApp() {
         setShowChinese(data.settings.chinese_explanation);
         setActiveItemId(data.items.find((item) => item.status === "in_progress")?.id ?? data.items[0]?.id ?? null);
         setReady(true);
+        void (async () => {
+          try {
+            const current = await refreshStorageStatus();
+            if (!current.persisted) await refreshStorageStatus(true);
+          } catch {
+            // Database availability is reported separately; storage persistence
+            // support is an enhancement and must never hide otherwise safe data.
+          }
+        })();
       } catch (error) {
         if (live) setFatal(errorMessage(error));
       }
     })();
     return () => { live = false; };
-  }, []);
+  }, [refreshStorageStatus]);
+
+  useEffect(() => subscribeVocabChanges(() => { void refresh().catch(() => undefined); }), [refresh]);
 
   useEffect(() => {
     if (!toast) return;
@@ -223,6 +252,40 @@ export default function VocabApp() {
     await updateItemProgress(item.id, Math.max(0, Math.min(1, progress)), progress > .98);
   }, []);
 
+  const exportBackup = useCallback(async () => {
+    const backup = await exportCompleteVocabBackup();
+    const url = URL.createObjectURL(backup.blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = backup.fileName;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
+    return `备份文件已交给浏览器下载，包含 ${backup.audioCount} 个本地音频。`;
+  }, []);
+
+  const restoreBackup = useCallback(async (file: File) => {
+    const complete = await isCompleteVocabBackup(file);
+    const approved = window.confirm(
+      complete
+        ? "将从完整备份恢复拾词数据与本地音频。恢复前会完整校验，并保留上一代恢复快照。确定继续吗？"
+        : "这是旧版 SQLite 备份，只能恢复数据库内容；其中原有的本地音频无法随文件恢复。恢复前会先校验，确定继续吗？",
+    );
+    if (!approved) return "已取消恢复，当前数据没有改动。";
+
+    const result = complete
+      ? await restoreCompleteVocabBackup(file)
+      : await restoreLegacyVocabDatabase(file);
+    await initializeVocabDatabase();
+    await refresh();
+    await refreshStorageStatus().catch(() => null);
+    if ("audioCount" in result) {
+      return `完整备份已恢复，校验了 ${result.audioCount} 个本地音频；上一代恢复快照仍保留。`;
+    }
+    return "旧版 SQLite 已恢复；本地音频引用已安全清除，上一代恢复快照仍保留。";
+  }, [refresh, refreshStorageStatus]);
+
   useEffect(() => {
     const shortcuts = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
@@ -249,10 +312,10 @@ export default function VocabApp() {
     <aside ref={sidebarDialog} id="sc-navigation" className={`sc-sidebar ${sideOpen ? "open" : ""}`} role={sideOpen ? "dialog" : undefined} aria-modal={sideOpen ? true : undefined} aria-label="拾词导航" tabIndex={sideOpen ? -1 : undefined}>
       <Link href="/" className="sc-brand" aria-label="返回私人工作台"><Logo /></Link>
       <nav>{navigation.map((item) => <button key={item.id} aria-current={view === item.id ? "page" : undefined} className={view === item.id ? "active" : ""} onClick={() => go(item.id)}><i>{item.glyph}</i><span>{item.label}</span></button>)}</nav>
-      <div className="sc-side-foot"><button className={view === "settings" ? "active" : ""} onClick={() => go("settings")}><i>设</i><span>设置</span></button><div><i /><span>本地数据库<small>已安全保存</small></span></div></div>
+      <div className="sc-side-foot"><button className={view === "settings" ? "active" : ""} onClick={() => go("settings")}><i>设</i><span>设置</span></button><div><i className={storageStatus?.persisted ? "persisted" : ""} /><span>当前浏览器<small>{storageStatus?.persisted ? "已获持久化保护" : "请定期导出备份"}</small></span></div></div>
     </aside>
     <section className="sc-main">
-      <header className="sc-topbar"><button className="sc-menu" onClick={() => setSideOpen((value) => !value)} aria-expanded={sideOpen} aria-controls="sc-navigation" aria-label={sideOpen ? "关闭导航" : "打开导航"}>拾</button><div className="sc-crumb"><span>拾词</span><b>/</b><strong>{pageLabel}</strong></div><div className="sc-top-actions"><button className="sc-search-jump" onClick={() => setSearchOpen(true)}>⌕ <span>搜索</span><kbd>⌘ K</kbd></button><button className="sc-import" onClick={() => setImportOpen(true)}>＋ <span>导入内容</span></button></div></header>
+      <header className="sc-topbar"><button className="sc-menu" onClick={() => setSideOpen((value) => !value)} aria-expanded={sideOpen} aria-controls="sc-navigation" aria-label={sideOpen ? "关闭导航" : "打开导航"}>拾</button><div className="sc-crumb"><span>拾词</span><b>/</b><strong>{pageLabel}</strong></div><div className="sc-top-actions"><button className="sc-search-jump" aria-label="搜索资料、词和语境" onClick={() => setSearchOpen(true)}>⌕ <span>搜索</span><kbd>⌘ K</kbd></button><button className="sc-import" aria-label="导入内容" onClick={() => setImportOpen(true)}>＋ <span>导入内容</span></button></div></header>
       <div className="sc-view">
         {view === "today" && <TodayView snapshot={snapshot} due={dueCards.length} onOpen={openItem} onGo={go} onImport={() => setImportOpen(true)} onWord={setWordId} />}
         {view === "library" && <LibraryView items={snapshot.items} onOpen={openItem} onImport={() => setImportOpen(true)} onArchive={async (item) => { await updateItemStatus(item.id, item.status === "archived" ? "unread" : "archived"); await refresh(); }} />}
@@ -261,7 +324,7 @@ export default function VocabApp() {
         {view === "words" && <WordsView lexemes={snapshot.lexemes} occurrences={snapshot.occurrences} onOpen={setWordId} onStar={async (word) => { await toggleLexemeStar(word.id, !word.starred); await refresh(); }} />}
         {view === "review" && <ReviewView cards={snapshot.reviewCards} onRate={async (card: ReviewCard, rating: ReviewRating) => { const id = await rateReview(card, rating); await refresh(); return id; }} onUndo={async (id) => { await undoReview(id); await refresh(); }} />}
         {view === "stats" && <StatsView snapshot={snapshot} />}
-        {view === "settings" && <SettingsView settings={snapshot.settings} onChange={changeSettings} onExport={async () => { const bytes = await exportVocabDatabase(); const blob = new Blob([bytes.slice().buffer as ArrayBuffer], { type: "application/vnd.sqlite3" }); const url = URL.createObjectURL(blob); const link = document.createElement("a"); link.href = url; link.download = `拾词备份-${new Date().toISOString().slice(0, 10)}.sqlite3`; link.click(); URL.revokeObjectURL(url); setToast("完整备份已导出"); }} onImport={async (file) => { await importVocabDatabase(new Uint8Array(await file.arrayBuffer())); await refresh(); setToast("备份已恢复"); }} onTestAi={async () => { if (snapshot.settings.local_lock) throw new Error("请先关闭本地锁"); const response = await fetch("/api/health", { headers: { Accept: "application/json" } }); const health = await response.json() as { ai?: { configured?: boolean } }; if (!response.ok) throw new Error("无法检查 AI 服务状态"); if (!health.ai?.configured) throw new Error("DeepSeek API Key 尚未配置"); }} />}
+        {view === "settings" && <SettingsView settings={snapshot.settings} storage={storageStatus} onChange={changeSettings} onExport={exportBackup} onImport={restoreBackup} onPersist={async () => (await refreshStorageStatus(true)).persisted} onTestAi={async () => { if (snapshot.settings.local_lock) throw new Error("请先关闭本地锁"); const response = await fetch("/api/health", { headers: { Accept: "application/json" } }); const health = await response.json() as { ai?: { configured?: boolean } }; if (!response.ok) throw new Error("无法检查 AI 服务状态"); if (!health.ai?.configured) throw new Error("DeepSeek API Key 尚未配置"); }} />}
       </div>
     </section>
     <nav className="sc-mobile-tabs" aria-label="拾词页面">{navigation.slice(0, 4).map((item) => <button key={item.id} aria-current={view === item.id ? "page" : undefined} className={view === item.id ? "active" : ""} onClick={() => go(item.id)}><i>{item.glyph}</i><span>{item.label}</span></button>)}</nav>
