@@ -477,16 +477,58 @@ export function PodcastView({ item, segments, occurrences, autoFollow, autoFollo
   return <div className="sc-podcast-page">{src && <audio ref={audio} src={src} preload="metadata" onLoadedMetadata={(event) => { const nextDuration=Number.isFinite(event.currentTarget.duration)?event.currentTarget.duration*1000:fallbackDuration;durationRef.current=nextDuration;setDurationMs(nextDuration);const restored=Math.min(nextDuration,Math.max(0,item.progress*nextDuration));currentMsRef.current=restored;event.currentTarget.currentTime=restored/1000;setCurrentMs(restored); }} onTimeUpdate={updateTime} onPlay={() => { terminalIntent.current=false;setTerminalRetry(false);setPlaying(true);startListen(); }} onPause={() => { setPlaying(false);commitListen();reportCurrentPosition(); }} onEnded={() => { terminalIntent.current=true;setTerminalRetry(true);setPlaying(false);commitListen();if(item.status!=="complete"&&item.status!=="archived")onFinish(item, null); }} onError={() => setMediaError("音频无法播放，来源可能已失效或格式不受支持。")}/>}<header className="sc-podcast-head"><div><span className="sc-eyebrow">LISTEN IN CONTEXT</span><h1>{item.title}</h1><p>{item.description}</p><div><b>{item.source}</b><span>{item.author}</span><span>{formatKnownVocabDuration(knownDuration)}</span></div></div><div className="sc-podcast-art"><i/><i/><i/><strong>声</strong></div></header><section className="sc-player" aria-label="音频播放器"><button className="sc-play" aria-label={playing?"暂停":"播放"} disabled={!src} onClick={() => { if (audio.current?.paused) void audio.current.play(); else audio.current?.pause(); }}>{playing ? "Ⅱ" : "▶"}</button><span>{formatDuration(currentMs)}</span><input type="range" aria-label="播放进度" aria-valuetext={`${formatDuration(currentMs)} / ${formatDuration(duration)}`} min={0} max={Math.max(1,duration)} value={Math.min(currentMs,duration)} onChange={(event) => seek(Number(event.target.value), "slider-input")} onPointerUp={reportCurrentPosition} onBlur={reportCurrentPosition}/><span>{formatDuration(duration)}</span><button className="sc-speed" aria-label={`播放速度 ${speed} 倍，点击切换`} onClick={() => { const next = speed >= 2 ? .75 : speed + .25; setSpeed(next); if (audio.current) audio.current.playbackRate = next; }}>{speed}×</button><button aria-label="收藏当前播放位置" onClick={() => onBookmark(item,currentMs,active?.text.slice(0,24) ?? item.title)}>◇</button></section>{item.status !== "complete" && item.status !== "archived" && <div className="sc-podcast-terminal-actions"><button type="button" disabled={!completeActionEnabled} aria-busy={itemWriteBusy || undefined} aria-describedby={itemWriteStatus ? "sc-podcast-item-write-status" : undefined} onClick={(event) => { setTerminalRetry(false);onFinish(item, event.currentTarget); }}>{itemWriteBusy ? "正在安全确认…" : terminalRetry ? "重新标记已听完" : "标记已听完"}</button></div>}{itemWriteStatus && <div id="sc-podcast-item-write-status" className="sc-item-inline-status" role="status">{itemWriteStatus}</div>}{itemWriteLocked && !itemWriteStatus && <div className="sc-item-inline-status" role="status">{itemWritePermanentReadOnly ? "当前只读开放；播放和字幕可用，位置只留在本页且不会用不安全的凭据写入。" : "当前位置先暂存在本页；安全操作结束后会再尝试保存。"}</div>}{mediaError && <div className="sc-inline-error" role="alert">{mediaError}</div>}{remoteBlocked ? <div className="sc-notice">本地锁阻止了远程音频请求。你仍可阅读字幕；关闭本地锁后才会连接音频来源。</div> : !src && <div className="sc-notice">当前单集没有可播放音频。英文字幕仍可阅读和选词。</div>}{!alignedTranscript && episodeSegments.length > 0 && <div className="sc-notice">这份纯文本字幕没有时间轴，因此不会伪装成同步字幕；你仍可逐段阅读和选词。</div>}<section className="sc-transcript-shell"><aside><span>本期字幕</span><strong>{episodeSegments.length}</strong><p>{alignedTranscript?"段":"段 · 未对齐"}</p><button type="button" className={follow ? "active" : ""} aria-pressed={follow} aria-busy={autoFollowWriteBusy || undefined} aria-describedby={autoFollowStatus ? followStatusId : undefined} disabled={!alignedTranscript || (autoFollowWriteLocked && !canResumeLocally)} onClick={(event) => { if (canResumeLocally) setFollowPaused(false); else { if (!autoFollow) setFollowPaused(false); onAutoFollow(!autoFollow, event.currentTarget); } }}>◎ {autoFollowWriteBusy ? "正在确认偏好…" : follow ? "正在跟随" : autoFollow ? "继续这次跟随" : "开启自动跟随"}</button>{autoFollowStatus && <small id={followStatusId} className="sc-podcast-follow-status" role="status">{autoFollowStatus}</small>}</aside><div className="sc-transcript" onWheel={() => { if (autoFollow) setFollowPaused(true); }}>{episodeSegments.length ? episodeSegments.map((segment,index) => { const words=wordRanges(segment.text);const activeRange=keyboardWord?.segmentId===segment.id?words[keyboardWord.index]:null;return <button ref={alignedTranscript&&index === activeIndex ? activeRow : undefined} key={segment.id} className={alignedTranscript&&index === activeIndex ? "active" : ""} aria-current={alignedTranscript&&index===activeIndex?"true":undefined} title="左右方向键选择单词，Enter 或 E 查看解释；Space 跳到此处" onFocus={()=>{if(words.length&&keyboardWord?.segmentId!==segment.id)setKeyboardWord({segmentId:segment.id,index:0});}} onKeyDown={(event)=>transcriptKey(segment,index,event)} onClick={() => { if (alignedTranscript) seek(segment.start_ms); }} onMouseUp={(event) => pick(segment,index,event)}><time>{alignedTranscript?formatDuration(segment.start_ms):"—"}</time><p><AnnotatedText text={segment.text} ranges={occurrences.filter((entry) => entry.segment_id === segment.id)} activeRange={activeRange}/></p>{segment.speaker && <small>{segment.speaker}</small>}</button>;}) : <EmptyState title="没有字幕" copy="导入 VTT、SRT、LRC 或纯文本后，字幕会显示在这里。"/>}</div></section></div>;
 }
 
-export function WordsView({ lexemes, occurrences, onOpen, onStar }: { lexemes: Lexeme[]; occurrences: Occurrence[]; onOpen: (id: string) => void; onStar: (word: Lexeme) => void }) {
+export function WordsView({
+  lexemes,
+  occurrences,
+  lexemeWriteLocked,
+  lexemeWriteBusy,
+  lexemeWriteStatus,
+  onOpen,
+  onStar,
+}: Readonly<{
+  lexemes: Lexeme[];
+  occurrences: Occurrence[];
+  lexemeWriteLocked: boolean;
+  lexemeWriteBusy: boolean;
+  lexemeWriteStatus: string;
+  onOpen: (id: string) => void;
+  onStar: (word: Lexeme, trigger: HTMLButtonElement) => void | Promise<void>;
+}>) {
   const [query,setQuery]=useState(""); const [filter,setFilter]=useState<"all"|Lexeme["status"]|"starred">("all");
+  const occurrenceCounts = useMemo(() => {
+    const counts = new Map<string, number>();
+    occurrences.forEach((occurrence) => {
+      counts.set(occurrence.lexeme_id, (counts.get(occurrence.lexeme_id) ?? 0) + 1);
+    });
+    return counts;
+  }, [occurrences]);
   const visible=lexemes.filter((word)=>(filter==="all"?true:filter==="starred"?Boolean(word.starred):word.status===filter)&&`${word.headword}${word.pronunciation}${word.gloss_en}`.toLowerCase().includes(query.toLowerCase()));
-  return <div className="sc-page sc-words-page"><header className="sc-page-title"><div><span className="sc-eyebrow">WORDS IN CONTEXT</span><h1>词库</h1><p>{lexemes.length} 个英文词，来自 {new Set(occurrences.map((item)=>item.item_id).filter(Boolean)).size} 份语境。</p></div></header><div className="sc-toolbar"><label className="sc-search">⌕<input value={query} onChange={(event)=>setQuery(event.target.value)} placeholder="搜索单词、发音或英文释义"/></label><div className="sc-segmented">{([['all','全部'],['learning','学习中'],['known','已掌握'],['starred','收藏']] as const).map(([id,label])=><button aria-pressed={filter===id} key={id} className={filter===id?"active":""} onClick={()=>setFilter(id)}>{label}</button>)}</div></div>{visible.length?<div className="sc-word-table"><div className="sc-word-table-head"><span>单词</span><span>英文释义</span><span>出现</span><span>状态</span><span/></div>{visible.map((word)=><article key={word.id}><button className="sc-star" onClick={()=>onStar(word)} aria-label={word.starred?"取消收藏":"收藏单词"}>{word.starred?"◆":"◇"}</button><button className="sc-word-open" onClick={()=>onOpen(word.id)}><span className="sc-word-name"><strong>{word.headword}</strong><span>{word.pronunciation||"Pronunciation pending"}</span></span><span className="sc-word-gloss">{word.gloss_en||"No explanation yet"}</span><b>{word.occurrence_count}</b><i className={`status-${word.status}`}>{word.status==="learning"?"学习中":word.status==="known"?"已掌握":word.status==="ignored"?"已忽略":"已保存"}</i><span className="sc-row-arrow">→</span></button></article>)}</div>:<EmptyState title="没有符合条件的词" copy="试试别的搜索，或回到英文原文里拾起一个词。"/>}</div>;
+  return <div className="sc-page sc-words-page">
+    <header className="sc-page-title"><div><span className="sc-eyebrow">WORDS IN CONTEXT</span><h1>词库</h1><p>{lexemes.length} 个英文词，来自 {new Set(occurrences.map((item)=>item.item_id).filter(Boolean)).size} 份语境。</p></div></header>
+    {lexemeWriteStatus && <p id="sc-words-lexeme-write-status" className="sc-lexeme-inline-status" role="status" aria-live="polite">{lexemeWriteStatus}</p>}
+    <div className="sc-toolbar"><label className="sc-search">⌕<input value={query} onChange={(event)=>setQuery(event.target.value)} placeholder="搜索单词、发音或英文释义"/></label><div className="sc-segmented">{([['all','全部'],['learning','学习中'],['known','已掌握'],['starred','收藏']] as const).map(([id,label])=><button aria-pressed={filter===id} key={id} className={filter===id?"active":""} onClick={()=>setFilter(id)}>{label}</button>)}</div></div>
+    {visible.length?<div className="sc-word-table"><div className="sc-word-table-head"><span>单词</span><span>英文释义</span><span>出现</span><span>状态</span><span/></div>{visible.map((word)=><article key={word.id}>
+      <button
+        className="sc-star"
+        disabled={lexemeWriteLocked || lexemeWriteBusy}
+        aria-busy={lexemeWriteBusy || undefined}
+        aria-describedby={lexemeWriteStatus ? "sc-words-lexeme-write-status" : undefined}
+        onClick={(event)=>void onStar(word, event.currentTarget)}
+        aria-label={word.starred?"取消收藏":"收藏单词"}
+      >{word.starred?"◆":"◇"}</button>
+      <button className="sc-word-open" onClick={()=>onOpen(word.id)}><span className="sc-word-name"><strong>{word.headword}</strong><span>{word.pronunciation||"Pronunciation pending"}</span></span><span className="sc-word-gloss">{word.gloss_en||"No explanation yet"}</span><b>{occurrenceCounts.get(word.id) ?? 0}</b><i className={`status-${word.status}`}>{word.status==="learning"?"学习中":word.status==="known"?"已掌握":word.status==="ignored"?"已忽略":"已保存"}</i><span className="sc-row-arrow">→</span></button>
+    </article>)}</div>:<EmptyState title="没有符合条件的词" copy="试试别的搜索，或回到英文原文里拾起一个词。"/>}
+  </div>;
 }
 
 type ReviewViewProps = {
   cards: ReviewCard[];
   onRefresh: () => Promise<void>;
   onGo: (view: VocabView) => void;
+  externalWriteLocked: boolean;
+  claimReviewMutation: () => boolean;
+  releaseReviewMutation: () => void;
+  onRecoveryBarrierChange: (locked: boolean) => void;
 };
 
 type ReviewJournalState = VocabReviewRecoveryReadResult & Readonly<{
@@ -515,7 +557,15 @@ function reviewActionLabel(ticket: VocabReviewRecoveryTicket): string {
   return ticket.action === "rating" ? "这次选择" : "这次撤销";
 }
 
-export function ReviewView({ cards, onRefresh, onGo }: ReviewViewProps) {
+export function ReviewView({
+  cards,
+  onRefresh,
+  onGo,
+  externalWriteLocked,
+  claimReviewMutation,
+  releaseReviewMutation,
+  onRecoveryBarrierChange,
+}: ReviewViewProps) {
   const [reviewClock, setReviewClock] = useState(() => Date.now());
   const due = getDueCards(cards, reviewClock);
   const [roundIds, setRoundIds] = useState(() => startReviewRound(due));
@@ -553,9 +603,14 @@ export function ReviewView({ cards, onRefresh, onGo }: ReviewViewProps) {
   const round = resolveReviewRound(roundSource, roundIds);
   const card = round[0] ?? null;
   const activeRecovery = journal.entries[0] ?? null;
-  const recoveryBlocksWrites = !journal.loaded || journal.storageUnavailable ||
+  const localRecoveryBlocksWrites = !journal.loaded || journal.storageUnavailable ||
     journalLockUnavailable || journal.unreadableEntries.length > 0 ||
     journal.entries.length > 0;
+  const recoveryBlocksWrites = localRecoveryBlocksWrites || externalWriteLocked;
+
+  useEffect(() => {
+    onRecoveryBarrierChange(localRecoveryBlocksWrites);
+  }, [localRecoveryBlocksWrites, onRecoveryBarrierChange]);
 
   const reloadReviewJournal = useCallback(() => {
     const next = readBrowserVocabReviewRecovery();
@@ -607,16 +662,18 @@ export function ReviewView({ cards, onRefresh, onGo }: ReviewViewProps) {
   }, [reloadReviewJournal]);
 
   const claim = useCallback(() => {
-    if (operationClaim.current) return false;
+    if (operationClaim.current || externalWriteLocked || !claimReviewMutation()) return false;
     operationClaim.current = true;
     setBusy(true);
     return true;
-  }, []);
+  }, [claimReviewMutation, externalWriteLocked]);
 
   const release = useCallback(() => {
+    if (!operationClaim.current) return;
     operationClaim.current = false;
     setBusy(false);
-  }, []);
+    releaseReviewMutation();
+  }, [releaseReviewMutation]);
 
   const focusRecovery = useCallback((target: "operation" | "recent-undo" = "operation") => {
     recoveryFocusTarget.current = target;

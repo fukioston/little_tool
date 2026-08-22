@@ -129,11 +129,140 @@ function removeImportRecovery(recovery: ImportRecovery): boolean {
   return false;
 }
 
-export function WordDetail({ word, occurrences, onClose, onNote, onStatus }: { word: Lexeme | null; occurrences: Occurrence[]; onClose: () => void; onNote: (id: string, note: string) => Promise<void>; onStatus: (id: string, status: Lexeme["status"]) => Promise<void> }) {
-  const [note, setNote] = useState(word?.notes ?? "");
-  const dialog = useOverlayDialog<HTMLElement>(Boolean(word), onClose, "button[data-dialog-close]");
+type WordDetailProps = Readonly<{
+  word: Lexeme | null;
+  occurrences: Occurrence[];
+  note: string;
+  noteDirty: boolean;
+  writeLocked: boolean;
+  statusWriteLocked: boolean;
+  writeBusy: boolean;
+  writeStatus: string;
+  onClose: () => void;
+  onNoteChange: (note: string) => void;
+  onNoteSave: (trigger: HTMLButtonElement) => void | Promise<void>;
+  onStatus: (
+    word: Lexeme,
+    status: Lexeme["status"],
+    trigger: HTMLButtonElement,
+  ) => void | Promise<void>;
+}>;
+
+export function WordDetail({
+  word,
+  occurrences,
+  note,
+  noteDirty,
+  writeLocked,
+  statusWriteLocked,
+  writeBusy,
+  writeStatus,
+  onClose,
+  onNoteChange,
+  onNoteSave,
+  onStatus,
+}: WordDetailProps) {
+  const dialog = useOverlayDialog<HTMLElement>(Boolean(word), onClose, "[data-dialog-heading]");
   if (!word) return null;
-  return <><button className="sc-drawer-scrim" onClick={onClose} aria-label="关闭词语详情"/><aside ref={dialog} className="sc-word-drawer" role="dialog" aria-modal="true" aria-labelledby="sc-word-title" tabIndex={-1}><header><span>单词详情</span><button data-dialog-close onClick={onClose} aria-label="关闭词语详情">×</button></header><div className="sc-word-hero"><span>{word.pronunciation || "PRONUNCIATION PENDING"}</span><h2 id="sc-word-title">{word.headword}</h2><p>{word.gloss_en || "No explanation yet"}</p></div><section><span>ENGLISH IN CONTEXT</span><p>{word.explanation_en || "在文章或字幕中再次请求 AI，即可补充英文语境解释。"}</p>{word.explanation_zh && <p className="sc-muted">{word.explanation_zh}</p>}</section><section><header><span>出现过 {occurrences.length} 次</span></header><div className="sc-occurrence-list">{occurrences.map((occurrence) => <article key={occurrence.id}><small>{occurrence.item_title || "来源已移除"}</small><p>{occurrence.context_sentence}</p>{occurrence.note && <em>{occurrence.note}</em>}</article>)}</div></section><section><label className="sc-note-editor"><span>我的笔记</span><textarea value={note} onChange={(event) => setNote(event.target.value)} placeholder="写下辨析、联想或记忆线索…"/><button onClick={() => void onNote(word.id, note)}>保存笔记</button></label></section><footer><span>学习状态</span><div>{([['saved','已保存'],['learning','学习中'],['known','已掌握'],['ignored','已忽略']] as const).map(([status,label]) => <button aria-pressed={word.status === status} className={word.status === status ? "active" : ""} key={status} onClick={() => void onStatus(word.id,status)}>{label}</button>)}</div></footer></aside></>;
+  const statusLocked = statusWriteLocked || writeLocked || writeBusy || noteDirty;
+  return <>
+    <button
+      className="sc-drawer-scrim"
+      disabled={writeBusy}
+      onClick={onClose}
+      aria-label="关闭词语详情"
+    />
+    <aside ref={dialog} className="sc-word-drawer" role="dialog" aria-modal="true" aria-labelledby="sc-word-title" tabIndex={-1}>
+      <header>
+        <span>单词详情</span>
+        <button data-dialog-close disabled={writeBusy} onClick={onClose} aria-label="关闭词语详情">×</button>
+      </header>
+      <div className="sc-word-hero">
+        <span>{word.pronunciation || "PRONUNCIATION PENDING"}</span>
+        <h2 id="sc-word-title" data-dialog-heading tabIndex={-1}>{word.headword}</h2>
+        <p>{word.gloss_en || "No explanation yet"}</p>
+      </div>
+      <section>
+        <span>ENGLISH IN CONTEXT</span>
+        <p>{word.explanation_en || "在文章或字幕中再次请求 AI，即可补充英文语境解释。"}</p>
+        {word.explanation_zh && <p className="sc-muted">{word.explanation_zh}</p>}
+      </section>
+      <section>
+        <header><span>出现过 {occurrences.length} 次</span></header>
+        <div className="sc-occurrence-list">
+          {occurrences.map((occurrence) => <article key={occurrence.id}>
+            <small>{occurrence.item_title || "来源已移除"}</small>
+            <p>{occurrence.context_sentence}</p>
+            {occurrence.note && <em>{occurrence.note}</em>}
+          </article>)}
+        </div>
+      </section>
+      <section>
+        <label className="sc-note-editor">
+          <span>我的笔记</span>
+          <textarea
+            value={note}
+            onChange={(event) => onNoteChange(event.target.value)}
+            placeholder="写下辨析、联想或记忆线索…"
+            aria-describedby="sc-lexeme-note-state"
+          />
+          <button
+            disabled={!noteDirty || writeLocked || writeBusy}
+            aria-busy={writeBusy}
+            onClick={(event) => void onNoteSave(event.currentTarget)}
+          >{writeBusy ? "正在确认…" : "保存笔记"}</button>
+        </label>
+        <p id="sc-lexeme-note-state" className="sc-lexeme-editor-state" role="status" aria-live="polite">
+          {writeStatus || (noteDirty ? "草稿只保留在当前页面；保存前不会改动词库。" : "笔记已与当前词条同步。")}
+        </p>
+      </section>
+      <footer>
+        <span>学习状态</span>
+        <div>{([['saved','已保存'],['learning','学习中'],['known','已掌握'],['ignored','已忽略']] as const).map(([status,label]) => <button
+          aria-pressed={word.status === status}
+          aria-busy={writeBusy}
+          className={word.status === status ? "active" : ""}
+          disabled={statusLocked || word.status === status}
+          key={status}
+          onClick={(event) => void onStatus(word, status, event.currentTarget)}
+        >{label}</button>)}</div>
+      </footer>
+    </aside>
+  </>;
+}
+
+export function LexemeDraftExitDialog({
+  open,
+  busy,
+  onStay,
+  onDiscard,
+}: Readonly<{
+  open: boolean;
+  busy: boolean;
+  onStay: () => void;
+  onDiscard: () => void;
+}>) {
+  const dialog = useOverlayDialog<HTMLElement>(open, onStay, "[data-lexeme-stay]");
+  if (!open) return null;
+  return <>
+    <button className="sc-item-exit-scrim" onClick={onStay} aria-label="继续编辑词语笔记" />
+    <section
+      ref={dialog}
+      className="sc-item-exit-dialog sc-lexeme-exit-dialog"
+      role="alertdialog"
+      aria-modal="true"
+      aria-labelledby="sc-lexeme-exit-title"
+      aria-describedby="sc-lexeme-exit-copy"
+      tabIndex={-1}
+    >
+      <h2 id="sc-lexeme-exit-title">放弃还没保存的笔记？</h2>
+      <p id="sc-lexeme-exit-copy">继续编辑是安全默认选项。放弃草稿后会重新读取整个词库，不会提交这段文字。</p>
+      <footer>
+        <button data-lexeme-stay onClick={onStay}>继续编辑</button>
+        <button className="danger" disabled={busy} onClick={onDiscard}>放弃草稿并读取最新</button>
+      </footer>
+    </section>
+  </>;
 }
 
 type ImportPhase = "idle" | "preparing" | "committing" | "refreshing" | "uncertain" | "conflict" | "recovery_absent" | "refresh_failed";

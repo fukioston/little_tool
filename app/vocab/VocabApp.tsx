@@ -15,16 +15,19 @@ import {
   getDueCards,
   initializeVocabDatabase,
   isVocabOccurrenceWriteReceipt,
+  loadVocabLexemeExpectedStates,
   loadVocabSnapshot,
   inspectVocabOccurrenceWrite,
   loadVocabSettingsExpectedState,
+  prepareVocabLexemeNoteSave,
+  prepareVocabLexemeStarSet,
+  prepareVocabLexemeStatusSet,
   type VocabItemWriteSnapshot,
   prepareVocabOccurrenceWrite,
   prepareVocabSettingsSave,
-  saveLexemeNote,
   saveOccurrence,
-  toggleLexemeStar,
-  updateLexemeStatus,
+  type VocabLexemeExpectedSet,
+  type VocabLexemeWriteReceipt,
   VocabSettingsMutationError,
   VocabWriteConflictError,
   VocabWriteNotSavedError,
@@ -33,9 +36,9 @@ import {
   type VocabSettingsWriteReceipt,
   type VocabSettingsWriteSnapshot,
 } from "@/lib/vocab/store";
-import type { AiExplanation, LibraryItem, SelectionTarget, VocabSettings, VocabSnapshot, VocabView } from "@/lib/vocab/types";
+import type { AiExplanation, Lexeme, LibraryItem, SelectionTarget, VocabSettings, VocabSnapshot, VocabView } from "@/lib/vocab/types";
 import { subscribeVocabChanges } from "@/lib/vocab/lock";
-import { ContextPanel, ImportWizard, WordDetail } from "./overlays";
+import { ContextPanel, ImportWizard, LexemeDraftExitDialog, WordDetail } from "./overlays";
 import { LibraryView, PodcastView, ReaderView, ReviewView, SettingsView, StatsView, TodayView, WordsView } from "./views";
 import { Loader, Logo } from "./ui";
 import { useOverlayDialog } from "./useOverlayDialog";
@@ -58,6 +61,34 @@ import {
   vocabItemExitDecision,
   vocabItemHistoryBackDecision,
 } from "./item-write-state";
+import {
+  VocabLexemeWriteBanner,
+  VocabLexemeWriteRecovery,
+  useVocabLexemeWriteFlow,
+  type VocabLexemeRefreshOutcome,
+} from "./VocabLexemeWriteFlow";
+import {
+  beginVocabLexemeEditorPreparation,
+  bindVocabLexemeEditorReceipt,
+  cancelVocabLexemeEditorPreparation,
+  createVocabLexemeBindings,
+  createVocabLexemeNoteEditor,
+  discardVocabLexemeEditorOperation,
+  getBoundVocabLexemeExpected,
+  sameVocabLexemeExpectedSet,
+  settleChangedVocabLexemeEditor,
+  settleVocabLexemeEditor,
+  updateVocabLexemeNoteEditor,
+  vocabLexemeEditorNeedsProtection,
+  vocabLexemeExitDecision,
+  vocabLexemeNoteEditorDirty,
+  type VocabLexemeBindingMap,
+  type VocabLexemeNoteEditor,
+} from "./lexeme-write-state";
+import {
+  VOCAB_REVIEW_RECOVERY_PREFIX,
+  readBrowserVocabReviewRecovery,
+} from "./review-recovery";
 
 const VOCAB_ITEM_HISTORY_GUARD = "__privateAiSuiteVocabItemGuard";
 
@@ -75,10 +106,14 @@ const empty: VocabSnapshot = {
 };
 
 type VocabSnapshotReadStatus = "loading" | "ready" | "stale";
-type VocabFactsReadBundle = Readonly<{
+type VocabSettingsFactsReadBundle = Readonly<{
   snapshot: VocabSnapshot;
   expected: VocabSettingsWriteSnapshot;
   itemExpectedById: VocabItemExpectedMap;
+}>;
+type VocabFactsReadBundle = VocabSettingsFactsReadBundle & Readonly<{
+  lexemeExpected: VocabLexemeExpectedSet;
+  lexemeBindingsById: VocabLexemeBindingMap;
 }>;
 type VocabSettingsDraft = Readonly<{
   settings: VocabSettings;
@@ -133,7 +168,7 @@ function sameVocabSettingsExpectedState(
     });
 }
 
-async function loadVocabFactsWithSettingsExpected(): Promise<VocabFactsReadBundle> {
+async function loadVocabFactsWithSettingsExpected(): Promise<VocabSettingsFactsReadBundle> {
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const expectedBefore = await loadVocabSettingsExpectedState();
     const facts = await loadVocabSnapshot();
@@ -158,6 +193,35 @@ async function loadVocabFactsWithSettingsExpected(): Promise<VocabFactsReadBundl
     }
   }
   throw new Error("设置在读取期间持续变化；这次没有拼接新旧词库资料，请重新尝试。");
+}
+
+async function loadVocabFactsWithLexemeExpected(): Promise<VocabFactsReadBundle> {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const lexemeBefore = await loadVocabLexemeExpectedStates();
+    const bundle = await loadVocabFactsWithSettingsExpected();
+    const lexemeAfter = await loadVocabLexemeExpectedStates();
+    const sameGeneration = bundle.expected.generationId ===
+        lexemeAfter.generationId &&
+      bundle.expected.generationSequence === lexemeAfter.generationSequence;
+    const lexemeBindingsById = sameGeneration &&
+        sameVocabLexemeExpectedSet(lexemeBefore, lexemeAfter)
+      ? createVocabLexemeBindings(
+          bundle.snapshot.lexemes,
+          bundle.snapshot.reviewCards,
+          lexemeAfter,
+        )
+      : null;
+    if (lexemeBindingsById) {
+      return {
+        ...bundle,
+        lexemeExpected: lexemeAfter,
+        lexemeBindingsById,
+      };
+    }
+  }
+  throw new Error(
+    "词条或复习卡在读取期间持续变化；这次没有拼接新旧词库资料，请重新尝试。",
+  );
 }
 
 class VocabSnapshotSupersededError extends Error {
@@ -263,6 +327,11 @@ export default function VocabApp() {
   const [settingsRecoveryOpen, setSettingsRecoveryOpen] = useState(false);
   const [itemRecoveryOpen, setItemRecoveryOpen] = useState(false);
   const [itemExternalPending, setItemExternalPending] = useState(false);
+  const [lexemeRecoveryOpen, setLexemeRecoveryOpen] = useState(false);
+  const [lexemeExternalPending, setLexemeExternalPending] = useState(false);
+  const [lexemeWriteNotice, setLexemeWriteNotice] = useState("");
+  const [lexemeEditor, setLexemeEditor] = useState<VocabLexemeNoteEditor | null>(null);
+  const [lexemeCloseConfirmOpen, setLexemeCloseConfirmOpen] = useState(false);
   const [itemExitConfirmOpen, setItemExitConfirmOpen] = useState(false);
   const [itemExitDestination, setItemExitDestination] = useState<"suite" | "history">("suite");
   const [ready, setReady] = useState(false);
@@ -295,14 +364,37 @@ export default function VocabApp() {
   const committedOccurrenceRef = useRef<{ surface: string } | null>(null);
   const wordAbandonOpenerRef = useRef<HTMLElement | null>(null);
   const snapshotReadRequestRef = useRef(0);
+  const snapshotReadStatusRef = useRef<VocabSnapshotReadStatus>("loading");
   const snapshotRef = useRef(snapshot);
   const settingsExpectedRef = useRef<VocabSettingsWriteSnapshot | null>(null);
   const itemExpectedByIdRef = useRef<VocabItemExpectedMap>(new Map());
+  const lexemeBindingsByIdRef = useRef<VocabLexemeBindingMap>(new Map());
   const itemWriteGuardRef = useRef<(next: VocabItemExpectedMap) => boolean>(() => false);
+  const lexemeWriteGuardRef = useRef<(
+    next: VocabLexemeBindingMap,
+    editor: VocabLexemeNoteEditor | null,
+  ) => boolean>(() => false);
   const settingsDraftRef = useRef<VocabSettingsDraft | null>(null);
+  const lexemeEditorRef = useRef<VocabLexemeNoteEditor | null>(null);
+  const lexemeExternalPendingRef = useRef(false);
+  const lexemePrepareBindingRef = useRef<Readonly<{
+    kind: VocabLexemeWriteReceipt["kind"];
+    token: symbol | null;
+    trigger: HTMLElement;
+  }> | null>(null);
   const flushedSettingsDraftRevisionRef = useRef<number | null>(null);
   const pendingSettingsBundleRef = useRef<Readonly<{ requestId: number; bundle: VocabFactsReadBundle }> | null>(null);
   const pendingItemBundleRef = useRef<Readonly<{ requestId: number; bundle: VocabFactsReadBundle }> | null>(null);
+  const pendingLexemeBundleRef = useRef<Readonly<{ requestId: number; bundle: VocabFactsReadBundle }> | null>(null);
+  const lexemePendingActionRef = useRef<(() => void) | null>(null);
+  const lexemeCloseOpenerRef = useRef<HTMLElement | null>(null);
+  const lexemeRecoveryOpenerRef = useRef<HTMLElement | null>(null);
+  const lexemeFocusFrame = useRef<number | null>(null);
+  const cardMutationOwnerRef = useRef<"status" | "review" | null>(null);
+  const [cardMutationOwner, setCardMutationOwner] = useState<"status" | "review" | null>(null);
+  const reviewRecoveryLockedRef = useRef(true);
+  const [reviewRecoveryLocked, setReviewRecoveryLocked] = useState(true);
+  const externalDatabaseOperationRef = useRef<() => boolean>(() => true);
   const settingsPrepareBindingRef = useRef<Readonly<{
     trigger: HTMLElement;
     revision: number | null;
@@ -438,19 +530,35 @@ export default function VocabApp() {
     if (itemExitFocusFrame.current !== null) {
       window.cancelAnimationFrame(itemExitFocusFrame.current);
     }
+    if (lexemeFocusFrame.current !== null) {
+      window.cancelAnimationFrame(lexemeFocusFrame.current);
+    }
   }, []);
 
   const applyVocabFactsBundle = useCallback((bundle: VocabFactsReadBundle) => {
     snapshotRef.current = bundle.snapshot;
     settingsExpectedRef.current = bundle.expected;
     itemExpectedByIdRef.current = bundle.itemExpectedById;
+    lexemeBindingsByIdRef.current = bundle.lexemeBindingsById;
+    const editor = lexemeEditorRef.current;
+    if (editor && !vocabLexemeEditorNeedsProtection(editor)) {
+      const binding = bundle.lexemeBindingsById.get(editor.lexemeId) ?? null;
+      const nextEditor = binding ? createVocabLexemeNoteEditor(binding) : null;
+      lexemeEditorRef.current = nextEditor;
+      setLexemeEditor(nextEditor);
+      if (!binding) setWordId(null);
+    }
     setSnapshot(bundle.snapshot);
     setSettingsExpected(bundle.expected);
+    snapshotReadStatusRef.current = "ready";
     setSnapshotReadStatus("ready");
     setSnapshotReadError("");
     setReady(true);
     pendingItemBundleRef.current = null;
     setItemExternalPending(false);
+    pendingLexemeBundleRef.current = null;
+    lexemeExternalPendingRef.current = false;
+    setLexemeExternalPending(false);
   }, []);
 
   const readVocabFacts = useCallback(async (): Promise<Readonly<{
@@ -459,13 +567,22 @@ export default function VocabApp() {
   }>> => {
     const requestId = ++snapshotReadRequestRef.current;
     try {
-      const bundle = await loadVocabFactsWithSettingsExpected();
+      const bundle = await loadVocabFactsWithLexemeExpected();
       if (requestId !== snapshotReadRequestRef.current) {
         return { outcome: "superseded", snapshot: snapshotRef.current };
       }
       if (itemWriteGuardRef.current(bundle.itemExpectedById)) {
         pendingItemBundleRef.current = { requestId, bundle };
         setItemExternalPending(true);
+        return { outcome: "deferred", snapshot: snapshotRef.current };
+      }
+      if (lexemeWriteGuardRef.current(
+        bundle.lexemeBindingsById,
+        lexemeEditorRef.current,
+      )) {
+        pendingLexemeBundleRef.current = { requestId, bundle };
+        lexemeExternalPendingRef.current = true;
+        setLexemeExternalPending(true);
         return { outcome: "deferred", snapshot: snapshotRef.current };
       }
       const draft = settingsDraftRef.current;
@@ -479,13 +596,26 @@ export default function VocabApp() {
         const nextSnapshot = { ...bundle.snapshot, settings: draft.expected.settings };
         snapshotRef.current = nextSnapshot;
         itemExpectedByIdRef.current = bundle.itemExpectedById;
+        lexemeBindingsByIdRef.current = bundle.lexemeBindingsById;
+        const editor = lexemeEditorRef.current;
+        if (editor && !vocabLexemeEditorNeedsProtection(editor)) {
+          const binding = bundle.lexemeBindingsById.get(editor.lexemeId) ?? null;
+          const nextEditor = binding ? createVocabLexemeNoteEditor(binding) : null;
+          lexemeEditorRef.current = nextEditor;
+          setLexemeEditor(nextEditor);
+          if (!binding) setWordId(null);
+        }
         setSnapshot(nextSnapshot);
+        snapshotReadStatusRef.current = "ready";
         setSnapshotReadStatus("ready");
         setSnapshotReadError("");
         setReady(true);
         pendingSettingsBundleRef.current = null;
         pendingItemBundleRef.current = null;
+        pendingLexemeBundleRef.current = null;
         setItemExternalPending(false);
+        lexemeExternalPendingRef.current = false;
+        setLexemeExternalPending(false);
         setSettingsExternalPending(false);
         return { outcome: "applied", snapshot: nextSnapshot };
       }
@@ -495,6 +625,7 @@ export default function VocabApp() {
       return { outcome: "applied", snapshot: bundle.snapshot };
     } catch (reason) {
       if (requestId === snapshotReadRequestRef.current) {
+        snapshotReadStatusRef.current = "stale";
         setSnapshotReadStatus("stale");
         setSnapshotReadError(errorMessage(reason));
       }
@@ -542,6 +673,10 @@ export default function VocabApp() {
   }, [readVocabFacts]);
 
   const refreshItemFacts = useCallback(async (): Promise<VocabItemRefreshOutcome> => {
+    return (await readVocabFacts()).outcome;
+  }, [readVocabFacts]);
+
+  const refreshLexemeFacts = useCallback(async (): Promise<VocabLexemeRefreshOutcome> => {
     return (await readVocabFacts()).outcome;
   }, [readVocabFacts]);
 
@@ -601,6 +736,179 @@ export default function VocabApp() {
     });
   }, []);
 
+  const updateReviewMutationBarrier = useCallback((locked: boolean) => {
+    reviewRecoveryLockedRef.current = locked;
+    setReviewRecoveryLocked(locked);
+  }, []);
+
+  const scanReviewMutationBarrier = useCallback(() => {
+    const current = readBrowserVocabReviewRecovery();
+    const locked = current.storageUnavailable ||
+      current.unreadableEntries.length > 0 || current.entries.length > 0 ||
+      typeof navigator === "undefined" || !navigator.locks;
+    updateReviewMutationBarrier(locked);
+    return locked;
+  }, [updateReviewMutationBarrier]);
+
+  useEffect(() => {
+    let live = true;
+    queueMicrotask(() => {
+      if (live) scanReviewMutationBarrier();
+    });
+    const storage = (event: StorageEvent) => {
+      if (
+        event.storageArea === window.localStorage &&
+        (event.key === null || event.key.startsWith(VOCAB_REVIEW_RECOVERY_PREFIX))
+      ) scanReviewMutationBarrier();
+    };
+    const focus = () => scanReviewMutationBarrier();
+    window.addEventListener("storage", storage);
+    window.addEventListener("focus", focus);
+    return () => {
+      live = false;
+      window.removeEventListener("storage", storage);
+      window.removeEventListener("focus", focus);
+    };
+  }, [scanReviewMutationBarrier]);
+
+  const claimStatusMutation = useCallback(() => {
+    if (
+      cardMutationOwnerRef.current !== null ||
+      reviewRecoveryLockedRef.current || externalDatabaseOperationRef.current()
+    ) return false;
+    cardMutationOwnerRef.current = "status";
+    setCardMutationOwner("status");
+    return true;
+  }, []);
+
+  const releaseStatusMutation = useCallback(() => {
+    if (cardMutationOwnerRef.current !== "status") return;
+    cardMutationOwnerRef.current = null;
+    setCardMutationOwner(null);
+  }, []);
+
+  const claimReviewMutation = useCallback(() => {
+    if (
+      cardMutationOwnerRef.current !== null ||
+      externalDatabaseOperationRef.current()
+    ) return false;
+    cardMutationOwnerRef.current = "review";
+    setCardMutationOwner("review");
+    return true;
+  }, []);
+
+  const releaseReviewMutation = useCallback(() => {
+    if (cardMutationOwnerRef.current !== "review") return;
+    scanReviewMutationBarrier();
+    cardMutationOwnerRef.current = null;
+    setCardMutationOwner(null);
+  }, [scanReviewMutationBarrier]);
+
+  const bindPreparedLexemeReceipt = useCallback((
+    receipt: VocabLexemeWriteReceipt,
+    trigger: HTMLElement,
+  ) => {
+    const binding = lexemePrepareBindingRef.current;
+    lexemePrepareBindingRef.current = null;
+    if (!binding || binding.kind !== receipt.kind || binding.trigger !== trigger) return;
+    const current = lexemeEditorRef.current;
+    if (current && binding.token) {
+      const next = bindVocabLexemeEditorReceipt(
+        current,
+        binding.token,
+        receipt,
+      );
+      if (next !== current) {
+        lexemeEditorRef.current = next;
+        setLexemeEditor(next);
+      }
+    }
+  }, []);
+
+  const restoreLexemeActionFocus = useCallback((
+    receipt: VocabLexemeWriteReceipt,
+    trigger: HTMLElement | null,
+  ) => {
+    const currentEditor = lexemeEditorRef.current;
+    if (currentEditor && currentEditor.lexemeId !== receipt.after.lexeme.id) return;
+    if (lexemeFocusFrame.current !== null) {
+      window.cancelAnimationFrame(lexemeFocusFrame.current);
+    }
+    lexemeFocusFrame.current = window.requestAnimationFrame(() => {
+      lexemeFocusFrame.current = window.requestAnimationFrame(() => {
+        lexemeFocusFrame.current = null;
+        const current = lexemeEditorRef.current;
+        if (current && current.lexemeId !== receipt.after.lexeme.id) return;
+        const preferred = trigger?.isConnected && !trigger.matches(":disabled") &&
+            trigger.getClientRects().length > 0
+          ? trigger
+          : null;
+        const target = preferred ?? document.querySelector<HTMLElement>(
+          current
+            ? ".sc-word-drawer h2, .sc-main h1, .sc-menu:not(:disabled)"
+            : ".sc-main h1, .sc-menu:not(:disabled)",
+        );
+        if (!target?.isConnected || target.getClientRects().length === 0) return;
+        if (target.matches("h1,h2")) target.tabIndex = -1;
+        target.focus({ preventScroll: true });
+      });
+    });
+  }, []);
+
+  const settleLexemeWrite = useCallback((
+    receipt: VocabLexemeWriteReceipt,
+    trigger: HTMLElement | null,
+  ) => {
+    const current = lexemeEditorRef.current;
+    const next = settleVocabLexemeEditor(
+      current,
+      receipt,
+      lexemeBindingsByIdRef.current.get(receipt.after.lexeme.id) ?? null,
+    );
+    if (next !== current) {
+      lexemeEditorRef.current = next;
+      setLexemeEditor(next);
+    }
+    setLexemeWriteNotice("");
+    restoreLexemeActionFocus(receipt, trigger);
+  }, [restoreLexemeActionFocus]);
+
+  const settleChangedLexemeWrite = useCallback((
+    receipt: VocabLexemeWriteReceipt,
+    trigger: HTMLElement | null,
+  ) => {
+    const current = lexemeEditorRef.current;
+    const next = settleChangedVocabLexemeEditor(
+      current,
+      receipt,
+      lexemeBindingsByIdRef.current.get(receipt.before.lexeme.id) ?? null,
+    );
+    if (next !== current) {
+      lexemeEditorRef.current = next;
+      setLexemeEditor(next);
+      if (!next) setWordId(null);
+    }
+    restoreLexemeActionFocus(receipt, trigger);
+  }, [restoreLexemeActionFocus]);
+
+  const discardLexemeReceipt = useCallback((
+    receipt: VocabLexemeWriteReceipt,
+    trigger: HTMLElement | null,
+  ) => {
+    const current = lexemeEditorRef.current;
+    if (current) {
+      const next = discardVocabLexemeEditorOperation(current, receipt);
+      if (next !== current) {
+        lexemeEditorRef.current = next;
+        setLexemeEditor(next);
+      }
+    }
+    if (lexemePrepareBindingRef.current?.kind === receipt.kind) {
+      lexemePrepareBindingRef.current = null;
+    }
+    restoreLexemeActionFocus(receipt, trigger);
+  }, [restoreLexemeActionFocus]);
+
   const settingsWrites = useVocabSettingsWriteFlow({
     refresh: refreshSettingsFacts,
     onToast: setToast,
@@ -632,16 +940,63 @@ export default function VocabApp() {
       }
     },
   });
+  const itemBlocksLexemeWrites = itemWrites.busy ||
+    itemWrites.operationInProgress() || itemWrites.hasDirtyCheckpoint ||
+    itemWrites.hasConflictedCheckpoint || itemWrites.hasHeldReceipt ||
+    !itemWrites.journal.loaded || itemWrites.journal.storageUnavailable ||
+    itemWrites.journal.lockUnavailable || itemWrites.journal.unreadable.length > 0 ||
+    itemWrites.journal.entries.length > 0;
+  const lexemeExternalWriteLocked = settingsDatabaseWriteLocked ||
+    itemBlocksLexemeWrites || snapshotReadStatus !== "ready" ||
+    lexemeExternalPending;
+  const lexemeExternalWriteInProgress = useCallback(() =>
+    lexemeExternalWriteLocked || snapshotReadStatusRef.current !== "ready" ||
+    lexemeExternalPendingRef.current ||
+    settingsWrites.operationInProgress() || itemWrites.operationInProgress(),
+  [itemWrites, lexemeExternalWriteLocked, settingsWrites]);
+  useEffect(() => {
+    externalDatabaseOperationRef.current = lexemeExternalWriteInProgress;
+  }, [lexemeExternalWriteInProgress]);
+  const lexemeWrites = useVocabLexemeWriteFlow({
+    refresh: refreshLexemeFacts,
+    externalWriteLocked: lexemeExternalWriteLocked,
+    externalWriteInProgress: lexemeExternalWriteInProgress,
+    claimStatusMutation,
+    releaseStatusMutation,
+    onToast: setToast,
+    onAttention: (receipt) => {
+      const currentEditor = lexemeEditorRef.current;
+      const shouldFocus = !receipt || !currentEditor ||
+        currentEditor.lexemeId === receipt.before.lexeme.id;
+      if (!lexemeRecoveryOpen && shouldFocus) {
+        const active = document.activeElement;
+        lexemeRecoveryOpenerRef.current = active instanceof HTMLElement &&
+            active !== document.body &&
+            !active.closest(".sc-lexeme-write-recovery")
+          ? active
+          : null;
+      }
+      if (shouldFocus) setLexemeRecoveryOpen(true);
+      return shouldFocus;
+    },
+    onReceiptPrepared: bindPreparedLexemeReceipt,
+    onDurableSettled: settleLexemeWrite,
+    onChangedSettled: settleChangedLexemeWrite,
+    onReceiptDiscarded: discardLexemeReceipt,
+  });
   useEffect(() => {
     itemWriteGuardRef.current = itemWrites.shouldDeferBundle;
   }, [itemWrites.shouldDeferBundle]);
+  useEffect(() => {
+    lexemeWriteGuardRef.current = lexemeWrites.shouldDeferBundle;
+  }, [lexemeWrites.shouldDeferBundle]);
   const effectiveLocalLock = vocabSettingsOutboundBlocked(
     snapshot.settings.local_lock,
     settingsWrites.journal.loaded,
     settingsWrites.busy,
     settingsWrites.journal.storageUnavailable,
     settingsWrites.journal.unreadable.length,
-    settingsWrites.journal.entries.length,
+    settingsWrites.journal.entries.length + (settingsWrites.hasHeldReceipt ? 1 : 0),
   );
   const settingsOutboundBlocked = useCallback(() => vocabSettingsOutboundBlocked(
     snapshotRef.current.settings.local_lock,
@@ -649,7 +1004,7 @@ export default function VocabApp() {
     settingsWrites.busy,
     settingsWrites.journal.storageUnavailable,
     settingsWrites.journal.unreadable.length,
-    settingsWrites.journal.entries.length,
+    settingsWrites.journal.entries.length + (settingsWrites.hasHeldReceipt ? 1 : 0),
     settingsWrites.operationInProgress(),
   ), [settingsWrites]);
 
@@ -658,6 +1013,7 @@ export default function VocabApp() {
     const current = settingsDraftRef.current;
     const expected = current?.expected ?? settingsExpectedRef.current;
     if (!expected || (!current && snapshotRef.current.settings !== expected.settings)) {
+      snapshotReadStatusRef.current = "stale";
       setSnapshotReadStatus("stale");
       setSettingsWriteNotice("设置与安全读取凭据没有成对就绪；没有改动草稿，请先只重新读取。");
       return;
@@ -680,6 +1036,7 @@ export default function VocabApp() {
   ) => {
     if (snapshotReadStatus !== "ready" || settingsWrites.writeLocked || settingsWrites.operationInProgress() ||
         settingsExpectedRef.current !== expected || snapshotRef.current.settings !== expected.settings) {
+      snapshotReadStatusRef.current = "stale";
       setSnapshotReadStatus("stale");
       setSettingsWriteNotice("当前设置与安全读取凭据不再属于同一次读取；仍显示上次确认内容，请先只重新读取。");
       return;
@@ -693,6 +1050,7 @@ export default function VocabApp() {
         "设置已保存在当前浏览器的本地词库",
       );
     } catch (reason) {
+      snapshotReadStatusRef.current = "stale";
       setSnapshotReadStatus("stale");
       setSettingsWriteNotice(reason instanceof VocabSettingsMutationError && reason.code === "changed"
         ? "另一页已经更新了设置；这次没有写入，当前草稿仍保留。请明确放弃草稿后只重新读取。"
@@ -720,6 +1078,7 @@ export default function VocabApp() {
     }
     const expected = settingsExpectedRef.current;
     if (!expected) {
+      snapshotReadStatusRef.current = "stale";
       setSnapshotReadStatus("stale");
       setSettingsWriteNotice("设置读取凭据尚未就绪；开关没有改动。");
       return;
@@ -737,6 +1096,15 @@ export default function VocabApp() {
       if (itemWriteGuardRef.current(pending.bundle.itemExpectedById)) {
         pendingItemBundleRef.current = pending;
         setItemExternalPending(true);
+        return;
+      }
+      if (lexemeWriteGuardRef.current(
+        pending.bundle.lexemeBindingsById,
+        lexemeEditorRef.current,
+      )) {
+        pendingLexemeBundleRef.current = pending;
+        lexemeExternalPendingRef.current = true;
+        setLexemeExternalPending(true);
         return;
       }
       applyVocabFactsBundle(pending.bundle);
@@ -839,6 +1207,20 @@ export default function VocabApp() {
     return () => window.removeEventListener("beforeunload", protectDraft);
   }, [settingsDraft]);
 
+  useEffect(() => {
+    if (!vocabLexemeNoteEditorDirty(lexemeEditor)) return;
+    const protectDraft = (event: BeforeUnloadEvent) => event.preventDefault();
+    window.addEventListener("beforeunload", protectDraft);
+    return () => window.removeEventListener("beforeunload", protectDraft);
+  }, [lexemeEditor]);
+
+  useEffect(() => {
+    if (cardMutationOwner !== "review") return;
+    const protectReview = (event: BeforeUnloadEvent) => event.preventDefault();
+    window.addEventListener("beforeunload", protectReview);
+    return () => window.removeEventListener("beforeunload", protectReview);
+  }, [cardMutationOwner]);
+
   useEffect(() => () => {
     if (settingsFocusFrame.current !== null) window.cancelAnimationFrame(settingsFocusFrame.current);
   }, []);
@@ -908,20 +1290,110 @@ export default function VocabApp() {
 
   useEffect(() => () => aiRequest.current?.controller.abort(), []);
 
+  const clearLexemeEditor = useCallback(() => {
+    lexemeEditorRef.current = null;
+    setLexemeEditor(null);
+    setWordId(null);
+    setLexemeWriteNotice("");
+  }, []);
+
+  const requestLexemeEditorExit = useCallback((action: () => void) => {
+    const decision = vocabLexemeExitDecision(
+      lexemeWrites.hasVolatileOperation,
+      vocabLexemeNoteEditorDirty(lexemeEditorRef.current),
+    );
+    if (decision === "block") {
+      setLexemeWriteNotice("正在安全保留词条收据；线索完整前先留在当前词条。");
+      return;
+    }
+    if (decision === "leave") {
+      action();
+      return;
+    }
+    const active = document.activeElement;
+    lexemeCloseOpenerRef.current = active instanceof HTMLElement &&
+        active !== document.body
+      ? active
+      : null;
+    lexemePendingActionRef.current = action;
+    setLexemeCloseConfirmOpen(true);
+  }, [lexemeWrites.hasVolatileOperation]);
+
+  const cancelLexemeEditorExit = useCallback(() => {
+    setLexemeCloseConfirmOpen(false);
+    lexemePendingActionRef.current = null;
+    window.requestAnimationFrame(() => {
+      const opener = lexemeCloseOpenerRef.current;
+      lexemeCloseOpenerRef.current = null;
+      if (opener?.isConnected && opener.getClientRects().length > 0) {
+        opener.focus({ preventScroll: true });
+      }
+    });
+  }, []);
+
+  const confirmLexemeEditorExit = useCallback(() => {
+    if (lexemeWrites.hasVolatileOperation) return;
+    const action = lexemePendingActionRef.current;
+    lexemePendingActionRef.current = null;
+    setLexemeCloseConfirmOpen(false);
+    clearLexemeEditor();
+    action?.();
+  }, [clearLexemeEditor, lexemeWrites.hasVolatileOperation]);
+
   const go = useCallback((next: VocabView) => {
-    setView(next); closeMobileSidebar();
-    if (next !== "reader" && next !== "podcast") clearSelection();
-    const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-    window.scrollTo({ top: 0, behavior: reducedMotion ? "auto" : "smooth" });
-  }, [clearSelection, closeMobileSidebar]);
+    requestLexemeEditorExit(() => {
+      clearLexemeEditor();
+      setView(next); closeMobileSidebar();
+      if (next !== "reader" && next !== "podcast") clearSelection();
+      const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+      window.scrollTo({ top: 0, behavior: reducedMotion ? "auto" : "smooth" });
+    });
+  }, [clearLexemeEditor, clearSelection, closeMobileSidebar, requestLexemeEditorExit]);
 
   const openItem = useCallback((item: LibraryItem) => {
-    setActiveItemId(item.id);
-    setView(item.kind === "article" ? "reader" : "podcast");
-    clearSelection();
-    const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-    window.scrollTo({ top: 0, behavior: reducedMotion ? "auto" : "smooth" });
-  }, [clearSelection]);
+    requestLexemeEditorExit(() => {
+      clearLexemeEditor();
+      setActiveItemId(item.id);
+      setView(item.kind === "article" ? "reader" : "podcast");
+      clearSelection();
+      const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+      window.scrollTo({ top: 0, behavior: reducedMotion ? "auto" : "smooth" });
+    });
+  }, [clearLexemeEditor, clearSelection, requestLexemeEditorExit]);
+
+  const openWord = useCallback((id: string) => {
+    const action = () => {
+      const binding = lexemeBindingsByIdRef.current.get(id) ?? null;
+      if (!binding) {
+        snapshotReadStatusRef.current = "stale";
+        setSnapshotReadStatus("stale");
+        setLexemeWriteNotice("词条与安全读取凭据没有成对就绪；没有打开可编辑内容。");
+        return;
+      }
+      const editor = createVocabLexemeNoteEditor(binding);
+      lexemeEditorRef.current = editor;
+      setLexemeEditor(editor);
+      setWordId(id);
+      setLexemeWriteNotice("");
+    };
+    const current = lexemeEditorRef.current;
+    if (current?.lexemeId === id) return;
+    requestLexemeEditorExit(action);
+  }, [requestLexemeEditorExit]);
+
+  const openSearch = useCallback(() => {
+    requestLexemeEditorExit(() => {
+      clearLexemeEditor();
+      setSearchOpen(true);
+    });
+  }, [clearLexemeEditor, requestLexemeEditorExit]);
+
+  const openImport = useCallback(() => {
+    requestLexemeEditorExit(() => {
+      clearLexemeEditor();
+      setImportOpen(true);
+    });
+  }, [clearLexemeEditor, requestLexemeEditorExit]);
 
   const askAiFor = useCallback(async (target: SelectionTarget, includeChinese: boolean) => {
     const key = selectionIdentity(target);
@@ -1225,6 +1697,177 @@ export default function VocabApp() {
     return savePickedWord(note);
   }, [inspectPendingWord, refreshCommittedWord, requestAbandonConflictedWord, savePickedWord, wordSavePhase]);
 
+  const updateLexemeNote = useCallback((note: string) => {
+    const current = lexemeEditorRef.current;
+    if (!current) return;
+    const next = updateVocabLexemeNoteEditor(current, note);
+    lexemeEditorRef.current = next;
+    setLexemeEditor(next);
+    setLexemeWriteNotice("");
+  }, []);
+
+  const cancelLexemeEditorPreparation = useCallback((token: symbol | null) => {
+    if (!token) return;
+    const current = lexemeEditorRef.current;
+    if (!current) return;
+    const next = cancelVocabLexemeEditorPreparation(current, token);
+    if (next !== current) {
+      lexemeEditorRef.current = next;
+      setLexemeEditor(next);
+    }
+  }, []);
+
+  const saveLexemeNoteDurably = useCallback(async (trigger: HTMLButtonElement) => {
+    const editor = lexemeEditorRef.current;
+    if (!editor || !vocabLexemeNoteEditorDirty(editor)) return;
+    if (
+      snapshotReadStatus !== "ready" || lexemeExternalPending ||
+      lexemeWrites.writeLocked || lexemeWrites.operationInProgress()
+    ) {
+      setLexemeWriteNotice("词条安全门尚未开放；笔记草稿仍保留在本页，没有调用写入。");
+      return;
+    }
+    const token = Symbol("vocab-lexeme-note-prepare");
+    const preparedEditor = beginVocabLexemeEditorPreparation(
+      editor,
+      "note-save",
+      token,
+    );
+    if (preparedEditor === editor) return;
+    lexemeEditorRef.current = preparedEditor;
+    setLexemeEditor(preparedEditor);
+    const binding = { kind: "note-save", token, trigger } as const;
+    lexemePrepareBindingRef.current = binding;
+    try {
+      await lexemeWrites.start(
+        "note-save",
+        () => prepareVocabLexemeNoteSave(editor.note, editor.expected),
+        trigger,
+      );
+    } finally {
+      if (lexemePrepareBindingRef.current === binding) {
+        lexemePrepareBindingRef.current = null;
+      }
+      cancelLexemeEditorPreparation(token);
+    }
+  }, [cancelLexemeEditorPreparation, lexemeExternalPending, lexemeWrites, snapshotReadStatus]);
+
+  const setLexemeStarDurably = useCallback(async (
+    display: Lexeme,
+    trigger: HTMLButtonElement,
+  ) => {
+    const expected = getBoundVocabLexemeExpected(
+      lexemeBindingsByIdRef.current,
+      display,
+    );
+    if (
+      !expected || snapshotReadStatus !== "ready" || lexemeExternalPending ||
+      vocabLexemeNoteEditorDirty(lexemeEditorRef.current) ||
+      lexemeWrites.writeLocked || lexemeWrites.operationInProgress()
+    ) {
+      setLexemeWriteNotice("当前词条与安全读取凭据不再成对，或还有笔记草稿；收藏没有改动。");
+      return;
+    }
+    const currentEditor = lexemeEditorRef.current;
+    const token = currentEditor?.lexemeId === display.id &&
+        currentEditor.display === display && currentEditor.expected === expected
+      ? Symbol("vocab-lexeme-star-prepare")
+      : null;
+    if (currentEditor && token) {
+      const preparedEditor = beginVocabLexemeEditorPreparation(
+        currentEditor,
+        "star-set",
+        token,
+      );
+      if (preparedEditor === currentEditor) return;
+      lexemeEditorRef.current = preparedEditor;
+      setLexemeEditor(preparedEditor);
+    }
+    const binding = { kind: "star-set", token, trigger } as const;
+    lexemePrepareBindingRef.current = binding;
+    try {
+      await lexemeWrites.start(
+        "star-set",
+        () => prepareVocabLexemeStarSet(!display.starred, expected),
+        trigger,
+      );
+    } finally {
+      if (lexemePrepareBindingRef.current === binding) {
+        lexemePrepareBindingRef.current = null;
+      }
+      cancelLexemeEditorPreparation(token);
+    }
+  }, [cancelLexemeEditorPreparation, lexemeExternalPending, lexemeWrites, snapshotReadStatus]);
+
+  const setLexemeStatusDurably = useCallback(async (
+    display: Lexeme,
+    nextStatus: Lexeme["status"],
+    trigger: HTMLButtonElement,
+  ) => {
+    const expected = getBoundVocabLexemeExpected(
+      lexemeBindingsByIdRef.current,
+      display,
+    );
+    if (display.status === nextStatus) return;
+    if (
+      !expected || snapshotReadStatus !== "ready" || lexemeExternalPending ||
+      vocabLexemeNoteEditorDirty(lexemeEditorRef.current) ||
+      lexemeWrites.writeLocked || lexemeWrites.operationInProgress() ||
+      cardMutationOwnerRef.current !== null || reviewRecoveryLockedRef.current
+    ) {
+      setLexemeWriteNotice("当前词条、复习卡或安全读取凭据尚未就绪；学习状态没有改动。");
+      return;
+    }
+    const currentEditor = lexemeEditorRef.current;
+    const token = currentEditor?.lexemeId === display.id &&
+        currentEditor.display === display && currentEditor.expected === expected
+      ? Symbol("vocab-lexeme-status-prepare")
+      : null;
+    if (currentEditor && token) {
+      const preparedEditor = beginVocabLexemeEditorPreparation(
+        currentEditor,
+        "status-set",
+        token,
+      );
+      if (preparedEditor === currentEditor) return;
+      lexemeEditorRef.current = preparedEditor;
+      setLexemeEditor(preparedEditor);
+    }
+    const binding = { kind: "status-set", token, trigger } as const;
+    lexemePrepareBindingRef.current = binding;
+    try {
+      await lexemeWrites.start(
+        "status-set",
+        () => prepareVocabLexemeStatusSet(nextStatus, expected),
+        trigger,
+      );
+    } finally {
+      if (lexemePrepareBindingRef.current === binding) {
+        lexemePrepareBindingRef.current = null;
+      }
+      cancelLexemeEditorPreparation(token);
+    }
+  }, [cancelLexemeEditorPreparation, lexemeExternalPending, lexemeWrites, snapshotReadStatus]);
+
+  const discardLexemeDraftAndRead = useCallback(() => {
+    const editor = lexemeEditorRef.current;
+    if (lexemeWrites.hasVolatileOperation || lexemeWrites.busy) return;
+    if (editor) {
+      const binding = lexemeBindingsByIdRef.current.get(editor.lexemeId) ?? null;
+      const next = binding ? createVocabLexemeNoteEditor(binding) : null;
+      lexemeEditorRef.current = next;
+      setLexemeEditor(next);
+      if (!next) setWordId(null);
+    }
+    pendingLexemeBundleRef.current = null;
+    lexemeExternalPendingRef.current = false;
+    setLexemeExternalPending(false);
+    setLexemeWriteNotice("");
+    void readVocabFacts().catch((reason) => {
+      setLexemeWriteNotice(`${errorMessage(reason)} 仍显示上次成功读取的词条。`);
+    });
+  }, [lexemeWrites.busy, lexemeWrites.hasVolatileOperation, readVocabFacts]);
+
   const queueItemCheckpoint = itemWrites.queueCheckpoint;
   const recordItemProgressCandidate = useCallback((item: LibraryItem, progress: number) => {
     return queueItemCheckpoint(item, progress);
@@ -1237,6 +1880,11 @@ export default function VocabApp() {
   const itemWriteBusy = itemWrites.busy;
   const itemHasDirtyCheckpoint = itemWrites.hasDirtyCheckpoint;
   const itemHasVolatileReceipt = itemWrites.hasVolatileHeldReceipt;
+  const settingsHasVolatileWork = settingsWrites.busy ||
+    settingsWrites.operationInProgress() || settingsWrites.hasVolatileHeldReceipt;
+  const lexemeHasVolatileWork = lexemeWrites.hasVolatileOperation ||
+    cardMutationOwner === "review";
+  const lexemeNoteDirty = vocabLexemeNoteEditorDirty(lexemeEditor);
   const discardItemPositionsAndReadLatest = useCallback(async (
     trigger: HTMLButtonElement,
   ) => {
@@ -1245,8 +1893,9 @@ export default function VocabApp() {
 
   const requestSuiteExit = useCallback((event: ReactMouseEvent<HTMLAnchorElement>) => {
     const decision = vocabItemExitDecision(
-      itemWriteBusy || itemOperationInProgress() || itemHasVolatileReceipt,
-      itemHasDirtyCheckpoint,
+      itemWriteBusy || itemOperationInProgress() || itemHasVolatileReceipt ||
+        settingsHasVolatileWork || lexemeHasVolatileWork,
+      itemHasDirtyCheckpoint || lexemeNoteDirty,
     );
     if (decision === "leave") {
       if (itemHistoryGuardRef.current !== null) {
@@ -1264,11 +1913,12 @@ export default function VocabApp() {
     itemExitOpenerRef.current = event.currentTarget;
     setItemExitDestination("suite");
     setItemExitConfirmOpen(true);
-  }, [itemHasDirtyCheckpoint, itemHasVolatileReceipt, itemOperationInProgress, itemWriteBusy]);
+  }, [itemHasDirtyCheckpoint, itemHasVolatileReceipt, itemOperationInProgress, itemWriteBusy, lexemeHasVolatileWork, lexemeNoteDirty, settingsHasVolatileWork]);
 
   useEffect(() => {
     const hasRisk = itemWriteBusy || itemOperationInProgress() ||
-      itemHasDirtyCheckpoint || itemHasVolatileReceipt;
+      itemHasDirtyCheckpoint || itemHasVolatileReceipt ||
+      settingsHasVolatileWork || lexemeHasVolatileWork || lexemeNoteDirty;
     if (hasRisk && itemHistoryGuardRef.current === null) {
       const token = typeof crypto.randomUUID === "function"
         ? crypto.randomUUID()
@@ -1307,8 +1957,9 @@ export default function VocabApp() {
         current[VOCAB_ITEM_HISTORY_GUARD] === token
       ) return;
       const decision = vocabItemHistoryBackDecision(
-        itemWriteBusy || itemOperationInProgress() || itemHasVolatileReceipt,
-        itemHasDirtyCheckpoint,
+        itemWriteBusy || itemOperationInProgress() || itemHasVolatileReceipt ||
+          settingsHasVolatileWork || lexemeHasVolatileWork,
+        itemHasDirtyCheckpoint || lexemeNoteDirty,
       );
       if (decision === "continue") {
         itemHistoryGuardRef.current = null;
@@ -1324,27 +1975,31 @@ export default function VocabApp() {
     };
     window.addEventListener("popstate", onPopState);
     return () => window.removeEventListener("popstate", onPopState);
-  }, [itemHasDirtyCheckpoint, itemHasVolatileReceipt, itemOperationInProgress, itemWriteBusy]);
+  }, [itemHasDirtyCheckpoint, itemHasVolatileReceipt, itemOperationInProgress, itemWriteBusy, lexemeHasVolatileWork, lexemeNoteDirty, settingsHasVolatileWork]);
 
   const abandonItemPositionAndLeaveSuite = useCallback(() => {
-    if (itemWriteBusy || itemOperationInProgress() || itemHasVolatileReceipt) return;
+    if (itemWriteBusy || itemOperationInProgress() || itemHasVolatileReceipt ||
+        settingsHasVolatileWork || lexemeHasVolatileWork) return;
     const guarded = itemHistoryGuardRef.current !== null;
     discardAllItemCheckpoints();
+    clearLexemeEditor();
     allowDiscardedItemNavigation();
     itemHistoryGuardRef.current = null;
     setItemExitConfirmOpen(false);
     if (guarded) window.location.replace("/");
     else window.location.assign("/");
-  }, [allowDiscardedItemNavigation, discardAllItemCheckpoints, itemHasVolatileReceipt, itemOperationInProgress, itemWriteBusy]);
+  }, [allowDiscardedItemNavigation, clearLexemeEditor, discardAllItemCheckpoints, itemHasVolatileReceipt, itemOperationInProgress, itemWriteBusy, lexemeHasVolatileWork, settingsHasVolatileWork]);
 
   const abandonItemPositionAndContinueHistory = useCallback(() => {
-    if (itemWriteBusy || itemOperationInProgress() || itemHasVolatileReceipt) return;
+    if (itemWriteBusy || itemOperationInProgress() || itemHasVolatileReceipt ||
+        settingsHasVolatileWork || lexemeHasVolatileWork) return;
     discardAllItemCheckpoints();
+    clearLexemeEditor();
     setItemExitConfirmOpen(false);
     const guarded = itemHistoryGuardRef.current !== null;
     itemHistoryGuardRef.current = null;
     window.history.go(guarded ? -2 : -1);
-  }, [discardAllItemCheckpoints, itemHasVolatileReceipt, itemOperationInProgress, itemWriteBusy]);
+  }, [clearLexemeEditor, discardAllItemCheckpoints, itemHasVolatileReceipt, itemOperationInProgress, itemWriteBusy, lexemeHasVolatileWork, settingsHasVolatileWork]);
 
   useEffect(() => {
     if (!itemRecoveryOpen || itemWrites.flow.phase !== "idle") return;
@@ -1360,6 +2015,43 @@ export default function VocabApp() {
     });
     return () => window.cancelAnimationFrame(frame);
   }, [itemRecoveryOpen, itemWrites.flow.phase, itemWrites.hasHeldReceipt, itemWrites.journal, restoreItemRecoveryFocus]);
+
+  useEffect(() => {
+    if (!lexemeRecoveryOpen || lexemeWrites.flow.phase !== "idle") return;
+    if (
+      lexemeWrites.journal.storageUnavailable ||
+      lexemeWrites.journal.lockUnavailable ||
+      lexemeWrites.journal.entries.length > 0 ||
+      lexemeWrites.journal.unreadable.length > 0 ||
+      lexemeWrites.hasHeldReceipt
+    ) return;
+    const frame = window.requestAnimationFrame(() => {
+      const active = document.activeElement;
+      const shouldRestore = lexemeFocusFrame.current === null &&
+        active instanceof HTMLElement &&
+        Boolean(active.closest(".sc-lexeme-write-recovery"));
+      if (shouldRestore) {
+        lexemeFocusFrame.current = window.requestAnimationFrame(() => {
+          lexemeFocusFrame.current = null;
+          const opener = lexemeRecoveryOpenerRef.current;
+          const target = opener?.isConnected && !opener.matches(":disabled") &&
+              opener.getClientRects().length > 0
+            ? opener
+            : document.querySelector<HTMLElement>(
+                ".sc-main h1, .sc-menu:not(:disabled)",
+              );
+          lexemeRecoveryOpenerRef.current = null;
+          if (!target?.isConnected || target.getClientRects().length === 0) return;
+          if (target.matches("h1")) target.tabIndex = -1;
+          target.focus({ preventScroll: true });
+        });
+      } else {
+        lexemeRecoveryOpenerRef.current = null;
+      }
+      setLexemeRecoveryOpen(false);
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [lexemeRecoveryOpen, lexemeWrites.flow.phase, lexemeWrites.hasHeldReceipt, lexemeWrites.journal]);
 
   const exportBackup = useCallback(async () => {
     const backup = await exportCompleteVocabBackup();
@@ -1384,18 +2076,18 @@ export default function VocabApp() {
     const shortcuts = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
         event.preventDefault();
-        setSearchOpen(true);
+        openSearch();
         return;
       }
       const tag = (event.target as HTMLElement | null)?.tagName;
       if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
-      if (event.key.toLowerCase() === "i") setImportOpen(true);
+      if (event.key.toLowerCase() === "i") openImport();
       if (event.key.toLowerCase() === "e" && selection) void askAi();
       if (event.key.toLowerCase() === "s" && selection) void wordPrimaryAction();
     };
     window.addEventListener("keydown", shortcuts);
     return () => window.removeEventListener("keydown", shortcuts);
-  }, [askAi, selection, wordPrimaryAction]);
+  }, [askAi, openImport, openSearch, selection, wordPrimaryAction]);
 
   if (fatal) return <main className="shici sc-fatal"><Logo /><section><span>词库暂时没有完整打开</span><h1>你的内容没有被改动。</h1><p>{fatal}</p><button onClick={() => window.location.reload()}>重新尝试</button></section></main>;
   if (!ready) return <Loader />;
@@ -1417,6 +2109,15 @@ export default function VocabApp() {
     !itemWrites.journal.loaded || itemWrites.journal.storageUnavailable ||
     itemWrites.journal.lockUnavailable || itemWrites.journal.entries.length > 0 ||
     itemWrites.journal.unreadable.length > 0;
+  const lexemeDatabaseMutationLocked = lexemeWrites.busy ||
+    lexemeWrites.operationInProgress() || lexemeWrites.hasHeldReceipt ||
+    cardMutationOwner !== null || reviewRecoveryLocked ||
+    lexemeNoteDirty || lexemeExternalPending || !lexemeWrites.journal.loaded ||
+    lexemeWrites.journal.storageUnavailable || lexemeWrites.journal.lockUnavailable ||
+    lexemeWrites.journal.entries.length > 0 ||
+    lexemeWrites.journal.unreadable.length > 0;
+  const lexemeControlsLocked = snapshotReadStatus !== "ready" ||
+    lexemeExternalPending || lexemeWrites.writeLocked;
   const settingsControlStatus = settingsWrites.busy
     ? "正在安全确认设置；结果明确前不会开始另一笔写入。"
     : snapshotReadStatus !== "ready"
@@ -1441,13 +2142,19 @@ export default function VocabApp() {
       <div className="sc-side-foot"><button tabIndex={sidebarHidden ? -1 : undefined} className={view === "settings" ? "active" : ""} onClick={() => go("settings")}><i>设</i><span>设置</span></button><div><i className={storageStatus?.persisted === true ? "persisted" : ""} /><span>当前浏览器<small>{storageStatus?.persisted === true ? "已获持久化保护" : !persistenceSupported ? "未提供持久化保护接口" : storageStatus?.persisted === false ? "请定期导出备份" : "保护状态暂时未知"}</small></span></div></div>
     </aside>
     <section className="sc-main">
-      <header className="sc-topbar"><button ref={sidebarOpener} className="sc-menu" onClick={() => setSideOpen((value) => !value)} aria-expanded={sideOpen} aria-controls="sc-navigation" aria-label={sideOpen ? "关闭导航" : "打开导航"}>拾</button><div className="sc-crumb"><span>拾词</span><b>/</b><strong>{pageLabel}</strong></div><div className="sc-top-actions"><button className="sc-search-jump" aria-label="搜索资料、词和语境" onClick={() => setSearchOpen(true)}>⌕ <span>搜索</span><kbd>⌘ K</kbd></button><button className="sc-import" aria-label="导入内容" onClick={() => setImportOpen(true)}>＋ <span>导入内容</span></button></div></header>
+      <header className="sc-topbar"><button ref={sidebarOpener} className="sc-menu" onClick={() => setSideOpen((value) => !value)} aria-expanded={sideOpen} aria-controls="sc-navigation" aria-label={sideOpen ? "关闭导航" : "打开导航"}>拾</button><div className="sc-crumb"><span>拾词</span><b>/</b><strong>{pageLabel}</strong></div><div className="sc-top-actions"><button className="sc-search-jump" aria-label="搜索资料、词和语境" onClick={openSearch}>⌕ <span>搜索</span><kbd>⌘ K</kbd></button><button className="sc-import" aria-label="导入内容" onClick={openImport}>＋ <span>导入内容</span></button></div></header>
       <VocabSettingsWriteBanner controller={settingsWrites} />
       {settingsRecoveryOpen && <VocabSettingsWriteRecovery controller={settingsWrites} />}
       <VocabItemWriteBanner controller={itemWrites} onOpen={rememberItemRecoveryOpener} />
       {itemRecoveryOpen && <VocabItemWriteRecovery controller={itemWrites} />}
+      <VocabLexemeWriteBanner controller={lexemeWrites} onOpen={(trigger) => {
+        lexemeRecoveryOpenerRef.current = trigger;
+        setLexemeRecoveryOpen(true);
+      }} />
+      {lexemeRecoveryOpen && <VocabLexemeWriteRecovery controller={lexemeWrites} />}
       {snapshotReadStatus === "stale" && !itemExternalPending &&
-        !settingsExternalPending && !globalSettingsNotice &&
+        !settingsExternalPending && !lexemeExternalPending &&
+        !globalSettingsNotice && !lexemeWriteNotice &&
         <section className="sc-item-truth-notice sc-snapshot-read-notice" role="alert">
           <span>{snapshotReadError
             ? `${snapshotReadError} 当前仍显示上次成功读取的完整资料；所有条目写入保持暂停。`
@@ -1455,31 +2162,46 @@ export default function VocabApp() {
           <button type="button" disabled={itemWrites.busy || settingsWrites.busy} onClick={(event) => retryVocabFactsRead(event.currentTarget)}>只重新读取</button>
         </section>}
       {itemExternalPending && <section className="sc-item-truth-notice" role="status"><span>另一页的条目已经变化；当前阅读位置仍按原完整条目保留，没有拼接或覆盖。</span><button type="button" disabled={itemWrites.busy} onClick={(event) => void discardItemPositionsAndReadLatest(event.currentTarget)}>放弃本页位置并读取最新</button></section>}
+      {(lexemeExternalPending || lexemeWriteNotice) && <section className="sc-lexeme-truth-notice" role={lexemeExternalPending ? "alert" : "status"}><span>{lexemeWriteNotice || "另一页的词条或复习卡已经变化；当前笔记草稿仍与打开时的完整词条成对保留，没有拼接或覆盖。"}</span><button type="button" disabled={lexemeWrites.busy || lexemeWrites.hasVolatileOperation} onClick={discardLexemeDraftAndRead}>{vocabLexemeNoteEditorDirty(lexemeEditor) ? "放弃笔记草稿并读取最新" : "只重新读取"}</button></section>}
       {globalSettingsNotice && <section className="sc-settings-truth-notice" role="status"><span>{globalSettingsNotice}</span><button type="button" disabled={settingsWrites.busy} onClick={rereadSettingsTruth}>{settingsDraft ? "放弃草稿并读取最新设置" : "只重新读取"}</button></section>}
       <div className="sc-view">
-        {view === "today" && <TodayView snapshot={snapshot} due={dueCards.length} onOpen={openItem} onGo={go} onImport={() => setImportOpen(true)} onWord={setWordId} />}
-        {view === "library" && <LibraryView items={snapshot.items} itemWriteLocked={snapshotReadStatus !== "ready" || itemWrites.writeLocked} itemWriteBusy={itemWrites.busy} itemWriteStatus={itemWrites.error || itemWrites.status} onOpen={openItem} onImport={() => setImportOpen(true)} onArchive={(item, trigger) => void itemWrites.startLifecycle(item.status === "archived" ? "restore" : "archive", item, trigger)} />}
+        {view === "today" && <TodayView snapshot={snapshot} due={dueCards.length} onOpen={openItem} onGo={go} onImport={openImport} onWord={openWord} />}
+        {view === "library" && <LibraryView items={snapshot.items} itemWriteLocked={snapshotReadStatus !== "ready" || itemWrites.writeLocked} itemWriteBusy={itemWrites.busy} itemWriteStatus={itemWrites.error || itemWrites.status} onOpen={openItem} onImport={openImport} onArchive={(item, trigger) => void itemWrites.startLifecycle(item.status === "archived" ? "restore" : "archive", item, trigger)} />}
         {view === "reader" && <ReaderView item={activeItem?.kind === "article" ? activeItem : snapshot.items.find((item) => item.kind === "article") ?? null} blocks={snapshot.blocks} occurrences={snapshot.occurrences} bookmarks={snapshot.bookmarks} itemWriteLocked={snapshotReadStatus !== "ready" || itemWrites.writeLocked} itemWriteBusy={itemWrites.busy} itemWriteStatus={itemWrites.error || itemWrites.status} onSelect={selectText} onBack={() => go("library")} onProgress={recordItemProgressCandidate} onFinish={(item, trigger) => void itemWrites.startLifecycle("complete", item, trigger)} onBookmark={async (item, block) => { await createBookmark(item.id, block?.id ?? "top", block?.text.slice(0, 30) ?? item.title); await refresh(); setToast("已收藏当前位置"); }} />}
         {view === "podcast" && <PodcastView key={(activeItem?.kind === "podcast" ? activeItem : snapshot.items.find((item) => item.kind === "podcast"))?.id ?? "empty-podcast"} item={activeItem?.kind === "podcast" ? activeItem : snapshot.items.find((item) => item.kind === "podcast") ?? null} segments={snapshot.segments} occurrences={snapshot.occurrences} autoFollow={snapshot.settings.auto_follow} autoFollowWriteLocked={settingsControlsLocked} autoFollowWriteBusy={settingsWrites.busy} autoFollowStatus={settingsControlStatus} itemWriteLocked={snapshotReadStatus !== "ready" || itemWrites.writeLocked} itemWritePermanentReadOnly={itemWritePermanentReadOnly} itemWriteBusy={itemWrites.busy} itemWriteStatus={itemWrites.error || itemWrites.status} localLock={effectiveLocalLock} onAutoFollow={(value, trigger) => requestSettingsChange({ auto_follow: value }, trigger)} onSelect={selectText} onProgress={recordItemProgressCandidate} onFinish={(item, trigger) => void itemWrites.startLifecycle("complete", item, trigger)} onBookmark={async (item, ms, label) => { await createBookmark(item.id, `t:${ms}`, label); await refresh(); setToast("已收藏此刻"); }} />}
-        {view === "words" && <WordsView lexemes={snapshot.lexemes} occurrences={snapshot.occurrences} onOpen={setWordId} onStar={async (word) => { await toggleLexemeStar(word.id, !word.starred); await refresh(); }} />}
-        {view === "review" && <ReviewView cards={snapshot.reviewCards} onRefresh={refresh} onGo={go} />}
+        {view === "words" && <WordsView lexemes={snapshot.lexemes} occurrences={snapshot.occurrences} lexemeWriteLocked={lexemeControlsLocked || lexemeNoteDirty} lexemeWriteBusy={lexemeWrites.busy} lexemeWriteStatus={lexemeWrites.error || lexemeWrites.status || lexemeWriteNotice} onOpen={openWord} onStar={(word, trigger) => void setLexemeStarDurably(word, trigger)} />}
+        {view === "review" && <ReviewView cards={snapshot.reviewCards} externalWriteLocked={lexemeWrites.ratingWriteLocked || cardMutationOwner === "status"} claimReviewMutation={claimReviewMutation} releaseReviewMutation={releaseReviewMutation} onRecoveryBarrierChange={updateReviewMutationBarrier} onRefresh={refresh} onGo={go} />}
         {view === "stats" && <StatsView snapshot={snapshot} />}
-        {view === "settings" && <SettingsView settings={displayedSettings} settingsDraftDirty={Boolean(settingsDraft)} settingsWriteLocked={settingsControlsLocked} settingsWriteBusy={settingsWrites.busy} databaseMutationLocked={itemDatabaseMutationLocked} settingsWriteStatus={settingsControlStatus} storage={storageStatus} persistenceSupported={persistenceSupported} onDraftChange={updateSettingsDraft} onDraftCommit={submitSettingsDraft} onToggle={(patch, trigger) => requestSettingsChange(patch, trigger)} onDiscardDraft={discardSettingsDraftAndRead} onExport={exportBackup} onRestoreRefresh={refreshAfterBackupActivation} onPersist={async () => { const granted = await requestPersistentLocalStorage(); const checked = await refreshStorageStatus(); return checked.persisted ?? granted; }} onTestAi={async () => { if (settingsOutboundBlocked()) throw new Error("本地锁已开启或正在安全确认；没有发出检查请求"); const response = await fetch("/api/health", { headers: { Accept: "application/json" } }); const health = await response.json() as { ai?: { configured?: boolean } }; if (!response.ok) throw new Error("无法检查 AI 服务状态"); if (!health.ai?.configured) throw new Error("DeepSeek API Key 尚未配置"); }} />}
+        {view === "settings" && <SettingsView settings={displayedSettings} settingsDraftDirty={Boolean(settingsDraft)} settingsWriteLocked={settingsControlsLocked} settingsWriteBusy={settingsWrites.busy} databaseMutationLocked={itemDatabaseMutationLocked || lexemeDatabaseMutationLocked} settingsWriteStatus={settingsControlStatus} storage={storageStatus} persistenceSupported={persistenceSupported} onDraftChange={updateSettingsDraft} onDraftCommit={submitSettingsDraft} onToggle={(patch, trigger) => requestSettingsChange(patch, trigger)} onDiscardDraft={discardSettingsDraftAndRead} onExport={exportBackup} onRestoreRefresh={refreshAfterBackupActivation} onPersist={async () => { const granted = await requestPersistentLocalStorage(); const checked = await refreshStorageStatus(); return checked.persisted ?? granted; }} onTestAi={async () => { if (settingsOutboundBlocked()) throw new Error("本地锁已开启或正在安全确认；没有发出检查请求"); const response = await fetch("/api/health", { headers: { Accept: "application/json" } }); const health = await response.json() as { ai?: { configured?: boolean } }; if (!response.ok) throw new Error("无法检查 AI 服务状态"); if (!health.ai?.configured) throw new Error("DeepSeek API Key 尚未配置"); }} />}
       </div>
     </section>
     <nav className="sc-mobile-tabs" aria-label="拾词页面">{navigation.slice(0, 4).map((item) => <button key={item.id} aria-current={view === item.id ? "page" : undefined} className={view === item.id ? "active" : ""} onClick={() => go(item.id)}><i>{item.glyph}</i><span>{item.label}</span></button>)}</nav>
     {selection && <ContextPanel target={selection} explanation={explanation} loading={aiBusy} error={aiError} showChinese={showChinese} saveBusy={wordSaveBusy} saveLabel={wordSavePhase === "uncertain" ? "只读核对" : wordSavePhase === "conflict" ? "移除这条提醒" : wordSavePhase === "refresh_failed" ? "只刷新词库" : "＋ 收入词库"} saveMessage={wordSaveMessage} confirmReminderRemoval={wordAbandonConfirm} onChinese={async (value) => { setShowChinese(value); if (value && explanation && !explanation.sense?.explanation_zh) await addChinese(); }} onExplain={() => void askAi()} onSave={wordPrimaryAction} onCancelReminderRemoval={cancelWordAbandon} onConfirmReminderRemoval={abandonConflictedWord} onClose={requestCloseSelection} />}
-    {wordId && <WordDetail key={wordId} word={snapshot.lexemes.find((word) => word.id === wordId) ?? null} occurrences={snapshot.occurrences.filter((item) => item.lexeme_id === wordId)} onClose={() => setWordId(null)} onNote={async (id, note) => { await saveLexemeNote(id, note); await refresh(); setToast("笔记已保存"); }} onStatus={async (id, status) => { await updateLexemeStatus(id, status); await refresh(); }} />}
+    {wordId && lexemeEditor && <WordDetail key={wordId} word={lexemeEditor.display} occurrences={snapshot.occurrences.filter((item) => item.lexeme_id === wordId)} note={lexemeEditor.note} noteDirty={vocabLexemeNoteEditorDirty(lexemeEditor)} writeLocked={lexemeControlsLocked} statusWriteLocked={reviewRecoveryLocked || cardMutationOwner === "review"} writeBusy={lexemeWrites.busy} writeStatus={lexemeWrites.error || lexemeWrites.status || lexemeWriteNotice} onClose={() => requestLexemeEditorExit(clearLexemeEditor)} onNoteChange={updateLexemeNote} onNoteSave={(trigger) => void saveLexemeNoteDurably(trigger)} onStatus={(word, status, trigger) => void setLexemeStatusDurably(word, status, trigger)} />}
     {importOpen && <ImportWizard localLock={effectiveLocalLock} onClose={() => setImportOpen(false)} onImported={async (id) => { const data = await readAndApplySnapshot(); setImportOpen(false); const item = data.items.find((entry) => entry.id === id); if (item) openItem(item); setToast("内容已存入本地资料库"); }} />}
-    {searchOpen && <SearchPalette snapshot={snapshot} onClose={() => setSearchOpen(false)} onOpenItem={openItem} onOpenWord={(id) => { setWordId(id); }} />}
+    {searchOpen && <SearchPalette snapshot={snapshot} onClose={() => setSearchOpen(false)} onOpenItem={openItem} onOpenWord={openWord} />}
+    <LexemeDraftExitDialog
+      open={lexemeCloseConfirmOpen}
+      busy={lexemeWrites.hasVolatileOperation}
+      onStay={cancelLexemeEditorExit}
+      onDiscard={confirmLexemeEditorExit}
+    />
     {itemExitConfirmOpen && <>
       <div className="sc-item-exit-scrim" aria-hidden="true" />
       <section ref={itemExitDialog} className="sc-item-exit-dialog" role="dialog" aria-modal="true" aria-labelledby="sc-item-exit-title" tabIndex={-1}>
-        <h2 id="sc-item-exit-title">还有未保存的阅读位置</h2>
-        <p>默认留在本页继续安全保存。若现在离开，只会放弃本页尚未写入的位置；已保存资料和安全收据不会删除。</p>
+        <h2 id="sc-item-exit-title">{itemHasDirtyCheckpoint && lexemeNoteDirty
+          ? "还有未保存的阅读位置和词语笔记"
+          : lexemeNoteDirty
+            ? "还有未保存的词语笔记"
+            : "还有未保存的阅读位置"}</h2>
+        <p>{itemHasDirtyCheckpoint && lexemeNoteDirty
+          ? "默认留在本页继续安全保存。若现在离开，会放弃本页尚未写入的位置和词语笔记草稿；已保存资料和安全收据不会删除。"
+          : lexemeNoteDirty
+            ? "默认留在本页继续编辑。若现在离开，只会放弃尚未写入的词语笔记草稿；已保存资料和安全收据不会删除。"
+            : "默认留在本页继续安全保存。若现在离开，只会放弃本页尚未写入的位置；已保存资料和安全收据不会删除。"}</p>
         <footer>
           <button data-item-exit-stay type="button" onClick={closeItemExitConfirm}>继续留在本页</button>
-          {itemExitDestination === "suite" ? <button className="danger" type="button" disabled={itemWrites.busy || itemWrites.hasVolatileHeldReceipt} onClick={abandonItemPositionAndLeaveSuite}>放弃本页位置并离开</button> : <button className="danger" type="button" disabled={itemWrites.busy || itemWrites.hasVolatileHeldReceipt} onClick={abandonItemPositionAndContinueHistory}>放弃本页位置并返回</button>}
+          {itemExitDestination === "suite" ? <button className="danger" type="button" disabled={itemWrites.busy || itemWrites.operationInProgress() || itemWrites.hasVolatileHeldReceipt || settingsHasVolatileWork || lexemeHasVolatileWork} onClick={abandonItemPositionAndLeaveSuite}>{lexemeNoteDirty ? itemHasDirtyCheckpoint ? "放弃位置和笔记并离开" : "放弃笔记并离开" : "放弃本页位置并离开"}</button> : <button className="danger" type="button" disabled={itemWrites.busy || itemWrites.operationInProgress() || itemWrites.hasVolatileHeldReceipt || settingsHasVolatileWork || lexemeHasVolatileWork} onClick={abandonItemPositionAndContinueHistory}>{lexemeNoteDirty ? itemHasDirtyCheckpoint ? "放弃位置和笔记并返回" : "放弃笔记并返回" : "放弃本页位置并返回"}</button>}
         </footer>
       </section>
     </>}

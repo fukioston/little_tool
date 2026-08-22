@@ -1444,7 +1444,11 @@ test("suite navigation blocks busy work and confirms only volatile checkpoint lo
   assert.match(appSource, /useOverlayDialog<HTMLElement>\([\s\S]*?itemExitConfirmOpen[\s\S]*?"\[data-item-exit-stay\]"/);
   assert.match(exitDialog, /sc-item-exit-scrim" aria-hidden="true"/);
   assert.doesNotMatch(exitDialog, /sc-item-exit-scrim[^>]*onClick/);
-  assert.match(exitDialog, /disabled=\{itemWrites\.busy \|\| itemWrites\.hasVolatileHeldReceipt\}[\s\S]*?abandonItemPositionAndContinueHistory/);
+  assert.match(
+    exitDialog,
+    /disabled=\{itemWrites\.busy \|\| itemWrites\.operationInProgress\(\) \|\| itemWrites\.hasVolatileHeldReceipt \|\| settingsHasVolatileWork \|\| lexemeHasVolatileWork\}[\s\S]*?abandonItemPositionAndContinueHistory/,
+    "the destructive exit stays disabled for every volatile database receipt, not only item checkpoints",
+  );
   const exitClose = appSource.slice(
     appSource.indexOf("const closeItemExitConfirm"),
     appSource.indexOf("const itemExitDialog"),
@@ -1901,7 +1905,16 @@ test("UI wiring is durable-first, terminal-safe, and mobile actions remain 44px"
   assert.match(inspectLease, /inspectVocabItemWrite/);
   assert.doesNotMatch(inspect, /commitVocabItemWrite/);
   assert.match(appSource, /settingsDatabaseWriteLocked = settingsWrites\.writeLocked \|\|\s*settingsWrites\.operationInProgress\(\)/);
-  assert.match(appSource, /databaseMutationLocked=\{itemDatabaseMutationLocked\}/);
+  assert.match(
+    appSource,
+    /const lexemeDatabaseMutationLocked = lexemeWrites\.busy[\s\S]*?lexemeWrites\.journal\.unreadable\.length > 0/,
+    "lexeme drafts, held receipts, recovery entries, and unavailable journal protection lock backup activation",
+  );
+  assert.match(
+    appSource,
+    /databaseMutationLocked=\{itemDatabaseMutationLocked \|\| lexemeDatabaseMutationLocked\}/,
+    "Settings backup and generation activation share the item and lexeme mutation gate",
+  );
   assert.match(viewsSource, /status === "in_progress"[\s\S]*?status === "unread"/);
   assert.match(cssSource, /\.sc-item-write-banner[\s\S]*?min-height:44px/);
   assert.match(cssSource, /\.sc-item-write-recovery[\s\S]*?min-height:44px/);
