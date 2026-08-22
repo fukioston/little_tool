@@ -72,6 +72,7 @@ for (const contract of [
       "career_activity",
       "career_lifecycle_events",
       "career_core_write_operations",
+      "career_write_operations",
     ],
     migrationLedger: {
       table: "career_schema_migrations",
@@ -80,6 +81,7 @@ for (const contract of [
         { version: 2, name: "contact-history" },
         { version: 3, name: "reversible-lifecycle" },
         { version: 4, name: "career-core-write-recovery" },
+        { version: 5, name: "career-lifecycle-task-write-recovery" },
       ],
     },
   },
