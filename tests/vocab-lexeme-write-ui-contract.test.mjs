@@ -1013,7 +1013,8 @@ test("an authoritative external lock stops rating before its callback and reopen
   assert.equal(ratingCallbacks, 0);
   assert.equal(attempt(false), true);
   assert.equal(ratingCallbacks, 1);
-  assert.match(flowSource, /vocabLexemeRatingPreflightOpen\(\s*externalWriteLocked \|\| externalWriteInProgress\(\)/);
+  assert.match(flowSource, /vocabLexemeRatingPreflightOpen\(\s*externalWriteLocked,/);
+  assert.match(flowSource, /const externalGateOpen = useCallback[\s\S]*?vocabLexemeExternalGateOpen\([\s\S]*?externalWriteInProgress/);
   assert.match(viewsSource, /if \(operationClaim\.current \|\| externalWriteLocked \|\| !claimReviewMutation\(\)\) return false/);
 });
 
@@ -1065,8 +1066,11 @@ test("same-tick and prepare-await external claims stop lexeme persistence and co
     flowSource.indexOf("const discardExpected = useCallback"),
   );
   assert.match(continuation, /!externalGateOpen\(\)[\s\S]*?commitEntry/);
-  assert.match(appSource, /externalDatabaseOperationRef\.current = lexemeExternalWriteInProgress/);
-  assert.match(appSource, /snapshotReadStatusRef\.current !== "ready"[\s\S]*?settingsWrites\.operationInProgress\(\) \|\| itemWrites\.operationInProgress\(\)/);
+  assert.match(
+    appSource,
+    /useLayoutEffect\(\(\) => \{[\s\S]*?externalDatabaseOperationRef\.current = \(\) =>[\s\S]*?lexemeBlocksExternalWritesNow\(\)[\s\S]*?engagementBlocksExternalWrites\(\)/,
+  );
+  assert.match(appSource, /snapshotReadStatusRef\.current !== "ready"[\s\S]*?settingsBlocksExternalWritesNow\(\) \|\| itemBlocksExternalWritesNow\(\)/);
   assert.match(appSource, /claimReviewMutation[\s\S]*?externalDatabaseOperationRef\.current\(\)/);
 });
 
@@ -1126,10 +1130,10 @@ test("status/rating, restore, navigation, dirty note, and focus gates are wired 
   assert.match(viewsSource, /externalWriteLocked[\s\S]*?claimReviewMutation\(\)/);
   assert.match(viewsSource, /onRecoveryBarrierChange\(localRecoveryBlocksWrites\)/);
   assert.match(appSource, /statusWriteLocked=\{reviewRecoveryLocked \|\| cardMutationOwner === "review"\}/);
-  assert.match(appSource, /databaseMutationLocked=\{itemDatabaseMutationLocked \|\| lexemeDatabaseMutationLocked\}/);
+  assert.match(appSource, /databaseMutationLocked=\{itemDatabaseMutationLocked \|\| lexemeDatabaseMutationLocked \|\| engagementWrites\.backupBlocked\}/);
   assert.match(appSource, /lexemeWrites\.hasHeldReceipt[\s\S]*?reviewRecoveryLocked[\s\S]*?lexemeWrites\.journal\.entries\.length > 0/);
   assert.match(appSource, /vocabLexemeExitDecision/);
-  assert.match(appSource, /settingsHasVolatileWork \|\| lexemeHasVolatileWork/);
+  assert.match(appSource, /settingsHasVolatileWork \|\| lexemeHasVolatileWork \|\|\s*engagementVolatileWorkInProgress\(\)/);
   assert.match(appSource, /settingsWrites\.journal\.entries\.length \+ \(settingsWrites\.hasHeldReceipt \? 1 : 0\)/);
   assert.match(appSource, /settingsWrites\.busy \|\|\s*settingsWrites\.operationInProgress\(\) \|\| settingsWrites\.hasVolatileHeldReceipt/);
   assert.match(appSource, /vocabLexemeNoteEditorDirty\(lexemeEditor\)[\s\S]*?beforeunload/);

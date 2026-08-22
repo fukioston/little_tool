@@ -530,6 +530,7 @@ export type VocabStudyActivityRecordInput = Readonly<{
   kind: "read" | "listen";
   seconds: number;
   recordedAt?: number;
+  timezoneOffsetMinutes?: number;
 }>;
 
 export type VocabPreparedStudyActivityInput = Readonly<{
@@ -6093,14 +6094,33 @@ function isVocabStudyActivityRecordInput(
 ): value is VocabStudyActivityRecordInput {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const input = value as Partial<VocabStudyActivityRecordInput>;
-  const keys = input.recordedAt === undefined
-    ? ["kind", "seconds"]
-    : ["kind", "seconds", "recordedAt"];
+  const keys = [
+    "kind",
+    "seconds",
+    ...(input.recordedAt === undefined ? [] : ["recordedAt"]),
+    ...(input.timezoneOffsetMinutes === undefined
+      ? []
+      : ["timezoneOffsetMinutes"]),
+  ];
   return settingsExactObjectKeys(value, keys) &&
     (input.kind === "read" || input.kind === "listen") &&
     typeof input.seconds === "number" && Number.isSafeInteger(input.seconds) &&
     input.seconds >= 1 && input.seconds <= VOCAB_ENGAGEMENT_MAX_SECONDS &&
-    (input.recordedAt === undefined || isReceiptTimestamp(input.recordedAt));
+    (input.recordedAt === undefined || isReceiptTimestamp(input.recordedAt)) &&
+    (input.timezoneOffsetMinutes === undefined || (
+      input.recordedAt !== undefined &&
+      Number.isSafeInteger(input.timezoneOffsetMinutes) &&
+      input.timezoneOffsetMinutes >= -1_440 &&
+      input.timezoneOffsetMinutes <= 1_440
+    ));
+}
+
+function isVocabPreparedStudyActivityInput(
+  value: unknown,
+): value is VocabPreparedStudyActivityInput {
+  return isVocabStudyActivityRecordInput(value) &&
+    settingsExactObjectKeys(value, ["kind", "seconds", "recordedAt"]) &&
+    (value as VocabStudyActivityRecordInput).recordedAt !== undefined;
 }
 
 function isVocabBookmarkRow(value: unknown): value is Bookmark {
@@ -6232,8 +6252,7 @@ function isVocabEngagementWriteReceiptUnchecked(
       VOCAB_ENGAGEMENT_ACTIVITY_ID_PATTERN.test(target.id) &&
       activityReceipt.generationId === expected.generationId &&
       activityReceipt.generationSequence === expected.generationSequence &&
-      !!request && isVocabStudyActivityRecordInput(request) &&
-      request.recordedAt !== undefined &&
+      !!request && isVocabPreparedStudyActivityInput(request) &&
       target.created_at === request.recordedAt &&
       typeof timezoneOffsetMinutes === "number" &&
       Number.isSafeInteger(timezoneOffsetMinutes) &&
@@ -6634,7 +6653,7 @@ export function createVocabEngagementStorageService(
       if (!isReceiptTimestamp(createdAt)) {
         throw vocabEngagementError("invalid_input", "学习时间片的记录时间不在可接受范围。");
       }
-      const timezoneOffsetMinutes = (
+      const timezoneOffsetMinutes = input.timezoneOffsetMinutes ?? (
         runtime.timezoneOffsetMinutes ??
         ((timestamp: number) => new Date(timestamp).getTimezoneOffset())
       )(createdAt);

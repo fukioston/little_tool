@@ -189,7 +189,7 @@ export function useVocabLexemeWriteFlow({
     entryCount: journal.entries.length,
   }, externalWriteLocked, hasHeldReceipt) || busy;
   const ratingWriteLocked = !vocabLexemeRatingPreflightOpen(
-    externalWriteLocked || externalWriteInProgress(),
+    externalWriteLocked,
     {
       loaded: journal.loaded,
       storageUnavailable: journal.storageUnavailable,
@@ -225,6 +225,16 @@ export function useVocabLexemeWriteFlow({
     journalRef.current = loaded;
     if (mounted.current) setJournal(loaded);
     return next;
+  }, []);
+
+  const operationInProgress = useCallback(() => Boolean(operationRef.current), []);
+  const blocksExternalWritesNow = useCallback(() => {
+    const current = journalRef.current;
+    return Boolean(
+      operationRef.current || heldEntriesRef.current.size > 0 ||
+      !current.loaded || current.storageUnavailable || current.lockUnavailable ||
+      current.entries.length > 0 || current.unreadable.length > 0
+    );
   }, []);
 
   const holdEntry = useCallback((entry: VocabLexemeWriteEntry) => {
@@ -970,7 +980,8 @@ export function useVocabLexemeWriteFlow({
     clearUnreadable,
     recheckJournal: reloadJournal,
     shouldDeferBundle,
-    operationInProgress: () => Boolean(operationRef.current),
+    operationInProgress,
+    blocksExternalWritesNow,
   } as const;
 }
 

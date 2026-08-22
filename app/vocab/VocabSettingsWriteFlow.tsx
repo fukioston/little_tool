@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   commitVocabSettingsWrite,
   inspectVocabSettingsWrite,
@@ -65,6 +65,8 @@ function phaseForEntry(entry: VocabSettingsWriteEntry): Flow {
 
 export function useVocabSettingsWriteFlow({
   refresh,
+  externalWriteLocked,
+  externalWriteInProgress,
   onToast,
   onAttention,
   onDurablePrepared,
@@ -72,6 +74,8 @@ export function useVocabSettingsWriteFlow({
   onDurableSettled,
 }: {
   refresh: () => Promise<VocabSettingsRefreshOutcome>;
+  externalWriteLocked: boolean;
+  externalWriteInProgress: () => boolean;
   onToast: (message: string) => void;
   onAttention: () => void;
   onDurablePrepared?: (receipt: VocabSettingsWriteReceipt) => void;
@@ -84,9 +88,21 @@ export function useVocabSettingsWriteFlow({
   const [error, setError] = useState("");
   const [focusRequest, setFocusRequest] = useState(0);
   const [heldEntries, setHeldEntries] = useState<readonly VocabSettingsWriteEntry[]>([]);
+  const journalRef = useRef<JournalView>(EMPTY_JOURNAL);
   const operationRef = useRef<VocabSettingsWriteToken | null>(null);
   const heldEntriesRef = useRef(new Map<string, VocabSettingsWriteEntry>());
+  const externalWriteLockedRef = useRef(externalWriteLocked);
+  const externalWriteInProgressRef = useRef(externalWriteInProgress);
   const mounted = useRef(false);
+
+  const externalWriteBlockedNow = useCallback(() => {
+    if (externalWriteLockedRef.current) return true;
+    try {
+      return externalWriteInProgressRef.current();
+    } catch {
+      return true;
+    }
+  }, []);
 
   const busy = flow.phase === "working";
   const heldBarrier = vocabSettingsHeldReceiptBarrier(
@@ -95,8 +111,10 @@ export function useVocabSettingsWriteFlow({
   );
   const hasHeldReceipt = heldBarrier.blocksWrites;
   const hasVolatileHeldReceipt = heldBarrier.volatile;
+  const externalWriteBlocked = externalWriteLocked;
   const writeLocked = !journal.loaded || journal.storageUnavailable || journal.lockUnavailable ||
-    journal.entries.length > 0 || journal.unreadable.length > 0 || hasHeldReceipt || busy;
+    journal.entries.length > 0 || journal.unreadable.length > 0 || hasHeldReceipt ||
+    busy || externalWriteBlocked;
 
   const reloadJournal = useCallback(() => {
     let next: VocabSettingsWriteJournal;
@@ -105,8 +123,20 @@ export function useVocabSettingsWriteFlow({
     } catch {
       next = { entries: [], unreadable: [], storageUnavailable: true, lockUnavailable: typeof navigator === "undefined" || !navigator.locks };
     }
-    if (mounted.current) setJournal({ ...next, loaded: true });
+    const loaded = { ...next, loaded: true };
+    journalRef.current = loaded;
+    if (mounted.current) setJournal(loaded);
     return next;
+  }, []);
+
+  const operationInProgress = useCallback(() => Boolean(operationRef.current), []);
+  const blocksExternalWritesNow = useCallback(() => {
+    const current = journalRef.current;
+    return Boolean(
+      operationRef.current || heldEntriesRef.current.size > 0 ||
+      !current.loaded || current.storageUnavailable || current.lockUnavailable ||
+      current.entries.length > 0 || current.unreadable.length > 0
+    );
   }, []);
 
   const holdEntry = useCallback((entry: VocabSettingsWriteEntry) => {
@@ -139,6 +169,11 @@ export function useVocabSettingsWriteFlow({
   const release = useCallback((token: VocabSettingsWriteToken) => {
     releaseVocabSettingsWrite(operationRef, token);
   }, []);
+
+  useLayoutEffect(() => {
+    externalWriteLockedRef.current = externalWriteLocked;
+    externalWriteInProgressRef.current = externalWriteInProgress;
+  }, [externalWriteInProgress, externalWriteLocked]);
 
   useEffect(() => {
     mounted.current = true;
@@ -348,6 +383,7 @@ export function useVocabSettingsWriteFlow({
     setFlow({ phase: "working", action: "commit" });
     try {
       const result = await runWithExclusiveCurrentVocabSettingsWrite(entry, async (lease) => {
+        if (externalWriteBlockedNow()) return "external-blocked" as const;
         try {
           const committed = await commitVocabSettingsWrite(entry.ticket.receipt);
           if (committed.outcome === "saved" || committed.outcome === "already_saved") {
@@ -384,6 +420,12 @@ export function useVocabSettingsWriteFlow({
         release(token);
         return "attention";
       }
+      if (result.value === "external-blocked") {
+        showAttention({ phase: "check", entry: result.entry ?? entry, message: "另一笔数据库安全操作正在进行；收据仍保留，没有调用设置写入。" });
+        setError("当前数据库安全门尚未开放；稍后只读核对这张收据。");
+        release(token);
+        return "attention";
+      }
       if (result.value === "saved" && result.entry) return finishCommitted(result.entry, success, token);
       if (result.value === "changed" && result.entry) {
         showAttention({ phase: "changed", entry: result.entry, message: "设置已经在别处变化；这份旧内容没有覆盖当前内容，也不会再次写入。" });
@@ -401,7 +443,7 @@ export function useVocabSettingsWriteFlow({
       release(token);
       return "attention";
     }
-  }, [finishCommitted, reloadJournal, release, reopenLatest, showAttention]);
+  }, [externalWriteBlockedNow, finishCommitted, reloadJournal, release, reopenLatest, showAttention]);
 
   const start = useCallback(async (
     prepare: () => Promise<VocabSettingsWriteReceipt>,
@@ -413,6 +455,9 @@ export function useVocabSettingsWriteFlow({
     let preparedReceipt: VocabSettingsWriteReceipt | null = null;
     let preparedEntry: VocabSettingsWriteEntry | null = null;
     try {
+      if (externalWriteBlockedNow()) {
+        throw new Error("另一笔数据库安全操作正在进行；没有准备新的设置写入。");
+      }
       const current = reloadJournal();
       if (current.storageUnavailable) throw new Error("暂时无法读取设置核对存储；没有开始写入。");
       if (current.lockUnavailable) throw new Error("当前浏览器没有安全跨页面写入锁；没有开始写入。");
@@ -420,6 +465,9 @@ export function useVocabSettingsWriteFlow({
       if (current.entries.length > 0) throw new Error("先处理上一条设置核对线索；没有开始写入。");
       if (heldEntriesRef.current.size > 0) throw new Error("先只读核对当前页保留的原设置收据；没有开始新的写入。");
       const receipt = await prepare();
+      if (externalWriteBlockedNow()) {
+        throw new Error("准备期间另一笔数据库安全操作开始；没有保存或提交这张设置收据。");
+      }
       preparedReceipt = receipt;
       preparedEntry = createVocabSettingsWriteEntry(
         createVocabSettingsWriteTicket(receipt),
@@ -428,6 +476,12 @@ export function useVocabSettingsWriteFlow({
       holdEntry(entry);
       onDurablePrepared?.(receipt);
       reloadJournal();
+      if (externalWriteBlockedNow()) {
+        showAttention({ phase: "check", entry, message: "设置收据已经安全保留；另一笔数据库操作结束前不会提交。" });
+        setError("当前数据库安全门尚未开放；稍后先只读核对这张收据。");
+        release(token);
+        return "attention";
+      }
       return await commitEntry(entry, success, token);
     } catch (reason) {
       if (entry) {
@@ -497,7 +551,7 @@ export function useVocabSettingsWriteFlow({
       release(token);
       throw reason;
     }
-  }, [claim, commitEntry, holdEntry, inspectEntryWithLease, onDurablePrepared, reloadJournal, release, restoreHeldFlowOrIdle, settleInspectionResult, showAttention]);
+  }, [claim, commitEntry, externalWriteBlockedNow, holdEntry, inspectEntryWithLease, onDurablePrepared, reloadJournal, release, restoreHeldFlowOrIdle, settleInspectionResult, showAttention]);
 
   const open = useCallback((entry?: VocabSettingsWriteEntry) => {
     if (operationRef.current) return;
@@ -568,6 +622,11 @@ export function useVocabSettingsWriteFlow({
   }, [claim, holdEntry, inspectEntryWithLease, onDurablePrepared, reloadJournal, release, settleInspectionResult, showAttention]);
 
   const continueExpected = useCallback(async (entry: VocabSettingsWriteEntry) => {
+    if (externalWriteBlockedNow()) {
+      showAttention({ phase: "expected", entry, message: "这张收据仍保留；另一笔数据库安全操作结束前不会继续写入。" });
+      setError("当前数据库安全门尚未开放；没有调用设置写入。");
+      return;
+    }
     const current = reloadJournal();
     const selected = selectVocabSettingsWriteRecoveryEntry(
       [...heldEntriesRef.current.values()],
@@ -581,7 +640,8 @@ export function useVocabSettingsWriteFlow({
     );
     if (
       current.storageUnavailable || current.lockUnavailable ||
-      current.unreadable.length > 0 || !selectedReceiptMatches
+      current.unreadable.length > 0 || !selectedReceiptMatches ||
+      externalWriteBlockedNow()
     ) {
       const durablePeer = selected && current.entries.includes(selected) &&
         selected.storageKey !== entry.storageKey
@@ -604,8 +664,14 @@ export function useVocabSettingsWriteFlow({
     }
     const token = claim("commit");
     if (!token) return;
+    if (externalWriteBlockedNow()) {
+      showAttention({ phase: "expected", entry, message: "这张收据仍保留；另一笔数据库安全操作结束前不会继续写入。" });
+      setError("当前数据库安全门尚未开放；没有调用设置写入。");
+      release(token);
+      return;
+    }
     await commitEntry(entry, "设置已保存并重新读取", token);
-  }, [claim, commitEntry, reloadJournal, showAttention]);
+  }, [claim, commitEntry, externalWriteBlockedNow, release, reloadJournal, showAttention]);
 
   const discardExpected = useCallback(async (entry: VocabSettingsWriteEntry) => {
     const token = claim("journal");
@@ -716,7 +782,8 @@ export function useVocabSettingsWriteFlow({
     dismissInvalid,
     clearUnreadable,
     recheckJournal: reloadJournal,
-    operationInProgress: () => Boolean(operationRef.current),
+    operationInProgress,
+    blocksExternalWritesNow,
   } as const;
 }
 

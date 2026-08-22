@@ -53,6 +53,8 @@ type VocabBackupFlowState =
 
 type VocabBackupFlowProps = Readonly<{
   controlsDisabled?: boolean;
+  externalWriteInProgress(): boolean;
+  onDatabaseOperationChange?(inProgress: boolean): void;
   onExport(): Promise<string>;
   onRefreshActivated(): Promise<void>;
   onNotice(message: string): void;
@@ -140,6 +142,8 @@ function entryReceipt(entry: VocabBackupRecoveryEntry): VocabRestoreReceipt | nu
 
 export function VocabBackupFlow({
   controlsDisabled = false,
+  externalWriteInProgress,
+  onDatabaseOperationChange,
   onExport,
   onRefreshActivated,
   onNotice,
@@ -159,6 +163,14 @@ export function VocabBackupFlow({
   const flowHeadingRef = useRef<HTMLHeadingElement>(null);
   const shouldFocusFlowRef = useRef(false);
   const backendRejectedRef = useRef(new Set<string>());
+
+  const externalDatabaseWriteBlocked = useCallback(() => {
+    try {
+      return externalWriteInProgress();
+    } catch {
+      return true;
+    }
+  }, [externalWriteInProgress]);
 
   const reloadRecoveries = useCallback(() => {
     const result = readVocabBackupRecoveryStorage();
@@ -512,16 +524,32 @@ export function VocabBackupFlow({
     if (
       entry.ticket.kind !== "candidate" ||
       entry.ticket.mode !== "review" ||
-      operationRef.current
+      operationRef.current || externalDatabaseWriteBlocked()
     ) return;
     operationRef.current = true;
     try {
+      onDatabaseOperationChange?.(true);
       const checkingEntry = await transitionOrExplain(
         candidateTicket(entry.ticket.receipt, "activation-check"),
         entry,
         "当前网址的浏览器存储暂时不能保存启用后的继续信息，因此没有启用。恢复存储后再试。",
       );
       if (!checkingEntry) return;
+      if (externalDatabaseWriteBlocked()) {
+        const restoredEntry = await transitionOrExplain(
+          candidateTicket(entry.ticket.receipt, "review"),
+          checkingEntry,
+          "另一笔数据库安全操作已经开始，因此没有启用这份备份。候选与原继续信息仍保留。",
+        );
+        if (restoredEntry) {
+          present({
+            phase: "review",
+            entry: restoredEntry,
+            message: "另一笔数据库安全操作正在进行；这次没有启用备份，稍后仍可重新确认。",
+          });
+        }
+        return;
+      }
       present({ phase: "activating", entry: checkingEntry });
       try {
         await activatePreparedVocabRestore(entry.ticket.receipt);
@@ -569,6 +597,11 @@ export function VocabBackupFlow({
       }
     } finally {
       operationRef.current = false;
+      try {
+        onDatabaseOperationChange?.(false);
+      } catch {
+        // Reporting must not strand this component's own operation claim.
+      }
     }
   }
 
@@ -953,7 +986,7 @@ export function VocabBackupFlow({
       }</h3></div></header>
       {flow.phase === "preparing" && <><p>{prepareStopping ? "正在安全停止。如果候选已经开始建立，会保留同一次继续信息。" : <>正在判断“<b className="sc-backup-file-name">{flow.fileName}</b>”是什么，并建立独立候选。核对完成前，当前词库不会切换。</>}</p><footer><button className="secondary" disabled={prepareStopping} onClick={stopPreparation}>{prepareStopping ? "正在停止…" : "停止核对"}</button></footer></>}
       {flow.phase === "checking" && <p>{flow.message}</p>}
-      {flow.phase === "review" && <>{flow.message && <p>{flow.message}</p>}{receipt && renderSummary(receipt.summary)}{receipt?.summary.kind === "legacy-vocab-sqlite" && <p className="sc-backup-calm-note">旧版数据库不带本地音频；启用后会清空其中的本地音频引用，避免显示并不存在的音频。</p>}<p className="sc-backup-calm-note">当前词库此刻还没有改变。只有选择“启用这份备份”后才会切换。</p><p className="sc-backup-calm-note">启用后会保留上一代数据库恢复快照；它不是可下载备份，也不代表这里提供一键回退，请仍保留原备份文件。</p><footer><button className="secondary" onClick={() => void discardCandidate(flow.entry)}>暂不使用</button><button className="primary" data-backup-initial onClick={() => void activateCandidate(flow.entry)}>启用这份备份</button></footer></>}
+      {flow.phase === "review" && <>{flow.message && <p>{flow.message}</p>}{receipt && renderSummary(receipt.summary)}{receipt?.summary.kind === "legacy-vocab-sqlite" && <p className="sc-backup-calm-note">旧版数据库不带本地音频；启用后会清空其中的本地音频引用，避免显示并不存在的音频。</p>}<p className="sc-backup-calm-note">当前词库此刻还没有改变。只有选择“启用这份备份”后才会切换。</p><p className="sc-backup-calm-note">启用后会保留上一代数据库恢复快照；它不是可下载备份，也不代表这里提供一键回退，请仍保留原备份文件。</p><footer><button className="secondary" onClick={() => void discardCandidate(flow.entry)}>暂不使用</button><button className="primary" data-backup-initial disabled={controlsDisabled || externalDatabaseWriteBlocked()} onClick={() => void activateCandidate(flow.entry)}>启用这份备份</button></footer></>}
       {flow.phase === "activating" && <p>候选已经通过核对。这里只执行一次版本切换，完成后再单独重新读取页面资料。</p>}
       {flow.phase === "activation-check" && <><p>{flow.message}</p><footer><button className="primary" onClick={() => void inspectCandidate(flow.entry)}>只核对当前版本</button></footer></>}
       {flow.phase === "discard-only" && <><p>{flow.message}</p><footer><button className="secondary" onClick={() => void discardCandidate(flow.entry)}>继续收尾</button></footer></>}

@@ -1446,7 +1446,7 @@ test("suite navigation blocks busy work and confirms only volatile checkpoint lo
   assert.doesNotMatch(exitDialog, /sc-item-exit-scrim[^>]*onClick/);
   assert.match(
     exitDialog,
-    /disabled=\{itemWrites\.busy \|\| itemWrites\.operationInProgress\(\) \|\| itemWrites\.hasVolatileHeldReceipt \|\| settingsHasVolatileWork \|\| lexemeHasVolatileWork\}[\s\S]*?abandonItemPositionAndContinueHistory/,
+    /disabled=\{itemWrites\.busy \|\| itemWrites\.operationInProgress\(\) \|\| itemWrites\.hasVolatileHeldReceipt \|\| settingsHasVolatileWork \|\| lexemeHasVolatileWork \|\| engagementHasVolatileWork\}[\s\S]*?abandonItemPositionAndContinueHistory/,
     "the destructive exit stays disabled for every volatile database receipt, not only item checkpoints",
   );
   const exitClose = appSource.slice(
@@ -1554,7 +1554,8 @@ test("views only report candidates and never write from cleanup", () => {
     podcast.indexOf("}, [commitListen", podcast.indexOf("document.addEventListener(\"visibilitychange\", visibility)")),
   );
   assert.doesNotMatch(visibilityCleanup, /onProgress|onFinish/);
-  assert.match(viewsSource, /\.catch\(\(\) => undefined\)/);
+  assert.doesNotMatch(viewsSource, /recordStudySeconds|createBookmark/);
+  assert.match(podcast, /onStudyActivity\(\{\s*kind: "listen"/);
 });
 
 test("Podcast explicit seek and visible completion retry stay display-bound", () => {
@@ -1837,14 +1838,19 @@ test("expected continuation and delayed checkpoints recheck the current external
     flowSource.indexOf("const scheduleCheckpoint = useCallback"),
     flowSource.indexOf("const queueCheckpoint"),
   );
-  assert.ok(scheduler.indexOf("externalWriteLockedRef.current") <
+  assert.ok(scheduler.indexOf("externalWriteBlockedNow()") <
     scheduler.indexOf("flushCheckpoint()"));
   const prepared = flowSource.slice(
     flowSource.indexOf("const startPrepared = useCallback"),
     flowSource.indexOf("const flushCheckpoint"),
   );
-  assert.ok(prepared.indexOf("externalWriteLockedRef.current") <
-    prepared.indexOf("receipt = await prepare()"));
+  const prepareAwait = prepared.indexOf("const preparedReceipt = await prepare()");
+  assert.ok(prepared.indexOf("externalWriteBlockedNow()") < prepareAwait);
+  assert.ok(prepareAwait < prepared.indexOf(
+    "externalWriteBlockedNow()",
+    prepareAwait,
+  ));
+  assert.match(prepared, /persistVocabItemWrite[\s\S]*?externalWriteBlockedNow\(\)/);
   assert.match(flowSource, /useLayoutEffect\(\(\) => \{[\s\S]*?externalWriteLockedRef\.current = externalWriteLocked;[\s\S]*?clearCheckpointTimer\(\)/);
 });
 
@@ -1890,7 +1896,7 @@ test("UI wiring is durable-first, terminal-safe, and mobile actions remain 44px"
     flowSource.indexOf("const startPrepared = useCallback"),
     flowSource.indexOf("const flushCheckpoint = useCallback"),
   );
-  assert.ok(start.indexOf("receipt = await prepare()") <
+  assert.ok(start.indexOf("const preparedReceipt = await prepare()") <
     start.indexOf("await persistVocabItemWrite"));
   assert.ok(start.indexOf("await persistVocabItemWrite") <
     start.indexOf("await commitEntry"));
@@ -1904,7 +1910,7 @@ test("UI wiring is durable-first, terminal-safe, and mobile actions remain 44px"
   );
   assert.match(inspectLease, /inspectVocabItemWrite/);
   assert.doesNotMatch(inspect, /commitVocabItemWrite/);
-  assert.match(appSource, /settingsDatabaseWriteLocked = settingsWrites\.writeLocked \|\|\s*settingsWrites\.operationInProgress\(\)/);
+  assert.match(appSource, /settingsDatabaseWriteLocked = settingsWrites\.busy \|\|\s*settingsWrites\.hasHeldReceipt[\s\S]*?settingsWrites\.journal\.entries\.length > 0/);
   assert.match(
     appSource,
     /const lexemeDatabaseMutationLocked = lexemeWrites\.busy[\s\S]*?lexemeWrites\.journal\.unreadable\.length > 0/,
@@ -1912,8 +1918,8 @@ test("UI wiring is durable-first, terminal-safe, and mobile actions remain 44px"
   );
   assert.match(
     appSource,
-    /databaseMutationLocked=\{itemDatabaseMutationLocked \|\| lexemeDatabaseMutationLocked\}/,
-    "Settings backup and generation activation share the item and lexeme mutation gate",
+    /databaseMutationLocked=\{itemDatabaseMutationLocked \|\| lexemeDatabaseMutationLocked \|\| engagementWrites\.backupBlocked\}/,
+    "Settings backup and generation activation share the item, lexeme, and engagement mutation gate",
   );
   assert.match(viewsSource, /status === "in_progress"[\s\S]*?status === "unread"/);
   assert.match(cssSource, /\.sc-item-write-banner[\s\S]*?min-height:44px/);

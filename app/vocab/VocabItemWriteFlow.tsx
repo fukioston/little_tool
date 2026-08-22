@@ -124,12 +124,14 @@ export function useVocabItemWriteFlow({
   refresh,
   getExpected,
   externalWriteLocked,
+  externalWriteInProgress,
   onToast,
   onAttention,
 }: {
   refresh: () => Promise<VocabItemRefreshOutcome>;
   getExpected: (itemId: string) => VocabItemWriteSnapshot | null;
   externalWriteLocked: boolean;
+  externalWriteInProgress: () => boolean;
   onToast: (message: string) => void;
   onAttention: (background: boolean) => void;
 }) {
@@ -146,6 +148,7 @@ export function useVocabItemWriteFlow({
   const operationRef = useRef<VocabItemWriteToken | null>(null);
   const operationPromiseRef = useRef<Promise<unknown> | null>(null);
   const externalWriteLockedRef = useRef(externalWriteLocked);
+  const externalWriteInProgressRef = useRef(externalWriteInProgress);
   const mounted = useRef(false);
   const discardedNavigationAllowedRef = useRef(false);
   const dirtyRef = useRef(new Map<string, VocabItemCheckpointCandidate>());
@@ -170,6 +173,16 @@ export function useVocabItemWriteFlow({
   const heldEntriesRef = useRef(new Map<string, VocabItemWriteEntry>());
   const focusFrame = useRef<number | null>(null);
 
+  const externalWriteBlockedNow = useCallback(() => {
+    if (externalWriteLockedRef.current) return true;
+    try {
+      return externalWriteInProgressRef.current();
+    } catch {
+      return true;
+    }
+  }, []);
+
+  const externalWriteBlocked = externalWriteLocked;
   const busy = flow.phase === "working";
   const hasDirtyCheckpoint = dirtyCount > 0;
   const hasConflictedCheckpoint = conflictCount > 0;
@@ -189,8 +202,8 @@ export function useVocabItemWriteFlow({
     lockUnavailable: journal.lockUnavailable,
     entryCount: journal.entries.length,
     unreadableCount: journal.unreadable.length,
-  }, externalWriteLocked, hasConflictedCheckpoint || hasHeldReceipt) || busy;
-  const expectedContinuationBlocked = externalWriteLocked ||
+  }, externalWriteBlocked, hasConflictedCheckpoint || hasHeldReceipt) || busy;
+  const expectedContinuationBlocked = externalWriteBlocked ||
     hasConflictedCheckpoint || !journal.loaded || journal.storageUnavailable ||
     journal.lockUnavailable || journal.unreadable.length > 0;
 
@@ -224,6 +237,18 @@ export function useVocabItemWriteFlow({
       }
     }
     return next;
+  }, []);
+
+  const operationInProgress = useCallback(() => Boolean(operationRef.current), []);
+  const blocksExternalWritesNow = useCallback(() => {
+    const current = journalRef.current;
+    return Boolean(
+      operationRef.current || dirtyRef.current.size > 0 ||
+      checkpointConflictRef.current.size > 0 ||
+      heldEntriesRef.current.size > 0 || !current.loaded ||
+      current.storageUnavailable || current.lockUnavailable ||
+      current.entries.length > 0 || current.unreadable.length > 0
+    );
   }, []);
 
   const holdEntry = useCallback((entry: VocabItemWriteEntry) => {
@@ -289,8 +314,9 @@ export function useVocabItemWriteFlow({
 
   useLayoutEffect(() => {
     externalWriteLockedRef.current = externalWriteLocked;
-    if (externalWriteLocked) clearCheckpointTimer();
-  }, [clearCheckpointTimer, externalWriteLocked]);
+    externalWriteInProgressRef.current = externalWriteInProgress;
+    if (externalWriteBlockedNow()) clearCheckpointTimer();
+  }, [clearCheckpointTimer, externalWriteBlockedNow, externalWriteInProgress, externalWriteLocked]);
 
   const publishDirty = useCallback(() => {
     setDirtyCount(dirtyRef.current.size);
@@ -686,7 +712,7 @@ export function useVocabItemWriteFlow({
     });
     try {
       const result = await runWithCurrentVocabItemWrite(entry, async (lease) => {
-        if (externalWriteLockedRef.current) return "external-blocked" as const;
+        if (externalWriteBlockedNow()) return "external-blocked" as const;
         try {
           const committed = await commitVocabItemWrite(receipt);
           if (committed.outcome === "saved" || committed.outcome === "already_saved") {
@@ -792,7 +818,7 @@ export function useVocabItemWriteFlow({
     } finally {
       if (operationRef.current === token) release(token);
     }
-  }, [clearExplicitBinding, finishCommitted, holdEntry, inspectEntryWithLease, publishDirty, reloadJournal, release, settleExpectedCheckpoint, settleInspectionResult, showAttention]);
+  }, [clearExplicitBinding, externalWriteBlockedNow, finishCommitted, holdEntry, inspectEntryWithLease, publishDirty, reloadJournal, release, settleExpectedCheckpoint, settleInspectionResult, showAttention]);
 
   const startPrepared = useCallback(async (
     prepare: () => Promise<VocabItemWriteReceipt>,
@@ -810,6 +836,9 @@ export function useVocabItemWriteFlow({
     let entry: VocabItemWriteEntry | null = null;
     let receipt: VocabItemWriteReceipt | null = null;
     try {
+      if (externalWriteBlockedNow()) {
+        throw new Error("先处理另一笔数据库安全操作；当前位置仍保留在本页。");
+      }
       const current = reloadJournal();
       if (current.storageUnavailable) {
         throw new Error("暂时无法读取条目核对存储；没有开始写入。");
@@ -823,10 +852,14 @@ export function useVocabItemWriteFlow({
       if (current.entries.length > 0) {
         throw new Error("先处理上一条条目核对线索；没有开始写入。");
       }
-      if (externalWriteLockedRef.current) {
+      if (externalWriteBlockedNow()) {
         throw new Error("先处理另一笔数据库安全操作；当前位置仍保留在本页。");
       }
-      receipt = await prepare();
+      const preparedReceipt = await prepare();
+      if (externalWriteBlockedNow()) {
+        throw new Error("准备期间另一笔数据库安全操作开始；原条目动作仍保留，且没有保存或提交收据。");
+      }
+      receipt = preparedReceipt;
       refreshProtectionRef.current = {
         receipt,
         mode: "before-only",
@@ -834,6 +867,9 @@ export function useVocabItemWriteFlow({
           submittedCandidate?.revision ?? null,
       };
       entry = await persistVocabItemWrite(createVocabItemWriteTicket(receipt));
+      if (externalWriteBlockedNow()) {
+        throw new Error("条目收据已经安全保留；另一笔数据库操作结束前不会提交。");
+      }
       if (trigger && receipt.kind !== "progress-checkpoint") {
         explicitTriggerRef.current = {
           itemId,
@@ -949,7 +985,7 @@ export function useVocabItemWriteFlow({
           submittedCandidate.revision
       ) submittedCheckpointRef.current.delete(itemId);
     }
-  }, [claim, clearDirty, commitEntry, holdEntry, inspectEntryWithLease, publishDirty, reloadJournal, release, restoreHeldFlowOrIdle, settleInspectionResult, showAttention]);
+  }, [claim, clearDirty, commitEntry, externalWriteBlockedNow, holdEntry, inspectEntryWithLease, publishDirty, reloadJournal, release, restoreHeldFlowOrIdle, settleInspectionResult, showAttention]);
 
   const flushCheckpoint = useCallback(async (): Promise<"saved" | "blocked" | "none"> => {
     clearCheckpointTimer();
@@ -965,7 +1001,7 @@ export function useVocabItemWriteFlow({
       !checkpointPausedRef.current.has(entry.itemId)
     );
     if (!candidate || operationRef.current) return "none";
-    if (externalWriteLockedRef.current) {
+    if (externalWriteBlockedNow()) {
       setStatus("当前位置仍保留在本页；另一笔数据库安全操作结束前不会开始条目写入。");
       return "blocked";
     }
@@ -997,19 +1033,19 @@ export function useVocabItemWriteFlow({
       currentJournal.unreadable.length === 0,
     );
     return saved ? "saved" : "blocked";
-  }, [clearCheckpointTimer, getExpected, publishDirty, reloadJournal, startPrepared]);
+  }, [clearCheckpointTimer, externalWriteBlockedNow, getExpected, publishDirty, reloadJournal, startPrepared]);
 
   const scheduleCheckpoint = useCallback(() => {
     clearCheckpointTimer();
     checkpointTimer.current = window.setTimeout(() => {
       checkpointTimer.current = null;
-      if (externalWriteLockedRef.current || operationRef.current) return;
+      if (externalWriteBlockedNow() || operationRef.current) return;
       const running = flushCheckpoint();
       operationPromiseRef.current = running.finally(() => {
         operationPromiseRef.current = null;
       });
     }, 800);
-  }, [clearCheckpointTimer, flushCheckpoint]);
+  }, [clearCheckpointTimer, externalWriteBlockedNow, flushCheckpoint]);
 
   const queueCheckpoint = useCallback((item: LibraryItem, progress: number) => {
     const currentJournal = journalRef.current;
@@ -1060,7 +1096,7 @@ export function useVocabItemWriteFlow({
     const hasHeldReceiptBarrier = heldEntriesRef.current.size > 0;
     if (!conflicted) checkpointPausedRef.current.delete(item.id);
     publishDirty();
-    if (!hasAnyConflict && !hasHeldReceiptBarrier && !externalWriteLocked && !operationRef.current && currentJournal.entries.length === 0) {
+    if (!hasAnyConflict && !hasHeldReceiptBarrier && !externalWriteBlockedNow() && !operationRef.current && currentJournal.entries.length === 0) {
       scheduleCheckpoint();
     }
     else if (hasAnyConflict) {
@@ -1073,14 +1109,14 @@ export function useVocabItemWriteFlow({
       setStatus("阅读位置已暂存在本页；处理完安全提醒后才会继续保存。");
     }
     return true;
-  }, [clearCheckpointCandidate, externalWriteLocked, getExpected, publishDirty, scheduleCheckpoint]);
+  }, [clearCheckpointCandidate, externalWriteBlockedNow, getExpected, publishDirty, scheduleCheckpoint]);
 
   useEffect(() => {
     if (!vocabItemCheckpointSchedulingOpen({
       dirtyCount: dirtyRef.current.size,
       operationInProgress: Boolean(operationRef.current),
       journalLoaded: journal.loaded,
-      externalWriteLocked,
+      externalWriteLocked: externalWriteBlocked,
       storageUnavailable: journal.storageUnavailable,
       lockUnavailable: journal.lockUnavailable,
       unreadableCount: journal.unreadable.length,
@@ -1094,7 +1130,7 @@ export function useVocabItemWriteFlow({
       return;
     }
     scheduleCheckpoint();
-  }, [busy, clearCheckpointTimer, dirtyVersion, externalWriteLocked, hasHeldReceipt, journal, scheduleCheckpoint]);
+  }, [busy, clearCheckpointTimer, dirtyVersion, externalWriteBlocked, hasHeldReceipt, journal, scheduleCheckpoint]);
 
   const cancelCheckpoint = useCallback((itemId: string) => {
     clearDirty(itemId);
@@ -1256,7 +1292,7 @@ export function useVocabItemWriteFlow({
       setError("有一条原收据仍待只读核对；核对完成前没有开始新的条目动作。");
       return;
     }
-    if (externalWriteLockedRef.current) {
+    if (externalWriteBlockedNow()) {
       setError("先处理另一笔数据库安全操作；没有开始条目动作。");
       return;
     }
@@ -1297,7 +1333,7 @@ export function useVocabItemWriteFlow({
       operationPromiseRef.current = null;
     });
     await running;
-  }, [clearCheckpointTimer, flushCheckpoint, getExpected, onAttention, reloadJournal, startPrepared]);
+  }, [clearCheckpointTimer, externalWriteBlockedNow, flushCheckpoint, getExpected, onAttention, reloadJournal, startPrepared]);
 
   const open = useCallback((entry?: VocabItemWriteEntry) => {
     if (operationRef.current) return;
@@ -1343,6 +1379,15 @@ export function useVocabItemWriteFlow({
 
   const continueExpected = useCallback(async (entry: VocabItemWriteEntry) => {
     if (entry.ticket.receipt.kind === "progress-checkpoint") return;
+    if (externalWriteBlockedNow()) {
+      showAttention({
+        phase: "expected",
+        entry,
+        message: "这张收据仍保留；另一笔数据库安全操作结束前不会继续写入。",
+      }, false);
+      setError("当前安全门尚未开放；没有调用条目写入。");
+      return;
+    }
     const current = reloadJournal();
     const selected = selectVocabItemWriteRecoveryEntry(
       [...heldEntriesRef.current.values()],
@@ -1355,7 +1400,7 @@ export function useVocabItemWriteFlow({
       ),
     );
     if (!vocabItemExpectedContinuationOpen({
-      externalWriteLocked: externalWriteLockedRef.current,
+      externalWriteLocked: externalWriteBlockedNow(),
       hasConflict: checkpointConflictRef.current.size > 0,
       storageUnavailable: current.storageUnavailable,
       lockUnavailable: current.lockUnavailable,
@@ -1372,8 +1417,18 @@ export function useVocabItemWriteFlow({
     }
     const token = claim("commit", entry.ticket.receipt.before.item.id, false);
     if (!token) return;
+    if (externalWriteBlockedNow()) {
+      showAttention({
+        phase: "expected",
+        entry,
+        message: "这张收据仍保留；另一笔数据库安全操作结束前不会继续写入。",
+      }, false);
+      setError("当前安全门尚未开放；没有调用条目写入。");
+      release(token);
+      return;
+    }
     await commitEntry(entry, token, false);
-  }, [claim, commitEntry, reloadJournal, showAttention]);
+  }, [claim, commitEntry, externalWriteBlockedNow, release, reloadJournal, showAttention]);
 
   const discardExpected = useCallback(async (entry: VocabItemWriteEntry) => {
     const token = claim("journal", entry.ticket.receipt.before.item.id, false);
@@ -1566,7 +1621,8 @@ export function useVocabItemWriteFlow({
     clearUnreadable,
     recheckJournal: reloadJournal,
     shouldDeferBundle,
-    operationInProgress: () => Boolean(operationRef.current),
+    operationInProgress,
+    blocksExternalWritesNow,
   } as const;
 }
 

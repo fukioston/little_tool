@@ -341,7 +341,12 @@ test("prepare snapshots bookmark/activity inputs before await and performs zero 
     assert.equal(store.isVocabEngagementWriteReceipt(bookmark), true);
 
     const generation = await context.service.loadVocabEngagementGenerationExpectation();
-    const activityInput = { kind: "read", seconds: 15, recordedAt: 1_777_777 };
+    const activityInput = {
+      kind: "read",
+      seconds: 15,
+      recordedAt: 1_777_777,
+      timezoneOffsetMinutes: 480,
+    };
     const mutableGeneration = structuredClone(generation);
     const preparingActivity = context.service.prepareVocabStudyActivityRecord(
       activityInput,
@@ -349,6 +354,7 @@ test("prepare snapshots bookmark/activity inputs before await and performs zero 
     );
     activityInput.kind = "listen";
     activityInput.seconds = 99;
+    activityInput.timezoneOffsetMinutes = -840;
     mutableGeneration.generationSequence = 9;
     const activity = await preparingActivity;
     assert.deepEqual(activity.request, {
@@ -358,6 +364,7 @@ test("prepare snapshots bookmark/activity inputs before await and performs zero 
     });
     assert.equal(activity.target.read_seconds, 15);
     assert.equal(activity.target.listen_seconds, 0);
+    assert.equal(activity.timezoneOffsetMinutes, 480);
     assert.equal(store.isVocabEngagementWriteReceipt(activity), true);
     assert.equal(context.state.batchCalls, 0);
     assert.deepEqual(bookmarkRows(context.database), []);
@@ -396,6 +403,19 @@ test("strict input bounds, enums, timestamps, and occupied natural keys fail wit
       { kind: "read", seconds: 86_401 },
       { kind: "read", seconds: Number.NaN },
       { kind: "read", seconds: 15, recordedAt: -1 },
+      { kind: "read", seconds: 15, timezoneOffsetMinutes: 480 },
+      {
+        kind: "read",
+        seconds: 15,
+        recordedAt: 1_777_777,
+        timezoneOffsetMinutes: 1.5,
+      },
+      {
+        kind: "read",
+        seconds: 15,
+        recordedAt: 1_777_777,
+        timezoneOffsetMinutes: 1_441,
+      },
     ]) {
       await assert.rejects(
         context.service.prepareVocabStudyActivityRecord(input, generation),
@@ -896,6 +916,28 @@ test("tampering, re-signed broken transitions, and oversized receipts fail befor
     oversized.target.label = oversized.request.label;
     const resignedOversized = await resignReceipt(oversized);
     assert.equal(store.isVocabEngagementWriteReceipt(resignedOversized), false);
+
+    const generation = await context.service
+      .loadVocabEngagementGenerationExpectation();
+    const activity = await context.service.prepareVocabStudyActivityRecord({
+      kind: "read",
+      seconds: 15,
+      recordedAt: 1_777_777,
+      timezoneOffsetMinutes: 480,
+    }, generation);
+    const duplicatedOffset = structuredClone(activity);
+    duplicatedOffset.request.timezoneOffsetMinutes = -840;
+    const resignedDuplicatedOffset = await resignReceipt(duplicatedOffset);
+    assert.equal(
+      store.isVocabEngagementWriteReceipt(resignedDuplicatedOffset),
+      false,
+    );
+    assert.equal(
+      await context.service.inspectVocabEngagementWrite(
+        resignedDuplicatedOffset,
+      ),
+      "invalid_receipt",
+    );
     assert.equal(context.state.batchCalls, 0);
     assert.deepEqual(bookmarkRows(context.database), []);
   } finally {
@@ -907,7 +949,7 @@ test("activity day is sealed from prepare-time offset and never recomputed after
   const timestamp = Date.UTC(2026, 0, 1, 0, 30);
   const context = await fixture({
     now: timestamp,
-    timezoneOffsetMinutes: 480,
+    timezoneOffsetMinutes: -840,
   });
   try {
     const expected = await context.service.loadVocabEngagementGenerationExpectation();
@@ -915,6 +957,7 @@ test("activity day is sealed from prepare-time offset and never recomputed after
       kind: "listen",
       seconds: 45,
       recordedAt: timestamp,
+      timezoneOffsetMinutes: 480,
     }, expected);
     assert.equal(receipt.target.day, "2025-12-31");
     assert.equal(receipt.timezoneOffsetMinutes, 480);
@@ -926,6 +969,25 @@ test("activity day is sealed from prepare-time offset and never recomputed after
       "saved",
     );
     assert.equal(activityRows(context.database)[0].day, "2025-12-31");
+
+    const fallbackContext = await fixture({
+      now: timestamp,
+      timezoneOffsetMinutes: 480,
+    });
+    try {
+      const fallbackExpected = await fallbackContext.service
+        .loadVocabEngagementGenerationExpectation();
+      const fallbackReceipt = await fallbackContext.service
+        .prepareVocabStudyActivityRecord({
+          kind: "read",
+          seconds: 15,
+          recordedAt: timestamp,
+        }, fallbackExpected);
+      assert.equal(fallbackReceipt.timezoneOffsetMinutes, 480);
+      assert.equal(fallbackReceipt.target.day, "2025-12-31");
+    } finally {
+      fallbackContext.database.close();
+    }
 
     const invalidClockContext = await fixture({ now: -1 });
     try {

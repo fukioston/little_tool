@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent } from "react";
 import { errorMessage, explainInChinese, explainSelection } from "@/lib/vocab/api";
 import { exportCompleteVocabBackup } from "@/lib/vocab/backup";
 import {
@@ -11,7 +11,6 @@ import {
   type LocalStorageEstimate,
 } from "@/lib/local-db/files";
 import {
-  createBookmark,
   getDueCards,
   initializeVocabDatabase,
   isVocabOccurrenceWriteReceipt,
@@ -23,6 +22,10 @@ import {
   prepareVocabLexemeStarSet,
   prepareVocabLexemeStatusSet,
   type VocabItemWriteSnapshot,
+  type VocabBookmarkExpectedState,
+  type VocabEngagementGenerationExpectation,
+  type VocabEngagementWriteReceipt,
+  type VocabStudyActivityRecordInput,
   prepareVocabOccurrenceWrite,
   prepareVocabSettingsSave,
   saveOccurrence,
@@ -67,6 +70,12 @@ import {
   useVocabLexemeWriteFlow,
   type VocabLexemeRefreshOutcome,
 } from "./VocabLexemeWriteFlow";
+import {
+  VocabEngagementWriteBanner,
+  VocabEngagementWriteRecovery,
+  useVocabEngagementWriteFlow,
+  type VocabEngagementApplyOutcome,
+} from "./VocabEngagementWriteFlow";
 import {
   beginVocabLexemeEditorPreparation,
   bindVocabLexemeEditorReceipt,
@@ -327,6 +336,9 @@ export default function VocabApp() {
   const [settingsRecoveryOpen, setSettingsRecoveryOpen] = useState(false);
   const [itemRecoveryOpen, setItemRecoveryOpen] = useState(false);
   const [itemExternalPending, setItemExternalPending] = useState(false);
+  const [engagementRecoveryOpen, setEngagementRecoveryOpen] = useState(false);
+  const [activeStudyActivityPending, setActiveStudyActivityPending] = useState(false);
+  const [backupDatabaseOperation, setBackupDatabaseOperation] = useState(false);
   const [lexemeRecoveryOpen, setLexemeRecoveryOpen] = useState(false);
   const [lexemeExternalPending, setLexemeExternalPending] = useState(false);
   const [lexemeWriteNotice, setLexemeWriteNotice] = useState("");
@@ -395,6 +407,11 @@ export default function VocabApp() {
   const reviewRecoveryLockedRef = useRef(true);
   const [reviewRecoveryLocked, setReviewRecoveryLocked] = useState(true);
   const externalDatabaseOperationRef = useRef<() => boolean>(() => true);
+  const settingsExternalWriteGateRef = useRef<() => boolean>(() => true);
+  const itemExternalWriteGateRef = useRef<() => boolean>(() => true);
+  const engagementExternalBarrierRef = useRef<() => boolean>(() => true);
+  const backupDatabaseOperationRef = useRef(false);
+  const activeStudyActivityPendingRef = useRef(false);
   const settingsPrepareBindingRef = useRef<Readonly<{
     trigger: HTMLElement;
     revision: number | null;
@@ -410,16 +427,60 @@ export default function VocabApp() {
   const itemRecoveryOpenRef = useRef(false);
   const itemRecoveryOpenerRef = useRef<HTMLElement | null>(null);
   const itemRecoveryFocusFrame = useRef<number | null>(null);
+  const engagementRecoveryOpenerRef = useRef<HTMLElement | null>(null);
+  const engagementRecoveryFocusFrame = useRef<number | null>(null);
   const snapshotReadFocusFrame = useRef<number | null>(null);
   const itemExitOpenerRef = useRef<HTMLElement | null>(null);
   const itemExitFocusFrame = useRef<number | null>(null);
   const itemHistoryGuardRef = useRef<string | null>(null);
   const itemHistoryRestoringRef = useRef(false);
   const itemHistoryConfirmAfterRestoreRef = useRef(false);
+  const settingsExternalWriteInProgress = useCallback(() => {
+    try {
+      return settingsExternalWriteGateRef.current();
+    } catch {
+      return true;
+    }
+  }, []);
+  const itemExternalWriteInProgress = useCallback(() => {
+    try {
+      return itemExternalWriteGateRef.current();
+    } catch {
+      return true;
+    }
+  }, []);
   const rememberItemRecoveryOpener = useCallback((trigger: HTMLButtonElement) => {
     itemRecoveryOpenerRef.current = trigger;
     itemRecoveryOpenRef.current = true;
     setItemRecoveryOpen(true);
+  }, []);
+  const rememberEngagementRecoveryOpener = useCallback((
+    trigger: HTMLButtonElement,
+  ) => {
+    engagementRecoveryOpenerRef.current = trigger;
+    setEngagementRecoveryOpen(true);
+  }, []);
+  const restoreEngagementRecoveryFocus = useCallback(() => {
+    if (engagementRecoveryFocusFrame.current !== null) {
+      window.cancelAnimationFrame(engagementRecoveryFocusFrame.current);
+    }
+    engagementRecoveryFocusFrame.current = window.requestAnimationFrame(() => {
+      engagementRecoveryFocusFrame.current = window.requestAnimationFrame(() => {
+        engagementRecoveryFocusFrame.current = null;
+        const opener = engagementRecoveryOpenerRef.current;
+        const preferred = opener?.isConnected && !opener.matches(":disabled") &&
+            opener.getClientRects().length > 0
+          ? opener
+          : null;
+        const target = preferred ?? document.querySelector<HTMLElement>(
+          ".sc-engagement-write-banner button:not(:disabled), .sc-main h1, .sc-menu:not(:disabled)",
+        );
+        engagementRecoveryOpenerRef.current = null;
+        if (!target?.isConnected || target.getClientRects().length === 0) return;
+        if (target.matches("h1")) target.tabIndex = -1;
+        target.focus({ preventScroll: true });
+      });
+    });
   }, []);
   const restoreItemRecoveryFocus = useCallback(() => {
     if (itemRecoveryFocusFrame.current !== null) {
@@ -532,6 +593,9 @@ export default function VocabApp() {
     }
     if (lexemeFocusFrame.current !== null) {
       window.cancelAnimationFrame(lexemeFocusFrame.current);
+    }
+    if (engagementRecoveryFocusFrame.current !== null) {
+      window.cancelAnimationFrame(engagementRecoveryFocusFrame.current);
     }
   }, []);
 
@@ -911,19 +975,27 @@ export default function VocabApp() {
 
   const settingsWrites = useVocabSettingsWriteFlow({
     refresh: refreshSettingsFacts,
+    externalWriteLocked: snapshotReadStatus !== "ready",
+    externalWriteInProgress: settingsExternalWriteInProgress,
     onToast: setToast,
     onAttention: () => setSettingsRecoveryOpen(true),
     onDurablePrepared: rememberPreparedSettings,
     onDurableCommitted: consumeCommittedSettingsDraft,
     onDurableSettled: settleSettingsWrite,
   });
-  const settingsDatabaseWriteLocked = settingsWrites.writeLocked ||
-    settingsWrites.operationInProgress();
+  const settingsBlocksExternalWritesNow = settingsWrites.blocksExternalWritesNow;
+  const settingsDatabaseWriteLocked = settingsWrites.busy ||
+    settingsWrites.hasHeldReceipt ||
+    !settingsWrites.journal.loaded || settingsWrites.journal.storageUnavailable ||
+    settingsWrites.journal.lockUnavailable ||
+    settingsWrites.journal.unreadable.length > 0 ||
+    settingsWrites.journal.entries.length > 0;
   const itemWrites = useVocabItemWriteFlow({
     refresh: refreshItemFacts,
     getExpected: getItemExpected,
     externalWriteLocked: settingsDatabaseWriteLocked ||
       snapshotReadStatus !== "ready",
+    externalWriteInProgress: itemExternalWriteInProgress,
     onToast: setToast,
     onAttention: (background) => {
       if (!background) {
@@ -940,23 +1012,26 @@ export default function VocabApp() {
       }
     },
   });
+  const itemBlocksExternalWritesNow = itemWrites.blocksExternalWritesNow;
+  const itemShouldDeferBundle = itemWrites.shouldDeferBundle;
   const itemBlocksLexemeWrites = itemWrites.busy ||
-    itemWrites.operationInProgress() || itemWrites.hasDirtyCheckpoint ||
+    itemWrites.hasDirtyCheckpoint ||
     itemWrites.hasConflictedCheckpoint || itemWrites.hasHeldReceipt ||
     !itemWrites.journal.loaded || itemWrites.journal.storageUnavailable ||
     itemWrites.journal.lockUnavailable || itemWrites.journal.unreadable.length > 0 ||
     itemWrites.journal.entries.length > 0;
   const lexemeExternalWriteLocked = settingsDatabaseWriteLocked ||
     itemBlocksLexemeWrites || snapshotReadStatus !== "ready" ||
-    lexemeExternalPending;
+    lexemeExternalPending || backupDatabaseOperation;
   const lexemeExternalWriteInProgress = useCallback(() =>
-    lexemeExternalWriteLocked || snapshotReadStatusRef.current !== "ready" ||
+    snapshotReadStatusRef.current !== "ready" ||
     lexemeExternalPendingRef.current ||
-    settingsWrites.operationInProgress() || itemWrites.operationInProgress(),
-  [itemWrites, lexemeExternalWriteLocked, settingsWrites]);
-  useEffect(() => {
-    externalDatabaseOperationRef.current = lexemeExternalWriteInProgress;
-  }, [lexemeExternalWriteInProgress]);
+    (cardMutationOwnerRef.current !== null &&
+      cardMutationOwnerRef.current !== "status") ||
+    wordSaveBusyRef.current ||
+    backupDatabaseOperationRef.current || engagementExternalBarrierRef.current() ||
+    settingsBlocksExternalWritesNow() || itemBlocksExternalWritesNow(),
+  [itemBlocksExternalWritesNow, settingsBlocksExternalWritesNow]);
   const lexemeWrites = useVocabLexemeWriteFlow({
     refresh: refreshLexemeFacts,
     externalWriteLocked: lexemeExternalWriteLocked,
@@ -984,6 +1059,207 @@ export default function VocabApp() {
     onChangedSettled: settleChangedLexemeWrite,
     onReceiptDiscarded: discardLexemeReceipt,
   });
+  const lexemeBlocksExternalWritesNow = lexemeWrites.blocksExternalWritesNow;
+  const lexemeShouldDeferBundle = lexemeWrites.shouldDeferBundle;
+  const lexemeDatabaseWriteBarrier = lexemeWrites.busy ||
+    lexemeWrites.hasHeldReceipt ||
+    !lexemeWrites.journal.loaded || lexemeWrites.journal.storageUnavailable ||
+    lexemeWrites.journal.lockUnavailable ||
+    lexemeWrites.journal.unreadable.length > 0 ||
+    lexemeWrites.journal.entries.length > 0;
+  const engagementExternalWriteLocked = snapshotReadStatus !== "ready" ||
+    settingsDatabaseWriteLocked || itemBlocksLexemeWrites ||
+    lexemeDatabaseWriteBarrier || backupDatabaseOperation ||
+    reviewRecoveryLocked || cardMutationOwner !== null || wordSaveBusy;
+  const engagementExternalWriteInProgress = useCallback(() =>
+    snapshotReadStatusRef.current !== "ready" ||
+    backupDatabaseOperationRef.current || reviewRecoveryLockedRef.current ||
+    cardMutationOwnerRef.current !== null || wordSaveBusyRef.current ||
+    settingsBlocksExternalWritesNow() || itemBlocksExternalWritesNow() ||
+    lexemeBlocksExternalWritesNow(),
+  [itemBlocksExternalWritesNow, lexemeBlocksExternalWritesNow, settingsBlocksExternalWritesNow]);
+  const applyEngagementFacts = useCallback(async (
+    receipt: VocabEngagementWriteReceipt,
+    confirmed: boolean,
+  ): Promise<VocabEngagementApplyOutcome> => {
+    if (
+      settingsDraftRef.current ||
+      itemShouldDeferBundle(itemExpectedByIdRef.current) ||
+      lexemeShouldDeferBundle(
+        lexemeBindingsByIdRef.current,
+        lexemeEditorRef.current,
+      ) || vocabLexemeNoteEditorDirty(lexemeEditorRef.current)
+    ) return "deferred";
+    const result = await readVocabFacts();
+    if (result.outcome !== "applied" || !confirmed) return result.outcome;
+    const expected = settingsExpectedRef.current;
+    if (
+      !expected || expected.generationId !== receipt.generationId ||
+      expected.generationSequence !== receipt.generationSequence
+    ) throw new Error("已确认的学习记录属于另一代词库；页面没有拼接应用它。");
+    if (receipt.kind === "bookmark-create") {
+      const saved = result.snapshot.bookmarks.some((bookmark) =>
+          bookmark.id === receipt.target.id &&
+          bookmark.item_id === receipt.target.item_id &&
+          bookmark.locator === receipt.target.locator &&
+          bookmark.label === receipt.target.label &&
+          bookmark.note === receipt.target.note &&
+          bookmark.created_at === receipt.target.created_at
+      );
+      if (!saved) {
+        throw new Error("已确认的书签尚未出现在整包读取中；收据继续保留。");
+      }
+    } else {
+      const day = result.snapshot.activity.find((row) =>
+        row.day === receipt.target.day
+      );
+      if (
+        !day || day.read_seconds < receipt.target.read_seconds ||
+        day.listen_seconds < receipt.target.listen_seconds ||
+        day.review_count < receipt.target.review_count ||
+        day.lookups < receipt.target.lookups
+      ) {
+        throw new Error("已确认的学习时间尚未出现在目标日期统计中；收据继续保留。");
+      }
+    }
+    return "applied";
+  }, [itemShouldDeferBundle, lexemeShouldDeferBundle, readVocabFacts]);
+  const applyConfirmedEngagement = useCallback((
+    receipt: VocabEngagementWriteReceipt,
+  ) => applyEngagementFacts(receipt, true), [applyEngagementFacts]);
+  const applyCurrentEngagement = useCallback((
+    receipt: VocabEngagementWriteReceipt,
+  ) => applyEngagementFacts(receipt, false), [applyEngagementFacts]);
+  const engagementWrites = useVocabEngagementWriteFlow({
+    applyConfirmed: applyConfirmedEngagement,
+    applyCurrent: applyCurrentEngagement,
+    externalWriteLocked: engagementExternalWriteLocked,
+    externalWriteInProgress: engagementExternalWriteInProgress,
+    onToast: setToast,
+    onAttention: () => {
+      if (!engagementRecoveryOpen) {
+        const active = document.activeElement;
+        engagementRecoveryOpenerRef.current = active instanceof HTMLElement &&
+            active !== document.body &&
+            !active.closest(".sc-engagement-write-recovery")
+          ? active
+          : null;
+      }
+      setEngagementRecoveryOpen(true);
+    },
+  });
+  const engagementBlocksExternalWrites = engagementWrites.blocksExternalWrites;
+  const engagementBlocksBackupActivation = engagementWrites.blocksBackupActivation;
+  const engagementHasVolatileWorkNow = engagementWrites.hasVolatileWorkNow;
+  const occurrenceExternalWriteInProgress = useCallback(() => {
+    try {
+      return snapshotReadStatusRef.current !== "ready" ||
+        backupDatabaseOperationRef.current ||
+        cardMutationOwnerRef.current !== null ||
+        settingsBlocksExternalWritesNow() || itemBlocksExternalWritesNow() ||
+        lexemeBlocksExternalWritesNow() || engagementBlocksExternalWrites();
+    } catch {
+      return true;
+    }
+  }, [engagementBlocksExternalWrites, itemBlocksExternalWritesNow, lexemeBlocksExternalWritesNow, settingsBlocksExternalWritesNow]);
+  useLayoutEffect(() => {
+    engagementExternalBarrierRef.current = engagementBlocksExternalWrites;
+    settingsExternalWriteGateRef.current = () =>
+      snapshotReadStatusRef.current !== "ready" ||
+      cardMutationOwnerRef.current !== null || wordSaveBusyRef.current ||
+      backupDatabaseOperationRef.current || itemBlocksExternalWritesNow() ||
+      lexemeBlocksExternalWritesNow() || engagementBlocksExternalWrites();
+    itemExternalWriteGateRef.current = () =>
+      snapshotReadStatusRef.current !== "ready" ||
+      cardMutationOwnerRef.current !== null || wordSaveBusyRef.current ||
+      backupDatabaseOperationRef.current || settingsBlocksExternalWritesNow() ||
+      lexemeBlocksExternalWritesNow() || engagementBlocksExternalWrites();
+    externalDatabaseOperationRef.current = () =>
+      backupDatabaseOperationRef.current || wordSaveBusyRef.current ||
+      (cardMutationOwnerRef.current !== null &&
+        cardMutationOwnerRef.current !== "review") ||
+      settingsBlocksExternalWritesNow() || itemBlocksExternalWritesNow() ||
+      lexemeBlocksExternalWritesNow() || engagementBlocksExternalWrites();
+  }, [engagementBlocksExternalWrites, itemBlocksExternalWritesNow, lexemeBlocksExternalWritesNow, settingsBlocksExternalWritesNow]);
+  const startEngagementBookmark = engagementWrites.startBookmark;
+  const queueEngagementActivity = engagementWrites.queueActivity;
+  const startBookmarkWrite = useCallback((
+    item: LibraryItem,
+    locator: string,
+    label: string,
+    trigger: HTMLButtonElement,
+  ) => {
+    const displayedSnapshot = snapshotRef.current;
+    const settingsGeneration = settingsExpectedRef.current;
+    const itemExpected = itemExpectedByIdRef.current.get(item.id) ?? null;
+    const displayedItem = displayedSnapshot.items.find((candidate) =>
+      candidate.id === item.id
+    ) ?? null;
+    if (
+      !settingsGeneration || !itemExpected || displayedItem !== item ||
+      itemExpected.item !== item ||
+      itemExpected.generationId !== settingsGeneration.generationId ||
+      itemExpected.generationSequence !== settingsGeneration.generationSequence
+    ) {
+      snapshotReadStatusRef.current = "stale";
+      setSnapshotReadStatus("stale");
+      setSnapshotReadError(
+        "书签位置与整包读取凭据不再属于同一次显示；没有准备书签写入。",
+      );
+      return;
+    }
+    const bookmarks = displayedSnapshot.bookmarks
+      .filter((bookmark) =>
+        bookmark.item_id === item.id && bookmark.locator === locator
+      )
+      .map((bookmark) => ({ ...bookmark }))
+      .sort((left, right) => left.id.localeCompare(right.id));
+    if (bookmarks.length > 0) {
+      setToast("此处已经有书签");
+      return;
+    }
+    const expected: VocabBookmarkExpectedState = {
+      generationId: settingsGeneration.generationId,
+      generationSequence: settingsGeneration.generationSequence,
+      item: itemExpected.item,
+      locator,
+      bookmarks,
+    };
+    void startEngagementBookmark(
+      { itemId: item.id, locator, label },
+      expected,
+      trigger,
+    );
+  }, [startEngagementBookmark]);
+  const queueStudyActivity = useCallback((
+    input: VocabStudyActivityRecordInput & Readonly<{ recordedAt: number }>,
+  ) => {
+    const displayed = settingsExpectedRef.current;
+    if (!displayed) return;
+    const generation: VocabEngagementGenerationExpectation = {
+      generationId: displayed.generationId,
+      generationSequence: displayed.generationSequence,
+    };
+    queueEngagementActivity(input, generation);
+  }, [queueEngagementActivity]);
+  const updateStudyActivityPending = useCallback((pending: boolean) => {
+    activeStudyActivityPendingRef.current = pending;
+    setActiveStudyActivityPending(pending);
+  }, []);
+  const backupExternalWriteInProgress = useCallback(() =>
+    snapshotReadStatusRef.current !== "ready" ||
+    activeStudyActivityPendingRef.current ||
+    settingsDraftRef.current !== null ||
+    vocabLexemeNoteEditorDirty(lexemeEditorRef.current) ||
+    settingsBlocksExternalWritesNow() || itemBlocksExternalWritesNow() ||
+    lexemeBlocksExternalWritesNow() || engagementBlocksBackupActivation() ||
+    reviewRecoveryLockedRef.current || cardMutationOwnerRef.current !== null ||
+    wordSaveBusyRef.current,
+  [engagementBlocksBackupActivation, itemBlocksExternalWritesNow, lexemeBlocksExternalWritesNow, settingsBlocksExternalWritesNow]);
+  const updateBackupDatabaseOperation = useCallback((inProgress: boolean) => {
+    backupDatabaseOperationRef.current = inProgress;
+    setBackupDatabaseOperation(inProgress);
+  }, []);
   useEffect(() => {
     itemWriteGuardRef.current = itemWrites.shouldDeferBundle;
   }, [itemWrites.shouldDeferBundle]);
@@ -1220,6 +1496,16 @@ export default function VocabApp() {
     window.addEventListener("beforeunload", protectReview);
     return () => window.removeEventListener("beforeunload", protectReview);
   }, [cardMutationOwner]);
+
+  useEffect(() => {
+    if (!activeStudyActivityPending && !backupDatabaseOperation) return;
+    const protectDatabaseWork = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", protectDatabaseWork);
+    return () => window.removeEventListener("beforeunload", protectDatabaseWork);
+  }, [activeStudyActivityPending, backupDatabaseOperation]);
 
   useEffect(() => () => {
     if (settingsFocusFrame.current !== null) window.cancelAnimationFrame(settingsFocusFrame.current);
@@ -1486,6 +1772,13 @@ export default function VocabApp() {
     if (wordSaveBusyRef.current) return;
     const target = selectionRef.current;
     if (!target) return;
+    if (occurrenceExternalWriteInProgress()) {
+      setWordSavePhase("idle");
+      setWordSaveMessage(
+        "另一个词库写入正在进行；这次收词尚未开始，请稍后重试。",
+      );
+      return;
+    }
     wordSaveBusyRef.current = true;
     setWordSaveBusy(true);
     setWordSavePhase("committing");
@@ -1581,7 +1874,7 @@ export default function VocabApp() {
       finishWordBusy();
       if (closeForNextRecovery) clearSelection();
     }
-  }, [activateNextOccurrenceRecovery, clearSelection, explanation, finishWordBusy, refresh]);
+  }, [activateNextOccurrenceRecovery, clearSelection, explanation, finishWordBusy, occurrenceExternalWriteInProgress, refresh]);
 
   const inspectPendingWord = useCallback(async () => {
     if (wordSaveBusyRef.current) return;
@@ -1884,6 +2177,12 @@ export default function VocabApp() {
     settingsWrites.operationInProgress() || settingsWrites.hasVolatileHeldReceipt;
   const lexemeHasVolatileWork = lexemeWrites.hasVolatileOperation ||
     cardMutationOwner === "review";
+  const engagementHasVolatileWork = engagementWrites.hasVolatileWork ||
+    activeStudyActivityPending || backupDatabaseOperation;
+  const engagementVolatileWorkInProgress = useCallback(() =>
+    engagementHasVolatileWorkNow() ||
+    activeStudyActivityPendingRef.current || backupDatabaseOperationRef.current,
+  [engagementHasVolatileWorkNow]);
   const lexemeNoteDirty = vocabLexemeNoteEditorDirty(lexemeEditor);
   const discardItemPositionsAndReadLatest = useCallback(async (
     trigger: HTMLButtonElement,
@@ -1894,7 +2193,8 @@ export default function VocabApp() {
   const requestSuiteExit = useCallback((event: ReactMouseEvent<HTMLAnchorElement>) => {
     const decision = vocabItemExitDecision(
       itemWriteBusy || itemOperationInProgress() || itemHasVolatileReceipt ||
-        settingsHasVolatileWork || lexemeHasVolatileWork,
+        settingsHasVolatileWork || lexemeHasVolatileWork ||
+        engagementVolatileWorkInProgress(),
       itemHasDirtyCheckpoint || lexemeNoteDirty,
     );
     if (decision === "leave") {
@@ -1913,12 +2213,13 @@ export default function VocabApp() {
     itemExitOpenerRef.current = event.currentTarget;
     setItemExitDestination("suite");
     setItemExitConfirmOpen(true);
-  }, [itemHasDirtyCheckpoint, itemHasVolatileReceipt, itemOperationInProgress, itemWriteBusy, lexemeHasVolatileWork, lexemeNoteDirty, settingsHasVolatileWork]);
+  }, [engagementVolatileWorkInProgress, itemHasDirtyCheckpoint, itemHasVolatileReceipt, itemOperationInProgress, itemWriteBusy, lexemeHasVolatileWork, lexemeNoteDirty, settingsHasVolatileWork]);
 
   useEffect(() => {
     const hasRisk = itemWriteBusy || itemOperationInProgress() ||
       itemHasDirtyCheckpoint || itemHasVolatileReceipt ||
-      settingsHasVolatileWork || lexemeHasVolatileWork || lexemeNoteDirty;
+      settingsHasVolatileWork || lexemeHasVolatileWork ||
+      engagementHasVolatileWork || lexemeNoteDirty;
     if (hasRisk && itemHistoryGuardRef.current === null) {
       const token = typeof crypto.randomUUID === "function"
         ? crypto.randomUUID()
@@ -1957,8 +2258,9 @@ export default function VocabApp() {
         current[VOCAB_ITEM_HISTORY_GUARD] === token
       ) return;
       const decision = vocabItemHistoryBackDecision(
-        itemWriteBusy || itemOperationInProgress() || itemHasVolatileReceipt ||
-          settingsHasVolatileWork || lexemeHasVolatileWork,
+          itemWriteBusy || itemOperationInProgress() || itemHasVolatileReceipt ||
+          settingsHasVolatileWork || lexemeHasVolatileWork ||
+          engagementVolatileWorkInProgress(),
         itemHasDirtyCheckpoint || lexemeNoteDirty,
       );
       if (decision === "continue") {
@@ -1975,11 +2277,12 @@ export default function VocabApp() {
     };
     window.addEventListener("popstate", onPopState);
     return () => window.removeEventListener("popstate", onPopState);
-  }, [itemHasDirtyCheckpoint, itemHasVolatileReceipt, itemOperationInProgress, itemWriteBusy, lexemeHasVolatileWork, lexemeNoteDirty, settingsHasVolatileWork]);
+  }, [engagementHasVolatileWork, engagementVolatileWorkInProgress, itemHasDirtyCheckpoint, itemHasVolatileReceipt, itemOperationInProgress, itemWriteBusy, lexemeHasVolatileWork, lexemeNoteDirty, settingsHasVolatileWork]);
 
   const abandonItemPositionAndLeaveSuite = useCallback(() => {
     if (itemWriteBusy || itemOperationInProgress() || itemHasVolatileReceipt ||
-        settingsHasVolatileWork || lexemeHasVolatileWork) return;
+        settingsHasVolatileWork || lexemeHasVolatileWork ||
+        engagementVolatileWorkInProgress()) return;
     const guarded = itemHistoryGuardRef.current !== null;
     discardAllItemCheckpoints();
     clearLexemeEditor();
@@ -1988,18 +2291,19 @@ export default function VocabApp() {
     setItemExitConfirmOpen(false);
     if (guarded) window.location.replace("/");
     else window.location.assign("/");
-  }, [allowDiscardedItemNavigation, clearLexemeEditor, discardAllItemCheckpoints, itemHasVolatileReceipt, itemOperationInProgress, itemWriteBusy, lexemeHasVolatileWork, settingsHasVolatileWork]);
+  }, [allowDiscardedItemNavigation, clearLexemeEditor, discardAllItemCheckpoints, engagementVolatileWorkInProgress, itemHasVolatileReceipt, itemOperationInProgress, itemWriteBusy, lexemeHasVolatileWork, settingsHasVolatileWork]);
 
   const abandonItemPositionAndContinueHistory = useCallback(() => {
     if (itemWriteBusy || itemOperationInProgress() || itemHasVolatileReceipt ||
-        settingsHasVolatileWork || lexemeHasVolatileWork) return;
+        settingsHasVolatileWork || lexemeHasVolatileWork ||
+        engagementVolatileWorkInProgress()) return;
     discardAllItemCheckpoints();
     clearLexemeEditor();
     setItemExitConfirmOpen(false);
     const guarded = itemHistoryGuardRef.current !== null;
     itemHistoryGuardRef.current = null;
     window.history.go(guarded ? -2 : -1);
-  }, [clearLexemeEditor, discardAllItemCheckpoints, itemHasVolatileReceipt, itemOperationInProgress, itemWriteBusy, lexemeHasVolatileWork, settingsHasVolatileWork]);
+  }, [clearLexemeEditor, discardAllItemCheckpoints, engagementVolatileWorkInProgress, itemHasVolatileReceipt, itemOperationInProgress, itemWriteBusy, lexemeHasVolatileWork, settingsHasVolatileWork]);
 
   useEffect(() => {
     if (!itemRecoveryOpen || itemWrites.flow.phase !== "idle") return;
@@ -2052,6 +2356,22 @@ export default function VocabApp() {
     });
     return () => window.cancelAnimationFrame(frame);
   }, [lexemeRecoveryOpen, lexemeWrites.flow.phase, lexemeWrites.hasHeldReceipt, lexemeWrites.journal]);
+
+  useEffect(() => {
+    if (!engagementRecoveryOpen || engagementWrites.flow.phase !== "idle") return;
+    if (
+      engagementWrites.journal.storageUnavailable ||
+      engagementWrites.journal.lockUnavailable ||
+      engagementWrites.journal.entries.length > 0 ||
+      engagementWrites.journal.unreadable.length > 0 ||
+      engagementWrites.hasHeldReceipt
+    ) return;
+    const frame = window.requestAnimationFrame(() => {
+      setEngagementRecoveryOpen(false);
+      restoreEngagementRecoveryFocus();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [engagementRecoveryOpen, engagementWrites.flow.phase, engagementWrites.hasHeldReceipt, engagementWrites.journal, restoreEngagementRecoveryFocus]);
 
   const exportBackup = useCallback(async () => {
     const backup = await exportCompleteVocabBackup();
@@ -2152,6 +2472,12 @@ export default function VocabApp() {
         setLexemeRecoveryOpen(true);
       }} />
       {lexemeRecoveryOpen && <VocabLexemeWriteRecovery controller={lexemeWrites} />}
+      <VocabEngagementWriteBanner
+        controller={engagementWrites}
+        onOpen={rememberEngagementRecoveryOpener}
+      />
+      {engagementRecoveryOpen &&
+        <VocabEngagementWriteRecovery controller={engagementWrites} />}
       {snapshotReadStatus === "stale" && !itemExternalPending &&
         !settingsExternalPending && !lexemeExternalPending &&
         !globalSettingsNotice && !lexemeWriteNotice &&
@@ -2167,12 +2493,12 @@ export default function VocabApp() {
       <div className="sc-view">
         {view === "today" && <TodayView snapshot={snapshot} due={dueCards.length} onOpen={openItem} onGo={go} onImport={openImport} onWord={openWord} />}
         {view === "library" && <LibraryView items={snapshot.items} itemWriteLocked={snapshotReadStatus !== "ready" || itemWrites.writeLocked} itemWriteBusy={itemWrites.busy} itemWriteStatus={itemWrites.error || itemWrites.status} onOpen={openItem} onImport={openImport} onArchive={(item, trigger) => void itemWrites.startLifecycle(item.status === "archived" ? "restore" : "archive", item, trigger)} />}
-        {view === "reader" && <ReaderView item={activeItem?.kind === "article" ? activeItem : snapshot.items.find((item) => item.kind === "article") ?? null} blocks={snapshot.blocks} occurrences={snapshot.occurrences} bookmarks={snapshot.bookmarks} itemWriteLocked={snapshotReadStatus !== "ready" || itemWrites.writeLocked} itemWriteBusy={itemWrites.busy} itemWriteStatus={itemWrites.error || itemWrites.status} onSelect={selectText} onBack={() => go("library")} onProgress={recordItemProgressCandidate} onFinish={(item, trigger) => void itemWrites.startLifecycle("complete", item, trigger)} onBookmark={async (item, block) => { await createBookmark(item.id, block?.id ?? "top", block?.text.slice(0, 30) ?? item.title); await refresh(); setToast("已收藏当前位置"); }} />}
-        {view === "podcast" && <PodcastView key={(activeItem?.kind === "podcast" ? activeItem : snapshot.items.find((item) => item.kind === "podcast"))?.id ?? "empty-podcast"} item={activeItem?.kind === "podcast" ? activeItem : snapshot.items.find((item) => item.kind === "podcast") ?? null} segments={snapshot.segments} occurrences={snapshot.occurrences} autoFollow={snapshot.settings.auto_follow} autoFollowWriteLocked={settingsControlsLocked} autoFollowWriteBusy={settingsWrites.busy} autoFollowStatus={settingsControlStatus} itemWriteLocked={snapshotReadStatus !== "ready" || itemWrites.writeLocked} itemWritePermanentReadOnly={itemWritePermanentReadOnly} itemWriteBusy={itemWrites.busy} itemWriteStatus={itemWrites.error || itemWrites.status} localLock={effectiveLocalLock} onAutoFollow={(value, trigger) => requestSettingsChange({ auto_follow: value }, trigger)} onSelect={selectText} onProgress={recordItemProgressCandidate} onFinish={(item, trigger) => void itemWrites.startLifecycle("complete", item, trigger)} onBookmark={async (item, ms, label) => { await createBookmark(item.id, `t:${ms}`, label); await refresh(); setToast("已收藏此刻"); }} />}
+        {view === "reader" && <ReaderView item={activeItem?.kind === "article" ? activeItem : snapshot.items.find((item) => item.kind === "article") ?? null} blocks={snapshot.blocks} occurrences={snapshot.occurrences} bookmarks={snapshot.bookmarks} itemWriteLocked={snapshotReadStatus !== "ready" || itemWrites.writeLocked} itemWriteBusy={itemWrites.busy} itemWriteStatus={itemWrites.error || itemWrites.status} engagementWriteLocked={snapshotReadStatus !== "ready" || engagementWrites.writeLocked} engagementWriteBusy={engagementWrites.busy} engagementWriteStatus={engagementWrites.error || engagementWrites.status} onSelect={selectText} onBack={() => go("library")} onProgress={recordItemProgressCandidate} onFinish={(item, trigger) => void itemWrites.startLifecycle("complete", item, trigger)} onStudyActivity={queueStudyActivity} onBookmark={(item, block, trigger) => startBookmarkWrite(item, block?.id ?? "top", block?.text.slice(0, 30) ?? item.title, trigger)} />}
+        {view === "podcast" && <PodcastView key={(activeItem?.kind === "podcast" ? activeItem : snapshot.items.find((item) => item.kind === "podcast"))?.id ?? "empty-podcast"} item={activeItem?.kind === "podcast" ? activeItem : snapshot.items.find((item) => item.kind === "podcast") ?? null} segments={snapshot.segments} occurrences={snapshot.occurrences} autoFollow={snapshot.settings.auto_follow} autoFollowWriteLocked={settingsControlsLocked} autoFollowWriteBusy={settingsWrites.busy} autoFollowStatus={settingsControlStatus} itemWriteLocked={snapshotReadStatus !== "ready" || itemWrites.writeLocked} itemWritePermanentReadOnly={itemWritePermanentReadOnly} itemWriteBusy={itemWrites.busy} itemWriteStatus={itemWrites.error || itemWrites.status} engagementWriteLocked={snapshotReadStatus !== "ready" || engagementWrites.writeLocked} engagementWriteBusy={engagementWrites.busy} engagementWriteStatus={engagementWrites.error || engagementWrites.status} localLock={effectiveLocalLock} onAutoFollow={(value, trigger) => requestSettingsChange({ auto_follow: value }, trigger)} onSelect={selectText} onProgress={recordItemProgressCandidate} onFinish={(item, trigger) => void itemWrites.startLifecycle("complete", item, trigger)} onStudyActivity={queueStudyActivity} onStudyActivityPendingChange={updateStudyActivityPending} onBookmark={(item, ms, label, trigger) => startBookmarkWrite(item, `t:${Math.round(ms)}`, label, trigger)} />}
         {view === "words" && <WordsView lexemes={snapshot.lexemes} occurrences={snapshot.occurrences} lexemeWriteLocked={lexemeControlsLocked || lexemeNoteDirty} lexemeWriteBusy={lexemeWrites.busy} lexemeWriteStatus={lexemeWrites.error || lexemeWrites.status || lexemeWriteNotice} onOpen={openWord} onStar={(word, trigger) => void setLexemeStarDurably(word, trigger)} />}
         {view === "review" && <ReviewView cards={snapshot.reviewCards} externalWriteLocked={lexemeWrites.ratingWriteLocked || cardMutationOwner === "status"} claimReviewMutation={claimReviewMutation} releaseReviewMutation={releaseReviewMutation} onRecoveryBarrierChange={updateReviewMutationBarrier} onRefresh={refresh} onGo={go} />}
         {view === "stats" && <StatsView snapshot={snapshot} />}
-        {view === "settings" && <SettingsView settings={displayedSettings} settingsDraftDirty={Boolean(settingsDraft)} settingsWriteLocked={settingsControlsLocked} settingsWriteBusy={settingsWrites.busy} databaseMutationLocked={itemDatabaseMutationLocked || lexemeDatabaseMutationLocked} settingsWriteStatus={settingsControlStatus} storage={storageStatus} persistenceSupported={persistenceSupported} onDraftChange={updateSettingsDraft} onDraftCommit={submitSettingsDraft} onToggle={(patch, trigger) => requestSettingsChange(patch, trigger)} onDiscardDraft={discardSettingsDraftAndRead} onExport={exportBackup} onRestoreRefresh={refreshAfterBackupActivation} onPersist={async () => { const granted = await requestPersistentLocalStorage(); const checked = await refreshStorageStatus(); return checked.persisted ?? granted; }} onTestAi={async () => { if (settingsOutboundBlocked()) throw new Error("本地锁已开启或正在安全确认；没有发出检查请求"); const response = await fetch("/api/health", { headers: { Accept: "application/json" } }); const health = await response.json() as { ai?: { configured?: boolean } }; if (!response.ok) throw new Error("无法检查 AI 服务状态"); if (!health.ai?.configured) throw new Error("DeepSeek API Key 尚未配置"); }} />}
+        {view === "settings" && <SettingsView settings={displayedSettings} settingsDraftDirty={Boolean(settingsDraft)} settingsWriteLocked={settingsControlsLocked} settingsWriteBusy={settingsWrites.busy} databaseMutationLocked={itemDatabaseMutationLocked || lexemeDatabaseMutationLocked || engagementWrites.backupBlocked} backupExternalWriteInProgress={backupExternalWriteInProgress} onBackupDatabaseOperationChange={updateBackupDatabaseOperation} settingsWriteStatus={settingsControlStatus} storage={storageStatus} persistenceSupported={persistenceSupported} onDraftChange={updateSettingsDraft} onDraftCommit={submitSettingsDraft} onToggle={(patch, trigger) => requestSettingsChange(patch, trigger)} onDiscardDraft={discardSettingsDraftAndRead} onExport={exportBackup} onRestoreRefresh={refreshAfterBackupActivation} onPersist={async () => { const granted = await requestPersistentLocalStorage(); const checked = await refreshStorageStatus(); return checked.persisted ?? granted; }} onTestAi={async () => { if (settingsOutboundBlocked()) throw new Error("本地锁已开启或正在安全确认；没有发出检查请求"); const response = await fetch("/api/health", { headers: { Accept: "application/json" } }); const health = await response.json() as { ai?: { configured?: boolean } }; if (!response.ok) throw new Error("无法检查 AI 服务状态"); if (!health.ai?.configured) throw new Error("DeepSeek API Key 尚未配置"); }} />}
       </div>
     </section>
     <nav className="sc-mobile-tabs" aria-label="拾词页面">{navigation.slice(0, 4).map((item) => <button key={item.id} aria-current={view === item.id ? "page" : undefined} className={view === item.id ? "active" : ""} onClick={() => go(item.id)}><i>{item.glyph}</i><span>{item.label}</span></button>)}</nav>
@@ -2201,7 +2527,7 @@ export default function VocabApp() {
             : "默认留在本页继续安全保存。若现在离开，只会放弃本页尚未写入的位置；已保存资料和安全收据不会删除。"}</p>
         <footer>
           <button data-item-exit-stay type="button" onClick={closeItemExitConfirm}>继续留在本页</button>
-          {itemExitDestination === "suite" ? <button className="danger" type="button" disabled={itemWrites.busy || itemWrites.operationInProgress() || itemWrites.hasVolatileHeldReceipt || settingsHasVolatileWork || lexemeHasVolatileWork} onClick={abandonItemPositionAndLeaveSuite}>{lexemeNoteDirty ? itemHasDirtyCheckpoint ? "放弃位置和笔记并离开" : "放弃笔记并离开" : "放弃本页位置并离开"}</button> : <button className="danger" type="button" disabled={itemWrites.busy || itemWrites.operationInProgress() || itemWrites.hasVolatileHeldReceipt || settingsHasVolatileWork || lexemeHasVolatileWork} onClick={abandonItemPositionAndContinueHistory}>{lexemeNoteDirty ? itemHasDirtyCheckpoint ? "放弃位置和笔记并返回" : "放弃笔记并返回" : "放弃本页位置并返回"}</button>}
+          {itemExitDestination === "suite" ? <button className="danger" type="button" disabled={itemWrites.busy || itemWrites.operationInProgress() || itemWrites.hasVolatileHeldReceipt || settingsHasVolatileWork || lexemeHasVolatileWork || engagementHasVolatileWork} onClick={abandonItemPositionAndLeaveSuite}>{lexemeNoteDirty ? itemHasDirtyCheckpoint ? "放弃位置和笔记并离开" : "放弃笔记并离开" : "放弃本页位置并离开"}</button> : <button className="danger" type="button" disabled={itemWrites.busy || itemWrites.operationInProgress() || itemWrites.hasVolatileHeldReceipt || settingsHasVolatileWork || lexemeHasVolatileWork || engagementHasVolatileWork} onClick={abandonItemPositionAndContinueHistory}>{lexemeNoteDirty ? itemHasDirtyCheckpoint ? "放弃位置和笔记并返回" : "放弃笔记并返回" : "放弃本页位置并返回"}</button>}
         </footer>
       </section>
     </>}
