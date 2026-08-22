@@ -421,8 +421,8 @@ async function prepare(context, kind) {
   }
 }
 
-test("v4 schema owns an immutable, payload-free core write marker", () => {
-  assert.equal(schema.ZHIJI_USER_VERSION, 4);
+test("v5 canonical schema preserves the immutable, payload-free v4 core write marker", () => {
+  assert.equal(schema.ZHIJI_USER_VERSION, 5);
   assert.equal(schema.ZHIJI_V4_MIGRATION_NAME, "career-core-write-recovery");
   assert.match(schemaSource, /CREATE TABLE career_core_write_operations/);
   assert.match(schemaSource, /projection_sha256 NOT GLOB '\*\[\^0-9a-f\]\*'/);
@@ -432,7 +432,7 @@ test("v4 schema owns an immutable, payload-free core write marker", () => {
   assert.match(source, /navigator[\s\S]{0,100}locks/);
 });
 
-test("exact v0 through v4 runtime and restore plans migrate to canonical v4", () => {
+test("exact v0 through v5 runtime and restore plans migrate to canonical v5", () => {
   function sourceDatabase(version) {
     const database = new sqlite3.oo1.DB(":memory:", "c");
     const apply = (statements) => execute(database, statements);
@@ -440,11 +440,12 @@ test("exact v0 through v4 runtime and restore plans migrate to canonical v4", ()
     if (version >= 2) apply(schema.ZHIJI_V2_SCHEMA_MIGRATION_STATEMENTS);
     if (version >= 3) apply(schema.ZHIJI_V3_SCHEMA_MIGRATION_STATEMENTS);
     if (version >= 4) apply(schema.ZHIJI_V4_SCHEMA_MIGRATION_STATEMENTS);
+    if (version >= 5) apply(schema.ZHIJI_V5_SCHEMA_MIGRATION_STATEMENTS);
     database.exec(`PRAGMA application_id=${version === 0
       ? 0
       : schema.ZHIJI_APPLICATION_ID}`);
     database.exec(`PRAGMA user_version=${version}`);
-    if (version === 4) {
+    if (version >= 4) {
       database.exec(`INSERT INTO career_core_write_operations(
         operation_id,purpose,receipt_version,kind,entity_id,
         projection_sha256,operation_at
@@ -459,7 +460,7 @@ test("exact v0 through v4 runtime and restore plans migrate to canonical v4", ()
   }
 
   function assertCanonical(database, version) {
-      assert.equal(database.selectValue("PRAGMA user_version"), 4);
+      assert.equal(database.selectValue("PRAGMA user_version"), 5);
       assert.equal(
         database.selectValue("PRAGMA application_id"),
         schema.ZHIJI_APPLICATION_ID,
@@ -468,7 +469,9 @@ test("exact v0 through v4 runtime and restore plans migrate to canonical v4", ()
         WHERE type='table' AND name='career_core_write_operations'`), 1);
       assert.equal(database.selectValue(
         "SELECT COUNT(*) FROM career_core_write_operations",
-      ), version === 4 ? 1 : 0);
+      ), version >= 4 ? 1 : 0);
+      assert.equal(database.selectValue(`SELECT COUNT(*) FROM sqlite_schema
+        WHERE type='table' AND name='career_write_operations'`), 1);
       assert.deepEqual(
         database.selectObjects(`SELECT version,name
           FROM career_schema_migrations ORDER BY version`)
@@ -478,12 +481,13 @@ test("exact v0 through v4 runtime and restore plans migrate to canonical v4", ()
           { version: 2, name: "contact-history" },
           { version: 3, name: "reversible-lifecycle" },
           { version: 4, name: "career-core-write-recovery" },
+          { version: 5, name: "career-lifecycle-task-write-recovery" },
         ],
       );
-      execute(database, backupPlan.createCareerSchemaGuardStatements(4));
+      execute(database, backupPlan.createCareerSchemaGuardStatements(5));
   }
 
-  for (const version of [0, 1, 2, 3, 4]) {
+  for (const version of [0, 1, 2, 3, 4, 5]) {
     const planners = [
       () => backupPlan.createCareerRuntimeUpgradeStatements(version),
       () => backupPlan.createCompleteCareerRestoreStatements([], version),

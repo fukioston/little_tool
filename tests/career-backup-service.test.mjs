@@ -197,7 +197,7 @@ async function attachmentKeysDigest(keys) {
   ], { type: "application/json" }));
 }
 
-function sqliteBytes(userVersion = 4, applicationId = userVersion === 0 ? 0 : ZHIJI_APPLICATION_ID) {
+function sqliteBytes(userVersion = 5, applicationId = userVersion === 0 ? 0 : ZHIJI_APPLICATION_ID) {
   const bytes = new Uint8Array(512);
   bytes.set(new TextEncoder().encode("SQLite format 3\0"));
   const view = new DataView(bytes.buffer);
@@ -206,7 +206,7 @@ function sqliteBytes(userVersion = 4, applicationId = userVersion === 0 ? 0 : ZH
   return bytes;
 }
 
-async function completeContainer(userVersion = 4) {
+async function completeContainer(userVersion = 5) {
   const file = new File(["private career material"], "resume.pdf", {
     type: "application/pdf",
   });
@@ -252,7 +252,7 @@ async function completeContainerWithThreeAttachments() {
     };
   }));
   return format.createCareerBackupBlob({
-    database: sqliteBytes(4),
+    database: sqliteBytes(5),
     attachments,
     exportedAt: "2026-08-20T08:09:10.000Z",
   }, hashBlob);
@@ -279,7 +279,7 @@ async function runtimeFixture(overrides = {}) {
     filename: `zhiji.${GENERATION_ID}.sqlite3`,
     activationToken: ACTIVATION_TOKEN,
     importedBytes: 512,
-    schemaVersion: 4,
+    schemaVersion: 5,
   };
   const state = {
     lockCalls: 0,
@@ -388,7 +388,7 @@ async function runtimeFixture(overrides = {}) {
         expectedCurrentGenerationId: state.current.generationId,
         expectedCurrentSequence: state.current.sequence,
         canonicalApplicationId: ZHIJI_APPLICATION_ID,
-        canonicalUserVersion: 4,
+        canonicalUserVersion: 5,
         projectionSha256: options.recovery.projectionSha256,
       };
       state.boundRecovery = recoveryReceipt;
@@ -488,7 +488,7 @@ async function runtimeFixture(overrides = {}) {
         filename: `zhiji.${generationId}.sqlite3`,
         persistent: true,
         sqliteVersion: "3.53.0",
-        schemaVersion: 4,
+        schemaVersion: 5,
         seeded: false,
         generationId,
         sequence: state.current.sequence,
@@ -610,7 +610,7 @@ test("a legacy restore without attachments also checkpoints before database stag
   let checkpoint;
 
   await backupService.prepareCareerBackupRestore(
-    new File([sqliteBytes(4)], "career-v4.sqlite3"),
+    new File([sqliteBytes(5)], "career-v5.sqlite3"),
     {
       onRecoveryPrepared(value) {
         checkpoint = JSON.parse(JSON.stringify(value));
@@ -1346,8 +1346,8 @@ test("a re-signed cleanup key list is rejected by the worker-owned binding", asy
   assert.ok(!rawServiceJavaScript.includes("WeakMap"));
 });
 
-test("legacy Career SQLite v0 through v4 prepare without activation", async () => {
-  for (const userVersion of [0, 1, 2, 3, 4]) {
+test("legacy Career SQLite v0 through v5 prepare without activation", async () => {
+  for (const userVersion of [0, 1, 2, 3, 4, 5]) {
     const fixture = await runtimeFixture();
     const receipt = await backupService.prepareCareerBackupRestore(
       new File([sqliteBytes(userVersion)], `career-v${userVersion}.sqlite3`),
@@ -1356,7 +1356,7 @@ test("legacy Career SQLite v0 through v4 prepare without activation", async () =
     assert.equal(receipt.summary.kind, "legacy-career-sqlite");
     assert.equal(receipt.summary.fileName, `career-v${userVersion}.sqlite3`);
     assert.equal(receipt.summary.sourceUserVersion, userVersion);
-    assert.equal(receipt.summary.canonicalUserVersion, 4);
+    assert.equal(receipt.summary.canonicalUserVersion, 5);
     assert.equal(receipt.summary.attachmentCount, 0);
     assert.deepEqual(receipt.stagedAttachmentKeys, []);
     assert.equal(fixture.state.staged.length, 1);
@@ -1365,8 +1365,8 @@ test("legacy Career SQLite v0 through v4 prepare without activation", async () =
   }
 });
 
-test("complete Career backups v0 through v4 prepare without activation", async () => {
-  for (const userVersion of [0, 1, 2, 3, 4]) {
+test("complete Career backups v0 through v5 prepare without activation", async () => {
+  for (const userVersion of [0, 1, 2, 3, 4, 5]) {
     const fixture = await runtimeFixture();
     const receipt = await backupService.prepareCareerBackupRestore(
       await completeContainer(userVersion),
@@ -1374,7 +1374,7 @@ test("complete Career backups v0 through v4 prepare without activation", async (
 
     assert.equal(receipt.summary.kind, "complete-backup");
     assert.equal(receipt.summary.sourceUserVersion, userVersion);
-    assert.equal(receipt.summary.canonicalUserVersion, 4);
+    assert.equal(receipt.summary.canonicalUserVersion, 5);
     assert.equal(receipt.summary.attachmentCount, 1);
     assert.equal(fixture.state.staged.length, 1);
     assert.equal(fixture.state.activated.length, 0);

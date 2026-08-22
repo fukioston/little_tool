@@ -19,6 +19,8 @@ import {
   ZHIJI_V3_SCHEMA_MIGRATION_STATEMENTS,
   ZHIJI_V4_MIGRATION_NAME,
   ZHIJI_V4_SCHEMA_MIGRATION_STATEMENTS,
+  ZHIJI_V5_MIGRATION_NAME,
+  ZHIJI_V5_SCHEMA_MIGRATION_STATEMENTS,
 } from "../schemas/zhiji";
 
 export const CAREER_APPLICATION_ID = ZHIJI_APPLICATION_ID;
@@ -186,7 +188,7 @@ function canonicalIdentityStatements(): SqlStatement[] {
   ];
 }
 
-type CareerSchemaVersion = 0 | 1 | 2 | 3 | 4;
+type CareerSchemaVersion = 0 | 1 | 2 | 3 | 4 | 5;
 const SCHEMA_GUARD_TABLE = "temp.__career_restore_schema_guard";
 
 function assertSourceVersion(
@@ -224,7 +226,7 @@ function schemaObjects(version: CareerSchemaVersion) {
 /**
  * Verify the complete known DDL, not merely familiar table names. Whitespace is
  * ignored because SQLite rewrites spacing around ALTER TABLE additions. The
- * v2/v3/v4 lineages are accepted only as coherent pairs, never mixed.
+ * v2/v3/v4/v5 lineages are accepted only as coherent pairs, never mixed.
  */
 export function createCareerSchemaGuardStatements(
   sourceUserVersion: number,
@@ -295,7 +297,7 @@ export function createCareerSchemaGuardStatements(
     })),
   ];
 
-  if (version === 2 || version === 3 || version === 4) {
+  if (version === 2 || version === 3 || version === 4 || version === 5) {
     const lineages = ZHIJI_SCHEMA_LINEAGES[version];
     statements.push({
       sql: `WITH expected(contacts_sql,tasks_sql) AS (
@@ -348,6 +350,9 @@ export function createCareerSchemaGuardStatements(
       { version: 3, name: ZHIJI_V3_MIGRATION_NAME },
       ...(version >= 4
         ? [{ version: 4, name: ZHIJI_V4_MIGRATION_NAME }]
+        : []),
+      ...(version >= 5
+        ? [{ version: 5, name: ZHIJI_V5_MIGRATION_NAME }]
         : []),
     ];
     statements.push({
@@ -410,6 +415,9 @@ function migrationStatements(sourceUserVersion: CareerSchemaVersion): SqlStateme
   if (sourceUserVersion < 4) {
     statements.push(...ZHIJI_V4_SCHEMA_MIGRATION_STATEMENTS);
   }
+  if (sourceUserVersion < 5) {
+    statements.push(...ZHIJI_V5_SCHEMA_MIGRATION_STATEMENTS);
+  }
   statements.push(
     ...canonicalIdentityStatements(),
     ...createCareerSchemaGuardStatements(CAREER_USER_VERSION),
@@ -424,6 +432,7 @@ export function createFreshCareerSchemaStatements(): SqlStatement[] {
     ...ZHIJI_V2_SCHEMA_MIGRATION_STATEMENTS,
     ...ZHIJI_V3_SCHEMA_MIGRATION_STATEMENTS,
     ...ZHIJI_V4_SCHEMA_MIGRATION_STATEMENTS,
+    ...ZHIJI_V5_SCHEMA_MIGRATION_STATEMENTS,
     ...canonicalIdentityStatements(),
     ...createCareerSchemaGuardStatements(CAREER_USER_VERSION),
     { sql: "PRAGMA optimize" },

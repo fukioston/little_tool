@@ -79,6 +79,7 @@ function createVersionDatabase(version, { facts = false, materials = [] } = {}) 
   if (version >= 2) statements.push(...schema.ZHIJI_V2_SCHEMA_MIGRATION_STATEMENTS);
   if (version >= 3) statements.push(...schema.ZHIJI_V3_SCHEMA_MIGRATION_STATEMENTS);
   if (version >= 4) statements.push(...schema.ZHIJI_V4_SCHEMA_MIGRATION_STATEMENTS);
+  if (version >= 5) statements.push(...schema.ZHIJI_V5_SCHEMA_MIGRATION_STATEMENTS);
   statements.push(
     {
       sql: `PRAGMA application_id = ${
@@ -95,7 +96,7 @@ function createVersionDatabase(version, { facts = false, materials = [] } = {}) 
 }
 
 function createDatabase(materials = []) {
-  return createVersionDatabase(4, { materials });
+  return createVersionDatabase(5, { materials });
 }
 
 function createDirectVersionTwoDatabase({
@@ -253,6 +254,11 @@ function assertCanonicalLedger(database) {
     {
       version: 4,
       name: schema.ZHIJI_V4_MIGRATION_NAME,
+      hasAppliedAt: 1,
+    },
+    {
+      version: 5,
+      name: schema.ZHIJI_V5_MIGRATION_NAME,
       hasAppliedAt: 1,
     },
   ]);
@@ -564,18 +570,18 @@ test("legacy restore clears all four attachment columns", () => {
   }
 });
 
-test("restore plan publishes the canonical v4 Career schema identity", () => {
+test("restore plan publishes the canonical v5 Career schema identity", () => {
   assert.equal(CAREER_APPLICATION_ID, 0x5a484a49);
-  assert.equal(CAREER_USER_VERSION, 4);
+  assert.equal(CAREER_USER_VERSION, 5);
   assert.deepEqual(CAREER_SCHEMA_REQUIREMENTS.sourceApplicationIds, [
     0,
     CAREER_APPLICATION_ID,
   ]);
   assert.equal(CAREER_SCHEMA_REQUIREMENTS.applicationId, CAREER_APPLICATION_ID);
-  assert.equal(CAREER_SCHEMA_REQUIREMENTS.minimumUserVersion, 4);
-  assert.equal(CAREER_SCHEMA_REQUIREMENTS.maximumUserVersion, 4);
+  assert.equal(CAREER_SCHEMA_REQUIREMENTS.minimumUserVersion, 5);
+  assert.equal(CAREER_SCHEMA_REQUIREMENTS.maximumUserVersion, 5);
   assert.equal(CAREER_SCHEMA_REQUIREMENTS.sourceMinimumUserVersion, 0);
-  assert.equal(CAREER_SCHEMA_REQUIREMENTS.sourceMaximumUserVersion, 4);
+  assert.equal(CAREER_SCHEMA_REQUIREMENTS.sourceMaximumUserVersion, 5);
 
   const materials = CAREER_SCHEMA_REQUIREMENTS.requiredTables.find(
     ({ name }) => name === "career_materials",
@@ -598,6 +604,9 @@ test("restore plan publishes the canonical v4 Career schema identity", () => {
   const coreWriteOperations = CAREER_SCHEMA_REQUIREMENTS.requiredTables.find(
     ({ name }) => name === "career_core_write_operations",
   );
+  const writeOperations = CAREER_SCHEMA_REQUIREMENTS.requiredTables.find(
+    ({ name }) => name === "career_write_operations",
+  );
   assert.equal(sourceContacts.columns.includes("updated_at"), false);
   assert.equal(sourceContacts.columns.includes("archived"), false);
   assert.equal(canonicalContacts.columns.includes("updated_at"), true);
@@ -613,6 +622,7 @@ test("restore plan publishes the canonical v4 Career schema identity", () => {
     "projection_sha256",
     "operation_at",
   ]);
+  assert.deepEqual(writeOperations?.columns, coreWriteOperations?.columns);
   assert.equal(
     CAREER_SCHEMA_REQUIREMENTS.sourceRequiredTables.some(
       ({ name }) => name === "career_core_write_operations",
@@ -625,6 +635,7 @@ test("restore plan publishes the canonical v4 Career schema identity", () => {
     "career_contact_interactions",
     "career_lifecycle_events",
     "career_core_write_operations",
+    "career_write_operations",
   ]) {
     assert.ok(
       CAREER_SCHEMA_REQUIREMENTS.requiredTables.some((table) => table.name === name),
@@ -632,8 +643,53 @@ test("restore plan publishes the canonical v4 Career schema identity", () => {
   }
 });
 
-for (const sourceVersion of [0, 1, 2, 3, 4]) {
-  test(`complete restore stages v${sourceVersion} to canonical v4 without losing facts`, () => {
+test("v4 and v5 restores preserve existing immutable operation proofs", () => {
+  for (const sourceVersion of [4, 5]) {
+    const database = createVersionDatabase(sourceVersion);
+    try {
+      database.exec(`INSERT INTO career_core_write_operations(
+        operation_id,purpose,receipt_version,kind,entity_id,
+        projection_sha256,operation_at
+      ) VALUES(
+        'career-core-operation-40000000-0000-4000-8000-000000000004',
+        'career-core-write',1,'stage-rename','stage_saved',
+        '${"a".repeat(64)}','2026-08-20T01:00:00.000Z'
+      )`);
+      if (sourceVersion === 5) {
+        database.exec(`INSERT INTO career_write_operations(
+          operation_id,purpose,receipt_version,kind,entity_id,
+          projection_sha256,operation_at
+        ) VALUES('future-operation','career-contact-write',1,'contact-update',
+          'contact-1','${"b".repeat(64)}','2026-08-20T01:00:00.000Z')`);
+      }
+      executeStatementsAtomically(
+        database,
+        createCompleteCareerRestoreStatements([], sourceVersion),
+      );
+      assert.equal(
+        Number(database.selectValue("SELECT COUNT(*) FROM career_core_write_operations")),
+        1,
+      );
+      assert.equal(
+        Number(database.selectValue("SELECT COUNT(*) FROM career_write_operations")),
+        sourceVersion === 5 ? 1 : 0,
+      );
+      if (sourceVersion === 5) {
+        assert.deepEqual(
+          database.selectObject(`SELECT purpose,kind FROM career_write_operations
+            WHERE operation_id='future-operation'`),
+          { purpose: "career-contact-write", kind: "contact-update" },
+        );
+      }
+      assertCanonicalLedger(database);
+    } finally {
+      database.close();
+    }
+  }
+});
+
+for (const sourceVersion of [0, 1, 2, 3, 4, 5]) {
+  test(`complete restore stages v${sourceVersion} to canonical v5 without losing facts`, () => {
     const originalKey = `source-v${sourceVersion}`;
     const stagedKey = `staged-v${sourceVersion}`;
     const database = createVersionDatabase(sourceVersion, {
@@ -690,7 +746,7 @@ for (const sourceVersion of [0, 1, 2, 3, 4]) {
     }
   });
 
-  test(`legacy restore stages v${sourceVersion} to canonical v4 and clears file references`, () => {
+  test(`legacy restore stages v${sourceVersion} to canonical v5 and clears file references`, () => {
     const database = createVersionDatabase(sourceVersion, {
       facts: true,
       materials: [{

@@ -211,7 +211,7 @@ function hasColumn(database, table, column) {
     .some((candidate) => candidate.name === column);
 }
 
-function installUntouchedLegacyDemo(database, sourceUserVersion = 4) {
+function installUntouchedLegacyDemo(database, sourceUserVersion = 5) {
   const now = "2026-08-21T06:15:32.456Z";
   const jobs = {
     Linear: generatedId("job", 1),
@@ -341,6 +341,7 @@ const businessTables = [
   "career_activity",
   "career_lifecycle_events",
   "career_core_write_operations",
+  "career_write_operations",
 ];
 
 function count(database, table) {
@@ -351,7 +352,7 @@ function assertIntegrity(database) {
   assert.equal(database.selectValue("PRAGMA integrity_check"), "ok");
   assert.deepEqual(database.selectObjects("PRAGMA foreign_key_check"), []);
   assert.equal(Number(database.selectValue("PRAGMA application_id")), 0x5a484a49);
-  assert.equal(Number(database.selectValue("PRAGMA user_version")), 4);
+  assert.equal(Number(database.selectValue("PRAGMA user_version")), 5);
   assert.deepEqual(
     database.selectObjects(
       "SELECT version,name FROM career_schema_migrations ORDER BY version",
@@ -361,6 +362,7 @@ function assertIntegrity(database) {
       { version: 2, name: "contact-history" },
       { version: 3, name: "reversible-lifecycle" },
       { version: 4, name: "career-core-write-recovery" },
+      { version: 5, name: "career-lifecycle-task-write-recovery" },
     ],
   );
 }
@@ -402,7 +404,7 @@ test("an untouched legacy demo is removed atomically and only once", async () =>
   }
 });
 
-test("an untouched v1 demo migrates atomically to canonical v4 before cleanup", async () => {
+test("an untouched v1 demo migrates atomically to canonical v5 before cleanup", async () => {
   const database = legacyDatabaseFixture(1);
   try {
     installUntouchedLegacyDemo(database, 1);
@@ -434,7 +436,7 @@ test("an untouched v1 demo migrates atomically to canonical v4 before cleanup", 
   }
 });
 
-test("v2 runtime migration preserves facts and backfills canonical v4 history", async () => {
+test("v2 runtime migration preserves facts and backfills canonical v5 history", async () => {
   const database = legacyDatabaseFixture(2);
   try {
     const createdAt = "2026-08-20T01:00:00.000Z";
@@ -559,7 +561,7 @@ for (const entity of ["task", "interview"]) {
   });
 }
 
-test("the historical direct-v2 lineage upgrades to and reopens as exact direct-v4", async () => {
+test("the historical direct-v2 lineage upgrades to and reopens as exact direct-v5", async () => {
   const database = directVersionTwoDatabaseFixture();
   try {
     const now = "2026-08-21T01:00:00.000Z";
@@ -817,6 +819,21 @@ for (const scenario of [
     expectedJobs: 6,
     expectedCoreWriteOperations: 1,
   },
+  {
+    name: "one durable lifecycle/task write operation marker",
+    mutate(database) {
+      insert(database, `INSERT INTO career_write_operations
+        (operation_id,purpose,receipt_version,kind,entity_id,
+         projection_sha256,operation_at)
+        VALUES (?,?,?,?,?,?,?)`, [
+        "career-task-operation-40000000-0000-4000-8000-000000000005",
+        "career-task-write", 1, "task-complete", "task-user-fact",
+        "b".repeat(64), "2026-08-21T07:00:00.000Z",
+      ]);
+    },
+    expectedJobs: 6,
+    expectedWriteOperations: 1,
+  },
 ]) {
   test(`legacy cleanup preserves everything and flags review after ${scenario.name}`, async () => {
     const database = await databaseFixture();
@@ -836,6 +853,10 @@ for (const scenario of [
       assert.equal(
         count(database, "career_core_write_operations"),
         scenario.expectedCoreWriteOperations ?? 0,
+      );
+      assert.equal(
+        count(database, "career_write_operations"),
+        scenario.expectedWriteOperations ?? 0,
       );
       if (scenario.expectedTaskOperationMarker) {
         assert.equal(

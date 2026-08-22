@@ -2,11 +2,12 @@ import type { LocalDatabaseSchema } from "./types";
 
 /** SQLite application_id for the ASCII-ish marker "ZHJI". */
 export const ZHIJI_APPLICATION_ID = 0x5a484a49;
-export const ZHIJI_USER_VERSION = 4;
+export const ZHIJI_USER_VERSION = 5;
 export const ZHIJI_V1_MIGRATION_NAME = "initial-career-runtime";
 export const ZHIJI_V2_MIGRATION_NAME = "contact-history";
 export const ZHIJI_V3_MIGRATION_NAME = "reversible-lifecycle";
 export const ZHIJI_V4_MIGRATION_NAME = "career-core-write-recovery";
+export const ZHIJI_V5_MIGRATION_NAME = "career-lifecycle-task-write-recovery";
 
 export const ZHIJI_V1_TABLE_COLUMNS = {
   career_stages: ["id", "name", "color", "position", "is_terminal", "hidden"],
@@ -83,6 +84,10 @@ export const ZHIJI_TABLE_COLUMNS = {
     "reason", "created_at",
   ],
   career_core_write_operations: [
+    "operation_id", "purpose", "receipt_version", "kind", "entity_id",
+    "projection_sha256", "operation_at",
+  ],
+  career_write_operations: [
     "operation_id", "purpose", "receipt_version", "kind", "entity_id",
     "projection_sha256", "operation_at",
   ],
@@ -418,6 +423,42 @@ export const ZHIJI_V4_SCHEMA_MIGRATION_STATEMENTS: readonly Readonly<{ sql: stri
   },
 ];
 
+/**
+ * Additive proof markers for extensible recoverable writes. The v4 core marker
+ * remains unchanged so an upgrade can never weaken or rewrite an existing
+ * immutable proof.
+ */
+export const ZHIJI_V5_SCHEMA_MIGRATION_STATEMENTS: readonly Readonly<{ sql: string }>[] = [
+  {
+    sql: `CREATE TABLE career_write_operations (
+      operation_id TEXT PRIMARY KEY CHECK (
+        length(trim(operation_id)) BETWEEN 1 AND 240
+      ),
+      purpose TEXT NOT NULL CHECK (
+        length(trim(purpose)) BETWEEN 1 AND 80
+      ),
+      receipt_version INTEGER NOT NULL CHECK (receipt_version = 1),
+      kind TEXT NOT NULL CHECK (
+        length(trim(kind)) BETWEEN 1 AND 80
+      ),
+      entity_id TEXT NOT NULL CHECK (
+        length(trim(entity_id)) BETWEEN 1 AND 240
+      ),
+      projection_sha256 TEXT NOT NULL CHECK (
+        length(projection_sha256) = 64
+        AND projection_sha256 NOT GLOB '*[^0-9a-f]*'
+      ),
+      operation_at TEXT NOT NULL CHECK (
+        length(trim(operation_at)) BETWEEN 1 AND 64
+      )
+    )`,
+  },
+  {
+    sql: `INSERT INTO career_schema_migrations(version,name,applied_at) VALUES
+      (5,'${ZHIJI_V5_MIGRATION_NAME}',strftime('%Y-%m-%dT%H:%M:%fZ','now'))`,
+  },
+];
+
 function objectSql(
   statements: readonly Readonly<{ sql: string }>[],
 ): Record<string, string> {
@@ -535,6 +576,15 @@ const v4DirectObjects: Record<string, string> = {
   ...v3DirectObjects,
   ...v4MigrationObjects,
 };
+const v5MigrationObjects = objectSql(ZHIJI_V5_SCHEMA_MIGRATION_STATEMENTS);
+const v5MigratedObjects: Record<string, string> = {
+  ...v4MigratedObjects,
+  ...v5MigrationObjects,
+};
+const v5DirectObjects: Record<string, string> = {
+  ...v4DirectObjects,
+  ...v5MigrationObjects,
+};
 
 export const ZHIJI_SCHEMA_OBJECT_SQL_VARIANTS = {
   0: Object.fromEntries(
@@ -561,7 +611,13 @@ export const ZHIJI_SCHEMA_OBJECT_SQL_VARIANTS = {
       ? [v4MigratedObjects[name], v4DirectObjects[name]]
       : [v4MigratedObjects[name]],
   ])),
-} as const satisfies Readonly<Record<0 | 1 | 2 | 3 | 4, Readonly<Record<string, readonly string[]>>>>;
+  5: Object.fromEntries(Object.keys(v5MigratedObjects).map((name) => [
+    name,
+    name === "career_contacts" || name === "career_tasks"
+      ? [v5MigratedObjects[name], v5DirectObjects[name]]
+      : [v5MigratedObjects[name]],
+  ])),
+} as const satisfies Readonly<Record<0 | 1 | 2 | 3 | 4 | 5, Readonly<Record<string, readonly string[]>>>>;
 
 export const ZHIJI_SCHEMA_LINEAGES = {
   2: [
@@ -592,6 +648,16 @@ export const ZHIJI_SCHEMA_LINEAGES = {
     {
       contactsSql: v4DirectObjects.career_contacts,
       tasksSql: v4DirectObjects.career_tasks,
+    },
+  ],
+  5: [
+    {
+      contactsSql: v5MigratedObjects.career_contacts,
+      tasksSql: v5MigratedObjects.career_tasks,
+    },
+    {
+      contactsSql: v5DirectObjects.career_contacts,
+      tasksSql: v5DirectObjects.career_tasks,
     },
   ],
 } as const;
@@ -640,6 +706,11 @@ export const zhijiSchema: LocalDatabaseSchema = {
       version: 4,
       description: ZHIJI_V4_MIGRATION_NAME,
       sql: statementsSql(ZHIJI_V4_SCHEMA_MIGRATION_STATEMENTS),
+    },
+    {
+      version: 5,
+      description: ZHIJI_V5_MIGRATION_NAME,
+      sql: statementsSql(ZHIJI_V5_SCHEMA_MIGRATION_STATEMENTS),
     },
   ],
   seedSql: ZHIJI_STRUCTURAL_SEED_SQL,

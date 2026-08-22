@@ -301,6 +301,7 @@ export const CAREER_LEGACY_DEMO_RESOLUTION_STATEMENTS: readonly SqlStatement[] =
         AND (SELECT COUNT(*) FROM career_contact_interactions) = 0
         AND (SELECT COUNT(*) FROM career_lifecycle_events) = 0
         AND (SELECT COUNT(*) FROM career_core_write_operations) = 0
+        AND (SELECT COUNT(*) FROM career_write_operations) = 0
         AND (SELECT COUNT(*) FROM career_materials) = 3
         AND (SELECT COUNT(DISTINCT name) FROM career_materials) = 3
         AND NOT EXISTS (
