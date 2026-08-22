@@ -23,6 +23,7 @@ export type ReviewSuspension = Pick<
 const DAY_MS = 86_400_000;
 const MANAGED_SUSPENSION_REASONS = new Set([
   "missing_explanation",
+  "lexeme_saved",
   "lexeme_known",
   "lexeme_ignored",
 ]);
@@ -112,7 +113,7 @@ export function applyDailyNewLimit(
 }
 
 export function lexemeStatusSuspendsReview(status: Lexeme["status"]): boolean {
-  return status === "known" || status === "ignored";
+  return status !== "learning";
 }
 
 export function hasUsefulEnglishExplanation(...values: readonly string[]): boolean {

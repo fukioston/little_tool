@@ -587,7 +587,7 @@ test("status reconciliation covers active, managed, unmanaged, missing-card and 
   }
 
   for (const [target, expectedReason] of [
-    ["saved", null],
+    ["saved", "lexeme_saved"],
     ["learning", null],
     ["known", "lexeme_known"],
     ["ignored", "lexeme_ignored"],
@@ -622,7 +622,7 @@ test("status reconciliation covers active, managed, unmanaged, missing-card and 
       expected,
     );
     assert.equal(receipt.after.reviewCard.state, "suspended");
-    assert.equal(receipt.after.reviewCard.suspended_reason, "missing_explanation");
+    assert.equal(receipt.after.reviewCard.suspended_reason, "lexeme_saved");
   } finally {
     missingExplanation.database.close();
   }
@@ -637,9 +637,23 @@ test("status reconciliation covers active, managed, unmanaged, missing-card and 
   try {
     const expected = await managed.service.loadVocabLexemeExpectedState("lexeme_fixture");
     const receipt = await managed.service.prepareVocabLexemeStatusSet("saved", expected);
-    assert.equal(receipt.after.reviewCard.state, "relearning");
-    assert.equal(receipt.after.reviewCard.suspended_from_state, null);
-    assert.equal(receipt.after.reviewCard.suspended_reason, null);
+    assert.equal(receipt.after.reviewCard.state, "suspended");
+    assert.equal(receipt.after.reviewCard.suspended_from_state, "relearning");
+    assert.equal(receipt.after.reviewCard.suspended_reason, "lexeme_saved");
+    assert.equal(
+      (await managed.service.commitVocabLexemeWrite(receipt)).outcome,
+      "saved",
+    );
+    const savedExpected = await managed.service.loadVocabLexemeExpectedState(
+      "lexeme_fixture",
+    );
+    const learned = await managed.service.prepareVocabLexemeStatusSet(
+      "learning",
+      savedExpected,
+    );
+    assert.equal(learned.after.reviewCard.state, "relearning");
+    assert.equal(learned.after.reviewCard.suspended_from_state, null);
+    assert.equal(learned.after.reviewCard.suspended_reason, null);
   } finally {
     managed.database.close();
   }
@@ -702,66 +716,70 @@ test("status and rating are one-winner CAS operations and neither overwrites the
   }
 });
 
-test("saved-learning status heartbeats make stale ratings lose in both commit orders", async () => {
-  for (const [fromStatus, toStatus] of [
-    ["saved", "learning"],
-    ["learning", "saved"],
-  ]) {
-    for (const firstWriter of ["status", "rating"]) {
-      const context = await fixture({
-        now: 2_150,
-        initialLexemes: [lexeme({ status: fromStatus })],
-      });
-      try {
-        globalThis.__vocabLexemeDefaultRuntime = context.runtime;
-        const expected = await context.service.loadVocabLexemeExpectedState(
-          "lexeme_fixture",
-        );
-        const status = await context.service.prepareVocabLexemeStatusSet(
-          toStatus,
-          expected,
-        );
-        const beforeCard = structuredClone(status.before.reviewCard);
-        const afterCard = structuredClone(status.after.reviewCard);
-        assert.ok(afterCard.updated_at > beforeCard.updated_at);
-        delete beforeCard.updated_at;
-        delete afterCard.updated_at;
-        assert.deepEqual(afterCard, beforeCard);
-        const rating = await store.prepareVocabReviewRating(
-          expected.reviewCard,
-          "good",
-        );
+test("saved-learning transitions reconcile and learning-to-saved makes stale ratings lose", async () => {
+  const optIn = await fixture({
+    now: 2_140,
+    initialLexemes: [lexeme({ status: "saved" })],
+    initialCards: [reviewCard({
+      state: "suspended",
+      suspended_from_state: "review",
+      suspended_reason: "lexeme_saved",
+    })],
+  });
+  try {
+    const expected = await optIn.service.loadVocabLexemeExpectedState("lexeme_fixture");
+    const learning = await optIn.service.prepareVocabLexemeStatusSet("learning", expected);
+    assert.equal(learning.after.reviewCard.state, "review");
+    assert.equal(learning.after.reviewCard.suspended_from_state, null);
+    assert.equal(learning.after.reviewCard.suspended_reason, null);
+    assert.equal((await optIn.service.commitVocabLexemeWrite(learning)).outcome, "saved");
+  } finally {
+    optIn.database.close();
+  }
 
-        if (firstWriter === "status") {
-          assert.equal(
-            (await context.service.commitVocabLexemeWrite(status)).outcome,
-            "saved",
-          );
-          await assert.rejects(
-            store.commitVocabReviewRating(rating),
-            (error) => error?.code === "VOCAB_REVIEW_CHANGED",
-          );
-          assert.equal(selectedLexeme(context.database).status, toStatus);
-          assert.equal(Number(context.database.selectValue(
-            "SELECT COUNT(*) FROM vocab_review_events WHERE id=?",
-            [rating.eventId],
-          )), 0);
-        } else {
-          assert.equal((await store.commitVocabReviewRating(rating)).status, "exact");
-          assert.equal(
-            (await context.service.commitVocabLexemeWrite(status)).outcome,
-            "changed",
-          );
-          assert.equal(selectedLexeme(context.database).status, fromStatus);
-          assert.equal(Number(context.database.selectValue(
-            "SELECT COUNT(*) FROM vocab_review_events WHERE id=?",
-            [rating.eventId],
-          )), 1);
-        }
-      } finally {
-        delete globalThis.__vocabLexemeDefaultRuntime;
-        context.database.close();
+  for (const firstWriter of ["status", "rating"]) {
+    const context = await fixture({
+      now: 2_150,
+      initialLexemes: [lexeme({ status: "learning" })],
+    });
+    try {
+      globalThis.__vocabLexemeDefaultRuntime = context.runtime;
+      const expected = await context.service.loadVocabLexemeExpectedState(
+        "lexeme_fixture",
+      );
+      const status = await context.service.prepareVocabLexemeStatusSet(
+        "saved",
+        expected,
+      );
+      assert.equal(status.after.reviewCard.state, "suspended");
+      assert.equal(status.after.reviewCard.suspended_from_state, "review");
+      assert.equal(status.after.reviewCard.suspended_reason, "lexeme_saved");
+      const rating = await store.prepareVocabReviewRating(
+        expected.reviewCard,
+        "good",
+      );
+
+      if (firstWriter === "status") {
+        assert.equal(
+          (await context.service.commitVocabLexemeWrite(status)).outcome,
+          "saved",
+        );
+        await assert.rejects(
+          store.commitVocabReviewRating(rating),
+          (error) => error?.code === "VOCAB_REVIEW_CHANGED",
+        );
+        assert.equal(selectedLexeme(context.database).status, "saved");
+      } else {
+        assert.equal((await store.commitVocabReviewRating(rating)).status, "exact");
+        assert.equal(
+          (await context.service.commitVocabLexemeWrite(status)).outcome,
+          "changed",
+        );
+        assert.equal(selectedLexeme(context.database).status, "learning");
       }
+    } finally {
+      delete globalThis.__vocabLexemeDefaultRuntime;
+      context.database.close();
     }
   }
 });

@@ -7,6 +7,7 @@ import {
   prepareVocabItemArchive,
   prepareVocabItemComplete,
   prepareVocabItemProgressCheckpoint,
+  prepareVocabItemReopen,
   prepareVocabItemRestore,
   VocabItemMutationError,
   type VocabItemWriteKind,
@@ -87,6 +88,7 @@ function reasonMessage(reason: unknown): string {
 
 function savedCopy(receipt: VocabItemWriteReceipt): string {
   if (receipt.kind === "complete") return "已确认标记为完成。";
+  if (receipt.kind === "reopen") return "已确认重置为未读。";
   if (receipt.kind === "archive") return "已确认移入归档。";
   if (receipt.kind === "restore") return "已确认恢复到资料库。";
   return "阅读位置已经安全保存在当前浏览器。";
@@ -116,6 +118,7 @@ function phaseForEntry(entry: VocabItemWriteEntry): Flow {
 
 function lifecycleLabel(kind: LifecycleKind): string {
   if (kind === "complete") return "标记完成";
+  if (kind === "reopen") return "重新开始";
   if (kind === "archive") return "移入归档";
   return "恢复到资料库";
 }
@@ -1312,6 +1315,8 @@ export function useVocabItemWriteFlow({
     }
     const prepare = kind === "complete"
       ? () => prepareVocabItemComplete(expected)
+      : kind === "reopen"
+        ? () => prepareVocabItemReopen(expected)
       : kind === "archive"
         ? () => prepareVocabItemArchive(expected)
         : () => prepareVocabItemRestore(expected);

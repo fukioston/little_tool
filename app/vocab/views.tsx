@@ -4,6 +4,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type FocusEvent as ReactFocusEvent, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type SyntheticEvent } from "react";
 import { createLocalFileObjectUrl, type LocalStorageEstimate } from "@/lib/local-db/files";
 import { adjacentSentence, formatDuration, formatShortDate, sentenceContext, wordAt, wordRanges } from "@/lib/vocab/content";
+import { subscribeVocabOutboundBlock } from "@/lib/vocab/lock";
 import { resolveReviewRound, restoreUndoneCardToRound, startReviewRound } from "@/lib/vocab/review-round";
 import {
   commitVocabReviewRating,
@@ -19,7 +20,7 @@ import {
   VocabReviewUncertainError,
 } from "@/lib/vocab/store";
 import { scheduleReviewV2 } from "@/lib/vocab/srs";
-import type { ContentBlock, Lexeme, LibraryItem, Occurrence, ReviewCard, ReviewRating, SelectionTarget, TranscriptSegment, VocabSettings, VocabSnapshot, VocabView } from "@/lib/vocab/types";
+import type { Bookmark, ContentBlock, Lexeme, LibraryItem, Occurrence, ReviewCard, ReviewRating, SelectionTarget, TranscriptSegment, VocabSettings, VocabSnapshot, VocabView } from "@/lib/vocab/types";
 import {
   shouldReportVocabReaderProgress,
   sameVocabLibraryItemFacts,
@@ -31,6 +32,12 @@ import {
 } from "./item-write-state";
 import { AnnotatedText, EmptyState, Metric, Toggle } from "./ui";
 import { VocabBackupFlow } from "./VocabBackupFlow";
+import {
+  sameVocabBookmarkIdentity,
+  sameVocabBookmarkRow,
+  vocabBookmarkIdentityKey,
+  type VocabBookmarkNoteDraft,
+} from "./engagement-write-state";
 import {
   VOCAB_REVIEW_RECOVERY_PREFIX,
   VOCAB_REVIEW_RECENT_UNDO_KEY,
@@ -136,12 +143,79 @@ export function LibraryView({ items, itemWriteLocked, itemWriteBusy, itemWriteSt
     {visible.length ? <div className="sc-library-grid">{visible.map((item,index) => <article className="sc-library-card" key={item.id}><button className="sc-card-main" onClick={() => onOpen(item)}><div className={`sc-cover cover-${index % 4 + 1}`}><span>{item.kind === "article" ? "ARTICLE" : "PODCAST"}</span><strong>{item.title.slice(0,1)}</strong><i>{Math.round(item.progress * 100)}%</i></div><div className="sc-card-copy"><span>{item.source}</span><h2>{item.title}</h2><p>{item.description}</p><footer><small>{item.author || formatShortDate(item.published_at)}</small><b>{item.kind === "article" ? "阅读" : formatKnownVocabDuration(item.duration_ms)} · {Math.round(item.progress * 100)}%</b></footer></div></button><button className="sc-card-menu" disabled={itemWriteLocked || itemWriteBusy} aria-busy={itemWriteBusy || undefined} aria-describedby={itemWriteStatus ? "sc-library-item-write-status" : undefined} onClick={(event) => onArchive(item, event.currentTarget)} aria-label={item.status === "archived" ? "恢复到资料库" : "移入归档"}>{item.status === "archived" ? "恢复" : "归档"}</button></article>)}</div> : <EmptyState title="没有找到内容" copy="换一个搜索词，或带回新的英文文章与播客。" action={<button onClick={onImport}>导入内容</button>} />}</div>;
 }
 
-export function ReaderView({ item, blocks, occurrences, bookmarks, itemWriteLocked, itemWriteBusy, itemWriteStatus, engagementWriteLocked, engagementWriteBusy, engagementWriteStatus, onSelect, onBack, onProgress, onFinish, onBookmark, onStudyActivity }: { item: LibraryItem | null; blocks: ContentBlock[]; occurrences: Occurrence[]; bookmarks: VocabSnapshot["bookmarks"]; itemWriteLocked: boolean; itemWriteBusy: boolean; itemWriteStatus: string; engagementWriteLocked: boolean; engagementWriteBusy: boolean; engagementWriteStatus: string; onSelect: (target: SelectionTarget) => void; onBack: () => void; onProgress: (item: LibraryItem, progress: number) => unknown; onFinish: (item: LibraryItem, trigger: HTMLButtonElement) => void; onBookmark: (item: LibraryItem, block: ContentBlock | undefined, trigger: HTMLButtonElement) => void; onStudyActivity: (input: VocabStudyActivitySlice) => void }) {
+function BookmarkEntry({ bookmark, draft, locked, busy, onJump, onDraft, onDiscardDraft, onKeepDeletedDraft, onNote, onDelete }: Readonly<{
+  bookmark: Bookmark | null;
+  draft: VocabBookmarkNoteDraft | null;
+  locked: boolean;
+  busy: boolean;
+  onJump: (bookmark: Bookmark) => void;
+  onDraft: (bookmark: Bookmark, note: string) => void;
+  onDiscardDraft: (bookmark: Bookmark, trigger: HTMLButtonElement) => void;
+  onKeepDeletedDraft: (bookmark: Bookmark, trigger: HTMLButtonElement) => void;
+  onNote: (bookmark: Bookmark, note: string, trigger: HTMLButtonElement) => void;
+  onDelete: (bookmark: Bookmark, trigger: HTMLButtonElement) => void;
+}>) {
+  const row = bookmark ?? draft?.baseline;
+  if (!row) return null;
+  const deleted = bookmark === null;
+  const changed = Boolean(
+    bookmark && draft?.observed &&
+    !sameVocabBookmarkRow(draft.baseline, draft.observed),
+  );
+  const conflict = deleted || changed;
+  const note = draft?.note ?? row.note;
+  return <li>
+    <button type="button" className="sc-bookmark-jump" disabled={deleted} onClick={() => bookmark && onJump(bookmark)}>
+      <b>{deleted ? `已删除 · ${row.label || "未命名位置"}` : row.label || "未命名位置"}</b><small>{row.locator}</small>
+    </button>
+    <label><span>书签笔记</span><textarea value={note} disabled={busy} maxLength={65_536} onChange={(event) => onDraft(row, event.target.value)} placeholder="给这个位置留一句话"/>{deleted ? <small className="sc-bookmark-conflict" role="alert">这条书签已被另一页删除或不在恢复后的词库中；当前草稿仍保留在本页。</small> : changed && <small className="sc-bookmark-conflict" role="alert">另一页已修改这条书签；当前草稿仍与原书签成对保留。采用最新内容后可继续操作。</small>}{deleted && draft?.retainedAfterDelete && <small className="sc-bookmark-retained" role="status">已选择继续保留草稿；复制完成后仍可采用删除。</small>}</label>
+    <div>
+      {deleted && <><button type="button" disabled={busy} onClick={(event) => onKeepDeletedDraft(row, event.currentTarget)}>保留草稿</button><button type="button" className="danger" disabled={busy} onClick={(event) => onDiscardDraft(row, event.currentTarget)}>采用删除</button></>}
+      {changed && <button type="button" disabled={busy} onClick={(event) => onDiscardDraft(row, event.currentTarget)}>采用最新内容</button>}
+      {!conflict && <button type="button" disabled={locked || busy || !draft || note === row.note} onClick={(event) => onNote(row, note, event.currentTarget)}>保存笔记</button>}
+      {!conflict && <button type="button" className="danger" disabled={locked || busy} onClick={(event) => {
+        if (window.confirm("删除这个书签？笔记也会一并删除。")) {
+          onDelete(row, event.currentTarget);
+        }
+      }}>删除</button>
+      }
+    </div>
+  </li>;
+}
+
+function BookmarkPanel({ itemId, bookmarks, drafts, locked, busy, onJump, onDraft, onDiscardDraft, onKeepDeletedDraft, onNote, onDelete }: Readonly<{
+  itemId: string;
+  bookmarks: readonly Bookmark[];
+  drafts: readonly VocabBookmarkNoteDraft[];
+  locked: boolean;
+  busy: boolean;
+  onJump: (bookmark: Bookmark) => void;
+  onDraft: (bookmark: Bookmark, note: string) => void;
+  onDiscardDraft: (bookmark: Bookmark, trigger: HTMLButtonElement) => void;
+  onKeepDeletedDraft: (bookmark: Bookmark, trigger: HTMLButtonElement) => void;
+  onNote: (bookmark: Bookmark, note: string, trigger: HTMLButtonElement) => void;
+  onDelete: (bookmark: Bookmark, trigger: HTMLButtonElement) => void;
+}>) {
+  const itemDrafts = drafts.filter((draft) => draft.baseline.item_id === itemId);
+  const missingDrafts = itemDrafts.filter((draft) =>
+    !bookmarks.some((bookmark) =>
+      sameVocabBookmarkIdentity(draft.baseline, bookmark)
+    )
+  );
+  if (bookmarks.length === 0 && missingDrafts.length === 0) return null;
+  return <section className="sc-bookmark-panel" data-bookmark-list={itemId} aria-labelledby={`sc-bookmark-panel-title-${itemId}`}>
+    <header><h2 id={`sc-bookmark-panel-title-${itemId}`} tabIndex={-1}>书签</h2><span>{bookmarks.length}</span></header>
+    <ul>{bookmarks.map((bookmark) => <BookmarkEntry key={`live-${vocabBookmarkIdentityKey(bookmark)}`} bookmark={bookmark} draft={itemDrafts.find((draft) => sameVocabBookmarkIdentity(draft.baseline, bookmark)) ?? null} locked={locked} busy={busy} onJump={onJump} onDraft={onDraft} onDiscardDraft={onDiscardDraft} onKeepDeletedDraft={onKeepDeletedDraft} onNote={onNote} onDelete={onDelete}/>)}{missingDrafts.map((draft) => <BookmarkEntry key={`missing-${vocabBookmarkIdentityKey(draft.baseline)}`} bookmark={null} draft={draft} locked={locked} busy={busy} onJump={onJump} onDraft={onDraft} onDiscardDraft={onDiscardDraft} onKeepDeletedDraft={onKeepDeletedDraft} onNote={onNote} onDelete={onDelete}/>)}</ul>
+  </section>;
+}
+
+export function ReaderView({ item, blocks, occurrences, bookmarks, bookmarkDrafts, itemWriteLocked, itemWriteBusy, itemWriteStatus, engagementWriteLocked, engagementWriteBusy, engagementWriteStatus, onSelect, onBack, onProgress, onFinish, onBookmark, onBookmarkDraftChange, onBookmarkDraftDiscard, onBookmarkDraftKeep, onBookmarkNote, onBookmarkDelete, onStudyActivity }: { item: LibraryItem | null; blocks: ContentBlock[]; occurrences: Occurrence[]; bookmarks: VocabSnapshot["bookmarks"]; bookmarkDrafts: readonly VocabBookmarkNoteDraft[]; itemWriteLocked: boolean; itemWriteBusy: boolean; itemWriteStatus: string; engagementWriteLocked: boolean; engagementWriteBusy: boolean; engagementWriteStatus: string; onSelect: (target: SelectionTarget) => void; onBack: () => void; onProgress: (item: LibraryItem, progress: number) => unknown; onFinish: (item: LibraryItem, trigger: HTMLButtonElement) => void; onBookmark: (item: LibraryItem, block: ContentBlock | undefined, trigger: HTMLButtonElement) => void; onBookmarkDraftChange: (bookmark: Bookmark, note: string) => void; onBookmarkDraftDiscard: (bookmark: Bookmark, trigger: HTMLButtonElement) => void; onBookmarkDraftKeep: (bookmark: Bookmark, trigger: HTMLButtonElement) => void; onBookmarkNote: (bookmark: Bookmark, note: string, trigger: HTMLButtonElement) => void; onBookmarkDelete: (bookmark: Bookmark, trigger: HTMLButtonElement) => void; onStudyActivity: (input: VocabStudyActivitySlice) => void }) {
   const prose = useRef<HTMLDivElement>(null);
   const lastActivity = useRef(0);
   const lastSavedProgress = useRef(item?.progress ?? 0);
   const restoredItem = useRef<string | null>(null);
   const trackedItemId = item?.id ?? null;
+
   const articleBlocks = useMemo(() => blocks.filter((block) => block.item_id === trackedItemId), [blocks, trackedItemId]);
   const [currentBlockId, setCurrentBlockId] = useState<string | null>(null);
   const [displayProgress, setDisplayProgress] = useState(item?.progress ?? 0);
@@ -273,17 +347,27 @@ export function ReaderView({ item, blocks, occurrences, bookmarks, itemWriteLock
 
   if (!item) return <EmptyState title="还没有文章" copy="先从资料库导入一篇英文文章。"/>;
   const bookmarkBlock = articleBlocks.find((block) => block.id === currentBlockId) ?? articleBlocks[0];
-  return <div className="sc-reader-layout"><aside className="sc-reader-rail"><button onClick={onBack}>← 返回资料库</button><span>阅读位置</span><strong>{Math.round(displayProgress * 100)}%</strong><i><em style={{ height: `${displayProgress * 100}%` }}/></i><nav>{articleBlocks.filter((block) => block.kind === "heading").map((block,index) => <a href={`#${block.id}`} key={block.id}><b>{String(index + 1).padStart(2,"0")}</b>{block.text}</a>)}</nav></aside><article className="sc-reader"><header><div><span>{item.source || "LOCAL ARTICLE"}</span><i>·</i><span>{Math.max(1, Math.ceil(articleBlocks.reduce((sum,block) => sum + block.text.length,0)/900))} MIN READ</span></div><button disabled={engagementWriteLocked || engagementWriteBusy} aria-busy={engagementWriteBusy || undefined} aria-describedby={engagementWriteStatus ? "sc-reader-engagement-write-status" : undefined} onClick={(event) => onBookmark(item, bookmarkBlock, event.currentTarget)}>◇ {engagementWriteBusy ? "正在安全确认…" : "收藏当前位置"}</button></header>{engagementWriteStatus && <small id="sc-reader-engagement-write-status" className="sc-engagement-inline-status" role="status">{engagementWriteStatus}</small>}<h1>{item.title}</h1><p className="sc-deck">{item.description}</p><div className="sc-byline"><span>{(item.author || "拾").slice(0,1)}</span><div><strong>{item.author || "Local import"}</strong><small>{item.published_at || "刚刚导入"}</small></div><i/></div><div ref={prose} className="sc-prose">{articleBlocks.map((block) => {
+  const itemBookmarks = bookmarks.filter((bookmark) => bookmark.item_id === item.id);
+  const jumpToBookmark = (bookmark: Bookmark) => {
+    if (bookmark.locator === "top") {
+      window.scrollTo({ top: 0, behavior: "smooth" });
+      return;
+    }
+    const target = document.getElementById(bookmark.locator);
+    target?.scrollIntoView({ behavior: "smooth", block: "center" });
+    target?.focus({ preventScroll: true });
+  };
+  return <div className="sc-reader-layout"><aside className="sc-reader-rail"><button onClick={onBack}>← 返回资料库</button><span>阅读位置</span><strong>{Math.round(displayProgress * 100)}%</strong><i><em style={{ height: `${displayProgress * 100}%` }}/></i><nav>{articleBlocks.filter((block) => block.kind === "heading").map((block,index) => <a href={`#${block.id}`} key={block.id}><b>{String(index + 1).padStart(2,"0")}</b>{block.text}</a>)}</nav></aside><article className="sc-reader"><header><div><span>{item.source || "LOCAL ARTICLE"}</span><i>·</i><span>{Math.max(1, Math.ceil(articleBlocks.reduce((sum,block) => sum + block.text.length,0)/900))} MIN READ</span></div><button data-reader-bookmark-fallback disabled={engagementWriteLocked || engagementWriteBusy} aria-busy={engagementWriteBusy || undefined} aria-describedby={engagementWriteStatus ? "sc-reader-engagement-write-status" : undefined} onClick={(event) => onBookmark(item, bookmarkBlock, event.currentTarget)}>◇ {engagementWriteBusy ? "正在安全确认…" : "收藏当前位置"}</button></header>{engagementWriteStatus && <small id="sc-reader-engagement-write-status" className="sc-engagement-inline-status" role="status">{engagementWriteStatus}</small>}<BookmarkPanel itemId={item.id} bookmarks={itemBookmarks} drafts={bookmarkDrafts} locked={engagementWriteLocked} busy={engagementWriteBusy} onJump={jumpToBookmark} onDraft={onBookmarkDraftChange} onDiscardDraft={onBookmarkDraftDiscard} onKeepDeletedDraft={onBookmarkDraftKeep} onNote={onBookmarkNote} onDelete={onBookmarkDelete}/><h1>{item.title}</h1><p className="sc-deck">{item.description}</p><div className="sc-byline"><span>{(item.author || "拾").slice(0,1)}</span><div><strong>{item.author || "Local import"}</strong><small>{item.published_at || "刚刚导入"}</small></div><i/></div><div ref={prose} className="sc-prose">{articleBlocks.map((block) => {
       const words = wordRanges(block.text);
       const activeRange = keyboardWord?.blockId === block.id ? words[keyboardWord.index] : null;
       const body = <AnnotatedText text={block.text} ranges={occurrences.filter((entry) => entry.block_id === block.id)} activeRange={activeRange}/>;
       if (block.kind === "heading") return <h2 id={block.id} data-block-id={block.id} key={block.id} {...keyboardProps(block)}>{body}</h2>;
       if (block.kind === "quote") return <blockquote id={block.id} data-block-id={block.id} key={block.id} {...keyboardProps(block)}>{body}</blockquote>;
       return <p id={block.id} data-block-id={block.id} key={block.id} {...keyboardProps(block)}>{body}</p>;
-    })}</div><footer className="sc-reader-end"><span>拾</span><p>You reached the end.</p><button disabled={itemWriteLocked || itemWriteBusy || item.status === "complete" || item.status === "archived"} aria-busy={itemWriteBusy || undefined} aria-describedby={itemWriteStatus ? "sc-reader-item-write-status" : undefined} onClick={(event) => onFinish(item, event.currentTarget)}>{item.status === "complete" ? "已经读完" : itemWriteBusy ? "正在安全确认…" : "标记为读完"}</button>{itemWriteStatus && <small id="sc-reader-item-write-status" className="sc-item-inline-status" role="status">{itemWriteStatus}</small>}</footer></article><aside className="sc-reader-meta"><div><span>已拾词</span><strong>{occurrences.filter((entry) => entry.item_id === item.id).length}</strong></div><div><span>书签</span><strong>{bookmarks.filter((entry) => entry.item_id === item.id).length}</strong></div><p>点击一个词、拖选短语，或聚焦段落后用方向键和 Enter。AI 只会收到附近语境。</p></aside></div>;
+    })}</div><footer className="sc-reader-end"><span>拾</span><p>You reached the end.</p><button disabled={itemWriteLocked || itemWriteBusy || item.status === "archived"} aria-busy={itemWriteBusy || undefined} aria-describedby={itemWriteStatus ? "sc-reader-item-write-status" : undefined} onClick={(event) => onFinish(item, event.currentTarget)}>{itemWriteBusy ? "正在安全确认…" : item.status === "complete" ? "重新开始阅读" : "标记为读完"}</button>{itemWriteStatus && <small id="sc-reader-item-write-status" className="sc-item-inline-status" role="status">{itemWriteStatus}</small>}</footer></article><aside className="sc-reader-meta"><div><span>已拾词</span><strong>{occurrences.filter((entry) => entry.item_id === item.id).length}</strong></div><div><span>书签</span><strong>{bookmarks.filter((entry) => entry.item_id === item.id).length}</strong></div><p>点击一个词、拖选短语，或聚焦段落后用方向键和 Enter。AI 只会收到附近语境。</p></aside></div>;
 }
 
-export function PodcastView({ item, segments, occurrences, autoFollow, autoFollowWriteLocked, autoFollowWriteBusy, autoFollowStatus, itemWriteLocked, itemWritePermanentReadOnly, itemWriteBusy, itemWriteStatus, engagementWriteLocked, engagementWriteBusy, engagementWriteStatus, localLock, onAutoFollow, onSelect, onProgress, onFinish, onBookmark, onStudyActivity, onStudyActivityPendingChange }: { item: LibraryItem | null; segments: TranscriptSegment[]; occurrences: Occurrence[]; autoFollow: boolean; autoFollowWriteLocked: boolean; autoFollowWriteBusy: boolean; autoFollowStatus: string; itemWriteLocked: boolean; itemWritePermanentReadOnly: boolean; itemWriteBusy: boolean; itemWriteStatus: string; engagementWriteLocked: boolean; engagementWriteBusy: boolean; engagementWriteStatus: string; localLock: boolean; onAutoFollow: (value: boolean, trigger: HTMLButtonElement) => void; onSelect: (target: SelectionTarget) => void; onProgress: (item: LibraryItem, progress: number) => unknown; onFinish: (item: LibraryItem, trigger: HTMLButtonElement | null) => void; onBookmark: (item: LibraryItem, ms: number, label: string, trigger: HTMLButtonElement) => void; onStudyActivity: (input: VocabStudyActivitySlice) => void; onStudyActivityPendingChange: (pending: boolean) => void }) {
+export function PodcastView({ item, segments, occurrences, bookmarks, bookmarkDrafts, autoFollow, autoFollowWriteLocked, autoFollowWriteBusy, autoFollowStatus, itemWriteLocked, itemWritePermanentReadOnly, itemWriteBusy, itemWriteStatus, engagementWriteLocked, engagementWriteBusy, engagementWriteStatus, localLock, onAutoFollow, onSelect, onProgress, onFinish, onBookmark, onBookmarkDraftChange, onBookmarkDraftDiscard, onBookmarkDraftKeep, onBookmarkNote, onBookmarkDelete, onStudyActivity, onStudyActivityPendingChange }: { item: LibraryItem | null; segments: TranscriptSegment[]; occurrences: Occurrence[]; bookmarks: VocabSnapshot["bookmarks"]; bookmarkDrafts: readonly VocabBookmarkNoteDraft[]; autoFollow: boolean; autoFollowWriteLocked: boolean; autoFollowWriteBusy: boolean; autoFollowStatus: string; itemWriteLocked: boolean; itemWritePermanentReadOnly: boolean; itemWriteBusy: boolean; itemWriteStatus: string; engagementWriteLocked: boolean; engagementWriteBusy: boolean; engagementWriteStatus: string; localLock: boolean; onAutoFollow: (value: boolean, trigger: HTMLButtonElement) => void; onSelect: (target: SelectionTarget) => void; onProgress: (item: LibraryItem, progress: number) => unknown; onFinish: (item: LibraryItem, trigger: HTMLButtonElement | null) => void; onBookmark: (item: LibraryItem, ms: number, label: string, trigger: HTMLButtonElement) => void; onBookmarkDraftChange: (bookmark: Bookmark, note: string) => void; onBookmarkDraftDiscard: (bookmark: Bookmark, trigger: HTMLButtonElement) => void; onBookmarkDraftKeep: (bookmark: Bookmark, trigger: HTMLButtonElement) => void; onBookmarkNote: (bookmark: Bookmark, note: string, trigger: HTMLButtonElement) => void; onBookmarkDelete: (bookmark: Bookmark, trigger: HTMLButtonElement) => void; onStudyActivity: (input: VocabStudyActivitySlice) => void; onStudyActivityPendingChange: (pending: boolean) => void }) {
   const audio = useRef<HTMLAudioElement>(null);
   const activeRow = useRef<HTMLButtonElement>(null);
   const listenStartedAt = useRef<number | null>(null);
@@ -324,6 +408,14 @@ export function PodcastView({ item, segments, occurrences, autoFollow, autoFollo
   const canResumeLocally = autoFollow && followPaused;
   const followStatusId = "sc-podcast-follow-status";
   const trackedItemId = item?.id ?? null;
+
+  useEffect(() => subscribeVocabOutboundBlock(() => {
+    const player = audio.current;
+    if (!player) return;
+    player.pause();
+    player.removeAttribute("src");
+    player.load();
+  }), []);
 
   useEffect(() => {
     positionActivityRef.current = false;
@@ -499,7 +591,14 @@ export function PodcastView({ item, segments, occurrences, autoFollow, autoFollo
     itemWriteLocked,
     itemWriteBusy,
   );
-  return <div className="sc-podcast-page">{src && <audio ref={audio} src={src} preload="metadata" onLoadedMetadata={(event) => { const nextDuration=Number.isFinite(event.currentTarget.duration)?event.currentTarget.duration*1000:fallbackDuration;durationRef.current=nextDuration;setDurationMs(nextDuration);const restored=Math.min(nextDuration,Math.max(0,item.progress*nextDuration));currentMsRef.current=restored;event.currentTarget.currentTime=restored/1000;setCurrentMs(restored); }} onTimeUpdate={updateTime} onPlay={() => { terminalIntent.current=false;setTerminalRetry(false);setPlaying(true);startListen(); }} onPause={() => { setPlaying(false);commitListen();reportCurrentPosition(); }} onEnded={() => { terminalIntent.current=true;setTerminalRetry(true);setPlaying(false);commitListen();if(item.status!=="complete"&&item.status!=="archived")onFinish(item, null); }} onError={() => setMediaError("音频无法播放，来源可能已失效或格式不受支持。")}/>}<header className="sc-podcast-head"><div><span className="sc-eyebrow">LISTEN IN CONTEXT</span><h1>{item.title}</h1><p>{item.description}</p><div><b>{item.source}</b><span>{item.author}</span><span>{formatKnownVocabDuration(knownDuration)}</span></div></div><div className="sc-podcast-art"><i/><i/><i/><strong>声</strong></div></header><section className="sc-player" aria-label="音频播放器"><button className="sc-play" aria-label={playing?"暂停":"播放"} disabled={!src} onClick={() => { if (audio.current?.paused) void audio.current.play(); else audio.current?.pause(); }}>{playing ? "Ⅱ" : "▶"}</button><span>{formatDuration(currentMs)}</span><input type="range" aria-label="播放进度" aria-valuetext={`${formatDuration(currentMs)} / ${formatDuration(duration)}`} min={0} max={Math.max(1,duration)} value={Math.min(currentMs,duration)} onChange={(event) => seek(Number(event.target.value), "slider-input")} onPointerUp={reportCurrentPosition} onBlur={reportCurrentPosition}/><span>{formatDuration(duration)}</span><button className="sc-speed" aria-label={`播放速度 ${speed} 倍，点击切换`} onClick={() => { const next = speed >= 2 ? .75 : speed + .25; setSpeed(next); if (audio.current) audio.current.playbackRate = next; }}>{speed}×</button><button aria-label="收藏当前播放位置" disabled={engagementWriteLocked || engagementWriteBusy} aria-busy={engagementWriteBusy || undefined} aria-describedby={engagementWriteStatus ? "sc-podcast-engagement-write-status" : undefined} onClick={(event) => onBookmark(item,currentMs,active?.text.slice(0,24) ?? item.title,event.currentTarget)}>◇</button></section>{engagementWriteStatus && <div id="sc-podcast-engagement-write-status" className="sc-engagement-inline-status" role="status">{engagementWriteStatus}</div>}{item.status !== "complete" && item.status !== "archived" && <div className="sc-podcast-terminal-actions"><button type="button" disabled={!completeActionEnabled} aria-busy={itemWriteBusy || undefined} aria-describedby={itemWriteStatus ? "sc-podcast-item-write-status" : undefined} onClick={(event) => { setTerminalRetry(false);onFinish(item, event.currentTarget); }}>{itemWriteBusy ? "正在安全确认…" : terminalRetry ? "重新标记已听完" : "标记已听完"}</button></div>}{itemWriteStatus && <div id="sc-podcast-item-write-status" className="sc-item-inline-status" role="status">{itemWriteStatus}</div>}{itemWriteLocked && !itemWriteStatus && <div className="sc-item-inline-status" role="status">{itemWritePermanentReadOnly ? "当前只读开放；播放和字幕可用，位置只留在本页且不会用不安全的凭据写入。" : "当前位置先暂存在本页；安全操作结束后会再尝试保存。"}</div>}{mediaError && <div className="sc-inline-error" role="alert">{mediaError}</div>}{remoteBlocked ? <div className="sc-notice">本地锁阻止了远程音频请求。你仍可阅读字幕；关闭本地锁后才会连接音频来源。</div> : !src && <div className="sc-notice">当前单集没有可播放音频。英文字幕仍可阅读和选词。</div>}{!alignedTranscript && episodeSegments.length > 0 && <div className="sc-notice">这份纯文本字幕没有时间轴，因此不会伪装成同步字幕；你仍可逐段阅读和选词。</div>}<section className="sc-transcript-shell"><aside><span>本期字幕</span><strong>{episodeSegments.length}</strong><p>{alignedTranscript?"段":"段 · 未对齐"}</p><button type="button" className={follow ? "active" : ""} aria-pressed={follow} aria-busy={autoFollowWriteBusy || undefined} aria-describedby={autoFollowStatus ? followStatusId : undefined} disabled={!alignedTranscript || (autoFollowWriteLocked && !canResumeLocally)} onClick={(event) => { if (canResumeLocally) setFollowPaused(false); else { if (!autoFollow) setFollowPaused(false); onAutoFollow(!autoFollow, event.currentTarget); } }}>◎ {autoFollowWriteBusy ? "正在确认偏好…" : follow ? "正在跟随" : autoFollow ? "继续这次跟随" : "开启自动跟随"}</button>{autoFollowStatus && <small id={followStatusId} className="sc-podcast-follow-status" role="status">{autoFollowStatus}</small>}</aside><div className="sc-transcript" onWheel={() => { if (autoFollow) setFollowPaused(true); }}>{episodeSegments.length ? episodeSegments.map((segment,index) => { const words=wordRanges(segment.text);const activeRange=keyboardWord?.segmentId===segment.id?words[keyboardWord.index]:null;return <button ref={alignedTranscript&&index === activeIndex ? activeRow : undefined} key={segment.id} className={alignedTranscript&&index === activeIndex ? "active" : ""} aria-current={alignedTranscript&&index===activeIndex?"true":undefined} title="左右方向键选择单词，Enter 或 E 查看解释；Space 跳到此处" onFocus={()=>{if(words.length&&keyboardWord?.segmentId!==segment.id)setKeyboardWord({segmentId:segment.id,index:0});}} onKeyDown={(event)=>transcriptKey(segment,index,event)} onClick={() => { if (alignedTranscript) seek(segment.start_ms); }} onMouseUp={(event) => pick(segment,index,event)}><time>{alignedTranscript?formatDuration(segment.start_ms):"—"}</time><p><AnnotatedText text={segment.text} ranges={occurrences.filter((entry) => entry.segment_id === segment.id)} activeRange={activeRange}/></p>{segment.speaker && <small>{segment.speaker}</small>}</button>;}) : <EmptyState title="没有字幕" copy="导入 VTT、SRT、LRC 或纯文本后，字幕会显示在这里。"/>}</div></section></div>;
+  const itemBookmarks = bookmarks.filter((bookmark) => bookmark.item_id === item.id);
+  const jumpToBookmark = (bookmark: Bookmark) => {
+    const match = /^t:(\d+)$/.exec(bookmark.locator);
+    if (!match) return;
+    seek(Math.min(duration, Number(match[1])));
+    audio.current?.focus({ preventScroll: true });
+  };
+  return <div className="sc-podcast-page">{src && <audio ref={audio} src={src} preload="metadata" onLoadedMetadata={(event) => { const nextDuration=Number.isFinite(event.currentTarget.duration)?event.currentTarget.duration*1000:fallbackDuration;durationRef.current=nextDuration;setDurationMs(nextDuration);const restored=Math.min(nextDuration,Math.max(0,item.progress*nextDuration));currentMsRef.current=restored;event.currentTarget.currentTime=restored/1000;setCurrentMs(restored); }} onTimeUpdate={updateTime} onPlay={() => { terminalIntent.current=false;setTerminalRetry(false);setPlaying(true);startListen(); }} onPause={() => { setPlaying(false);commitListen();reportCurrentPosition(); }} onEnded={() => { terminalIntent.current=true;setTerminalRetry(true);setPlaying(false);commitListen();if(item.status!=="complete"&&item.status!=="archived")onFinish(item, null); }} onError={() => setMediaError("音频无法播放，来源可能已失效或格式不受支持。")}/>}<header className="sc-podcast-head"><div><span className="sc-eyebrow">LISTEN IN CONTEXT</span><h1>{item.title}</h1><p>{item.description}</p><div><b>{item.source}</b><span>{item.author}</span><span>{formatKnownVocabDuration(knownDuration)}</span></div></div><div className="sc-podcast-art"><i/><i/><i/><strong>声</strong></div></header><section className="sc-player" aria-label="音频播放器"><button className="sc-play" aria-label={playing?"暂停":"播放"} disabled={!src} onClick={() => { if (audio.current?.paused) void audio.current.play(); else audio.current?.pause(); }}>{playing ? "Ⅱ" : "▶"}</button><span>{formatDuration(currentMs)}</span><input type="range" aria-label="播放进度" aria-valuetext={`${formatDuration(currentMs)} / ${formatDuration(duration)}`} min={0} max={Math.max(1,duration)} value={Math.min(currentMs,duration)} onChange={(event) => seek(Number(event.target.value), "slider-input")} onPointerUp={reportCurrentPosition} onBlur={reportCurrentPosition}/><span>{formatDuration(duration)}</span><button className="sc-speed" aria-label={`播放速度 ${speed} 倍，点击切换`} onClick={() => { const next = speed >= 2 ? .75 : speed + .25; setSpeed(next); if (audio.current) audio.current.playbackRate = next; }}>{speed}×</button><button data-podcast-bookmark-fallback aria-label="收藏当前播放位置" disabled={engagementWriteLocked || engagementWriteBusy} aria-busy={engagementWriteBusy || undefined} aria-describedby={engagementWriteStatus ? "sc-podcast-engagement-write-status" : undefined} onClick={(event) => onBookmark(item,currentMs,active?.text.slice(0,24) ?? item.title,event.currentTarget)}>◇</button></section>{engagementWriteStatus && <div id="sc-podcast-engagement-write-status" className="sc-engagement-inline-status" role="status">{engagementWriteStatus}</div>}<BookmarkPanel itemId={item.id} bookmarks={itemBookmarks} drafts={bookmarkDrafts} locked={engagementWriteLocked} busy={engagementWriteBusy} onJump={jumpToBookmark} onDraft={onBookmarkDraftChange} onDiscardDraft={onBookmarkDraftDiscard} onKeepDeletedDraft={onBookmarkDraftKeep} onNote={onBookmarkNote} onDelete={onBookmarkDelete}/>{item.status !== "archived" && <div className="sc-podcast-terminal-actions"><button type="button" disabled={!completeActionEnabled} aria-busy={itemWriteBusy || undefined} aria-describedby={itemWriteStatus ? "sc-podcast-item-write-status" : undefined} onClick={(event) => { setTerminalRetry(false);onFinish(item, event.currentTarget); }}>{itemWriteBusy ? "正在安全确认…" : item.status === "complete" ? "重新开始收听" : terminalRetry ? "重新标记已听完" : "标记已听完"}</button></div>}{itemWriteStatus && <div id="sc-podcast-item-write-status" className="sc-item-inline-status" role="status">{itemWriteStatus}</div>}{itemWriteLocked && !itemWriteStatus && <div className="sc-item-inline-status" role="status">{itemWritePermanentReadOnly ? "当前只读开放；播放和字幕可用，位置只留在本页且不会用不安全的凭据写入。" : "当前位置先暂存在本页；安全操作结束后会再尝试保存。"}</div>}{mediaError && <div className="sc-inline-error" role="alert">{mediaError}</div>}{remoteBlocked ? <div className="sc-notice">本地锁阻止了远程音频请求。你仍可阅读字幕；关闭本地锁后才会连接音频来源。</div> : !src && <div className="sc-notice">当前单集没有可播放音频。英文字幕仍可阅读和选词。</div>}{!alignedTranscript && episodeSegments.length > 0 && <div className="sc-notice">这份纯文本字幕没有时间轴，因此不会伪装成同步字幕；你仍可逐段阅读和选词。</div>}<section className="sc-transcript-shell"><aside><span>本期字幕</span><strong>{episodeSegments.length}</strong><p>{alignedTranscript?"段":"段 · 未对齐"}</p><button type="button" className={follow ? "active" : ""} aria-pressed={follow} aria-busy={autoFollowWriteBusy || undefined} aria-describedby={autoFollowStatus ? followStatusId : undefined} disabled={!alignedTranscript || (autoFollowWriteLocked && !canResumeLocally)} onClick={(event) => { if (canResumeLocally) setFollowPaused(false); else { if (!autoFollow) setFollowPaused(false); onAutoFollow(!autoFollow, event.currentTarget); } }}>◎ {autoFollowWriteBusy ? "正在确认偏好…" : follow ? "正在跟随" : autoFollow ? "继续这次跟随" : "开启自动跟随"}</button>{autoFollowStatus && <small id={followStatusId} className="sc-podcast-follow-status" role="status">{autoFollowStatus}</small>}</aside><div className="sc-transcript" onWheel={() => { if (autoFollow) setFollowPaused(true); }}>{episodeSegments.length ? episodeSegments.map((segment,index) => { const words=wordRanges(segment.text);const activeRange=keyboardWord?.segmentId===segment.id?words[keyboardWord.index]:null;return <button ref={alignedTranscript&&index === activeIndex ? activeRow : undefined} key={segment.id} className={alignedTranscript&&index === activeIndex ? "active" : ""} aria-current={alignedTranscript&&index===activeIndex?"true":undefined} title="左右方向键选择单词，Enter 或 E 查看解释；Space 跳到此处" onFocus={()=>{if(words.length&&keyboardWord?.segmentId!==segment.id)setKeyboardWord({segmentId:segment.id,index:0});}} onKeyDown={(event)=>transcriptKey(segment,index,event)} onClick={() => { if (alignedTranscript) seek(segment.start_ms); }} onMouseUp={(event) => pick(segment,index,event)}><time>{alignedTranscript?formatDuration(segment.start_ms):"—"}</time><p><AnnotatedText text={segment.text} ranges={occurrences.filter((entry) => entry.segment_id === segment.id)} activeRange={activeRange}/></p>{segment.speaker && <small>{segment.speaker}</small>}</button>;}) : <EmptyState title="没有字幕" copy="导入 VTT、SRT、LRC 或纯文本后，字幕会显示在这里。"/>}</div></section></div>;
 }
 
 export function WordsView({
@@ -1400,6 +1499,7 @@ type SettingsViewProps = {
   databaseMutationLocked: boolean;
   backupExternalWriteInProgress: () => boolean;
   onBackupDatabaseOperationChange: (inProgress: boolean) => void;
+  onBackupActivationOutboundClaim: () => void;
   settingsWriteStatus: string;
   storage: LocalStorageEstimate | null;
   persistenceSupported: boolean;
@@ -1408,12 +1508,12 @@ type SettingsViewProps = {
   onToggle: (patch: Partial<VocabSettings>, trigger: HTMLButtonElement) => void;
   onDiscardDraft: () => void;
   onExport: () => Promise<string>;
-  onRestoreRefresh: () => Promise<void>;
+  onRestoreTrustedRefresh: () => Promise<void>;
   onPersist: () => Promise<boolean | null>;
   onTestAi: () => Promise<void>;
 };
 
-export function SettingsView({ settings, settingsDraftDirty, settingsWriteLocked, settingsWriteBusy, databaseMutationLocked, backupExternalWriteInProgress, onBackupDatabaseOperationChange, settingsWriteStatus, storage, persistenceSupported, onDraftChange, onDraftCommit, onToggle, onDiscardDraft, onExport, onRestoreRefresh, onPersist, onTestAi }: SettingsViewProps) {
+export function SettingsView({ settings, settingsDraftDirty, settingsWriteLocked, settingsWriteBusy, databaseMutationLocked, backupExternalWriteInProgress, onBackupDatabaseOperationChange, onBackupActivationOutboundClaim, settingsWriteStatus, storage, persistenceSupported, onDraftChange, onDraftCommit, onToggle, onDiscardDraft, onExport, onRestoreTrustedRefresh, onPersist, onTestAi }: SettingsViewProps) {
   const [message,setMessage]=useState("");
   const [busy,setBusy]=useState(false);
   const run=async(action:()=>Promise<string|void>,success:string)=>{setBusy(true);setMessage("");try{const result=await action();setMessage(result||success);}catch(error){setMessage(error instanceof Error?error.message:"操作失败");}finally{setBusy(false);}};
@@ -1434,7 +1534,7 @@ export function SettingsView({ settings, settingsDraftDirty, settingsWriteLocked
       </section>
       <section id="ai"><header><h2>AI 与隐私</h2><p>选词后会先显示准确字段说明；只有再点“解释这个词”才会发送。</p></header><Toggle label="默认显示简体中文说明" copy="英文释义始终优先" value={settings.chinese_explanation} disabled={settingsWriteLocked} describedBy={settingsWriteStatus ? settingsStatusId : undefined} onChange={(value, trigger)=>onToggle({chinese_explanation:value}, trigger)}/><Toggle label="本地锁" copy="阻止 URL、RSS、AI、转写与远程音频请求" value={settings.local_lock} disabled={settingsWriteLocked} describedBy={settingsWriteStatus ? settingsStatusId : undefined} onChange={(value, trigger)=>onToggle({local_lock:value}, trigger)}/><div className="sc-endpoint"><span><i className={settings.local_lock?"locked":""}/><b>DeepSeek · OpenAI compatible</b><small>{settings.local_lock?"本地锁已开启":"由服务端安全配置"}</small></span><button disabled={busy||settingsWriteLocked||settingsWriteBusy||settings.local_lock} onClick={()=>void run(onTestAi,"检测到服务端 AI 配置；这次检查没有发送文章或词语内容。")}>检查配置</button></div></section>
       <section id="review-settings"><header><h2>复习节奏</h2><p>这里只控制每天首次加入复习的新词，不会隐藏旧卡。</p></header><div className="sc-setting-row"><label htmlFor="sc-daily-limit">每日新词<small>0 只暂停新词；已到期、学习中和重新学习的词不受影响</small></label><input {...rangeProps} id="sc-daily-limit" type="range" min="0" max="30" value={settings.daily_new_limit} aria-valuetext={settings.daily_new_limit === 0 ? "暂停加入新词" : `每天最多 ${settings.daily_new_limit} 个新词`} onChange={(event)=>onDraftChange({daily_new_limit:Number(event.target.value)})}/><b>{settings.daily_new_limit === 0 ? "暂停" : `${settings.daily_new_limit} 个`}</b></div></section>
-      <section id="data"><header><h2>数据与备份</h2><p>完整备份包含 SQLite 数据与实际保存在拾词里的本地音频。</p></header><div className={`sc-storage-fact ${storage?.persisted===true?"persisted":""}`}><span><i /><b>{storage?.persisted===true?"浏览器已授予持久化保护":!persistenceSupported?"当前浏览器未提供持久化保护接口":storage===null?"正在读取存储状态":storage.persisted===false?"仍可能被浏览器清理":"保护状态暂时未知"}</b><small>{storage?`当前占用 ${formatStorageBytes(storage.usage)} · 可用约 ${formatStorageBytes(storage.available)}`:"正在读取当前浏览器的容量信息"}</small></span>{persistenceSupported&&storage?.persisted!==true&&<button disabled={busy || settingsWriteLocked || settingsWriteBusy || databaseMutationLocked} onClick={()=>void run(async()=>{const result=await onPersist();return result===true?"已获得浏览器持久化保护。":result===false?"浏览器暂未授予持久化保护，请保持定期备份。":"保护请求已完成，但浏览器暂时无法复查状态。";},"")}>请求保护</button>}</div><VocabBackupFlow controlsDisabled={busy || settingsWriteLocked || settingsWriteBusy || databaseMutationLocked} externalWriteInProgress={backupExternalWriteInProgress} onDatabaseOperationChange={onBackupDatabaseOperationChange} onExport={onExport} onRefreshActivated={onRestoreRefresh} onNotice={setMessage}/>{(settingsWriteLocked || settingsWriteBusy || databaseMutationLocked) && <p className="sc-settings-backup-lock" role="status">先核对完页面上方的设置或条目收据，并处理未保存的阅读位置，再开始备份或切换资料库。</p>}<p className="sc-data-note">备份是未加密的私人文件，不含 AI 密钥。请把它保存在受信任的位置；旧版拾词数据库不包含本地音频原件。</p></section>
+      <section id="data"><header><h2>数据与备份</h2><p>完整备份包含 SQLite 数据与实际保存在拾词里的本地音频。</p></header><div className={`sc-storage-fact ${storage?.persisted===true?"persisted":""}`}><span><i /><b>{storage?.persisted===true?"浏览器已授予持久化保护":!persistenceSupported?"当前浏览器未提供持久化保护接口":storage===null?"正在读取存储状态":storage.persisted===false?"仍可能被浏览器清理":"保护状态暂时未知"}</b><small>{storage?`当前占用 ${formatStorageBytes(storage.usage)} · 可用约 ${formatStorageBytes(storage.available)}`:"正在读取当前浏览器的容量信息"}</small></span>{persistenceSupported&&storage?.persisted!==true&&<button disabled={busy || settingsWriteLocked || settingsWriteBusy || databaseMutationLocked} onClick={()=>void run(async()=>{const result=await onPersist();return result===true?"已获得浏览器持久化保护。":result===false?"浏览器暂未授予持久化保护，请保持定期备份。":"保护请求已完成，但浏览器暂时无法复查状态。";},"")}>请求保护</button>}</div><VocabBackupFlow controlsDisabled={busy || settingsWriteLocked || settingsWriteBusy || databaseMutationLocked} externalWriteInProgress={backupExternalWriteInProgress} onDatabaseOperationChange={onBackupDatabaseOperationChange} onActivationOutboundClaim={onBackupActivationOutboundClaim} onExport={onExport} onRefreshTrustedCurrent={onRestoreTrustedRefresh} onNotice={setMessage}/>{(settingsWriteLocked || settingsWriteBusy || databaseMutationLocked) && <p className="sc-settings-backup-lock" role="status">先核对完页面上方的设置或条目收据，并处理未保存的阅读位置，再开始备份或切换资料库。</p>}<p className="sc-data-note">备份是未加密的私人文件，不含 AI 密钥。请把它保存在受信任的位置；旧版拾词数据库不包含本地音频原件。</p></section>
       {settingsWriteStatus&&<div id={settingsStatusId} className="sc-settings-safe-status" role="status"><span>{settingsWriteStatus}</span>{settingsDraftDirty&&<button type="button" disabled={settingsWriteBusy} onClick={onDiscardDraft}>放弃这次预览并读取最新设置</button>}</div>}
       {message&&<div className="sc-settings-message" role="status">{message}</div>}
     </div></div>

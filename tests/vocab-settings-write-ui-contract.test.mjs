@@ -452,6 +452,29 @@ test("privacy is fail-closed during every volatile or durable settings state", (
   if (!flushHelpers.vocabSettingsOutboundBlocked(false, true, false, false, 0, 0, true)) outbound += 1;
   assert.equal(outbound, 0, "a synchronously claimed operation blocks outbound work before React rerenders");
   assert.equal(flushHelpers.vocabSettingsOutboundBlocked(false, false, false, false, 0, 0), true);
+  assert.equal(
+    flushHelpers.vocabSettingsOutboundBlocked(false, true, false, false, 0, 0, false, true),
+    true,
+    "a stale/deferred whole bundle blocks outbound even while the displayed lock is false",
+  );
+  assert.equal(
+    flushHelpers.vocabSettingsOutboundBlocked(false, true, false, false, 0, 0, false, false, true),
+    true,
+    "a claimed restore remains an independent outbound latch",
+  );
+  assert.match(gate, /snapshotReadStatus !== "ready"/);
+  const changedRead = appSource.slice(
+    appSource.indexOf("if (settingsChanged)"),
+    appSource.indexOf("const nextSnapshot"),
+  );
+  assert.match(changedRead, /blockOutboundForUntrustedFacts\(\)/);
+  assert.match(changedRead, /setSettingsExternalPending\(true\)/);
+  assert.match(appSource, /subscribeVocabChanges\(\(\) => \{\s*blockOutboundForUntrustedFacts\(\)/);
+  assert.match(appSource, /const claimRestoreOutboundBarrier[\s\S]*?restoreOutboundBarrierRef\.current = true[\s\S]*?signalVocabOutboundBlock\(\)/);
+  assert.match(appSource, /const refreshTrustedCurrentAfterRestore[\s\S]*?initializeVocabDatabase[\s\S]*?result\.outcome !== "applied"[\s\S]*?releaseRestoreOutboundBarrier\(\)/);
+  assert.match(appSource, /signalVocabOutboundBlock\(\)/);
+  assert.match(overlaysSource, /subscribeVocabOutboundBlock[\s\S]*?healthOperation\.current\?\.abort[\s\S]*?operation\.current\?\.abort/);
+  assert.match(viewsSource, /subscribeVocabOutboundBlock[\s\S]*?player\.pause\(\)[\s\S]*?removeAttribute\("src"\)/);
   assert.match(appSource, /if \(effectiveLocalLock\) aiRequest\.current\?\.controller\.abort\(\)/);
   assert.equal((appSource.match(/if \(settingsOutboundBlocked\(\)\)/g) ?? []).length >= 3, true);
   assert.match(appSource, /<PodcastView[\s\S]*?localLock=\{effectiveLocalLock\}/);

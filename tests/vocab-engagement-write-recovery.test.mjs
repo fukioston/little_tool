@@ -599,6 +599,105 @@ test("successful commits inspect exact, replay without duplicates, and ignore br
   }
 });
 
+test("bookmark note and delete are durable, recover response loss, and reject a cross-tab stale peer", async () => {
+  const context = await fixture();
+  try {
+    const empty = await context.service.loadVocabBookmarkExpectedState(
+      "article_engagement",
+      "block:0",
+    );
+    const created = await context.service.prepareVocabBookmarkCreate({
+      itemId: "article_engagement",
+      locator: "block:0",
+      label: "Paragraph one",
+    }, empty);
+    assert.equal(
+      (await context.service.commitVocabEngagementWrite(created)).outcome,
+      "saved",
+    );
+
+    const beforeNote = await context.service.loadVocabBookmarkExpectedState(
+      "article_engagement",
+      "block:0",
+    );
+    const noted = await context.service.prepareVocabBookmarkNoteSet({
+      itemId: "article_engagement",
+      locator: "block:0",
+      bookmarkId: created.target.id,
+      note: "Review this contrast",
+    }, beforeNote);
+    context.state.throwAfterBatch = true;
+    context.state.failQueryAfterBatch = true;
+    assert.equal(
+      (await context.service.commitVocabEngagementWrite(noted)).outcome,
+      "outcome_uncertain",
+    );
+    assert.equal(
+      await context.service.inspectVocabEngagementWrite(noted),
+      "exact_saved",
+    );
+    assert.equal(bookmarkRows(context.database)[0].note, "Review this contrast");
+
+    const beforeRace = await context.service.loadVocabBookmarkExpectedState(
+      "article_engagement",
+      "block:0",
+    );
+    const peerService = store.createVocabEngagementStorageService(context.runtime);
+    const noteAgain = await context.service.prepareVocabBookmarkNoteSet({
+      itemId: "article_engagement",
+      locator: "block:0",
+      bookmarkId: created.target.id,
+      note: "Peer note",
+    }, beforeRace);
+    const remove = await peerService.prepareVocabBookmarkDelete({
+      itemId: "article_engagement",
+      locator: "block:0",
+      bookmarkId: created.target.id,
+    }, beforeRace);
+    const raced = await Promise.all([
+      context.service.commitVocabEngagementWrite(noteAgain),
+      peerService.commitVocabEngagementWrite(remove),
+    ]);
+    assert.deepEqual(
+      raced.map(({ outcome }) => outcome).sort(),
+      ["changed", "saved"],
+    );
+    const winner = raced[0].outcome === "saved" ? noteAgain : remove;
+    assert.equal(
+      await context.service.inspectVocabEngagementWrite(winner),
+      "exact_saved",
+    );
+    if (bookmarkRows(context.database).length > 0) {
+      const latest = await context.service.loadVocabBookmarkExpectedState(
+        "article_engagement",
+        "block:0",
+      );
+      const durableDelete = await context.service.prepareVocabBookmarkDelete({
+        itemId: "article_engagement",
+        locator: "block:0",
+        bookmarkId: created.target.id,
+      }, latest);
+      assert.equal(
+        (await context.service.commitVocabEngagementWrite(durableDelete)).outcome,
+        "saved",
+      );
+      assert.equal(
+        await context.service.inspectVocabEngagementWrite(durableDelete),
+        "exact_saved",
+      );
+    }
+    assert.deepEqual(bookmarkRows(context.database), []);
+    assert.equal(
+      context.state.broadcasts.some((reason) =>
+        reason === "bookmark-note-set" || reason === "bookmark-deleted"
+      ),
+      true,
+    );
+  } finally {
+    context.database.close();
+  }
+});
+
 test("same-view/cross-service bookmark race stores one row despite no natural-key UNIQUE", async () => {
   const context = await fixture();
   try {

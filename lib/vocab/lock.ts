@@ -1,5 +1,6 @@
 const VOCAB_LOCK_NAME = "private-ai-suite:vocab:database";
 const VOCAB_CHANNEL_NAME = "private-ai-suite:vocab:changes";
+const VOCAB_OUTBOUND_BLOCK_EVENT = "private-ai-suite:vocab:outbound-blocked";
 
 export type VocabChangeMessage = Readonly<{
   type: "vocab-changed";
@@ -103,4 +104,16 @@ export function subscribeVocabChanges(
   };
   channel.addEventListener("message", receive);
   return () => channel.removeEventListener("message", receive);
+}
+
+/** Synchronously stops same-tab network work while durable facts are untrusted. */
+export function signalVocabOutboundBlock(): void {
+  if (typeof window === "undefined") return;
+  window.dispatchEvent(new Event(VOCAB_OUTBOUND_BLOCK_EVENT));
+}
+
+export function subscribeVocabOutboundBlock(listener: () => void): () => void {
+  if (typeof window === "undefined") return () => undefined;
+  window.addEventListener(VOCAB_OUTBOUND_BLOCK_EVENT, listener);
+  return () => window.removeEventListener(VOCAB_OUTBOUND_BLOCK_EVENT, listener);
 }

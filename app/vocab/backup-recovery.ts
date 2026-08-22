@@ -74,6 +74,16 @@ export type VocabBackupRecoveryReadResult = Readonly<{
   storageUnavailable: boolean;
 }>;
 
+export function vocabBackupRecoveryRequiresOutboundBarrier(
+  result: VocabBackupRecoveryReadResult,
+): boolean {
+  return result.storageUnavailable || result.unreadableEntries.length > 0 ||
+    result.entries.some(({ ticket }) =>
+      ticket.kind === "refresh-only" ||
+      (ticket.kind === "candidate" && ticket.mode === "activation-check")
+    );
+}
+
 type StorageLike = Pick<
   Storage,
   "length" | "key" | "getItem" | "setItem" | "removeItem"

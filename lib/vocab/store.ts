@@ -258,6 +258,7 @@ export type VocabSettingsStorageRuntime = Readonly<{
 export type VocabItemWriteKind =
   | "progress-checkpoint"
   | "complete"
+  | "reopen"
   | "archive"
   | "restore";
 
@@ -282,12 +283,14 @@ type VocabItemReceiptBase<Kind extends VocabItemWriteKind> = Readonly<{
 export type VocabItemProgressCheckpointReceipt =
   VocabItemReceiptBase<"progress-checkpoint">;
 export type VocabItemCompleteReceipt = VocabItemReceiptBase<"complete">;
+export type VocabItemReopenReceipt = VocabItemReceiptBase<"reopen">;
 export type VocabItemArchiveReceipt = VocabItemReceiptBase<"archive">;
 export type VocabItemRestoreReceipt = VocabItemReceiptBase<"restore">;
 
 export type VocabItemWriteReceipt =
   | VocabItemProgressCheckpointReceipt
   | VocabItemCompleteReceipt
+  | VocabItemReopenReceipt
   | VocabItemArchiveReceipt
   | VocabItemRestoreReceipt;
 
@@ -519,6 +522,24 @@ export type VocabBookmarkCreateInput = Readonly<{
   label: string;
 }>;
 
+export type VocabBookmarkNoteSetInput = Readonly<{
+  itemId: string;
+  locator: string;
+  bookmarkId: string;
+  note: string;
+}>;
+
+export type VocabBookmarkDeleteInput = Readonly<{
+  itemId: string;
+  locator: string;
+  bookmarkId: string;
+}>;
+
+export type VocabBookmarkMutationInput =
+  | VocabBookmarkCreateInput
+  | VocabBookmarkNoteSetInput
+  | VocabBookmarkDeleteInput;
+
 export type VocabBookmarkExpectedState =
   VocabEngagementGenerationExpectation & Readonly<{
     item: LibraryItem;
@@ -550,7 +571,8 @@ export type VocabStudyActivityRow = Readonly<{
 }>;
 
 type VocabEngagementReceiptBase<
-  Kind extends "bookmark-create" | "study-activity-record",
+  Kind extends "bookmark-create" | "bookmark-note-set" | "bookmark-delete" |
+    "study-activity-record",
   Expected,
   Target,
 > = Readonly<{
@@ -573,6 +595,24 @@ export type VocabBookmarkCreateReceipt = VocabEngagementReceiptBase<
   projectionSha256: string;
 }>;
 
+export type VocabBookmarkNoteSetReceipt = VocabEngagementReceiptBase<
+  "bookmark-note-set",
+  VocabBookmarkExpectedState,
+  Bookmark
+> & Readonly<{
+  request: VocabBookmarkNoteSetInput;
+  projectionSha256: string;
+}>;
+
+export type VocabBookmarkDeleteReceipt = VocabEngagementReceiptBase<
+  "bookmark-delete",
+  VocabBookmarkExpectedState,
+  Bookmark
+> & Readonly<{
+  request: VocabBookmarkDeleteInput;
+  projectionSha256: string;
+}>;
+
 export type VocabStudyActivityRecordReceipt = VocabEngagementReceiptBase<
   "study-activity-record",
   VocabEngagementGenerationExpectation,
@@ -585,6 +625,8 @@ export type VocabStudyActivityRecordReceipt = VocabEngagementReceiptBase<
 
 export type VocabEngagementWriteReceipt =
   | VocabBookmarkCreateReceipt
+  | VocabBookmarkNoteSetReceipt
+  | VocabBookmarkDeleteReceipt
   | VocabStudyActivityRecordReceipt;
 
 export type VocabEngagementWriteInspection =
@@ -1509,7 +1551,7 @@ export async function loadVocabSnapshot(): Promise<VocabSnapshot> {
            SELECT id FROM vocab_occurrences
            WHERE lexeme_id=l.id ORDER BY created_at DESC LIMIT 1
          )
-         WHERE c.state!='suspended' AND l.status NOT IN ('known','ignored')
+         WHERE c.state!='suspended' AND l.status='learning'
          ORDER BY c.due_at`,
       ),
       rawQuery<VocabSnapshot["bookmarks"][number]>(
@@ -4378,6 +4420,7 @@ const VOCAB_ITEM_STATUSES: readonly LibraryItem["status"][] = [
 const VOCAB_ITEM_KINDS: readonly VocabItemWriteKind[] = [
   "progress-checkpoint",
   "complete",
+  "reopen",
   "archive",
   "restore",
 ];
@@ -4482,6 +4525,9 @@ function isVocabItemTransition(
     case "complete":
       return before.item.status !== "archived" &&
         after.item.status === "complete" && after.item.progress === 1;
+    case "reopen":
+      return before.item.status === "complete" &&
+        after.item.status === "unread" && after.item.progress === 0;
     case "archive":
       return before.item.status !== "archived" &&
         after.item.status === "archived" &&
@@ -4660,6 +4706,7 @@ function vocabItemBroadcastReason(kind: VocabItemWriteKind): string {
   switch (kind) {
     case "progress-checkpoint": return "item-progress-changed";
     case "complete": return "item-completed";
+    case "reopen": return "item-reopened";
     case "archive": return "item-archived";
     case "restore": return "item-restored";
   }
@@ -4742,6 +4789,9 @@ export function createVocabItemStorageService(
     if (kind === "complete" && expected.item.status === "archived") {
       throw vocabItemError("invalid_input", "请先恢复已归档条目，再标记完成。");
     }
+    if (kind === "reopen" && expected.item.status !== "complete") {
+      throw vocabItemError("invalid_input", "只能重新开始已完成的条目。");
+    }
     if (kind === "archive" && expected.item.status === "archived") {
       throw vocabItemError("invalid_input", "这个条目已经归档。");
     }
@@ -4775,6 +4825,10 @@ export function createVocabItemStorageService(
         case "complete":
           nextProgress = 1;
           status = "complete";
+          break;
+        case "reopen":
+          nextProgress = 0;
+          status = "unread";
           break;
         case "archive":
           nextProgress = expected.item.progress;
@@ -4956,6 +5010,8 @@ export function createVocabItemStorageService(
     ),
     prepareVocabItemComplete: (expected: VocabItemWriteSnapshot) =>
       prepareTransition<VocabItemCompleteReceipt>("complete", expected),
+    prepareVocabItemReopen: (expected: VocabItemWriteSnapshot) =>
+      prepareTransition<VocabItemReopenReceipt>("reopen", expected),
     prepareVocabItemArchive: (expected: VocabItemWriteSnapshot) =>
       prepareTransition<VocabItemArchiveReceipt>("archive", expected),
     prepareVocabItemRestore: (expected: VocabItemWriteSnapshot) =>
@@ -4973,6 +5029,8 @@ export const prepareVocabItemProgressCheckpoint =
   defaultVocabItemStorageService.prepareVocabItemProgressCheckpoint;
 export const prepareVocabItemComplete =
   defaultVocabItemStorageService.prepareVocabItemComplete;
+export const prepareVocabItemReopen =
+  defaultVocabItemStorageService.prepareVocabItemReopen;
 export const prepareVocabItemArchive =
   defaultVocabItemStorageService.prepareVocabItemArchive;
 export const prepareVocabItemRestore =
@@ -6089,6 +6147,30 @@ function isVocabBookmarkCreateInput(
     isVocabBookmarkLabel(input.label);
 }
 
+function isVocabBookmarkNoteSetInput(
+  value: unknown,
+): value is VocabBookmarkNoteSetInput {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const input = value as Partial<VocabBookmarkNoteSetInput>;
+  return settingsExactObjectKeys(value, [
+    "itemId", "locator", "bookmarkId", "note",
+  ]) && isSafeOpaqueReviewCardId(input.itemId) &&
+    isVocabBookmarkLocator(input.locator) &&
+    isSafeOpaqueReviewCardId(input.bookmarkId) &&
+    isVocabBookmarkNote(input.note);
+}
+
+function isVocabBookmarkDeleteInput(
+  value: unknown,
+): value is VocabBookmarkDeleteInput {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const input = value as Partial<VocabBookmarkDeleteInput>;
+  return settingsExactObjectKeys(value, ["itemId", "locator", "bookmarkId"]) &&
+    isSafeOpaqueReviewCardId(input.itemId) &&
+    isVocabBookmarkLocator(input.locator) &&
+    isSafeOpaqueReviewCardId(input.bookmarkId);
+}
+
 function isVocabStudyActivityRecordInput(
   value: unknown,
 ): value is VocabStudyActivityRecordInput {
@@ -6235,6 +6317,42 @@ function isVocabEngagementWriteReceiptUnchecked(
       target.item_id === request.itemId && target.locator === request.locator &&
       target.label === request.label && target.note === "" &&
       target.created_at > Math.max(expected.item.created_at, expected.item.updated_at);
+  }
+  if (receipt.kind === "bookmark-note-set") {
+    if (!settingsExactObjectKeys(value, [
+      "purpose", "version", "kind", "operationId", "generationId",
+      "generationSequence", "expected", "request", "target", "projectionSha256",
+    ])) return false;
+    const bookmarkReceipt = receipt as Partial<VocabBookmarkNoteSetReceipt>;
+    const expected = bookmarkReceipt.expected;
+    const request = bookmarkReceipt.request;
+    const target = bookmarkReceipt.target;
+    const before = expected?.bookmarks.find((row) => row.id === request?.bookmarkId);
+    return isVocabBookmarkExpectedState(expected) &&
+      isVocabBookmarkNoteSetInput(request) && isVocabBookmarkRow(target) &&
+      !!before && bookmarkReceipt.generationId === expected.generationId &&
+      bookmarkReceipt.generationSequence === expected.generationSequence &&
+      request.itemId === expected.item.id && request.locator === expected.locator &&
+      target.id === before.id && target.item_id === before.item_id &&
+      target.locator === before.locator && target.label === before.label &&
+      target.created_at === before.created_at && target.note === request.note;
+  }
+  if (receipt.kind === "bookmark-delete") {
+    if (!settingsExactObjectKeys(value, [
+      "purpose", "version", "kind", "operationId", "generationId",
+      "generationSequence", "expected", "request", "target", "projectionSha256",
+    ])) return false;
+    const bookmarkReceipt = receipt as Partial<VocabBookmarkDeleteReceipt>;
+    const expected = bookmarkReceipt.expected;
+    const request = bookmarkReceipt.request;
+    const target = bookmarkReceipt.target;
+    const before = expected?.bookmarks.find((row) => row.id === request?.bookmarkId);
+    return isVocabBookmarkExpectedState(expected) &&
+      isVocabBookmarkDeleteInput(request) && isVocabBookmarkRow(target) &&
+      !!before && sameSettingsProjection(before, target) &&
+      bookmarkReceipt.generationId === expected.generationId &&
+      bookmarkReceipt.generationSequence === expected.generationSequence &&
+      request.itemId === expected.item.id && request.locator === expected.locator;
   }
   if (receipt.kind === "study-activity-record") {
     if (!settingsExactObjectKeys(value, [
@@ -6468,7 +6586,10 @@ function withRequiredVocabEngagementWriteLock<Result>(
 function vocabEngagementBroadcastReason(
   kind: VocabEngagementWriteReceipt["kind"],
 ): string {
-  return kind === "bookmark-create" ? "bookmark-created" : "study-time-recorded";
+  if (kind === "bookmark-create") return "bookmark-created";
+  if (kind === "bookmark-note-set") return "bookmark-note-set";
+  if (kind === "bookmark-delete") return "bookmark-deleted";
+  return "study-time-recorded";
 }
 
 export function createVocabEngagementStorageService(
@@ -6618,6 +6739,109 @@ export function createVocabEngagementStorageService(
     });
   }
 
+  async function prepareBookmarkNoteSet(
+    inputValue: VocabBookmarkNoteSetInput,
+    expectedValue: VocabBookmarkExpectedState,
+  ): Promise<VocabBookmarkNoteSetReceipt> {
+    const input = cloneVocabEngagementChecked(
+      inputValue,
+      isVocabBookmarkNoteSetInput,
+      "书签笔记写入内容",
+    );
+    const expected = cloneVocabEngagementChecked(
+      expectedValue,
+      isVocabBookmarkExpectedState,
+      "书签读取快照",
+    );
+    if (input.itemId !== expected.item.id || input.locator !== expected.locator) {
+      throw vocabEngagementError("invalid_input", "书签笔记与读取快照不属于同一位置。");
+    }
+    const before = expected.bookmarks.find((row) => row.id === input.bookmarkId);
+    if (!before) {
+      throw vocabEngagementError("invalid_input", "书签笔记目标不在读取快照中。");
+    }
+    if (before.note === input.note) {
+      throw vocabEngagementError("invalid_input", "书签笔记没有变化。");
+    }
+    return prepareLocked(async () => {
+      const generation = await readVocabEngagementGeneration(runtime);
+      if (!sameSettingsProjection(generation, {
+        generationId: expected.generationId,
+        generationSequence: expected.generationSequence,
+      })) {
+        throw vocabEngagementError("changed", "书签所在数据库已经更换；没有准备写入。");
+      }
+      const current = await readVocabBookmarkExpectedState(
+        runtime, generation, input.itemId, input.locator,
+      );
+      if (!current || !sameSettingsProjection(current, expected)) {
+        throw vocabEngagementError("changed", "书签已经在别处变化；没有准备写入笔记。");
+      }
+      return sealVocabEngagementReceipt<VocabBookmarkNoteSetReceipt>({
+        purpose: "vocab-engagement-write",
+        version: 1,
+        kind: "bookmark-note-set",
+        operationId: generatedVocabEngagementId(
+          runtime, "vocab-engagement-operation",
+        ),
+        ...generation,
+        expected,
+        request: input,
+        target: { ...before, note: input.note },
+      });
+    });
+  }
+
+  async function prepareBookmarkDelete(
+    inputValue: VocabBookmarkDeleteInput,
+    expectedValue: VocabBookmarkExpectedState,
+  ): Promise<VocabBookmarkDeleteReceipt> {
+    const input = cloneVocabEngagementChecked(
+      inputValue,
+      isVocabBookmarkDeleteInput,
+      "书签删除内容",
+    );
+    const expected = cloneVocabEngagementChecked(
+      expectedValue,
+      isVocabBookmarkExpectedState,
+      "书签读取快照",
+    );
+    if (input.itemId !== expected.item.id || input.locator !== expected.locator) {
+      throw vocabEngagementError("invalid_input", "待删除书签与读取快照不属于同一位置。");
+    }
+    const before = expected.bookmarks.find((row) => row.id === input.bookmarkId);
+    if (!before) {
+      throw vocabEngagementError("invalid_input", "待删除书签不在读取快照中。");
+    }
+    return prepareLocked(async () => {
+      const generation = await readVocabEngagementGeneration(runtime);
+      if (!sameSettingsProjection(generation, {
+        generationId: expected.generationId,
+        generationSequence: expected.generationSequence,
+      })) {
+        throw vocabEngagementError("changed", "书签所在数据库已经更换；没有准备删除。");
+      }
+      const current = await readVocabBookmarkExpectedState(
+        runtime, generation, input.itemId, input.locator,
+      );
+      if (!current || !sameSettingsProjection(current, expected)) {
+        throw vocabEngagementError("changed", "书签已经在别处变化；没有准备删除。");
+      }
+      return sealVocabEngagementReceipt<VocabBookmarkDeleteReceipt>({
+        purpose: "vocab-engagement-write",
+        version: 1,
+        kind: "bookmark-delete",
+        operationId: generatedVocabEngagementId(
+          runtime, "vocab-engagement-operation",
+        ),
+        ...generation,
+        expected,
+        request: input,
+        target: before,
+      });
+    });
+  }
+
   async function prepareStudyActivityRecord(
     inputValue: VocabStudyActivityRecordInput,
     expectedValue: VocabEngagementGenerationExpectation,
@@ -6721,6 +6945,49 @@ export function createVocabEngagementStorageService(
         ? "expected"
         : "changed";
     }
+    if (receipt.kind === "bookmark-note-set") {
+      const [current, targetById] = await Promise.all([
+        readVocabBookmarkExpectedState(
+          runtime, generation, receipt.target.item_id, receipt.target.locator,
+        ),
+        readVocabBookmarkById(runtime, receipt.target.id),
+      ]);
+      if (!current || !sameSettingsProjection(current.item, receipt.expected.item)) {
+        return "changed";
+      }
+      const afterRows = receipt.expected.bookmarks.map((row) =>
+        row.id === receipt.target.id ? receipt.target : row
+      );
+      if (targetById && sameSettingsProjection(targetById, receipt.target) &&
+          sameSettingsProjection(current.bookmarks, afterRows)) {
+        return "exact_saved";
+      }
+      return sameSettingsProjection(current, receipt.expected)
+        ? "expected"
+        : "changed";
+    }
+    if (receipt.kind === "bookmark-delete") {
+      const [current, targetById] = await Promise.all([
+        readVocabBookmarkExpectedState(
+          runtime, generation, receipt.target.item_id, receipt.target.locator,
+        ),
+        readVocabBookmarkById(runtime, receipt.target.id),
+      ]);
+      if (!current || !sameSettingsProjection(current.item, receipt.expected.item)) {
+        return "changed";
+      }
+      const afterRows = receipt.expected.bookmarks.filter((row) =>
+        row.id !== receipt.target.id
+      );
+      if (targetById === null &&
+          sameSettingsProjection(current.bookmarks, afterRows)) {
+        return "exact_saved";
+      }
+      return targetById && sameSettingsProjection(targetById, receipt.target) &&
+          sameSettingsProjection(current, receipt.expected)
+        ? "expected"
+        : "changed";
+    }
     const target = await readVocabStudyActivityById(runtime, receipt.target.id);
     if (target && sameSettingsProjection(target, receipt.target)) {
       return "exact_saved";
@@ -6816,6 +7083,62 @@ export function createVocabEngagementStorageService(
     ];
   }
 
+  function bookmarkMutationReceiptStatements(
+    receipt: VocabBookmarkNoteSetReceipt | VocabBookmarkDeleteReceipt,
+  ): Statement[] {
+    const item = engagementItemRowPredicate(receipt.expected.item);
+    const bookmarks = bookmarkSetPredicate(receipt.expected);
+    const before = receipt.expected.bookmarks.find((row) =>
+      row.id === receipt.target.id
+    );
+    if (!before) {
+      throw vocabEngagementError(
+        "invalid_receipt",
+        "书签变更回执没有完整的旧行；没有改动资料。",
+        receipt,
+      );
+    }
+    const guard: Statement = {
+      sql: `INSERT INTO vocab_bookmarks(id,item_id,locator,label,note,created_at)
+        SELECT '__vocab_engagement_cas_abort__',NULL,'','','',0
+        WHERE NOT ((${item.sql}) AND (${bookmarks.sql}))`,
+      params: [...item.params, ...bookmarks.params],
+    };
+    if (receipt.kind === "bookmark-note-set") {
+      return [
+        guard,
+        {
+          sql: `UPDATE vocab_bookmarks SET note=? WHERE id IS ? AND item_id IS ?
+            AND locator IS ? AND label IS ? AND note IS ? AND created_at IS ?`,
+          params: [
+            receipt.target.note,
+            before.id,
+            before.item_id,
+            before.locator,
+            before.label,
+            before.note,
+            before.created_at,
+          ],
+        },
+      ];
+    }
+    return [
+      guard,
+      {
+        sql: `DELETE FROM vocab_bookmarks WHERE id IS ? AND item_id IS ?
+          AND locator IS ? AND label IS ? AND note IS ? AND created_at IS ?`,
+        params: [
+          before.id,
+          before.item_id,
+          before.locator,
+          before.label,
+          before.note,
+          before.created_at,
+        ],
+      },
+    ];
+  }
+
   function activityReceiptStatements(
     receipt: VocabStudyActivityRecordReceipt,
   ): Statement[] {
@@ -6845,9 +7168,13 @@ export function createVocabEngagementStorageService(
   }
 
   function receiptStatements(receipt: VocabEngagementWriteReceipt): Statement[] {
-    return receipt.kind === "bookmark-create"
-      ? bookmarkReceiptStatements(receipt)
-      : activityReceiptStatements(receipt);
+    if (receipt.kind === "bookmark-create") {
+      return bookmarkReceiptStatements(receipt);
+    }
+    if (receipt.kind === "bookmark-note-set" || receipt.kind === "bookmark-delete") {
+      return bookmarkMutationReceiptStatements(receipt);
+    }
+    return activityReceiptStatements(receipt);
   }
 
   async function inspectWrite(value: unknown): Promise<VocabEngagementWriteInspection> {
@@ -6948,6 +7275,8 @@ export function createVocabEngagementStorageService(
     loadVocabEngagementGenerationExpectation: loadGenerationExpectation,
     loadVocabBookmarkExpectedState: loadBookmarkExpectedState,
     prepareVocabBookmarkCreate: prepareBookmarkCreate,
+    prepareVocabBookmarkNoteSet: prepareBookmarkNoteSet,
+    prepareVocabBookmarkDelete: prepareBookmarkDelete,
     prepareVocabStudyActivityRecord: prepareStudyActivityRecord,
     inspectVocabEngagementWrite: inspectWrite,
     commitVocabEngagementWrite: commitWrite,
@@ -6963,6 +7292,10 @@ export const loadVocabBookmarkExpectedState =
   defaultVocabEngagementStorageService.loadVocabBookmarkExpectedState;
 export const prepareVocabBookmarkCreate =
   defaultVocabEngagementStorageService.prepareVocabBookmarkCreate;
+export const prepareVocabBookmarkNoteSet =
+  defaultVocabEngagementStorageService.prepareVocabBookmarkNoteSet;
+export const prepareVocabBookmarkDelete =
+  defaultVocabEngagementStorageService.prepareVocabBookmarkDelete;
 export const prepareVocabStudyActivityRecord =
   defaultVocabEngagementStorageService.prepareVocabStudyActivityRecord;
 export const inspectVocabEngagementWrite =

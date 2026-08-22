@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState, type ChangeEvent, type DragEvent } from "react";
 import { errorMessage, postJson } from "@/lib/vocab/api";
 import { VOCAB_AI_DISCLOSURE_BY_ACTION } from "@/lib/vocab/ai-payload";
+import { subscribeVocabOutboundBlock } from "@/lib/vocab/lock";
 import {
   normalizeArticleApi,
   normalizePodcastApi,
@@ -427,6 +428,11 @@ export function ImportWizard({ localLock, onClose, onImported }: { localLock: bo
       operation.current?.abort();
     };
   }, []);
+
+  useEffect(() => subscribeVocabOutboundBlock(() => {
+    healthOperation.current?.abort(new VocabLocalLockImportError());
+    operation.current?.abort(new VocabLocalLockImportError());
+  }), []);
 
   useEffect(() => {
     healthOperation.current?.abort();

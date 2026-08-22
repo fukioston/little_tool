@@ -460,6 +460,33 @@ test("complete normalizes legacy complete progress and cannot complete archived 
   }
 });
 
+test("reopen durably resets only a complete item and is replay-safe", async () => {
+  const context = await fixture({
+    now: 900,
+    initialItem: item({ status: "complete", progress: 1, updated_at: 800 }),
+  });
+  try {
+    const expected = await context.service.loadVocabItemExpectedState("article_fixture");
+    const receipt = await context.service.prepareVocabItemReopen(expected);
+    assert.equal(receipt.kind, "reopen");
+    assert.equal(receipt.after.item.status, "unread");
+    assert.equal(receipt.after.item.progress, 0);
+    assert.equal((await context.service.commitVocabItemWrite(receipt)).outcome, "saved");
+    assert.equal((await context.service.commitVocabItemWrite(receipt)).outcome, "already_saved");
+    assert.equal(await context.service.inspectVocabItemWrite(receipt), "exact_saved");
+    assert.equal(selectedItem(context.database).status, "unread");
+    assert.equal(selectedItem(context.database).progress, 0);
+    const reopened = await context.service.loadVocabItemExpectedState("article_fixture");
+    await assert.rejects(
+      context.service.prepareVocabItemReopen(reopened),
+      (error) => error instanceof store.VocabItemMutationError &&
+        error.code === "invalid_input",
+    );
+  } finally {
+    context.database.close();
+  }
+});
+
 test("archive preserves progress and restore derives all three lifecycle states", async () => {
   for (const [progress, restoredStatus] of [
     [0, "unread"],

@@ -94,8 +94,7 @@ export function vocabPodcastCompleteActionEnabled(
   itemWriteLocked: boolean,
   itemWriteBusy: boolean,
 ): boolean {
-  return status !== "complete" && status !== "archived" &&
-    !itemWriteLocked && !itemWriteBusy;
+  return status !== "archived" && !itemWriteLocked && !itemWriteBusy;
 }
 
 export function firstVocabItemRecoveryFocusTarget<T>(

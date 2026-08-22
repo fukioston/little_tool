@@ -67,7 +67,8 @@ const executableJournal = transpile(
   `const isVocabEngagementWriteReceipt = (value) => Boolean(
     value && typeof value === "object" &&
     value.purpose === "vocab-engagement-write" &&
-    (value.kind === "bookmark-create" || value.kind === "study-activity-record") &&
+    (value.kind === "bookmark-create" || value.kind === "bookmark-note-set" ||
+      value.kind === "bookmark-delete" || value.kind === "study-activity-record") &&
     /^vocab-engagement-operation-[a-z0-9-]+$/.test(value.operationId)
   );`,
 );
@@ -1216,6 +1217,102 @@ test("bookmark clicks bind the displayed whole read without loading on click", (
     viewsSource,
     /onBookmark\(item,currentMs,active\?\.text\.slice\(0,24\) \?\? item\.title,event\.currentTarget\)/,
   );
+});
+
+test("article and podcast expose durable bookmark jump, note, and safe delete controls", () => {
+  const mutation = appSource.slice(
+    appSource.indexOf("const startBookmarkMutationWrite = useCallback"),
+    appSource.indexOf("const queueStudyActivity = useCallback"),
+  );
+  assert.match(mutation, /displayedBookmark !== bookmark/);
+  assert.match(mutation, /itemExpected\.item !== item/);
+  assert.match(mutation, /startEngagementBookmarkMutation\(kind, input, expected, trigger\)/);
+  assert.doesNotMatch(mutation, /loadVocab|readVocabFacts|refresh\(/);
+  assert.match(flowSource, /const startBookmarkMutation = useCallback/);
+  assert.match(flowSource, /freezeVocabBookmarkMutationIntent\(kind, input, expected\)/);
+  assert.match(flowSource, /vocabBookmarkMutationReceiptMatchesIntent\(receipt, intent\)/);
+  assert.match(viewsSource, /function BookmarkPanel/);
+  assert.match(viewsSource, /document\.getElementById\(bookmark\.locator\)/);
+  assert.match(viewsSource, /\^t:\(\\d\+\)\$/);
+  assert.match(viewsSource, /window\.confirm\("删除这个书签？笔记也会一并删除。"\)/);
+  assert.match(appSource, /bookmarkNoteDraftsRef/);
+  assert.match(viewsSource, /bookmark: Bookmark \| null/);
+  assert.match(viewsSource, /这条书签已被另一页删除或不在恢复后的词库中/);
+  assert.match(viewsSource, /采用最新内容/);
+  assert.match(viewsSource, /保留草稿/);
+  assert.match(viewsSource, /采用删除/);
+  assert.match(flowSource, /\[data-bookmark-list\] h2, \[data-reader-bookmark-fallback\], \[data-podcast-bookmark-fallback\]/);
+  assert.match(viewsSource, /data-reader-bookmark-fallback/);
+  assert.match(viewsSource, /data-podcast-bookmark-fallback/);
+  assert.match(cssSource, /\.sc-bookmark-panel li>div button\{[^}]*min-height:44px/);
+  assert.match(cssSource, /@media\(max-width:700px\)\{\.sc-bookmark-panel li\{grid-template-columns:minmax\(0,1fr\)\}/);
+  assert.match(cssSource, /@media\(max-width:700px\)\{\.sc-bookmark-orphan-notice\{grid-template-columns:minmax\(0,1fr\)\}/);
+});
+
+test("bookmark draft registry keys same-id restore rows by full identity across edit, keep, adopt, and delete", () => {
+  const bookmark = {
+    id: "bookmark-a",
+    item_id: "item-a",
+    locator: "block-a",
+    label: "A",
+    note: "server",
+    created_at: 10,
+  };
+  const dirty = state.updateVocabBookmarkNoteDrafts([], bookmark, "local draft");
+  assert.equal(dirty.length, 1);
+  assert.equal(dirty[0].note, "local draft");
+
+  const deleted = state.reconcileVocabBookmarkNoteDrafts(dirty, []);
+  assert.equal(deleted.length, 1);
+  assert.equal(deleted[0].observed, null);
+  assert.equal(deleted[0].note, "local draft");
+
+  const restoredElsewhere = { ...bookmark, label: "restored row", note: "new server", created_at: 11 };
+  const restored = state.reconcileVocabBookmarkNoteDrafts(deleted, [restoredElsewhere]);
+  assert.equal(restored.length, 1);
+  assert.deepEqual(restored[0].baseline, bookmark);
+  assert.equal(restored[0].observed, null);
+
+  const independentlyEdited = state.updateVocabBookmarkNoteDrafts(
+    restored,
+    restoredElsewhere,
+    "new-row draft",
+  );
+  assert.equal(independentlyEdited.length, 2);
+  const oldDraft = independentlyEdited.find((draft) =>
+    state.sameVocabBookmarkIdentity(draft.baseline, bookmark)
+  );
+  const newDraft = independentlyEdited.find((draft) =>
+    state.sameVocabBookmarkIdentity(draft.baseline, restoredElsewhere)
+  );
+  assert.equal(oldDraft.note, "local draft");
+  assert.equal(newDraft.note, "new-row draft");
+  assert.notEqual(
+    state.vocabBookmarkIdentityKey(oldDraft.baseline),
+    state.vocabBookmarkIdentityKey(newDraft.baseline),
+  );
+
+  const keptOld = state.retainDeletedVocabBookmarkNoteDraft(independentlyEdited, bookmark);
+  assert.equal(keptOld.find((draft) => state.sameVocabBookmarkIdentity(draft.baseline, bookmark)).retainedAfterDelete, true);
+  assert.equal(keptOld.find((draft) => state.sameVocabBookmarkIdentity(draft.baseline, restoredElsewhere)).retainedAfterDelete, false);
+
+  const deletedNew = state.discardVocabBookmarkNoteDraft(keptOld, restoredElsewhere);
+  assert.equal(deletedNew.length, 1);
+  assert.equal(state.sameVocabBookmarkIdentity(deletedNew[0].baseline, bookmark), true);
+  const adoptedOld = state.discardVocabBookmarkNoteDraft(independentlyEdited, bookmark);
+  assert.equal(adoptedOld.length, 1);
+  assert.equal(state.sameVocabBookmarkIdentity(adoptedOld[0].baseline, restoredElsewhere), true);
+
+  const confirmed = state.reconcileVocabBookmarkNoteDrafts(dirty, [{ ...bookmark, note: "local draft" }]);
+  assert.deepEqual(confirmed, []);
+  const apply = appSource.slice(
+    appSource.indexOf('receipt.kind === "bookmark-delete"'),
+    appSource.indexOf("const day = result.snapshot.activity.find"),
+  );
+  assert.match(apply, /discardVocabBookmarkNoteDraft\([\s\S]*?receipt\.target/);
+  assert.doesNotMatch(apply, /baseline\.id !== receipt\.target\.id/);
+  assert.match(viewsSource, /vocabBookmarkIdentityKey\(draft\.baseline\)/);
+  assert.match(appSource, /beforeunload[\s\S]*?bookmarkNoteDrafts\.length/);
 });
 
 test("confirmed engagement applies through whole-read arbitration and cannot be rolled back", async () => {

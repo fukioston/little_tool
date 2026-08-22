@@ -184,7 +184,7 @@ async function createReviewCard() {
     source: "local",
     blocks: [{ kind: "paragraph", text: "Steady practice compounds." }],
   }, "paste");
-  await store.saveOccurrence({
+  const saved = await store.saveOccurrence({
     surface: "Steady",
     sentence: "Steady practice compounds.",
     before: "",
@@ -199,6 +199,7 @@ async function createReviewCard() {
       explanation_en: "Consistent and reliable.",
     },
   });
+  await store.updateLexemeStatus(saved.lexemeId, "learning");
   const snapshot = await store.loadVocabSnapshot();
   assert.equal(snapshot.reviewCards.length, 1);
   return snapshot.reviewCards[0];

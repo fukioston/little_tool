@@ -128,11 +128,20 @@ test("review suspension follows explanation availability without overriding manu
   assert.deepEqual(missing, {
     state: "suspended",
     suspended_from_state: "new",
-    suspended_reason: "missing_explanation",
+    suspended_reason: "lexeme_saved",
+  });
+  const stillSaved = srs.reconcileReviewSuspension(missing, "saved", true);
+  assert.deepEqual(stillSaved, missing, "saved never enters the active queue");
+  const learning = srs.reconcileReviewSuspension(stillSaved, "learning", true);
+  assert.deepEqual(learning, {
+    state: "new",
+    suspended_from_state: null,
+    suspended_reason: null,
   });
   assert.deepEqual(
-    srs.reconcileReviewSuspension(missing, "saved", true),
-    { state: "new", suspended_from_state: null, suspended_reason: null },
+    srs.reconcileReviewSuspension(learning, "saved", true),
+    { state: "suspended", suspended_from_state: "new", suspended_reason: "lexeme_saved" },
+    "learning to saved dynamically leaves the queue",
   );
   const manual = {
     state: "suspended",

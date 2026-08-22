@@ -1577,8 +1577,9 @@ test("Podcast explicit seek and visible completion retry stay display-bound", ()
   assert.match(podcast, /lastReportedPositionRef[\s\S]*?vocabPodcastPositionReportChanged\(last, currentItem, progress\)[\s\S]*?return/);
   assert.match(podcast, /onClick=\{\(event\) => \{ setTerminalRetry\(false\);onFinish\(item, event\.currentTarget\); \}\}/);
   assert.match(podcast, /重新标记已听完|标记已听完/);
-  assert.match(podcast, /item\.status !== "complete" && item\.status !== "archived" && <div className="sc-podcast-terminal-actions">/);
-  assert.equal(state.vocabPodcastCompleteActionEnabled("complete", false, false), false);
+  assert.match(podcast, /item\.status !== "archived" && <div className="sc-podcast-terminal-actions">/);
+  assert.match(podcast, /item\.status === "complete" \? "重新开始收听"/);
+  assert.equal(state.vocabPodcastCompleteActionEnabled("complete", false, false), true);
   assert.equal(state.vocabPodcastCompleteActionEnabled("archived", false, false), false);
 
   const oldDisplayed = item({ id: "podcast-a", kind: "podcast", duration_ms: 10_000 });
@@ -1608,6 +1609,9 @@ test("Podcast explicit seek and visible completion retry stay display-bound", ()
   assert.equal(completePrepareCalls, 1, "the visible CTA prepares once with the current displayed object");
   assert.match(cssSource, /\.sc-podcast-terminal-actions button\{[\s\S]*?min-height:44px/);
   assert.match(podcast, /itemWritePermanentReadOnly \? "当前只读开放[^"]+" : "当前位置先暂存在本页；安全操作结束后会再尝试保存。"/);
+  assert.match(flowSource, /kind === "reopen"[\s\S]*?prepareVocabItemReopen\(expected\)/);
+  assert.match(appSource, /item\.status === "complete" \? "reopen" : "complete"/);
+  assert.match(viewsSource, /item\.status === "complete" \? "重新开始阅读" : "标记为读完"/);
 
   const temporarilyLocked = {
     dirtyCount: 1,
@@ -1866,7 +1870,7 @@ test("snapshot read failure stays visible and storage clear makes a held receipt
   );
   assert.equal(state.vocabItemExitDecision(true, false), "block");
   assert.match(flowSource, /event\.key === null \|\| event\.key\.startsWith\(VOCAB_ITEM_WRITE_PREFIX\)/);
-  assert.match(appSource, /setSnapshotReadStatus\("stale"\);\s*setSnapshotReadError\(errorMessage\(reason\)\)/);
+  assert.match(appSource, /catch \(reason\) \{[\s\S]*?blockOutboundForUntrustedFacts\(errorMessage\(reason\)\)/);
   assert.match(appSource, /snapshotReadStatus === "stale"[\s\S]*?sc-snapshot-read-notice[\s\S]*?只重新读取/);
   assert.match(appSource, /externalWriteLocked: settingsDatabaseWriteLocked \|\|\s*snapshotReadStatus !== "ready"/);
   assert.match(appSource, /retryVocabFactsRead[\s\S]*?readVocabFacts\(\)[\s\S]*?\.sc-main h1/);

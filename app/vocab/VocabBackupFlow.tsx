@@ -55,8 +55,9 @@ type VocabBackupFlowProps = Readonly<{
   controlsDisabled?: boolean;
   externalWriteInProgress(): boolean;
   onDatabaseOperationChange?(inProgress: boolean): void;
+  onActivationOutboundClaim(): void;
   onExport(): Promise<string>;
-  onRefreshActivated(): Promise<void>;
+  onRefreshTrustedCurrent(): Promise<void>;
   onNotice(message: string): void;
 }>;
 
@@ -144,8 +145,9 @@ export function VocabBackupFlow({
   controlsDisabled = false,
   externalWriteInProgress,
   onDatabaseOperationChange,
+  onActivationOutboundClaim,
   onExport,
-  onRefreshActivated,
+  onRefreshTrustedCurrent,
   onNotice,
 }: VocabBackupFlowProps) {
   const [flow, setFlow] = useState<VocabBackupFlowState>({ phase: "idle" });
@@ -361,7 +363,7 @@ export function VocabBackupFlow({
     try {
       if (!await ensureCurrent(entry)) return;
       present({ phase: "refreshing", entry, message });
-      await onRefreshActivated();
+      await onRefreshTrustedCurrent();
       if (await removeEntry(entry)) {
         setFlow({ phase: "idle" });
         onNotice("备份已经启用，页面资料也已重新读取。");
@@ -423,6 +425,18 @@ export function VocabBackupFlow({
           message: "候选仍可核对；启用时会再次检查当前内容。请核对后再决定。",
         });
         return;
+      }
+      if (mode === "activation-check") {
+        try {
+          await onRefreshTrustedCurrent();
+        } catch {
+          present({
+            phase: "activation-check",
+            entry,
+            message: "已经确认候选没有启用，但当前完整资料尚未重新读到。继续时仍只会核对并重新读取。",
+          });
+          return;
+        }
       }
       const next = await transitionOrExplain(
         candidateTicket(receipt, "discard-only"),
@@ -526,6 +540,7 @@ export function VocabBackupFlow({
       entry.ticket.mode !== "review" ||
       operationRef.current || externalDatabaseWriteBlocked()
     ) return;
+    onActivationOutboundClaim();
     operationRef.current = true;
     try {
       onDatabaseOperationChange?.(true);
@@ -534,7 +549,10 @@ export function VocabBackupFlow({
         entry,
         "当前网址的浏览器存储暂时不能保存启用后的继续信息，因此没有启用。恢复存储后再试。",
       );
-      if (!checkingEntry) return;
+      if (!checkingEntry) {
+        await onRefreshTrustedCurrent().catch(() => undefined);
+        return;
+      }
       if (externalDatabaseWriteBlocked()) {
         const restoredEntry = await transitionOrExplain(
           candidateTicket(entry.ticket.receipt, "review"),
@@ -548,6 +566,7 @@ export function VocabBackupFlow({
             message: "另一笔数据库安全操作正在进行；这次没有启用备份，稍后仍可重新确认。",
           });
         }
+        await onRefreshTrustedCurrent().catch(() => undefined);
         return;
       }
       present({ phase: "activating", entry: checkingEntry });
@@ -560,6 +579,16 @@ export function VocabBackupFlow({
         );
       } catch (error) {
         if (error instanceof VocabCurrentGenerationChangedError) {
+          try {
+            await onRefreshTrustedCurrent();
+          } catch {
+            present({
+              phase: "activation-check",
+              entry: checkingEntry,
+              message: "已经确认这份候选没有覆盖当前词库，但当前完整资料尚未重新读到。继续时仍只会核对并重新读取。",
+            });
+            return;
+          }
           const next = await transitionOrExplain(
             candidateTicket(entry.ticket.receipt, "discard-only"),
             checkingEntry,
@@ -573,6 +602,7 @@ export function VocabBackupFlow({
             });
           }
         } else if (errorCode(error) === "INVALID_RECEIPT") {
+          await onRefreshTrustedCurrent().catch(() => undefined);
           markBackendRejected(checkingEntry);
         } else {
           const receipt = error instanceof VocabActivationUncertainError

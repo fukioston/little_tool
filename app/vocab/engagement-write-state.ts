@@ -1,12 +1,17 @@
 import type {
   VocabBookmarkCreateInput,
   VocabBookmarkCreateReceipt,
+  VocabBookmarkDeleteInput,
+  VocabBookmarkDeleteReceipt,
   VocabBookmarkExpectedState,
+  VocabBookmarkNoteSetInput,
+  VocabBookmarkNoteSetReceipt,
   VocabEngagementGenerationExpectation,
   VocabEngagementWriteReceipt,
   VocabPreparedStudyActivityInput,
   VocabStudyActivityRecordInput,
 } from "@/lib/vocab/store";
+import type { Bookmark } from "@/lib/vocab/types";
 
 export const VOCAB_ENGAGEMENT_ACTIVITY_MAX_SECONDS = 86_400;
 
@@ -27,6 +32,109 @@ export type VocabBookmarkIntent = Readonly<{
   input: VocabBookmarkCreateInput;
   expected: VocabBookmarkExpectedState;
 }>;
+
+export type VocabBookmarkMutationIntent = Readonly<{
+  kind: "bookmark-note-set" | "bookmark-delete";
+  input: VocabBookmarkNoteSetInput | VocabBookmarkDeleteInput;
+  expected: VocabBookmarkExpectedState;
+}>;
+
+export type VocabBookmarkNoteDraft = Readonly<{
+  baseline: Bookmark;
+  observed: Bookmark | null;
+  note: string;
+  retainedAfterDelete: boolean;
+}>;
+
+export function sameVocabBookmarkIdentity(
+  left: Bookmark,
+  right: Bookmark,
+): boolean {
+  return left.id === right.id && left.item_id === right.item_id &&
+    left.locator === right.locator && left.created_at === right.created_at;
+}
+
+export function vocabBookmarkIdentityKey(bookmark: Bookmark): string {
+  return JSON.stringify([
+    bookmark.id,
+    bookmark.item_id,
+    bookmark.locator,
+    bookmark.created_at,
+  ]);
+}
+
+export function sameVocabBookmarkRow(
+  left: Bookmark,
+  right: Bookmark,
+): boolean {
+  return sameVocabBookmarkIdentity(left, right) &&
+    left.label === right.label && left.note === right.note;
+}
+
+export function updateVocabBookmarkNoteDrafts(
+  drafts: readonly VocabBookmarkNoteDraft[],
+  bookmark: Bookmark,
+  note: string,
+): readonly VocabBookmarkNoteDraft[] {
+  const existing = drafts.find((draft) =>
+    sameVocabBookmarkIdentity(draft.baseline, bookmark)
+  );
+  if (!existing && note === bookmark.note) return drafts;
+  const next: VocabBookmarkNoteDraft = existing
+    ? { ...existing, note }
+    : {
+        baseline: { ...bookmark },
+        observed: { ...bookmark },
+        note,
+        retainedAfterDelete: false,
+      };
+  return [
+    ...drafts.filter((draft) =>
+      !sameVocabBookmarkIdentity(draft.baseline, bookmark)
+    ),
+    next,
+  ];
+}
+
+export function discardVocabBookmarkNoteDraft(
+  drafts: readonly VocabBookmarkNoteDraft[],
+  bookmark: Bookmark,
+): readonly VocabBookmarkNoteDraft[] {
+  return drafts.filter((draft) =>
+    !sameVocabBookmarkIdentity(draft.baseline, bookmark)
+  );
+}
+
+export function retainDeletedVocabBookmarkNoteDraft(
+  drafts: readonly VocabBookmarkNoteDraft[],
+  bookmark: Bookmark,
+): readonly VocabBookmarkNoteDraft[] {
+  return drafts.map((draft) =>
+    sameVocabBookmarkIdentity(draft.baseline, bookmark)
+      ? { ...draft, retainedAfterDelete: true }
+      : draft
+  );
+}
+
+export function reconcileVocabBookmarkNoteDrafts(
+  drafts: readonly VocabBookmarkNoteDraft[],
+  bookmarks: readonly Bookmark[],
+): readonly VocabBookmarkNoteDraft[] {
+  return drafts.flatMap((draft) => {
+    const observed = bookmarks.find((bookmark) =>
+      sameVocabBookmarkIdentity(bookmark, draft.baseline)
+    ) ?? null;
+    if (
+      observed && sameVocabBookmarkIdentity(draft.baseline, observed) &&
+      draft.note === observed.note
+    ) return [];
+    return [{
+      ...draft,
+      observed: observed ? { ...observed } : null,
+      retainedAfterDelete: observed ? false : draft.retainedAfterDelete,
+    }];
+  });
+}
 
 export type VocabEngagementPreparedIntentResult<Receipt> =
   | Readonly<{ outcome: "ready"; receipt: Receipt }>
@@ -153,6 +261,50 @@ export function vocabBookmarkReceiptMatchesIntent(
     exactKeys(receipt.target, [
       "id", "item_id", "locator", "label", "note", "created_at",
     ]);
+}
+
+export function freezeVocabBookmarkMutationIntent(
+  kind: VocabBookmarkMutationIntent["kind"],
+  input: VocabBookmarkMutationIntent["input"],
+  expected: VocabBookmarkExpectedState,
+): VocabBookmarkMutationIntent {
+  return {
+    kind,
+    input: cloneJsonValue(input, "书签变更输入"),
+    expected: cloneJsonValue(expected, "书签读取快照"),
+  };
+}
+
+export function vocabBookmarkMutationReceiptMatchesIntent(
+  receipt: VocabBookmarkNoteSetReceipt | VocabBookmarkDeleteReceipt,
+  intent: VocabBookmarkMutationIntent,
+): boolean {
+  if (
+    receipt.purpose !== "vocab-engagement-write" || receipt.version !== 1 ||
+    receipt.kind !== intent.kind ||
+    !sameJsonValue(receipt.request, intent.input) ||
+    !sameJsonValue(receipt.expected, intent.expected) ||
+    receipt.generationId !== intent.expected.generationId ||
+    receipt.generationSequence !== intent.expected.generationSequence ||
+    receipt.target.item_id !== intent.input.itemId ||
+    receipt.target.locator !== intent.input.locator ||
+    receipt.target.id !== intent.input.bookmarkId
+  ) return false;
+  const before = intent.expected.bookmarks.find((row) =>
+    row.id === intent.input.bookmarkId
+  );
+  if (!before || !exactKeys(receipt.target, [
+    "id", "item_id", "locator", "label", "note", "created_at",
+  ])) return false;
+  if (receipt.kind === "bookmark-delete") {
+    return sameJsonValue(receipt.target, before);
+  }
+  return receipt.target.id === before.id &&
+    receipt.target.item_id === before.item_id &&
+    receipt.target.locator === before.locator &&
+    receipt.target.label === before.label &&
+    receipt.target.created_at === before.created_at &&
+    receipt.target.note === receipt.request.note;
 }
 
 export function vocabEngagementLocalDay(

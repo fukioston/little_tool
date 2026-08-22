@@ -39,8 +39,8 @@ import {
   type VocabSettingsWriteReceipt,
   type VocabSettingsWriteSnapshot,
 } from "@/lib/vocab/store";
-import type { AiExplanation, Lexeme, LibraryItem, SelectionTarget, VocabSettings, VocabSnapshot, VocabView } from "@/lib/vocab/types";
-import { subscribeVocabChanges } from "@/lib/vocab/lock";
+import type { AiExplanation, Bookmark, Lexeme, LibraryItem, SelectionTarget, VocabSettings, VocabSnapshot, VocabView } from "@/lib/vocab/types";
+import { signalVocabOutboundBlock, subscribeVocabChanges } from "@/lib/vocab/lock";
 import { ContextPanel, ImportWizard, LexemeDraftExitDialog, WordDetail } from "./overlays";
 import { LibraryView, PodcastView, ReaderView, ReviewView, SettingsView, StatsView, TodayView, WordsView } from "./views";
 import { Loader, Logo } from "./ui";
@@ -77,6 +77,15 @@ import {
   type VocabEngagementApplyOutcome,
 } from "./VocabEngagementWriteFlow";
 import {
+  discardVocabBookmarkNoteDraft,
+  reconcileVocabBookmarkNoteDrafts,
+  retainDeletedVocabBookmarkNoteDraft,
+  sameVocabBookmarkIdentity,
+  updateVocabBookmarkNoteDrafts,
+  vocabBookmarkIdentityKey,
+  type VocabBookmarkNoteDraft,
+} from "./engagement-write-state";
+import {
   beginVocabLexemeEditorPreparation,
   bindVocabLexemeEditorReceipt,
   cancelVocabLexemeEditorPreparation,
@@ -94,6 +103,11 @@ import {
   type VocabLexemeBindingMap,
   type VocabLexemeNoteEditor,
 } from "./lexeme-write-state";
+import {
+  VOCAB_BACKUP_RECOVERY_PREFIX,
+  readVocabBackupRecoveryStorage,
+  vocabBackupRecoveryRequiresOutboundBarrier,
+} from "./backup-recovery";
 import {
   VOCAB_REVIEW_RECOVERY_PREFIX,
   readBrowserVocabReviewRecovery,
@@ -147,9 +161,12 @@ function vocabSettingsOutboundBlocked(
   unreadableCount: number,
   entryCount: number,
   operationInProgress = false,
+  factsUnavailable = false,
+  restoreOutboundBarrier = false,
 ) {
   return confirmedLocalLock || !journalLoaded || busy || storageUnavailable ||
-    unreadableCount > 0 || entryCount > 0 || operationInProgress;
+    unreadableCount > 0 || entryCount > 0 || operationInProgress ||
+    factsUnavailable || restoreOutboundBarrier;
 }
 
 function sameVocabSettings(left: VocabSettings, right: VocabSettings) {
@@ -337,8 +354,10 @@ export default function VocabApp() {
   const [itemRecoveryOpen, setItemRecoveryOpen] = useState(false);
   const [itemExternalPending, setItemExternalPending] = useState(false);
   const [engagementRecoveryOpen, setEngagementRecoveryOpen] = useState(false);
+  const [bookmarkNoteDrafts, setBookmarkNoteDrafts] = useState<readonly VocabBookmarkNoteDraft[]>([]);
   const [activeStudyActivityPending, setActiveStudyActivityPending] = useState(false);
   const [backupDatabaseOperation, setBackupDatabaseOperation] = useState(false);
+  const [restoreOutboundBarrier, setRestoreOutboundBarrier] = useState(true);
   const [lexemeRecoveryOpen, setLexemeRecoveryOpen] = useState(false);
   const [lexemeExternalPending, setLexemeExternalPending] = useState(false);
   const [lexemeWriteNotice, setLexemeWriteNotice] = useState("");
@@ -369,6 +388,7 @@ export default function VocabApp() {
   const selectionRef = useRef<SelectionTarget | null>(null);
   const aiSequence = useRef(0);
   const aiRequest = useRef<{ id: number; key: string; controller: AbortController } | null>(null);
+  const settingsHealthRequest = useRef<AbortController | null>(null);
   const explanationKey = useRef<string | null>(null);
   const wordSaveBusyRef = useRef(false);
   const pendingOccurrenceRef = useRef<PendingOccurrenceWrite | null>(null);
@@ -411,6 +431,9 @@ export default function VocabApp() {
   const itemExternalWriteGateRef = useRef<() => boolean>(() => true);
   const engagementExternalBarrierRef = useRef<() => boolean>(() => true);
   const backupDatabaseOperationRef = useRef(false);
+  const restoreOutboundBarrierRef = useRef(true);
+  const restoreRecoveryClearRef = useRef(false);
+  const bookmarkNoteDraftsRef = useRef<readonly VocabBookmarkNoteDraft[]>([]);
   const activeStudyActivityPendingRef = useRef(false);
   const settingsPrepareBindingRef = useRef<Readonly<{
     trigger: HTMLElement;
@@ -429,6 +452,7 @@ export default function VocabApp() {
   const itemRecoveryFocusFrame = useRef<number | null>(null);
   const engagementRecoveryOpenerRef = useRef<HTMLElement | null>(null);
   const engagementRecoveryFocusFrame = useRef<number | null>(null);
+  const bookmarkDraftFocusFrame = useRef<number | null>(null);
   const snapshotReadFocusFrame = useRef<number | null>(null);
   const itemExitOpenerRef = useRef<HTMLElement | null>(null);
   const itemExitFocusFrame = useRef<number | null>(null);
@@ -597,6 +621,18 @@ export default function VocabApp() {
     if (engagementRecoveryFocusFrame.current !== null) {
       window.cancelAnimationFrame(engagementRecoveryFocusFrame.current);
     }
+    if (bookmarkDraftFocusFrame.current !== null) {
+      window.cancelAnimationFrame(bookmarkDraftFocusFrame.current);
+    }
+  }, []);
+
+  const reconcileBookmarkDrafts = useCallback((bookmarks: readonly Bookmark[]) => {
+    const next = reconcileVocabBookmarkNoteDrafts(
+      bookmarkNoteDraftsRef.current,
+      bookmarks,
+    );
+    bookmarkNoteDraftsRef.current = next;
+    setBookmarkNoteDrafts(next);
   }, []);
 
   const applyVocabFactsBundle = useCallback((bundle: VocabFactsReadBundle) => {
@@ -613,6 +649,7 @@ export default function VocabApp() {
       if (!binding) setWordId(null);
     }
     setSnapshot(bundle.snapshot);
+    reconcileBookmarkDrafts(bundle.snapshot.bookmarks);
     setSettingsExpected(bundle.expected);
     snapshotReadStatusRef.current = "ready";
     setSnapshotReadStatus("ready");
@@ -623,7 +660,40 @@ export default function VocabApp() {
     pendingLexemeBundleRef.current = null;
     lexemeExternalPendingRef.current = false;
     setLexemeExternalPending(false);
+    pendingSettingsBundleRef.current = null;
+    setSettingsExternalPending(false);
+  }, [reconcileBookmarkDrafts]);
+
+  const blockOutboundForUntrustedFacts = useCallback((message = "") => {
+    snapshotReadStatusRef.current = "stale";
+    setSnapshotReadStatus("stale");
+    if (message) setSnapshotReadError(message);
+    aiRequest.current?.controller.abort();
+    settingsHealthRequest.current?.abort();
+    signalVocabOutboundBlock();
   }, []);
+
+  const claimRestoreOutboundBarrier = useCallback(() => {
+    restoreRecoveryClearRef.current = false;
+    restoreOutboundBarrierRef.current = true;
+    setRestoreOutboundBarrier(true);
+    aiRequest.current?.controller.abort();
+    settingsHealthRequest.current?.abort();
+    signalVocabOutboundBlock();
+  }, []);
+
+  const releaseRestoreOutboundBarrier = useCallback(() => {
+    restoreOutboundBarrierRef.current = false;
+    setRestoreOutboundBarrier(false);
+  }, []);
+
+  const scanRestoreOutboundRecovery = useCallback(() => {
+    const result = readVocabBackupRecoveryStorage();
+    const blocked = vocabBackupRecoveryRequiresOutboundBarrier(result);
+    restoreRecoveryClearRef.current = !blocked;
+    if (blocked) claimRestoreOutboundBarrier();
+    return !blocked;
+  }, [claimRestoreOutboundBarrier]);
 
   const readVocabFacts = useCallback(async (): Promise<Readonly<{
     outcome: VocabSettingsRefreshOutcome;
@@ -636,6 +706,7 @@ export default function VocabApp() {
         return { outcome: "superseded", snapshot: snapshotRef.current };
       }
       if (itemWriteGuardRef.current(bundle.itemExpectedById)) {
+        blockOutboundForUntrustedFacts();
         pendingItemBundleRef.current = { requestId, bundle };
         setItemExternalPending(true);
         return { outcome: "deferred", snapshot: snapshotRef.current };
@@ -644,6 +715,7 @@ export default function VocabApp() {
         bundle.lexemeBindingsById,
         lexemeEditorRef.current,
       )) {
+        blockOutboundForUntrustedFacts();
         pendingLexemeBundleRef.current = { requestId, bundle };
         lexemeExternalPendingRef.current = true;
         setLexemeExternalPending(true);
@@ -653,6 +725,7 @@ export default function VocabApp() {
       if (draft) {
         const settingsChanged = !sameVocabSettingsExpectedState(draft.expected, bundle.expected);
         if (settingsChanged) {
+          blockOutboundForUntrustedFacts();
           pendingSettingsBundleRef.current = { requestId, bundle };
           setSettingsExternalPending(true);
           return { outcome: "deferred", snapshot: snapshotRef.current };
@@ -670,6 +743,7 @@ export default function VocabApp() {
           if (!binding) setWordId(null);
         }
         setSnapshot(nextSnapshot);
+        reconcileBookmarkDrafts(nextSnapshot.bookmarks);
         snapshotReadStatusRef.current = "ready";
         setSnapshotReadStatus("ready");
         setSnapshotReadError("");
@@ -689,13 +763,11 @@ export default function VocabApp() {
       return { outcome: "applied", snapshot: bundle.snapshot };
     } catch (reason) {
       if (requestId === snapshotReadRequestRef.current) {
-        snapshotReadStatusRef.current = "stale";
-        setSnapshotReadStatus("stale");
-        setSnapshotReadError(errorMessage(reason));
+        blockOutboundForUntrustedFacts(errorMessage(reason));
       }
       throw reason;
     }
-  }, [applyVocabFactsBundle]);
+  }, [applyVocabFactsBundle, blockOutboundForUntrustedFacts, reconcileBookmarkDrafts]);
 
   const retryVocabFactsRead = useCallback((trigger: HTMLButtonElement) => {
     setSnapshotReadError("");
@@ -1097,18 +1169,30 @@ export default function VocabApp() {
       !expected || expected.generationId !== receipt.generationId ||
       expected.generationSequence !== receipt.generationSequence
     ) throw new Error("已确认的学习记录属于另一代词库；页面没有拼接应用它。");
-    if (receipt.kind === "bookmark-create") {
+    if (receipt.kind === "bookmark-create" || receipt.kind === "bookmark-note-set") {
       const saved = result.snapshot.bookmarks.some((bookmark) =>
-          bookmark.id === receipt.target.id &&
-          bookmark.item_id === receipt.target.item_id &&
-          bookmark.locator === receipt.target.locator &&
-          bookmark.label === receipt.target.label &&
-          bookmark.note === receipt.target.note &&
-          bookmark.created_at === receipt.target.created_at
+        bookmark.id === receipt.target.id &&
+        bookmark.item_id === receipt.target.item_id &&
+        bookmark.locator === receipt.target.locator &&
+        bookmark.label === receipt.target.label &&
+        bookmark.note === receipt.target.note &&
+        bookmark.created_at === receipt.target.created_at
       );
       if (!saved) {
         throw new Error("已确认的书签尚未出现在整包读取中；收据继续保留。");
       }
+    } else if (receipt.kind === "bookmark-delete") {
+      if (result.snapshot.bookmarks.some((bookmark) =>
+        bookmark.id === receipt.target.id
+      )) {
+        throw new Error("已确认删除的书签仍出现在整包读取中；收据继续保留。");
+      }
+      const nextDrafts = discardVocabBookmarkNoteDraft(
+        bookmarkNoteDraftsRef.current,
+        receipt.target,
+      );
+      bookmarkNoteDraftsRef.current = nextDrafts;
+      setBookmarkNoteDrafts(nextDrafts);
     } else {
       const day = result.snapshot.activity.find((row) =>
         row.day === receipt.target.day
@@ -1182,7 +1266,59 @@ export default function VocabApp() {
       lexemeBlocksExternalWritesNow() || engagementBlocksExternalWrites();
   }, [engagementBlocksExternalWrites, itemBlocksExternalWritesNow, lexemeBlocksExternalWritesNow, settingsBlocksExternalWritesNow]);
   const startEngagementBookmark = engagementWrites.startBookmark;
+  const startEngagementBookmarkMutation = engagementWrites.startBookmarkMutation;
   const queueEngagementActivity = engagementWrites.queueActivity;
+  const updateBookmarkNoteDraft = useCallback((bookmark: Bookmark, note: string) => {
+    const next = updateVocabBookmarkNoteDrafts(
+      bookmarkNoteDraftsRef.current,
+      bookmark,
+      note,
+    );
+    bookmarkNoteDraftsRef.current = next;
+    setBookmarkNoteDrafts(next);
+  }, []);
+  const restoreBookmarkDraftFocus = useCallback((preferred: HTMLElement | null) => {
+    if (bookmarkDraftFocusFrame.current !== null) {
+      window.cancelAnimationFrame(bookmarkDraftFocusFrame.current);
+    }
+    bookmarkDraftFocusFrame.current = window.requestAnimationFrame(() => {
+      bookmarkDraftFocusFrame.current = window.requestAnimationFrame(() => {
+        bookmarkDraftFocusFrame.current = null;
+        const target = preferred?.isConnected && !preferred.matches(":disabled") &&
+            preferred.getClientRects().length > 0
+          ? preferred
+          : document.querySelector<HTMLElement>(
+              "[data-bookmark-list] h2, [data-reader-bookmark-fallback], [data-podcast-bookmark-fallback], .sc-reader h1, .sc-podcast-head h1, .sc-main h1",
+            );
+        if (!target?.isConnected || target.getClientRects().length === 0) return;
+        if (target.matches("h1,h2")) target.tabIndex = -1;
+        target.focus({ preventScroll: true });
+      });
+    });
+  }, []);
+  const discardBookmarkNoteDraft = useCallback((bookmark: Bookmark, trigger: HTMLElement | null) => {
+    const next = discardVocabBookmarkNoteDraft(
+      bookmarkNoteDraftsRef.current,
+      bookmark,
+    );
+    bookmarkNoteDraftsRef.current = next;
+    setBookmarkNoteDrafts(next);
+    restoreBookmarkDraftFocus(trigger);
+  }, [restoreBookmarkDraftFocus]);
+  const keepDeletedBookmarkNoteDraft = useCallback((bookmark: Bookmark, trigger: HTMLElement) => {
+    const next = retainDeletedVocabBookmarkNoteDraft(
+      bookmarkNoteDraftsRef.current,
+      bookmark,
+    );
+    bookmarkNoteDraftsRef.current = next;
+    setBookmarkNoteDrafts(next);
+    setToast("书签已删除；这段笔记草稿继续留在本页，采用删除前可以复制。 ");
+    window.requestAnimationFrame(() => {
+      if (trigger.isConnected && !trigger.matches(":disabled")) {
+        trigger.focus({ preventScroll: true });
+      }
+    });
+  }, []);
   const startBookmarkWrite = useCallback((
     item: LibraryItem,
     locator: string,
@@ -1201,9 +1337,7 @@ export default function VocabApp() {
       itemExpected.generationId !== settingsGeneration.generationId ||
       itemExpected.generationSequence !== settingsGeneration.generationSequence
     ) {
-      snapshotReadStatusRef.current = "stale";
-      setSnapshotReadStatus("stale");
-      setSnapshotReadError(
+      blockOutboundForUntrustedFacts(
         "书签位置与整包读取凭据不再属于同一次显示；没有准备书签写入。",
       );
       return;
@@ -1230,7 +1364,58 @@ export default function VocabApp() {
       expected,
       trigger,
     );
-  }, [startEngagementBookmark]);
+  }, [blockOutboundForUntrustedFacts, startEngagementBookmark]);
+  const startBookmarkMutationWrite = useCallback((
+    kind: "bookmark-note-set" | "bookmark-delete",
+    bookmark: Bookmark,
+    trigger: HTMLButtonElement,
+    note = "",
+  ) => {
+    const displayedSnapshot = snapshotRef.current;
+    const settingsGeneration = settingsExpectedRef.current;
+    const itemExpected = itemExpectedByIdRef.current.get(bookmark.item_id) ?? null;
+    const item = displayedSnapshot.items.find((candidate) =>
+      candidate.id === bookmark.item_id
+    ) ?? null;
+    const displayedBookmark = displayedSnapshot.bookmarks.find((candidate) =>
+      candidate.id === bookmark.id
+    ) ?? null;
+    if (
+      !settingsGeneration || !itemExpected || !item ||
+      displayedBookmark !== bookmark || itemExpected.item !== item ||
+      itemExpected.generationId !== settingsGeneration.generationId ||
+      itemExpected.generationSequence !== settingsGeneration.generationSequence
+    ) {
+      blockOutboundForUntrustedFacts(
+        "书签与整包读取凭据不再属于同一次显示；没有准备变更。",
+      );
+      return;
+    }
+    const expected: VocabBookmarkExpectedState = {
+      generationId: settingsGeneration.generationId,
+      generationSequence: settingsGeneration.generationSequence,
+      item: itemExpected.item,
+      locator: bookmark.locator,
+      bookmarks: displayedSnapshot.bookmarks
+        .filter((candidate) => candidate.item_id === bookmark.item_id &&
+          candidate.locator === bookmark.locator)
+        .map((candidate) => ({ ...candidate }))
+        .sort((left, right) => left.id.localeCompare(right.id)),
+    };
+    const input = kind === "bookmark-note-set"
+      ? {
+          itemId: bookmark.item_id,
+          locator: bookmark.locator,
+          bookmarkId: bookmark.id,
+          note,
+        }
+      : {
+          itemId: bookmark.item_id,
+          locator: bookmark.locator,
+          bookmarkId: bookmark.id,
+        };
+    void startEngagementBookmarkMutation(kind, input, expected, trigger);
+  }, [blockOutboundForUntrustedFacts, startEngagementBookmarkMutation]);
   const queueStudyActivity = useCallback((
     input: VocabStudyActivityRecordInput & Readonly<{ recordedAt: number }>,
   ) => {
@@ -1273,6 +1458,9 @@ export default function VocabApp() {
     settingsWrites.journal.storageUnavailable,
     settingsWrites.journal.unreadable.length,
     settingsWrites.journal.entries.length + (settingsWrites.hasHeldReceipt ? 1 : 0),
+    false,
+    snapshotReadStatus !== "ready",
+    restoreOutboundBarrier,
   );
   const settingsOutboundBlocked = useCallback(() => vocabSettingsOutboundBlocked(
     snapshotRef.current.settings.local_lock,
@@ -1282,6 +1470,8 @@ export default function VocabApp() {
     settingsWrites.journal.unreadable.length,
     settingsWrites.journal.entries.length + (settingsWrites.hasHeldReceipt ? 1 : 0),
     settingsWrites.operationInProgress(),
+    snapshotReadStatusRef.current !== "ready",
+    restoreOutboundBarrierRef.current,
   ), [settingsWrites]);
 
   const updateSettingsDraft = useCallback((patch: Partial<VocabSettings>) => {
@@ -1289,8 +1479,7 @@ export default function VocabApp() {
     const current = settingsDraftRef.current;
     const expected = current?.expected ?? settingsExpectedRef.current;
     if (!expected || (!current && snapshotRef.current.settings !== expected.settings)) {
-      snapshotReadStatusRef.current = "stale";
-      setSnapshotReadStatus("stale");
+      blockOutboundForUntrustedFacts();
       setSettingsWriteNotice("设置与安全读取凭据没有成对就绪；没有改动草稿，请先只重新读取。");
       return;
     }
@@ -1302,7 +1491,7 @@ export default function VocabApp() {
     settingsDraftRef.current = next;
     setSettingsDraft(next);
     setSettingsWriteNotice("");
-  }, [settingsWrites, snapshotReadStatus]);
+  }, [blockOutboundForUntrustedFacts, settingsWrites, snapshotReadStatus]);
 
   const requestSettingsSave = useCallback(async (
     next: VocabSettings,
@@ -1312,8 +1501,7 @@ export default function VocabApp() {
   ) => {
     if (snapshotReadStatus !== "ready" || settingsWrites.writeLocked || settingsWrites.operationInProgress() ||
         settingsExpectedRef.current !== expected || snapshotRef.current.settings !== expected.settings) {
-      snapshotReadStatusRef.current = "stale";
-      setSnapshotReadStatus("stale");
+      blockOutboundForUntrustedFacts();
       setSettingsWriteNotice("当前设置与安全读取凭据不再属于同一次读取；仍显示上次确认内容，请先只重新读取。");
       return;
     }
@@ -1326,15 +1514,14 @@ export default function VocabApp() {
         "设置已保存在当前浏览器的本地词库",
       );
     } catch (reason) {
-      snapshotReadStatusRef.current = "stale";
-      setSnapshotReadStatus("stale");
+      blockOutboundForUntrustedFacts();
       setSettingsWriteNotice(reason instanceof VocabSettingsMutationError && reason.code === "changed"
         ? "另一页已经更新了设置；这次没有写入，当前草稿仍保留。请明确放弃草稿后只重新读取。"
         : `${errorMessage(reason)} 没有确认安全收据是否完整保留；当前显示不会冒充已保存。`);
     } finally {
       if (settingsPrepareBindingRef.current === binding) settingsPrepareBindingRef.current = null;
     }
-  }, [settingsWrites, snapshotReadStatus]);
+  }, [blockOutboundForUntrustedFacts, settingsWrites, snapshotReadStatus]);
 
   const submitSettingsDraft = useCallback((trigger: HTMLElement) => {
     const draft = settingsDraftRef.current;
@@ -1354,13 +1541,12 @@ export default function VocabApp() {
     }
     const expected = settingsExpectedRef.current;
     if (!expected) {
-      snapshotReadStatusRef.current = "stale";
-      setSnapshotReadStatus("stale");
+      blockOutboundForUntrustedFacts();
       setSettingsWriteNotice("设置读取凭据尚未就绪；开关没有改动。");
       return;
     }
     void requestSettingsSave({ ...expected.settings, ...patch }, expected, trigger, null);
-  }, [requestSettingsSave, settingsWrites]);
+  }, [blockOutboundForUntrustedFacts, requestSettingsSave, settingsWrites]);
 
   const discardSettingsDraftAndRead = useCallback(() => {
     clearSettingsDraft();
@@ -1408,6 +1594,17 @@ export default function VocabApp() {
     return next;
   }, []);
 
+  const refreshTrustedCurrentAfterRestore = useCallback(async () => {
+    await initializeVocabDatabase();
+    const result = await readVocabFacts();
+    if (result.outcome !== "applied" || snapshotReadStatusRef.current !== "ready") {
+      throw new Error("当前完整词库尚未安全重新读取；外部连接继续保持锁定。");
+    }
+    restoreRecoveryClearRef.current = true;
+    releaseRestoreOutboundBarrier();
+    await refreshStorageStatus().catch(() => null);
+  }, [readVocabFacts, refreshStorageStatus, releaseRestoreOutboundBarrier]);
+
   const activateNextOccurrenceRecovery = useCallback(() => {
     const next = readOccurrenceRecovery();
     occurrenceRecoveryRef.current = next;
@@ -1427,9 +1624,16 @@ export default function VocabApp() {
     let live = true;
     void (async () => {
       try {
+        const recoveryClear = scanRestoreOutboundRecovery();
         await initializeVocabDatabase();
         const data = await readAndApplySnapshot();
         if (!live) return;
+        if (
+          recoveryClear && restoreRecoveryClearRef.current &&
+          snapshotReadStatusRef.current === "ready"
+        ) {
+          releaseRestoreOutboundBarrier();
+        }
         setShowChinese(data.settings.chinese_explanation);
         setActiveItemId(data.items.find((item) => item.status === "in_progress")?.id ?? data.items[0]?.id ?? null);
         void refreshStorageStatus().catch(() => undefined);
@@ -1441,7 +1645,26 @@ export default function VocabApp() {
       live = false;
       snapshotReadRequestRef.current += 1;
     };
-  }, [readAndApplySnapshot, refreshStorageStatus]);
+  }, [readAndApplySnapshot, refreshStorageStatus, releaseRestoreOutboundBarrier, scanRestoreOutboundRecovery]);
+
+  useEffect(() => {
+    const rescan = () => {
+      if (!scanRestoreOutboundRecovery() || !restoreOutboundBarrierRef.current) return;
+      void refreshTrustedCurrentAfterRestore().catch(() => undefined);
+    };
+    const onStorage = (event: StorageEvent) => {
+      if (
+        event.storageArea === window.localStorage &&
+        (event.key === null || event.key.startsWith(VOCAB_BACKUP_RECOVERY_PREFIX))
+      ) rescan();
+    };
+    window.addEventListener("storage", onStorage);
+    window.addEventListener("focus", rescan);
+    return () => {
+      window.removeEventListener("storage", onStorage);
+      window.removeEventListener("focus", rescan);
+    };
+  }, [refreshTrustedCurrentAfterRestore, scanRestoreOutboundRecovery]);
 
   useEffect(() => {
     let live = true;
@@ -1461,12 +1684,18 @@ export default function VocabApp() {
 
   useEffect(() => {
     if (!ready) return;
-    return subscribeVocabChanges(() => { void refresh().catch(() => undefined); });
-  }, [ready, refresh]);
+    return subscribeVocabChanges(() => {
+      blockOutboundForUntrustedFacts();
+      void refresh().catch(() => undefined);
+    });
+  }, [blockOutboundForUntrustedFacts, ready, refresh]);
 
   useEffect(() => {
     if (!ready) return;
-    const refreshVisibleFacts = () => { void refresh().catch(() => undefined); };
+    const refreshVisibleFacts = () => {
+      blockOutboundForUntrustedFacts();
+      void refresh().catch(() => undefined);
+    };
     const onVisibility = () => { if (document.visibilityState === "visible") refreshVisibleFacts(); };
     window.addEventListener("focus", refreshVisibleFacts);
     document.addEventListener("visibilitychange", onVisibility);
@@ -1474,7 +1703,7 @@ export default function VocabApp() {
       window.removeEventListener("focus", refreshVisibleFacts);
       document.removeEventListener("visibilitychange", onVisibility);
     };
-  }, [ready, refresh]);
+  }, [blockOutboundForUntrustedFacts, ready, refresh]);
 
   useEffect(() => {
     if (!settingsDraft) return;
@@ -1489,6 +1718,13 @@ export default function VocabApp() {
     window.addEventListener("beforeunload", protectDraft);
     return () => window.removeEventListener("beforeunload", protectDraft);
   }, [lexemeEditor]);
+
+  useEffect(() => {
+    if (bookmarkNoteDrafts.length === 0) return;
+    const protectBookmarkDrafts = (event: BeforeUnloadEvent) => event.preventDefault();
+    window.addEventListener("beforeunload", protectBookmarkDrafts);
+    return () => window.removeEventListener("beforeunload", protectBookmarkDrafts);
+  }, [bookmarkNoteDrafts.length]);
 
   useEffect(() => {
     if (cardMutationOwner !== "review") return;
@@ -1518,6 +1754,14 @@ export default function VocabApp() {
   }, [toast]);
 
   const activeItem = useMemo(() => snapshot.items.find((item) => item.id === activeItemId) ?? null, [activeItemId, snapshot.items]);
+  const orphanedBookmarkDrafts = useMemo(() => bookmarkNoteDrafts.filter((draft) => {
+    const missing = !draft.observed ||
+      !sameVocabBookmarkIdentity(draft.baseline, draft.observed);
+    const visibleInCurrentPanel = activeItem?.id === draft.baseline.item_id &&
+      ((view === "reader" && activeItem.kind === "article") ||
+        (view === "podcast" && activeItem.kind === "podcast"));
+    return missing && !visibleInCurrentPanel;
+  }), [activeItem, bookmarkNoteDrafts, view]);
   const dueCards = useMemo(() => getDueCards(snapshot.reviewCards), [snapshot.reviewCards]);
 
   const cancelAi = useCallback(() => {
@@ -1651,8 +1895,7 @@ export default function VocabApp() {
     const action = () => {
       const binding = lexemeBindingsByIdRef.current.get(id) ?? null;
       if (!binding) {
-        snapshotReadStatusRef.current = "stale";
-        setSnapshotReadStatus("stale");
+        blockOutboundForUntrustedFacts();
         setLexemeWriteNotice("词条与安全读取凭据没有成对就绪；没有打开可编辑内容。");
         return;
       }
@@ -1665,7 +1908,7 @@ export default function VocabApp() {
     const current = lexemeEditorRef.current;
     if (current?.lexemeId === id) return;
     requestLexemeEditorExit(action);
-  }, [requestLexemeEditorExit]);
+  }, [blockOutboundForUntrustedFacts, requestLexemeEditorExit]);
 
   const openSearch = useCallback(() => {
     requestLexemeEditorExit(() => {
@@ -2386,12 +2629,6 @@ export default function VocabApp() {
     return `备份文件已交给浏览器下载，包含 ${backup.audioCount} 个本地音频。`;
   }, []);
 
-  const refreshAfterBackupActivation = useCallback(async () => {
-    await initializeVocabDatabase();
-    await refresh();
-    await refreshStorageStatus().catch(() => null);
-  }, [refresh, refreshStorageStatus]);
-
   useEffect(() => {
     const shortcuts = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
@@ -2490,15 +2727,16 @@ export default function VocabApp() {
       {itemExternalPending && <section className="sc-item-truth-notice" role="status"><span>另一页的条目已经变化；当前阅读位置仍按原完整条目保留，没有拼接或覆盖。</span><button type="button" disabled={itemWrites.busy} onClick={(event) => void discardItemPositionsAndReadLatest(event.currentTarget)}>放弃本页位置并读取最新</button></section>}
       {(lexemeExternalPending || lexemeWriteNotice) && <section className="sc-lexeme-truth-notice" role={lexemeExternalPending ? "alert" : "status"}><span>{lexemeWriteNotice || "另一页的词条或复习卡已经变化；当前笔记草稿仍与打开时的完整词条成对保留，没有拼接或覆盖。"}</span><button type="button" disabled={lexemeWrites.busy || lexemeWrites.hasVolatileOperation} onClick={discardLexemeDraftAndRead}>{vocabLexemeNoteEditorDirty(lexemeEditor) ? "放弃笔记草稿并读取最新" : "只重新读取"}</button></section>}
       {globalSettingsNotice && <section className="sc-settings-truth-notice" role="status"><span>{globalSettingsNotice}</span><button type="button" disabled={settingsWrites.busy} onClick={rereadSettingsTruth}>{settingsDraft ? "放弃草稿并读取最新设置" : "只重新读取"}</button></section>}
+      {orphanedBookmarkDrafts.map((draft) => <section key={vocabBookmarkIdentityKey(draft.baseline)} className="sc-bookmark-orphan-notice" role="alert" data-bookmark-list="orphaned"><div><b>书签已删除或不在恢复后的词库中</b><span>“{draft.baseline.label || draft.baseline.locator}”的未保存笔记仍保留在本页。</span><textarea aria-label="保留的书签笔记草稿" value={draft.note} maxLength={65_536} onChange={(event) => updateBookmarkNoteDraft(draft.baseline, event.target.value)}/>{draft.retainedAfterDelete && <small role="status">已选择继续保留草稿；复制完成后仍可采用删除。</small>}</div><footer><button type="button" onClick={(event) => keepDeletedBookmarkNoteDraft(draft.baseline, event.currentTarget)}>保留草稿</button><button type="button" className="danger" onClick={(event) => discardBookmarkNoteDraft(draft.baseline, event.currentTarget)}>采用删除</button></footer></section>)}
       <div className="sc-view">
         {view === "today" && <TodayView snapshot={snapshot} due={dueCards.length} onOpen={openItem} onGo={go} onImport={openImport} onWord={openWord} />}
         {view === "library" && <LibraryView items={snapshot.items} itemWriteLocked={snapshotReadStatus !== "ready" || itemWrites.writeLocked} itemWriteBusy={itemWrites.busy} itemWriteStatus={itemWrites.error || itemWrites.status} onOpen={openItem} onImport={openImport} onArchive={(item, trigger) => void itemWrites.startLifecycle(item.status === "archived" ? "restore" : "archive", item, trigger)} />}
-        {view === "reader" && <ReaderView item={activeItem?.kind === "article" ? activeItem : snapshot.items.find((item) => item.kind === "article") ?? null} blocks={snapshot.blocks} occurrences={snapshot.occurrences} bookmarks={snapshot.bookmarks} itemWriteLocked={snapshotReadStatus !== "ready" || itemWrites.writeLocked} itemWriteBusy={itemWrites.busy} itemWriteStatus={itemWrites.error || itemWrites.status} engagementWriteLocked={snapshotReadStatus !== "ready" || engagementWrites.writeLocked} engagementWriteBusy={engagementWrites.busy} engagementWriteStatus={engagementWrites.error || engagementWrites.status} onSelect={selectText} onBack={() => go("library")} onProgress={recordItemProgressCandidate} onFinish={(item, trigger) => void itemWrites.startLifecycle("complete", item, trigger)} onStudyActivity={queueStudyActivity} onBookmark={(item, block, trigger) => startBookmarkWrite(item, block?.id ?? "top", block?.text.slice(0, 30) ?? item.title, trigger)} />}
-        {view === "podcast" && <PodcastView key={(activeItem?.kind === "podcast" ? activeItem : snapshot.items.find((item) => item.kind === "podcast"))?.id ?? "empty-podcast"} item={activeItem?.kind === "podcast" ? activeItem : snapshot.items.find((item) => item.kind === "podcast") ?? null} segments={snapshot.segments} occurrences={snapshot.occurrences} autoFollow={snapshot.settings.auto_follow} autoFollowWriteLocked={settingsControlsLocked} autoFollowWriteBusy={settingsWrites.busy} autoFollowStatus={settingsControlStatus} itemWriteLocked={snapshotReadStatus !== "ready" || itemWrites.writeLocked} itemWritePermanentReadOnly={itemWritePermanentReadOnly} itemWriteBusy={itemWrites.busy} itemWriteStatus={itemWrites.error || itemWrites.status} engagementWriteLocked={snapshotReadStatus !== "ready" || engagementWrites.writeLocked} engagementWriteBusy={engagementWrites.busy} engagementWriteStatus={engagementWrites.error || engagementWrites.status} localLock={effectiveLocalLock} onAutoFollow={(value, trigger) => requestSettingsChange({ auto_follow: value }, trigger)} onSelect={selectText} onProgress={recordItemProgressCandidate} onFinish={(item, trigger) => void itemWrites.startLifecycle("complete", item, trigger)} onStudyActivity={queueStudyActivity} onStudyActivityPendingChange={updateStudyActivityPending} onBookmark={(item, ms, label, trigger) => startBookmarkWrite(item, `t:${Math.round(ms)}`, label, trigger)} />}
+        {view === "reader" && <ReaderView item={activeItem?.kind === "article" ? activeItem : snapshot.items.find((item) => item.kind === "article") ?? null} blocks={snapshot.blocks} occurrences={snapshot.occurrences} bookmarks={snapshot.bookmarks} bookmarkDrafts={bookmarkNoteDrafts} itemWriteLocked={snapshotReadStatus !== "ready" || itemWrites.writeLocked} itemWriteBusy={itemWrites.busy} itemWriteStatus={itemWrites.error || itemWrites.status} engagementWriteLocked={snapshotReadStatus !== "ready" || engagementWrites.writeLocked} engagementWriteBusy={engagementWrites.busy} engagementWriteStatus={engagementWrites.error || engagementWrites.status} onSelect={selectText} onBack={() => go("library")} onProgress={recordItemProgressCandidate} onFinish={(item, trigger) => void itemWrites.startLifecycle(item.status === "complete" ? "reopen" : "complete", item, trigger)} onStudyActivity={queueStudyActivity} onBookmark={(item, block, trigger) => startBookmarkWrite(item, block?.id ?? "top", block?.text.slice(0, 30) ?? item.title, trigger)} onBookmarkDraftChange={updateBookmarkNoteDraft} onBookmarkDraftDiscard={discardBookmarkNoteDraft} onBookmarkDraftKeep={keepDeletedBookmarkNoteDraft} onBookmarkNote={(bookmark, note, trigger) => startBookmarkMutationWrite("bookmark-note-set", bookmark, trigger, note)} onBookmarkDelete={(bookmark, trigger) => startBookmarkMutationWrite("bookmark-delete", bookmark, trigger)} />}
+        {view === "podcast" && <PodcastView key={(activeItem?.kind === "podcast" ? activeItem : snapshot.items.find((item) => item.kind === "podcast"))?.id ?? "empty-podcast"} item={activeItem?.kind === "podcast" ? activeItem : snapshot.items.find((item) => item.kind === "podcast") ?? null} segments={snapshot.segments} occurrences={snapshot.occurrences} bookmarks={snapshot.bookmarks} bookmarkDrafts={bookmarkNoteDrafts} autoFollow={snapshot.settings.auto_follow} autoFollowWriteLocked={settingsControlsLocked} autoFollowWriteBusy={settingsWrites.busy} autoFollowStatus={settingsControlStatus} itemWriteLocked={snapshotReadStatus !== "ready" || itemWrites.writeLocked} itemWritePermanentReadOnly={itemWritePermanentReadOnly} itemWriteBusy={itemWrites.busy} itemWriteStatus={itemWrites.error || itemWrites.status} engagementWriteLocked={snapshotReadStatus !== "ready" || engagementWrites.writeLocked} engagementWriteBusy={engagementWrites.busy} engagementWriteStatus={engagementWrites.error || engagementWrites.status} localLock={effectiveLocalLock} onAutoFollow={(value, trigger) => requestSettingsChange({ auto_follow: value }, trigger)} onSelect={selectText} onProgress={recordItemProgressCandidate} onFinish={(item, trigger) => void itemWrites.startLifecycle(item.status === "complete" ? "reopen" : "complete", item, trigger)} onStudyActivity={queueStudyActivity} onStudyActivityPendingChange={updateStudyActivityPending} onBookmark={(item, ms, label, trigger) => startBookmarkWrite(item, `t:${Math.round(ms)}`, label, trigger)} onBookmarkDraftChange={updateBookmarkNoteDraft} onBookmarkDraftDiscard={discardBookmarkNoteDraft} onBookmarkDraftKeep={keepDeletedBookmarkNoteDraft} onBookmarkNote={(bookmark, note, trigger) => startBookmarkMutationWrite("bookmark-note-set", bookmark, trigger, note)} onBookmarkDelete={(bookmark, trigger) => startBookmarkMutationWrite("bookmark-delete", bookmark, trigger)} />}
         {view === "words" && <WordsView lexemes={snapshot.lexemes} occurrences={snapshot.occurrences} lexemeWriteLocked={lexemeControlsLocked || lexemeNoteDirty} lexemeWriteBusy={lexemeWrites.busy} lexemeWriteStatus={lexemeWrites.error || lexemeWrites.status || lexemeWriteNotice} onOpen={openWord} onStar={(word, trigger) => void setLexemeStarDurably(word, trigger)} />}
         {view === "review" && <ReviewView cards={snapshot.reviewCards} externalWriteLocked={lexemeWrites.ratingWriteLocked || cardMutationOwner === "status"} claimReviewMutation={claimReviewMutation} releaseReviewMutation={releaseReviewMutation} onRecoveryBarrierChange={updateReviewMutationBarrier} onRefresh={refresh} onGo={go} />}
         {view === "stats" && <StatsView snapshot={snapshot} />}
-        {view === "settings" && <SettingsView settings={displayedSettings} settingsDraftDirty={Boolean(settingsDraft)} settingsWriteLocked={settingsControlsLocked} settingsWriteBusy={settingsWrites.busy} databaseMutationLocked={itemDatabaseMutationLocked || lexemeDatabaseMutationLocked || engagementWrites.backupBlocked} backupExternalWriteInProgress={backupExternalWriteInProgress} onBackupDatabaseOperationChange={updateBackupDatabaseOperation} settingsWriteStatus={settingsControlStatus} storage={storageStatus} persistenceSupported={persistenceSupported} onDraftChange={updateSettingsDraft} onDraftCommit={submitSettingsDraft} onToggle={(patch, trigger) => requestSettingsChange(patch, trigger)} onDiscardDraft={discardSettingsDraftAndRead} onExport={exportBackup} onRestoreRefresh={refreshAfterBackupActivation} onPersist={async () => { const granted = await requestPersistentLocalStorage(); const checked = await refreshStorageStatus(); return checked.persisted ?? granted; }} onTestAi={async () => { if (settingsOutboundBlocked()) throw new Error("本地锁已开启或正在安全确认；没有发出检查请求"); const response = await fetch("/api/health", { headers: { Accept: "application/json" } }); const health = await response.json() as { ai?: { configured?: boolean } }; if (!response.ok) throw new Error("无法检查 AI 服务状态"); if (!health.ai?.configured) throw new Error("DeepSeek API Key 尚未配置"); }} />}
+        {view === "settings" && <SettingsView settings={displayedSettings} settingsDraftDirty={Boolean(settingsDraft)} settingsWriteLocked={settingsControlsLocked} settingsWriteBusy={settingsWrites.busy} databaseMutationLocked={itemDatabaseMutationLocked || lexemeDatabaseMutationLocked || engagementWrites.backupBlocked} backupExternalWriteInProgress={backupExternalWriteInProgress} onBackupDatabaseOperationChange={updateBackupDatabaseOperation} onBackupActivationOutboundClaim={claimRestoreOutboundBarrier} settingsWriteStatus={settingsControlStatus} storage={storageStatus} persistenceSupported={persistenceSupported} onDraftChange={updateSettingsDraft} onDraftCommit={submitSettingsDraft} onToggle={(patch, trigger) => requestSettingsChange(patch, trigger)} onDiscardDraft={discardSettingsDraftAndRead} onExport={exportBackup} onRestoreTrustedRefresh={refreshTrustedCurrentAfterRestore} onPersist={async () => { const granted = await requestPersistentLocalStorage(); const checked = await refreshStorageStatus(); return checked.persisted ?? granted; }} onTestAi={async () => { if (settingsOutboundBlocked()) throw new Error("本地锁已开启或正在安全确认；没有发出检查请求"); const controller = new AbortController(); settingsHealthRequest.current?.abort(); settingsHealthRequest.current = controller; try { const response = await fetch("/api/health", { headers: { Accept: "application/json" }, signal: controller.signal }); if (settingsOutboundBlocked()) throw new Error("本地锁已开启或正在安全确认；检查请求已经停止"); const health = await response.json() as { ai?: { configured?: boolean } }; if (!response.ok) throw new Error("无法检查 AI 服务状态"); if (!health.ai?.configured) throw new Error("DeepSeek API Key 尚未配置"); } finally { if (settingsHealthRequest.current === controller) settingsHealthRequest.current = null; } }} />}
       </div>
     </section>
     <nav className="sc-mobile-tabs" aria-label="拾词页面">{navigation.slice(0, 4).map((item) => <button key={item.id} aria-current={view === item.id ? "page" : undefined} className={view === item.id ? "active" : ""} onClick={() => go(item.id)}><i>{item.glyph}</i><span>{item.label}</span></button>)}</nav>

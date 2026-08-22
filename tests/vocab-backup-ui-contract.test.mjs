@@ -200,6 +200,21 @@ test("one damaged entry cannot hide peer operations and conservative phases sort
   ]);
 });
 
+test("restore outbound recovery risk is latched only for unreadable, activation-check, and refresh-only truth", () => {
+  const result = (entries = [], unreadableEntries = [], storageUnavailable = false) => ({
+    entries: entries.map((entry) => ({ storageKey: "key", raw: "raw", ticket: entry })),
+    unreadableEntries,
+    storageUnavailable,
+  });
+  assert.equal(recovery.vocabBackupRecoveryRequiresOutboundBarrier(result()), false);
+  assert.equal(recovery.vocabBackupRecoveryRequiresOutboundBarrier(result([ticket("candidate")])), false);
+  assert.equal(recovery.vocabBackupRecoveryRequiresOutboundBarrier(result([ticket("candidate", GENERATION_A, "discard-only")])), false);
+  assert.equal(recovery.vocabBackupRecoveryRequiresOutboundBarrier(result([ticket("candidate", GENERATION_A, "activation-check")])), true);
+  assert.equal(recovery.vocabBackupRecoveryRequiresOutboundBarrier(result([ticket("refresh-only")])), true);
+  assert.equal(recovery.vocabBackupRecoveryRequiresOutboundBarrier(result([], [{ storageKey: "bad", raw: null }])), true);
+  assert.equal(recovery.vocabBackupRecoveryRequiresOutboundBarrier(result([], [], true)), true);
+});
+
 test("journal replacement and removal use raw CAS under an independent lock", async () => {
   const storage = memoryStorage();
   const runtime = journalRuntime(storage);
@@ -467,7 +482,7 @@ test("activation success and refresh failure remain separate truthful outcomes",
   const refreshSlice = flowSource.slice(persistStart, inspectStart);
   assert.ok(
     refreshSlice.indexOf("refreshTicket(receipt)") <
-      refreshSlice.indexOf("await onRefreshActivated()"),
+      refreshSlice.indexOf("await onRefreshTrustedCurrent()"),
   );
   assert.match(refreshSlice, /页面暂时没有重新读到它，只需重新读取，不会重复启用/);
   assert.doesNotMatch(
@@ -526,9 +541,9 @@ test("storage failure and damaged tickets expose non-mutating exits", () => {
 });
 
 test("Settings wiring, mobile sidebar, and 319px CSS preserve operability", () => {
-  assert.match(viewsSource, /<VocabBackupFlow[\s\S]*?onRefreshActivated=\{onRestoreRefresh\}/);
+  assert.match(viewsSource, /<VocabBackupFlow[\s\S]*?onActivationOutboundClaim=\{onBackupActivationOutboundClaim\}[\s\S]*?onRefreshTrustedCurrent=\{onRestoreTrustedRefresh\}/);
   assert.doesNotMatch(viewsSource.slice(viewsSource.indexOf("type SettingsViewProps")), /onImport/);
-  assert.match(appSource, /const refreshAfterBackupActivation = useCallback\(async \(\) => \{\s*await initializeVocabDatabase\(\);\s*await refresh\(\)/);
+  assert.match(appSource, /const refreshTrustedCurrentAfterRestore = useCallback\(async \(\) => \{\s*await initializeVocabDatabase\(\);\s*const result = await readVocabFacts\(\)[\s\S]*?result\.outcome !== "applied"[\s\S]*?releaseRestoreOutboundBarrier\(\)/);
   assert.match(appSource, /aria-hidden=\{sidebarHidden \|\| undefined\} inert=\{sidebarHidden \|\| undefined\}/);
   assert.match(appSource, /button\[data-sidebar-close\]/);
   assert.match(appSource, /data-sidebar-close className="sc-sidebar-close"/);
@@ -537,4 +552,33 @@ test("Settings wiring, mobile sidebar, and 319px CSS preserve operability", () =
   assert.match(css, /@media\(max-width:760px\)[\s\S]*?\.sc-backup-summary\{grid-template-columns:1fr\}/);
   assert.match(css, /\.sc-backup-flow>footer\{display:grid;grid-template-columns:1fr\}/);
   assert.match(css, /\.sc-backup-file-name\{font-weight:650;overflow-wrap:anywhere\}/);
+});
+
+test("restore outbound latch claims before awaits, survives owner release, and releases only after trusted refresh", () => {
+  const activation = flowSource.slice(
+    flowSource.indexOf("async function activateCandidate"),
+    flowSource.indexOf("async function discardCandidate"),
+  );
+  assert.ok(activation.indexOf("onActivationOutboundClaim()") < activation.indexOf("operationRef.current = true"));
+  assert.ok(activation.indexOf("onActivationOutboundClaim()") < activation.indexOf("transitionOrExplain("));
+  assert.match(activation, /finally \{[\s\S]*?onDatabaseOperationChange\?\.\(false\)/);
+  assert.doesNotMatch(activation.slice(activation.indexOf("finally {")), /releaseRestoreOutboundBarrier|onRefreshTrustedCurrent/);
+  assert.match(activation, /VocabActivationUncertainError[\s\S]*?phase: "activation-check"/);
+
+  const claim = appSource.slice(
+    appSource.indexOf("const claimRestoreOutboundBarrier"),
+    appSource.indexOf("const releaseRestoreOutboundBarrier"),
+  );
+  assert.ok(claim.indexOf("restoreOutboundBarrierRef.current = true") < claim.indexOf("signalVocabOutboundBlock()"));
+  assert.match(claim, /aiRequest\.current\?\.controller\.abort\(\)/);
+  assert.match(claim, /settingsHealthRequest\.current\?\.abort\(\)/);
+  assert.match(appSource, /snapshotReadStatusRef\.current !== "ready",\s*restoreOutboundBarrierRef\.current/);
+
+  const inspect = flowSource.slice(
+    flowSource.indexOf("async function inspectCandidate"),
+    flowSource.indexOf("async function recoverPreparation"),
+  );
+  assert.ok(inspect.indexOf("inspection.status === \"current\"") < inspect.indexOf("onRefreshTrustedCurrent()"));
+  assert.ok(inspect.indexOf("onRefreshTrustedCurrent()") < inspect.indexOf('candidateTicket(receipt, "discard-only")'));
+  assert.match(inspect, /当前完整资料尚未重新读到[\s\S]*?phase: "activation-check"/);
 });

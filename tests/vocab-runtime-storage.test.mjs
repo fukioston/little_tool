@@ -552,6 +552,7 @@ test("review undo restores both the card and its activity row", async () => {
       startUtf16: 0,
       endUtf16: 3,
     }, usefulExplanation("C++", "a systems programming language"));
+    await store.updateLexemeStatus(saved.lexemeId, "learning");
     const before = await store.loadVocabSnapshot();
     const card = before.reviewCards.find(
       (candidate) => candidate.lexeme_id === saved.lexemeId,
@@ -607,7 +608,7 @@ test("review undo restores both the card and its activity row", async () => {
   }
 });
 
-test("known and ignored lexemes suspend their cards and saved resumes them", async () => {
+test("only learning resumes a managed card while saved, known, and ignored stay suspended", async () => {
   const database = await databaseFixture();
   try {
     await store.initializeVocabDatabase();
@@ -649,7 +650,71 @@ test("known and ignored lexemes suspend their cards and saved resumes them", asy
          FROM vocab_review_cards WHERE lexeme_id=?`,
         [lexemeId],
       ).map((row) => ({ ...row })),
+      [{
+        state: "suspended",
+        suspended_from_state: "new",
+        suspended_reason: "lexeme_saved",
+      }],
+    );
+    await store.updateLexemeStatus(lexemeId, "learning");
+    assert.deepEqual(
+      database.selectObjects(
+        `SELECT state,suspended_from_state,suspended_reason
+         FROM vocab_review_cards WHERE lexeme_id=?`,
+        [lexemeId],
+      ).map((row) => ({ ...row })),
       [{ state: "new", suspended_from_state: null, suspended_reason: null }],
+    );
+  } finally {
+    database.close();
+  }
+});
+
+test("snapshot reading excludes a legacy active saved card and initialization converges it", async () => {
+  const database = await databaseFixture();
+  try {
+    await store.initializeVocabDatabase();
+    const itemId = await store.saveArticle({
+      title: "Legacy saved card",
+      description: "",
+      author: "",
+      source: "local",
+      blocks: [{ kind: "paragraph", text: "Steady work helps." }],
+    }, "paste");
+    const { lexemeId } = await store.saveOccurrence({
+      surface: "Steady",
+      sentence: "Steady work helps.",
+      before: "",
+      after: "",
+      itemId,
+      startUtf16: 0,
+      endUtf16: 6,
+    }, usefulExplanation("steady", "stable and consistent"));
+    executeRun(
+      database,
+      `UPDATE vocab_review_cards SET state='review',suspended_from_state=NULL,
+        suspended_reason=NULL WHERE lexeme_id=?`,
+      [lexemeId],
+    );
+    assert.equal(
+      (await store.loadVocabSnapshot()).reviewCards.some((card) =>
+        card.lexeme_id === lexemeId
+      ),
+      false,
+      "read path never exposes an active card for a saved lexeme",
+    );
+    await store.initializeVocabDatabase();
+    assert.deepEqual(
+      database.selectObjects(
+        `SELECT state,suspended_from_state,suspended_reason
+         FROM vocab_review_cards WHERE lexeme_id=?`,
+        [lexemeId],
+      ).map((row) => ({ ...row })),
+      [{
+        state: "suspended",
+        suspended_from_state: "review",
+        suspended_reason: "lexeme_saved",
+      }],
     );
   } finally {
     database.close();
@@ -676,6 +741,7 @@ test("a word without a useful English explanation stays out of review until enri
       startUtf16: 0,
       endUtf16: 6,
     }, null);
+    await store.updateLexemeStatus(first.lexemeId, "learning");
     assert.deepEqual(
       database.selectObjects(
         `SELECT state,suspended_from_state,suspended_reason

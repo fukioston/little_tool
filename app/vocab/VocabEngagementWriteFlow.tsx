@@ -11,11 +11,17 @@ import {
   commitVocabEngagementWrite,
   inspectVocabEngagementWrite,
   prepareVocabBookmarkCreate,
+  prepareVocabBookmarkDelete,
+  prepareVocabBookmarkNoteSet,
   prepareVocabStudyActivityRecord,
   VocabEngagementMutationError,
   type VocabBookmarkCreateInput,
   type VocabBookmarkCreateReceipt,
+  type VocabBookmarkDeleteInput,
+  type VocabBookmarkDeleteReceipt,
   type VocabBookmarkExpectedState,
+  type VocabBookmarkNoteSetInput,
+  type VocabBookmarkNoteSetReceipt,
   type VocabEngagementGenerationExpectation,
   type VocabEngagementWriteReceipt,
   type VocabStudyActivityRecordInput,
@@ -41,9 +47,11 @@ import {
 import {
   freezeVocabStudyActivity,
   freezeVocabBookmarkIntent,
+  freezeVocabBookmarkMutationIntent,
   prepareVocabEngagementIntent,
   removeVocabStudyActivityHead,
   vocabBookmarkReceiptMatchesIntent,
+  vocabBookmarkMutationReceiptMatchesIntent,
   vocabEngagementApplyRemovesTicket,
   vocabEngagementBackupGate,
   vocabEngagementExternalWriteBlocked,
@@ -105,9 +113,10 @@ function isActivity(receipt: VocabEngagementWriteReceipt): boolean {
 }
 
 function savedCopy(receipt: VocabEngagementWriteReceipt): string {
-  return isActivity(receipt)
-    ? "学习时间已经确认记录。"
-    : "书签已经确认保存。";
+  if (isActivity(receipt)) return "学习时间已经确认记录。";
+  if (receipt.kind === "bookmark-delete") return "书签已经确认删除。";
+  if (receipt.kind === "bookmark-note-set") return "书签笔记已经确认保存。";
+  return "书签已经确认保存。";
 }
 
 function phaseForEntry(entry: VocabEngagementWriteEntry): Flow {
@@ -384,11 +393,18 @@ export function useVocabEngagementWriteFlow({
       focusFrameRef.current = window.requestAnimationFrame(() => {
         focusFrameRef.current = null;
         const trigger = binding.trigger;
-        if (
+        const preferred =
           trigger.isConnected && !trigger.matches(":disabled") &&
           trigger.getClientRects().length > 0 &&
           window.getComputedStyle(trigger).visibility !== "hidden"
-        ) trigger.focus({ preventScroll: true });
+            ? trigger
+            : null;
+        const target = preferred ?? document.querySelector<HTMLElement>(
+          "[data-bookmark-list] h2, [data-reader-bookmark-fallback], [data-podcast-bookmark-fallback], .sc-reader h1, .sc-podcast-head h1, .sc-main h1",
+        );
+        if (!target?.isConnected || target.getClientRects().length === 0) return;
+        if (target.matches("h1,h2")) target.tabIndex = -1;
+        target.focus({ preventScroll: true });
       });
     });
   }, []);
@@ -796,7 +812,7 @@ export function useVocabEngagementWriteFlow({
       );
       holdEntry(preparedEntry);
       if (submittedActivity) dropSubmittedActivity(submittedActivity);
-      if (trigger && receipt.kind === "bookmark-create") {
+      if (trigger && !isActivity(receipt)) {
         bookmarkTriggerRef.current = {
           operationId: receipt.operationId,
           trigger,
@@ -1008,6 +1024,37 @@ export function useVocabEngagementWriteFlow({
       () => prepare(intent.input, intent.expected),
       (receipt) => receipt.kind === "bookmark-create" &&
         vocabBookmarkReceiptMatchesIntent(receipt, intent),
+      false,
+      trigger,
+      null,
+    );
+  }, [startPrepared]);
+
+  const startBookmarkMutation = useCallback(async (
+    kind: "bookmark-note-set" | "bookmark-delete",
+    input: VocabBookmarkNoteSetInput | VocabBookmarkDeleteInput,
+    expected: VocabBookmarkExpectedState,
+    trigger: HTMLElement,
+    prepare: (
+      frozenInput: VocabBookmarkNoteSetInput | VocabBookmarkDeleteInput,
+      frozenExpected: VocabBookmarkExpectedState,
+    ) => Promise<VocabBookmarkNoteSetReceipt | VocabBookmarkDeleteReceipt> =
+      kind === "bookmark-note-set"
+        ? (frozenInput, frozenExpected) => prepareVocabBookmarkNoteSet(
+            frozenInput as VocabBookmarkNoteSetInput,
+            frozenExpected,
+          )
+        : (frozenInput, frozenExpected) => prepareVocabBookmarkDelete(
+            frozenInput as VocabBookmarkDeleteInput,
+            frozenExpected,
+          ),
+  ): Promise<VocabEngagementStartResult> => {
+    const intent = freezeVocabBookmarkMutationIntent(kind, input, expected);
+    return startPrepared(
+      () => prepare(intent.input, intent.expected),
+      (receipt) => (receipt.kind === "bookmark-note-set" ||
+          receipt.kind === "bookmark-delete") &&
+        vocabBookmarkMutationReceiptMatchesIntent(receipt, intent),
       false,
       trigger,
       null,
@@ -1313,6 +1360,7 @@ export function useVocabEngagementWriteFlow({
     error,
     focusRequest,
     startBookmark,
+    startBookmarkMutation,
     queueActivity,
     discardQueuedActivity,
     dismissPassiveNotice,
@@ -1408,6 +1456,21 @@ function receiptText(receipt: VocabEngagementWriteReceipt): string {
       `条目：${receipt.expected.item.title}`,
       `位置：${receipt.request.locator}`,
       `标签：${receipt.request.label || "（无）"}`,
+    ].join("\n");
+  }
+  if (receipt.kind === "bookmark-note-set") {
+    return [
+      `动作：修改书签笔记`,
+      `条目：${receipt.expected.item.title}`,
+      `位置：${receipt.request.locator}`,
+      `笔记：${receipt.request.note || "（清空）"}`,
+    ].join("\n");
+  }
+  if (receipt.kind === "bookmark-delete") {
+    return [
+      `动作：删除书签`,
+      `条目：${receipt.expected.item.title}`,
+      `位置：${receipt.request.locator}`,
     ].join("\n");
   }
   return [
