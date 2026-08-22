@@ -132,7 +132,7 @@ test("the one global journal lease covers backend work and blocks a peer persist
   const started = deferred();
   const release = deferred();
   let peerSettled = false;
-  const running = journal.runWithCurrentVocabSettingsWrite(first, async (lease) => {
+  const running = journal.runWithExclusiveCurrentVocabSettingsWrite(first, async (lease) => {
     started.resolve();
     await release.promise;
     lease.remove();
@@ -161,7 +161,7 @@ test("the in-lock full scan blocks unreadable peers and dynamic length failures 
     },
   };
   assert.deepEqual(
-    await journal.runWithCurrentVocabSettingsWrite(entry, () => { calls += 1; }, { storage: base, locks: peerLocks }),
+    await journal.runWithExclusiveCurrentVocabSettingsWrite(entry, () => { calls += 1; }, { storage: base, locks: peerLocks }),
     { outcome: "blocked", reason: "unreadable" },
   );
   assert.equal(calls, 0);
@@ -176,10 +176,76 @@ test("the in-lock full scan blocks unreadable peers and dynamic length failures 
   };
   const failingLocks = { request(_name, task) { failLength = true; return task(); } };
   assert.deepEqual(
-    await journal.runWithCurrentVocabSettingsWrite(entry, () => { calls += 1; }, { storage: failingStorage, locks: failingLocks }),
+    await journal.runWithExclusiveCurrentVocabSettingsWrite(entry, () => { calls += 1; }, { storage: failingStorage, locks: failingLocks }),
     { outcome: "blocked", reason: "storage" },
   );
   assert.equal(calls, 0);
+});
+
+test("exclusive settings commit admits only the exact sole valid ticket", async () => {
+  const storage = memoryStorage();
+  const locks = lockManager();
+  const target = await journal.persistVocabSettingsWrite(
+    ticket("check", "vocab-settings-operation-exclusive-target"),
+    { storage, locks },
+  );
+  const peer = journal.createVocabSettingsWriteEntry(
+    ticket("check", "vocab-settings-operation-exclusive-peer"),
+  );
+  storage.setItem(peer.storageKey, peer.raw);
+  let backendCalls = 0;
+  assert.deepEqual(
+    await journal.runWithExclusiveCurrentVocabSettingsWrite(
+      target,
+      () => { backendCalls += 1; },
+      { storage, locks },
+    ),
+    { outcome: "blocked", reason: "peer" },
+  );
+  assert.equal(backendCalls, 0);
+
+  storage.removeItem(peer.storageKey);
+  storage.setItem(`${journal.VOCAB_SETTINGS_WRITE_PREFIX}damaged`, "{damaged");
+  assert.deepEqual(
+    await journal.runWithExclusiveCurrentVocabSettingsWrite(
+      target,
+      () => { backendCalls += 1; },
+      { storage, locks },
+    ),
+    { outcome: "blocked", reason: "unreadable" },
+  );
+  assert.equal(backendCalls, 0);
+
+  storage.removeItem(`${journal.VOCAB_SETTINGS_WRITE_PREFIX}damaged`);
+  const unavailableStorage = {
+    get length() { throw new Error("length failed"); },
+    key: storage.key,
+    getItem: storage.getItem,
+    setItem: storage.setItem,
+    removeItem: storage.removeItem,
+  };
+  assert.deepEqual(
+    await journal.runWithExclusiveCurrentVocabSettingsWrite(
+      target,
+      () => { backendCalls += 1; },
+      { storage: unavailableStorage, locks },
+    ),
+    { outcome: "blocked", reason: "storage" },
+  );
+  assert.equal(backendCalls, 0);
+
+  const exact = await journal.runWithExclusiveCurrentVocabSettingsWrite(
+    target,
+    (lease) => {
+      backendCalls += 1;
+      lease.committed();
+      return "saved";
+    },
+    { storage, locks },
+  );
+  assert.equal(exact.outcome, "ran");
+  assert.equal(exact.entry.ticket.kind, "committed");
+  assert.equal(backendCalls, 1);
 });
 
 test("raw CAS never removes a ticket advanced by a peer", async () => {
@@ -193,6 +259,115 @@ test("raw CAS never removes a ticket advanced by a peer", async () => {
     { outcome: "stale" },
   );
   assert.equal(JSON.parse(storage.getItem(original.storageKey)).kind, "committed");
+});
+
+test("a durable peer is processed before a missing held receipt, which remains an inspect-only barrier", async () => {
+  const outcomes = [
+    ["check", "check"],
+    ["expected", "check"],
+    ["exact_saved", "committed"],
+    ["changed", "changed"],
+    ["invalid_receipt", "check"],
+  ];
+  for (const [inspection, finalKind] of outcomes) {
+    const operationSuffix = inspection.replaceAll("_", "-");
+    const operationId = `vocab-settings-operation-held-${operationSuffix}`;
+    const held = journal.createVocabSettingsWriteEntry(
+      ticket("committed", operationId),
+    );
+    const storage = memoryStorage();
+    const locks = lockManager();
+    const unrelated = await journal.persistVocabSettingsWrite(
+      ticket("check", `vocab-settings-operation-unrelated-${operationSuffix}`),
+      { storage, locks },
+    );
+    assert.equal(storage.getItem(held.storageKey), null, "the same-operation durable key starts missing");
+    assert.strictEqual(
+      journal.selectVocabSettingsWriteRecoveryEntry([held], [unrelated]),
+      unrelated,
+      "the durable peer is reachable while the operation-bound held receipt remains in memory",
+    );
+    assert.deepEqual(
+      journal.vocabSettingsHeldReceiptBarrier(
+        [operationId],
+        [unrelated.ticket.receipt.operationId],
+      ),
+      { blocksWrites: true, volatile: true },
+    );
+
+    let inspectCalls = 0;
+    assert.deepEqual(
+      await journal.runWithMissingVocabSettingsWrite(
+        held,
+        () => { inspectCalls += 1; },
+        { storage, locks },
+      ),
+      { outcome: "stale" },
+    );
+    assert.equal(inspectCalls, 0, "the held receipt cannot inspect around a durable peer");
+    assert.equal(storage.getItem(unrelated.storageKey), unrelated.raw);
+    const peerRemoval = await journal.runWithCurrentVocabSettingsWrite(
+      unrelated,
+      (lease) => lease.remove(),
+      { storage, locks },
+    );
+    assert.equal(peerRemoval.outcome, "ran");
+    assert.strictEqual(
+      journal.selectVocabSettingsWriteRecoveryEntry([held], []),
+      held,
+      "after the peer settles, the original held receipt becomes reachable",
+    );
+
+    const result = await journal.runWithMissingVocabSettingsWrite(
+      held,
+      (lease) => {
+        inspectCalls += 1;
+        assert.equal(
+          JSON.parse(storage.getItem(held.storageKey)).kind,
+          "check",
+          "the exact held receipt is checkpointed before inspect",
+        );
+        if (inspection === "exact_saved") lease.committed();
+        else if (inspection === "changed") lease.changed();
+        return inspection;
+      },
+      { storage, locks },
+    );
+    assert.equal(result.outcome, "ran");
+    assert.equal(result.value, inspection);
+    assert.equal(result.entry.ticket.kind, finalKind);
+    assert.equal(inspectCalls, 1);
+    assert.deepEqual(
+      journal.vocabSettingsHeldReceiptBarrier(
+        [operationId],
+        [operationId, unrelated.ticket.receipt.operationId],
+      ),
+      { blocksWrites: true, volatile: false },
+    );
+  }
+
+  const blockedHeld = journal.createVocabSettingsWriteEntry(
+    ticket("changed", "vocab-settings-operation-held-unreadable"),
+  );
+  const unreadableStorage = memoryStorage([
+    [`${journal.VOCAB_SETTINGS_WRITE_PREFIX}damaged`, "{damaged"],
+  ]);
+  let blockedInspectCalls = 0;
+  assert.deepEqual(
+    await journal.runWithMissingVocabSettingsWrite(
+      blockedHeld,
+      () => { blockedInspectCalls += 1; },
+      { storage: unreadableStorage, locks: lockManager() },
+    ),
+    { outcome: "blocked", reason: "unreadable" },
+  );
+  assert.equal(blockedInspectCalls, 0);
+  assert.equal(unreadableStorage.getItem(blockedHeld.storageKey), null);
+  assert.deepEqual(
+    journal.vocabSettingsHeldReceiptBarrier([], []),
+    { blocksWrites: false, volatile: false },
+    "only explicit settlement removes the held receipt barrier",
+  );
 });
 
 test("E1-S-E2 retries only whole bundles and retains the exact second envelope", async () => {
@@ -236,11 +411,19 @@ test("safe settings writes are nonoptimistic, durable, inspect-only on uncertain
   assert.match(request, /prepareVocabSettingsSave\(next, expected\)/);
   assert.doesNotMatch(request, /loadVocabSettingsExpectedState|loadVocabSnapshot|setSnapshot\(/);
   const start = flowSource.slice(flowSource.indexOf("const start = useCallback"), flowSource.indexOf("const open = useCallback"));
+  assert.ok(start.indexOf("heldEntriesRef.current.size > 0") < start.indexOf("await prepare()"));
   assert.ok(start.indexOf("await prepare()") < start.indexOf("await persistVocabSettingsWrite"));
   assert.ok(start.indexOf("await persistVocabSettingsWrite") < start.indexOf("commitEntry(entry"));
+  const inspectLease = flowSource.slice(flowSource.indexOf("const inspectEntryWithLease"), flowSource.indexOf("const finishCommitted"));
+  assert.match(inspectLease, /inspectVocabSettingsWrite/);
+  assert.doesNotMatch(inspectLease, /commitVocabSettingsWrite/);
   const inspect = flowSource.slice(flowSource.indexOf("const inspect = useCallback"), flowSource.indexOf("const continueExpected = useCallback"));
-  assert.match(inspect, /inspectVocabSettingsWrite/);
+  assert.match(inspect, /inspectEntryWithLease\(entry, false\)[\s\S]*?inspectEntryWithLease\(entry, true\)/);
   assert.doesNotMatch(inspect, /commitVocabSettingsWrite/);
+  const commit = flowSource.slice(flowSource.indexOf("const commitEntry = useCallback"), flowSource.indexOf("const start = useCallback"));
+  assert.match(commit, /runWithExclusiveCurrentVocabSettingsWrite/);
+  assert.doesNotMatch(commit, /runWithCurrentVocabSettingsWrite/);
+  assert.match(commit, /result\.reason === "peer"[\s\S]*?reopenLatest\(entry\)/);
   assert.match(appSource, /<VocabSettingsWriteBanner controller=\{settingsWrites\}/);
   assert.match(flowSource, /const writeLocked = !journal\.loaded \|\| journal\.storageUnavailable \|\| journal\.lockUnavailable/);
 });
@@ -309,14 +492,65 @@ test("ImportWizard gates every external request synchronously and aborts when th
   assert.equal((overlaysSource.match(/没有继续发送内容/g) ?? []).length >= 1, true);
 });
 
-test("only volatile work or an unsaved slider draft blocks unload and backup activation", () => {
-  const unload = flowSource.slice(flowSource.indexOf("useEffect(() => {\n    if (!busy)"), flowSource.indexOf("const reopenLatest"));
-  assert.match(unload, /if \(!busy\) return/);
+test("only busy work, a volatile held receipt, or an unsaved slider draft blocks unload", () => {
+  const unload = flowSource.slice(flowSource.indexOf("useEffect(() => {\n    if (!busy && !hasVolatileHeldReceipt)"), flowSource.indexOf("const setSafelyIdle"));
+  assert.match(unload, /if \(!busy && !hasVolatileHeldReceipt\) return/);
   assert.doesNotMatch(unload, /journal\.entries|journal\.unreadable/);
+  assert.match(flowSource, /event\.key === null \|\| event\.key\.startsWith\(VOCAB_SETTINGS_WRITE_PREFIX\)/);
+  assert.match(flowSource, /const refreshCommitted = inspect;/);
+  assert.match(flowSource, /hasHeldReceipt,\s*hasVolatileHeldReceipt,\s*writeLocked/);
+  const reopen = flowSource.slice(flowSource.indexOf("const reopenLatest"), flowSource.indexOf("const removeCurrent"));
+  assert.match(reopen, /selectVocabSettingsWriteRecoveryEntry/);
+  assert.doesNotMatch(reopen, /latestJournal\.entries\[0\]/);
   assert.match(appSource, /if \(!settingsDraft\) return;[\s\S]*?beforeunload/);
   assert.match(
     viewsSource,
     /VocabBackupFlow controlsDisabled=\{busy \|\| settingsWriteLocked \|\| settingsWriteBusy \|\| databaseMutationLocked\}/,
   );
   assert.match(uiSource, /disabled=\{disabled\}/);
+});
+
+test("background journal reloads stay passive while foreground recovery owns focus", async () => {
+  const effect = flowSource.slice(
+    flowSource.indexOf("useEffect(() => {\n    mounted.current = true;"),
+    flowSource.indexOf("useEffect(() => {\n    if (!busy && !hasVolatileHeldReceipt)"),
+  );
+  const handlers = effect.slice(
+    effect.indexOf("const onStorage"),
+    effect.indexOf('window.addEventListener("storage"'),
+  );
+  assert.match(handlers, /reloadJournal\(\)/);
+  assert.doesNotMatch(handlers, /setFocusRequest|onAttention|showAttention|setFlow|open\(/);
+  const executable = transpile(`
+let reloads = 0;
+let focusRequests = 0;
+let attentionRequests = 0;
+let opens = 0;
+let flowChanges = 0;
+const reloadJournal = () => { reloads += 1; };
+const setFocusRequest = () => { focusRequests += 1; };
+const onAttention = () => { attentionRequests += 1; };
+const showAttention = () => { attentionRequests += 1; };
+const open = () => { opens += 1; };
+const setFlow = () => { flowChanges += 1; };
+const window = { localStorage: {} };
+const document = { visibilityState: "visible" };
+${handlers}
+onStorage({ storageArea: window.localStorage, key: null });
+onFocus();
+onVisibility();
+export { reloads, focusRequests, attentionRequests, opens, flowChanges };
+`, "vocab-settings-background-reload-contract.ts");
+  const runtime = await import(`data:text/javascript;base64,${Buffer.from(executable).toString("base64")}`);
+  assert.equal(runtime.reloads, 3);
+  assert.equal(runtime.focusRequests, 0);
+  assert.equal(runtime.attentionRequests, 0);
+  assert.equal(runtime.opens, 0);
+  assert.equal(runtime.flowChanges, 0);
+
+  const dismiss = flowSource.slice(
+    flowSource.indexOf("const dismissInvalid = useCallback"),
+    flowSource.indexOf("const clearUnreadable = useCallback"),
+  );
+  assert.match(dismiss, /catch \(reason\)[\s\S]*?phase: "invalid"/);
 });

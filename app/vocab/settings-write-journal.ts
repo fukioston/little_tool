@@ -33,6 +33,36 @@ export type VocabSettingsWriteJournal = Readonly<{
   lockUnavailable: boolean;
 }>;
 
+export function selectVocabSettingsWriteRecoveryEntry(
+  heldEntries: readonly VocabSettingsWriteEntry[],
+  journalEntries: readonly VocabSettingsWriteEntry[],
+): VocabSettingsWriteEntry | null {
+  for (const held of heldEntries) {
+    const peer = journalEntries.find((entry) =>
+      entry.storageKey !== held.storageKey
+    );
+    if (peer) return peer;
+    const exact = journalEntries.find((entry) =>
+      entry.storageKey === held.storageKey
+    );
+    if (exact) return exact;
+  }
+  return journalEntries[0] ?? heldEntries[0] ?? null;
+}
+
+export function vocabSettingsHeldReceiptBarrier(
+  heldOperationIds: Iterable<string>,
+  durableOperationIds: Iterable<string>,
+): Readonly<{ blocksWrites: boolean; volatile: boolean }> {
+  const held = [...heldOperationIds];
+  if (held.length === 0) return { blocksWrites: false, volatile: false };
+  const durable = new Set(durableOperationIds);
+  return {
+    blocksWrites: true,
+    volatile: held.some((operationId) => !durable.has(operationId)),
+  };
+}
+
 export type VocabSettingsWriteJournalStorage = Pick<
   Storage,
   "length" | "key" | "getItem" | "setItem" | "removeItem"
@@ -48,7 +78,7 @@ export type VocabSettingsWriteLease = Readonly<{
 
 export type VocabSettingsWriteRunResult<Result> =
   | Readonly<{ outcome: "stale" }>
-  | Readonly<{ outcome: "blocked"; reason: "storage" | "unreadable" }>
+  | Readonly<{ outcome: "blocked"; reason: "storage" | "unreadable" | "peer" }>
   | Readonly<{ outcome: "ran"; value: Result; entry: VocabSettingsWriteEntry | null }>;
 
 export type VocabSettingsWriteToken = symbol;
@@ -113,6 +143,20 @@ export function createVocabSettingsWriteTicket(
   return ticket;
 }
 
+export function createVocabSettingsWriteEntry(
+  ticket: VocabSettingsWriteTicket,
+): VocabSettingsWriteEntry {
+  if (!isVocabSettingsWriteTicket(ticket)) {
+    throw new Error("设置核对凭据无效；没有开始写入。");
+  }
+  const storageKey = vocabSettingsWriteKey(ticket);
+  const raw = JSON.stringify(ticket);
+  if (raw.length > VOCAB_SETTINGS_WRITE_MAX_CHARS) {
+    throw new Error("这次设置内容过大，无法安全保留核对线索；没有开始写入。");
+  }
+  return { storageKey, raw, ticket };
+}
+
 export function readVocabSettingsWriteJournal(
   storage: VocabSettingsWriteJournalStorage = browserStorage(),
   locks: VocabSettingsWriteJournalLockManager | null = browserLocks(),
@@ -150,14 +194,8 @@ function persistToStorage(
   storage: VocabSettingsWriteJournalStorage,
   ticket: VocabSettingsWriteTicket,
 ): VocabSettingsWriteEntry {
-  if (!isVocabSettingsWriteTicket(ticket)) {
-    throw new Error("设置核对凭据无效；没有开始写入。");
-  }
-  const storageKey = vocabSettingsWriteKey(ticket);
-  const raw = JSON.stringify(ticket);
-  if (raw.length > VOCAB_SETTINGS_WRITE_MAX_CHARS) {
-    throw new Error("这次设置内容过大，无法安全保留核对线索；没有开始写入。");
-  }
+  const entry = createVocabSettingsWriteEntry(ticket);
+  const { storageKey, raw } = entry;
   const existing = storage.getItem(storageKey);
   if (existing !== null && existing !== raw) {
     throw new Error("另一页保留了同一动作的不同核对线索；没有开始写入。");
@@ -166,7 +204,7 @@ function persistToStorage(
   if (storage.getItem(storageKey) !== raw) {
     throw new Error("浏览器没有确认保留设置核对线索；没有开始写入。");
   }
-  return { storageKey, raw, ticket };
+  return entry;
 }
 
 export async function persistVocabSettingsWrite(
@@ -240,6 +278,111 @@ export async function runWithCurrentVocabSettingsWrite<Result>(
     if (journal.unreadable.length > 0) return { outcome: "blocked", reason: "unreadable" } as const;
     if (storage.getItem(entry.storageKey) !== entry.raw) return { outcome: "stale" } as const;
     let current: VocabSettingsWriteEntry | null = entry;
+    const lease: VocabSettingsWriteLease = {
+      committed() {
+        if (!current) throw new Error("设置核对线索已经结束。");
+        current = replaceInStorage(storage, current, "committed");
+        return current;
+      },
+      changed() {
+        if (!current) throw new Error("设置核对线索已经结束。");
+        current = replaceInStorage(storage, current, "changed");
+        return current;
+      },
+      remove() {
+        if (!current || !removeFromStorage(storage, current)) {
+          throw new Error("另一页已经处理了这条设置核对线索。");
+        }
+        current = null;
+      },
+    };
+    const value = await operation(lease);
+    return { outcome: "ran", value, entry: current } as const;
+  });
+}
+
+export async function runWithExclusiveCurrentVocabSettingsWrite<Result>(
+  entry: VocabSettingsWriteEntry,
+  operation: (lease: VocabSettingsWriteLease) => Result | Promise<Result>,
+  options?: Readonly<{
+    storage?: VocabSettingsWriteJournalStorage;
+    locks?: VocabSettingsWriteJournalLockManager | null;
+  }>,
+): Promise<VocabSettingsWriteRunResult<Result>> {
+  const storage = options?.storage ?? browserStorage();
+  const locks = options && "locks" in options ? options.locks ?? null : browserLocks();
+  return withJournalLock(locks, async () => {
+    const journal = readVocabSettingsWriteJournal(storage, locks);
+    if (journal.storageUnavailable) {
+      return { outcome: "blocked", reason: "storage" } as const;
+    }
+    if (journal.unreadable.length > 0) {
+      return { outcome: "blocked", reason: "unreadable" } as const;
+    }
+    const currentEntry = journal.entries.find((candidate) =>
+      candidate.storageKey === entry.storageKey
+    );
+    if (!currentEntry || currentEntry.raw !== entry.raw ||
+        storage.getItem(entry.storageKey) !== entry.raw) {
+      return { outcome: "stale" } as const;
+    }
+    if (journal.entries.length !== 1) {
+      return { outcome: "blocked", reason: "peer" } as const;
+    }
+    let current: VocabSettingsWriteEntry | null = currentEntry;
+    const lease: VocabSettingsWriteLease = {
+      committed() {
+        if (!current) throw new Error("设置核对线索已经结束。");
+        current = replaceInStorage(storage, current, "committed");
+        return current;
+      },
+      changed() {
+        if (!current) throw new Error("设置核对线索已经结束。");
+        current = replaceInStorage(storage, current, "changed");
+        return current;
+      },
+      remove() {
+        if (!current || !removeFromStorage(storage, current)) {
+          throw new Error("另一页已经处理了这条设置核对线索。");
+        }
+        current = null;
+      },
+    };
+    const value = await operation(lease);
+    return { outcome: "ran", value, entry: current } as const;
+  });
+}
+
+export async function runWithMissingVocabSettingsWrite<Result>(
+  heldEntry: VocabSettingsWriteEntry,
+  operation: (lease: VocabSettingsWriteLease) => Result | Promise<Result>,
+  options?: Readonly<{
+    storage?: VocabSettingsWriteJournalStorage;
+    locks?: VocabSettingsWriteJournalLockManager | null;
+  }>,
+): Promise<VocabSettingsWriteRunResult<Result>> {
+  const storage = options?.storage ?? browserStorage();
+  const locks = options && "locks" in options ? options.locks ?? null : browserLocks();
+  return withJournalLock(locks, async () => {
+    const journal = readVocabSettingsWriteJournal(storage, locks);
+    if (journal.storageUnavailable) {
+      return { outcome: "blocked", reason: "storage" } as const;
+    }
+    if (journal.unreadable.length > 0) {
+      return { outcome: "blocked", reason: "unreadable" } as const;
+    }
+    if (journal.entries.length > 0) {
+      return { outcome: "stale" } as const;
+    }
+    if (storage.getItem(heldEntry.storageKey) !== null) {
+      return { outcome: "stale" } as const;
+    }
+
+    const checkTicket = { ...heldEntry.ticket, kind: "check" } as const;
+    let current: VocabSettingsWriteEntry | null = persistToStorage(
+      storage,
+      checkTicket,
+    );
     const lease: VocabSettingsWriteLease = {
       committed() {
         if (!current) throw new Error("设置核对线索已经结束。");

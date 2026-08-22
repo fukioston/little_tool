@@ -10,14 +10,20 @@ import {
 import {
   VOCAB_SETTINGS_WRITE_PREFIX,
   claimVocabSettingsWrite,
+  createVocabSettingsWriteEntry,
   createVocabSettingsWriteTicket,
   persistVocabSettingsWrite,
   readVocabSettingsWriteJournal,
   releaseVocabSettingsWrite,
   removeUnreadableVocabSettingsWrite,
   runWithCurrentVocabSettingsWrite,
+  runWithExclusiveCurrentVocabSettingsWrite,
+  runWithMissingVocabSettingsWrite,
+  selectVocabSettingsWriteRecoveryEntry,
+  vocabSettingsHeldReceiptBarrier,
   type VocabSettingsWriteEntry,
   type VocabSettingsWriteJournal,
+  type VocabSettingsWriteLease,
   type VocabSettingsWriteToken,
 } from "./settings-write-journal";
 
@@ -77,12 +83,20 @@ export function useVocabSettingsWriteFlow({
   const [status, setStatus] = useState("");
   const [error, setError] = useState("");
   const [focusRequest, setFocusRequest] = useState(0);
+  const [heldEntries, setHeldEntries] = useState<readonly VocabSettingsWriteEntry[]>([]);
   const operationRef = useRef<VocabSettingsWriteToken | null>(null);
+  const heldEntriesRef = useRef(new Map<string, VocabSettingsWriteEntry>());
   const mounted = useRef(false);
 
   const busy = flow.phase === "working";
+  const heldBarrier = vocabSettingsHeldReceiptBarrier(
+    heldEntries.map((entry) => entry.ticket.receipt.operationId),
+    journal.entries.map((entry) => entry.ticket.receipt.operationId),
+  );
+  const hasHeldReceipt = heldBarrier.blocksWrites;
+  const hasVolatileHeldReceipt = heldBarrier.volatile;
   const writeLocked = !journal.loaded || journal.storageUnavailable || journal.lockUnavailable ||
-    journal.entries.length > 0 || journal.unreadable.length > 0 || busy;
+    journal.entries.length > 0 || journal.unreadable.length > 0 || hasHeldReceipt || busy;
 
   const reloadJournal = useCallback(() => {
     let next: VocabSettingsWriteJournal;
@@ -95,11 +109,23 @@ export function useVocabSettingsWriteFlow({
     return next;
   }, []);
 
+  const holdEntry = useCallback((entry: VocabSettingsWriteEntry) => {
+    heldEntriesRef.current.set(entry.ticket.receipt.operationId, entry);
+    setHeldEntries([...heldEntriesRef.current.values()]);
+  }, []);
+
+  const clearHeldEntry = useCallback((receipt?: VocabSettingsWriteReceipt) => {
+    if (receipt) heldEntriesRef.current.delete(receipt.operationId);
+    else heldEntriesRef.current.clear();
+    setHeldEntries([...heldEntriesRef.current.values()]);
+  }, []);
+
   const showAttention = useCallback((next: Flow) => {
+    if ("entry" in next) holdEntry(next.entry);
     setFlow(next);
     setFocusRequest((current) => current + 1);
     onAttention();
-  }, [onAttention]);
+  }, [holdEntry, onAttention]);
 
   const claim = useCallback((action: WorkingAction) => {
     const token = claimVocabSettingsWrite(operationRef);
@@ -118,10 +144,15 @@ export function useVocabSettingsWriteFlow({
     mounted.current = true;
     reloadJournal();
     const onStorage = (event: StorageEvent) => {
-      if (event.storageArea === window.localStorage && event.key?.startsWith(VOCAB_SETTINGS_WRITE_PREFIX)) reloadJournal();
+      if (
+        event.storageArea === window.localStorage &&
+        (event.key === null || event.key.startsWith(VOCAB_SETTINGS_WRITE_PREFIX))
+      ) reloadJournal();
     };
     const onFocus = () => reloadJournal();
-    const onVisibility = () => { if (document.visibilityState === "visible") reloadJournal(); };
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") reloadJournal();
+    };
     window.addEventListener("storage", onStorage);
     window.addEventListener("focus", onFocus);
     document.addEventListener("visibilitychange", onVisibility);
@@ -134,22 +165,55 @@ export function useVocabSettingsWriteFlow({
   }, [reloadJournal]);
 
   useEffect(() => {
-    if (!busy) return;
+    if (!busy && !hasVolatileHeldReceipt) return;
     const protect = (event: BeforeUnloadEvent) => event.preventDefault();
     window.addEventListener("beforeunload", protect);
     return () => window.removeEventListener("beforeunload", protect);
-  }, [busy]);
+  }, [busy, hasVolatileHeldReceipt]);
+
+  const setSafelyIdle = useCallback((receipt?: VocabSettingsWriteReceipt) => {
+    clearHeldEntry(receipt);
+    const current = reloadJournal();
+    const next = selectVocabSettingsWriteRecoveryEntry(
+      [...heldEntriesRef.current.values()],
+      current.entries,
+    );
+    if (next) holdEntry(next);
+    setFlow(next ? phaseForEntry(next) : { phase: "idle" });
+  }, [clearHeldEntry, holdEntry, reloadJournal]);
+
+  const restoreHeldFlowOrIdle = useCallback((message: string) => {
+    const current = reloadJournal();
+    const next = selectVocabSettingsWriteRecoveryEntry(
+      [...heldEntriesRef.current.values()],
+      current.entries,
+    );
+    if (next) holdEntry(next);
+    setFlow(next
+      ? current.entries.includes(next)
+        ? phaseForEntry(next)
+        : { phase: "check", entry: next, message }
+      : { phase: "idle" });
+  }, [holdEntry, reloadJournal]);
 
   const reopenLatest = useCallback((entry: VocabSettingsWriteEntry) => {
+    holdEntry(entry);
     const latestJournal = reloadJournal();
-    const latest = latestJournal.entries.find((candidate) => candidate.storageKey === entry.storageKey) ?? latestJournal.entries[0];
-    if (!latest) {
-      setFlow({ phase: "idle" });
-      setError("另一页已经处理了这条提醒；请按页面上的最新状态继续。");
+    const latest = selectVocabSettingsWriteRecoveryEntry(
+      [...heldEntriesRef.current.values()],
+      latestJournal.entries,
+    );
+    if (!latest || !latestJournal.entries.includes(latest)) {
+      showAttention({
+        phase: "check",
+        entry: latest ?? entry,
+        message: "另一页移除了这条提醒；当前页仍保留原收据。下一步只读核对，不会重复写入。",
+      });
+      setError("原收据暂时只保留在本页；核对完成前，所有设置写入保持暂停。");
       return;
     }
     showAttention(phaseForEntry(latest));
-  }, [reloadJournal, showAttention]);
+  }, [holdEntry, reloadJournal, showAttention]);
 
   const removeCurrent = useCallback(async (entry: VocabSettingsWriteEntry) => {
     const result = await runWithCurrentVocabSettingsWrite(entry, (lease) => lease.remove());
@@ -157,11 +221,27 @@ export function useVocabSettingsWriteFlow({
     return result.outcome;
   }, [reloadJournal]);
 
+  const inspectEntryWithLease = useCallback((
+    entry: VocabSettingsWriteEntry,
+    missing: boolean,
+  ) => {
+    const operation = async (lease: VocabSettingsWriteLease) => {
+      const inspection = await inspectVocabSettingsWrite(entry.ticket.receipt);
+      if (inspection === "exact_saved") lease.committed();
+      else if (inspection === "changed") lease.changed();
+      return inspection;
+    };
+    return missing
+      ? runWithMissingVocabSettingsWrite(entry, operation)
+      : runWithCurrentVocabSettingsWrite(entry, operation);
+  }, []);
+
   const finishCommitted = useCallback(async (
     entry: VocabSettingsWriteEntry,
     success: string,
     token: VocabSettingsWriteToken,
   ): Promise<VocabSettingsStartResult> => {
+    holdEntry(entry);
     setFlow({ phase: "working", action: "refresh" });
     setStatus(savedCopy());
     setError("");
@@ -195,7 +275,7 @@ export function useVocabSettingsWriteFlow({
         reopenLatest(entry);
         return "attention";
       }
-      setFlow({ phase: "idle" });
+      setSafelyIdle(entry.ticket.receipt);
       setStatus(success);
       onToast(success);
       onDurableSettled?.(entry.ticket.receipt);
@@ -207,7 +287,58 @@ export function useVocabSettingsWriteFlow({
     } finally {
       release(token);
     }
-  }, [onDurableCommitted, onDurableSettled, onToast, refresh, release, removeCurrent, reopenLatest, showAttention]);
+  }, [holdEntry, onDurableCommitted, onDurableSettled, onToast, refresh, release, removeCurrent, reopenLatest, setSafelyIdle, showAttention]);
+
+  const settleInspectionResult = useCallback(async (
+    result: Awaited<ReturnType<typeof inspectEntryWithLease>>,
+    held: VocabSettingsWriteEntry,
+    token: VocabSettingsWriteToken,
+  ): Promise<VocabSettingsStartResult> => {
+    reloadJournal();
+    if (result.outcome === "blocked") {
+      showAttention({
+        phase: "check",
+        entry: held,
+        message: "当前无法完整验证全部设置提醒；原收据仍保留在本页，没有调用写入。",
+      });
+      setError("核对存储尚未安全可用；所有设置写入保持暂停。");
+      return "attention";
+    }
+    if (result.outcome === "stale") {
+      reopenLatest(held);
+      return "attention";
+    }
+    if (result.value === "exact_saved" && result.entry) {
+      return finishCommitted(result.entry, "设置已确认并重新读取", token);
+    }
+    const entry = result.entry ?? held;
+    if (result.value === "expected") {
+      showAttention({
+        phase: "expected",
+        entry,
+        message: "这次确定还没有写入。可以清除提醒，或明确继续保存同一份内容。",
+      });
+    } else if (result.value === "changed") {
+      showAttention({
+        phase: "changed",
+        entry,
+        message: "当前设置已经变化；旧内容没有覆盖现在的设置。",
+      });
+    } else if (result.value === "invalid_receipt") {
+      showAttention({
+        phase: "invalid",
+        entry,
+        message: "这份设置收据无法验证；没有据此写入。",
+      });
+    } else {
+      showAttention({
+        phase: "check",
+        entry,
+        message: "结果仍无法确认；收据继续保留，不会自动重试。",
+      });
+    }
+    return "attention";
+  }, [finishCommitted, reloadJournal, reopenLatest, showAttention]);
 
   const commitEntry = useCallback(async (
     entry: VocabSettingsWriteEntry,
@@ -216,7 +347,7 @@ export function useVocabSettingsWriteFlow({
   ): Promise<VocabSettingsStartResult> => {
     setFlow({ phase: "working", action: "commit" });
     try {
-      const result = await runWithCurrentVocabSettingsWrite(entry, async (lease) => {
+      const result = await runWithExclusiveCurrentVocabSettingsWrite(entry, async (lease) => {
         try {
           const committed = await commitVocabSettingsWrite(entry.ticket.receipt);
           if (committed.outcome === "saved" || committed.outcome === "already_saved") {
@@ -237,6 +368,12 @@ export function useVocabSettingsWriteFlow({
       });
       reloadJournal();
       if (result.outcome === "blocked") {
+        if (result.reason === "peer") {
+          reopenLatest(entry);
+          setError("另一张耐久设置收据已经出现；原收据仍保留，先处理画面上的收据。");
+          release(token);
+          return "attention";
+        }
         showAttention({ phase: "check", entry, message: "设置核对线索暂时无法完整验证；没有调用设置写入。" });
         setError("现有设置没有改变；先处理全局安全提醒。");
         release(token);
@@ -274,15 +411,21 @@ export function useVocabSettingsWriteFlow({
     if (!token) return "attention";
     let entry: VocabSettingsWriteEntry | null = null;
     let preparedReceipt: VocabSettingsWriteReceipt | null = null;
+    let preparedEntry: VocabSettingsWriteEntry | null = null;
     try {
       const current = reloadJournal();
       if (current.storageUnavailable) throw new Error("暂时无法读取设置核对存储；没有开始写入。");
       if (current.lockUnavailable) throw new Error("当前浏览器没有安全跨页面写入锁；没有开始写入。");
       if (current.unreadable.length > 0) throw new Error("先处理无法验证的设置提醒；没有开始写入。");
       if (current.entries.length > 0) throw new Error("先处理上一条设置核对线索；没有开始写入。");
+      if (heldEntriesRef.current.size > 0) throw new Error("先只读核对当前页保留的原设置收据；没有开始新的写入。");
       const receipt = await prepare();
       preparedReceipt = receipt;
-      entry = await persistVocabSettingsWrite(createVocabSettingsWriteTicket(receipt));
+      preparedEntry = createVocabSettingsWriteEntry(
+        createVocabSettingsWriteTicket(receipt),
+      );
+      entry = await persistVocabSettingsWrite(preparedEntry.ticket);
+      holdEntry(entry);
       onDurablePrepared?.(receipt);
       reloadJournal();
       return await commitEntry(entry, success, token);
@@ -297,6 +440,20 @@ export function useVocabSettingsWriteFlow({
       const recoveredEntry = preparedReceipt
         ? recovered.entries.find((candidate) => candidate.ticket.receipt.operationId === preparedReceipt?.operationId)
         : null;
+      const recoverySelection = preparedEntry
+        ? selectVocabSettingsWriteRecoveryEntry([preparedEntry], recovered.entries)
+        : null;
+      if (
+        preparedEntry && recoverySelection &&
+        recovered.entries.includes(recoverySelection) &&
+        recoverySelection.storageKey !== preparedEntry.storageKey
+      ) {
+        holdEntry(preparedEntry);
+        showAttention(phaseForEntry(recoverySelection));
+        setError(`${reasonMessage(reason)} 先处理另一张耐久设置收据；原收据仍保留在本页。`);
+        release(token);
+        return "attention";
+      }
       if (recoveredEntry) {
         onDurablePrepared?.(recoveredEntry.ticket.receipt);
         showAttention({ phase: "check", entry: recoveredEntry, message: "安全收据可能已经保留；先只读核对结果，不会重复写入。" });
@@ -304,66 +461,151 @@ export function useVocabSettingsWriteFlow({
         release(token);
         return "attention";
       }
-      setFlow({ phase: "idle" });
+      if (preparedEntry) {
+        holdEntry(preparedEntry);
+        try {
+          const inspection = await inspectEntryWithLease(preparedEntry, true);
+          if (inspection.outcome === "ran" && inspection.entry) {
+            onDurablePrepared?.(inspection.entry.ticket.receipt);
+          }
+          return await settleInspectionResult(inspection, preparedEntry, token);
+        } catch (recoveryReason) {
+          const checkpointed = reloadJournal().entries.find((candidate) =>
+            candidate.ticket.receipt.operationId === preparedReceipt?.operationId
+          );
+          if (checkpointed) {
+            onDurablePrepared?.(checkpointed.ticket.receipt);
+            showAttention({
+              phase: "check",
+              entry: checkpointed,
+              message: "原收据已经重新保留；只读核对尚未完成，不会自动重试。",
+            });
+          } else {
+            showAttention({
+              phase: "check",
+              entry: preparedEntry,
+              message: "原收据暂时只保留在本页；只读核对尚未完成，所有设置写入保持暂停。",
+            });
+          }
+          setError(reasonMessage(recoveryReason));
+          return "attention";
+        } finally {
+          if (operationRef.current === token) release(token);
+        }
+      }
+      restoreHeldFlowOrIdle("原收据仍保留在本页；下一步只读核对，不会重复写入。");
       release(token);
       throw reason;
     }
-  }, [claim, commitEntry, onDurablePrepared, reloadJournal, release, showAttention]);
+  }, [claim, commitEntry, holdEntry, inspectEntryWithLease, onDurablePrepared, reloadJournal, release, restoreHeldFlowOrIdle, settleInspectionResult, showAttention]);
 
   const open = useCallback((entry?: VocabSettingsWriteEntry) => {
     if (operationRef.current) return;
-    const next = entry ?? reloadJournal().entries[0] ?? null;
+    const current = reloadJournal();
+    const next = entry ?? selectVocabSettingsWriteRecoveryEntry(
+      [...heldEntriesRef.current.values()],
+      current.entries,
+    );
     setError("");
-    showAttention(next ? phaseForEntry(next) : { phase: "idle" });
+    showAttention(next
+      ? current.entries.includes(next)
+        ? phaseForEntry(next)
+        : {
+            phase: "check",
+            entry: next,
+            message: "原收据暂时只保留在本页；先只读核对，不会重复写入。",
+          }
+      : { phase: "idle" });
   }, [reloadJournal, showAttention]);
 
   const inspect = useCallback(async (entry: VocabSettingsWriteEntry) => {
+    holdEntry(entry);
+    const current = reloadJournal();
+    const selected = selectVocabSettingsWriteRecoveryEntry(
+      [...heldEntriesRef.current.values()],
+      current.entries,
+    );
+    if (
+      selected && current.entries.includes(selected) &&
+      selected.storageKey !== entry.storageKey
+    ) {
+      setError("先处理另一张耐久设置收据；原收据仍保留在本页，之后可以继续核对。");
+      showAttention(phaseForEntry(selected));
+      return;
+    }
     const token = claim("inspect");
     if (!token) return;
+    let missing = false;
     try {
-      const result = await runWithCurrentVocabSettingsWrite(entry, async (lease) => {
-        const inspection = await inspectVocabSettingsWrite(entry.ticket.receipt);
-        if (inspection === "exact_saved") lease.committed();
-        else if (inspection === "changed") lease.changed();
-        return inspection;
-      });
-      reloadJournal();
-      if (result.outcome === "blocked") {
-        showAttention({ phase: "check", entry, message: "当前无法完整验证全部设置提醒；没有调用结果核对。" });
-        release(token);
-        return;
-      }
+      let result = await inspectEntryWithLease(entry, false);
       if (result.outcome === "stale") {
-        reopenLatest(entry);
-        release(token);
-        return;
+        holdEntry(entry);
+        missing = true;
+        result = await inspectEntryWithLease(entry, true);
       }
-      if (result.value === "exact_saved" && result.entry) {
-        await finishCommitted(result.entry, "设置已确认并重新读取", token);
-        return;
+      if (missing && result.outcome === "ran" && result.entry) {
+        onDurablePrepared?.(result.entry.ticket.receipt);
       }
-      if (result.value === "expected") {
-        showAttention({ phase: "expected", entry, message: "这次确定还没有写入。可以清除提醒，或明确继续保存同一份内容。" });
-      } else if (result.value === "changed" && result.entry) {
-        showAttention({ phase: "changed", entry: result.entry, message: "当前设置已经变化；旧内容没有覆盖现在的设置。" });
-      } else if (result.value === "invalid_receipt") {
-        showAttention({ phase: "invalid", entry, message: "这份设置收据无法验证；没有据此写入。" });
-      } else {
-        showAttention({ phase: "check", entry, message: "结果仍无法确认；收据继续保留，不会自动重试。" });
-      }
+      await settleInspectionResult(result, entry, token);
     } catch (reason) {
+      const checkpointed = missing
+        ? reloadJournal().entries.find((candidate) =>
+            candidate.ticket.receipt.operationId === entry.ticket.receipt.operationId
+          )
+        : null;
+      if (checkpointed) onDurablePrepared?.(checkpointed.ticket.receipt);
       setError(reasonMessage(reason));
-      showAttention({ phase: "check", entry, message: "只读核对没有完成；收据仍保留。" });
+      showAttention({
+        phase: "check",
+        entry: checkpointed ?? entry,
+        message: checkpointed
+          ? "原收据已经重新保留；只读核对没有完成，不会自动重试。"
+          : "只读核对没有完成；原收据仍保留在本页。",
+      });
     } finally {
-      release(token);
+      if (operationRef.current === token) release(token);
     }
-  }, [claim, finishCommitted, reloadJournal, release, reopenLatest, showAttention]);
+  }, [claim, holdEntry, inspectEntryWithLease, onDurablePrepared, reloadJournal, release, settleInspectionResult, showAttention]);
 
   const continueExpected = useCallback(async (entry: VocabSettingsWriteEntry) => {
+    const current = reloadJournal();
+    const selected = selectVocabSettingsWriteRecoveryEntry(
+      [...heldEntriesRef.current.values()],
+      current.entries,
+    );
+    const selectedReceiptMatches = Boolean(
+      selected && selected.storageKey === entry.storageKey &&
+      selected.raw === entry.raw && current.entries.some((candidate) =>
+        candidate.storageKey === entry.storageKey && candidate.raw === entry.raw
+      ),
+    );
+    if (
+      current.storageUnavailable || current.lockUnavailable ||
+      current.unreadable.length > 0 || !selectedReceiptMatches
+    ) {
+      const durablePeer = selected && current.entries.includes(selected) &&
+        selected.storageKey !== entry.storageKey
+        ? selected
+        : null;
+      if (durablePeer) {
+        setError("先处理另一张耐久设置收据；原收据仍保留在本页，之后可以继续。");
+        showAttention(phaseForEntry(durablePeer));
+        return;
+      }
+      showAttention({
+        phase: selectedReceiptMatches ? "expected" : "check",
+        entry,
+        message: selectedReceiptMatches
+          ? "这张收据仍保留；其他安全提醒处理完成前，不会继续写入。"
+          : "原收据暂时只保留在本页；先只读核对，不会继续写入。",
+      });
+      setError("当前安全门尚未开放；没有调用设置写入。请先只读核对这张收据。");
+      return;
+    }
     const token = claim("commit");
     if (!token) return;
     await commitEntry(entry, "设置已保存并重新读取", token);
-  }, [claim, commitEntry]);
+  }, [claim, commitEntry, reloadJournal, showAttention]);
 
   const discardExpected = useCallback(async (entry: VocabSettingsWriteEntry) => {
     const token = claim("journal");
@@ -373,7 +615,7 @@ export function useVocabSettingsWriteFlow({
       if (result === "blocked") showAttention({ phase: "expected", entry, message: "出现了无法验证的跨页面提醒；这条收据仍保留。" });
       else if (result === "stale") reopenLatest(entry);
       else {
-        setFlow({ phase: "idle" });
+        setSafelyIdle(entry.ticket.receipt);
         setStatus("这次确定未写入的设置收据已经清除；原设置没有改变。");
       }
     } catch (reason) {
@@ -382,15 +624,18 @@ export function useVocabSettingsWriteFlow({
     } finally {
       release(token);
     }
-  }, [claim, release, removeCurrent, reopenLatest, showAttention]);
+  }, [claim, release, removeCurrent, reopenLatest, setSafelyIdle, showAttention]);
 
-  const refreshCommitted = useCallback(async (entry: VocabSettingsWriteEntry) => {
-    const token = claim("refresh");
-    if (!token) return;
-    await finishCommitted(entry, "设置已重新读取", token);
-  }, [claim, finishCommitted]);
+  const refreshCommitted = inspect;
 
   const refreshChanged = useCallback(async (entry: VocabSettingsWriteEntry) => {
+    const current = reloadJournal();
+    if (!current.entries.some((candidate) =>
+      candidate.storageKey === entry.storageKey && candidate.raw === entry.raw
+    )) {
+      await inspect(entry);
+      return;
+    }
     const token = claim("refresh");
     if (!token) return;
     try {
@@ -403,7 +648,7 @@ export function useVocabSettingsWriteFlow({
       if (removal === "blocked") showAttention({ phase: "changed", entry, message: "页面已读取，但出现了无法验证的提醒；旧收据继续保留。" });
       else if (removal === "stale") reopenLatest(entry);
       else {
-        setFlow({ phase: "idle" });
+        setSafelyIdle(entry.ticket.receipt);
         setStatus("已经读取当前设置；旧内容没有覆盖或改写它。");
       }
     } catch (reason) {
@@ -412,7 +657,7 @@ export function useVocabSettingsWriteFlow({
     } finally {
       release(token);
     }
-  }, [claim, refresh, release, removeCurrent, reopenLatest, showAttention]);
+  }, [claim, inspect, refresh, release, reloadJournal, removeCurrent, reopenLatest, setSafelyIdle, showAttention]);
 
   const dismissInvalid = useCallback(async (entry: VocabSettingsWriteEntry) => {
     const token = claim("journal");
@@ -421,11 +666,15 @@ export function useVocabSettingsWriteFlow({
       const result = await removeCurrent(entry);
       if (result === "stale") reopenLatest(entry);
       else if (result === "blocked") showAttention({ phase: "invalid", entry, message: "出现了无法验证的提醒；这条旧提醒仍保留。" });
-      else setFlow({ phase: "idle" });
+      else setSafelyIdle(entry.ticket.receipt);
+    } catch (reason) {
+      reloadJournal();
+      setError(reasonMessage(reason));
+      showAttention({ phase: "invalid", entry, message: "提醒没有安全清除；原收据仍保留，可以再次尝试。" });
     } finally {
       release(token);
     }
-  }, [claim, release, removeCurrent, reopenLatest, showAttention]);
+  }, [claim, release, reloadJournal, removeCurrent, reopenLatest, setSafelyIdle, showAttention]);
 
   const clearUnreadable = useCallback(async () => {
     const token = claim("journal");
@@ -438,19 +687,21 @@ export function useVocabSettingsWriteFlow({
         }
       }
       reloadJournal();
-      setFlow({ phase: "idle" });
+      restoreHeldFlowOrIdle("原收据仍保留在本页；下一步只读核对，不会重复写入。");
       setStatus("无法验证的设置提醒已经清除；现有设置没有改变。");
     } catch (reason) {
       setError(reasonMessage(reason));
     } finally {
       release(token);
     }
-  }, [claim, release, reloadJournal]);
+  }, [claim, release, reloadJournal, restoreHeldFlowOrIdle]);
 
   return {
     journal,
     flow,
     busy,
+    hasHeldReceipt,
+    hasVolatileHeldReceipt,
     writeLocked,
     status,
     error,
@@ -472,18 +723,20 @@ export function useVocabSettingsWriteFlow({
 type Controller = ReturnType<typeof useVocabSettingsWriteFlow>;
 
 export function VocabSettingsWriteBanner({ controller }: { controller: Controller }) {
-  const { journal, busy } = controller;
-  if (!journal.loaded || (!journal.storageUnavailable && !journal.lockUnavailable && journal.entries.length === 0 && journal.unreadable.length === 0)) return null;
+  const { journal, busy, hasHeldReceipt, hasVolatileHeldReceipt } = controller;
+  if (!journal.loaded || (!journal.storageUnavailable && !journal.lockUnavailable && journal.entries.length === 0 && journal.unreadable.length === 0 && !hasHeldReceipt)) return null;
   const title = journal.storageUnavailable
     ? "设置核对线索暂时无法读取"
     : journal.lockUnavailable
       ? "这个浏览器可以读取词库，但暂不能安全改设置"
       : journal.unreadable.length > 0
         ? "有无法验证的设置提醒"
-        : `有 ${journal.entries.length} 条设置写入待核对`;
+        : hasVolatileHeldReceipt
+          ? "有一张设置收据暂时只保留在本页"
+          : `有 ${journal.entries.length} 条设置写入待核对`;
   return <section className="sc-settings-write-banner" role="status">
     <div><b>{title}</b><p>文章、播客和词库仍可阅读；设置写入会保持停用，直到这里可以安全处理。</p></div>
-    <button type="button" disabled={busy} onClick={() => controller.open()}>{journal.entries.length ? "打开下一条" : "查看安全说明"}</button>
+    <button type="button" disabled={busy} onClick={() => controller.open()}>{journal.entries.length || hasHeldReceipt ? "打开待核对收据" : "查看安全说明"}</button>
   </section>;
 }
 
