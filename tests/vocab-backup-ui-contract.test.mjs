@@ -493,6 +493,11 @@ test("review copy reports only verified facts and does not promise one-click rol
   assert.match(flowSource, /会清空其中的本地音频引用/);
   assert.match(flowSource, /它不是可下载备份，也不代表这里提供一键回退/);
   assert.doesNotMatch(flowSource, /可随时恢复上一版本|完整上一版本/);
+  assert.match(flowSource, /候选仍可核对；启用时会再次检查当前内容/);
+  assert.doesNotMatch(flowSource, /候选与当前词库仍然匹配/);
+  assert.match(flowSource, /候选建立后有过更新或切换/);
+  assert.match(flowSource, /刚刚有过更新或切换/);
+  assert.doesNotMatch(flowSource, /有过切换/);
 });
 
 test("mount and cross-tab changes only reload tickets without automatic backend work or focus", () => {

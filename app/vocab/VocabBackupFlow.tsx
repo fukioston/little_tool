@@ -420,7 +420,7 @@ export function VocabBackupFlow({
         present({
           phase: "review",
           entry,
-          message: "候选与当前词库仍然匹配，请核对后再决定。",
+          message: "候选仍可核对；启用时会再次检查当前内容。请核对后再决定。",
         });
         return;
       }
@@ -435,7 +435,7 @@ export function VocabBackupFlow({
         entry: next,
         message: mode === "activation-check" && baselineUnchanged
           ? "已经确认这次没有切换。为避免重复启用，现在只收起这份候选。"
-          : "当前词库在候选建立后有过切换。这份候选不会覆盖它，现在只收起候选。",
+          : "当前词库在候选建立后有过更新或切换。这份候选不会覆盖它，现在只收起候选。",
       });
     } catch (error) {
       if (errorCode(error) === "INVALID_RECEIPT") {
@@ -569,7 +569,7 @@ export function VocabBackupFlow({
             present({
               phase: "discard-only",
               entry: next,
-              message: "当前词库刚刚有过切换，这次没有覆盖它。现在只收起候选。",
+              message: "当前词库刚刚有过更新或切换，这次没有覆盖它。现在只收起候选。",
             });
           }
         } else if (errorCode(error) === "INVALID_RECEIPT") {
