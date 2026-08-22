@@ -7,7 +7,7 @@ import type {
 } from "@/lib/career/core-writes";
 import type { CareerLifecycleSnapshot } from "@/lib/career/lifecycle";
 import type {
-  CareerData,
+  CareerUiData,
   Interview,
   InterviewQuestion,
   Job,
@@ -50,7 +50,7 @@ export type CareerCoreBindings = Readonly<{
 }>;
 
 export type CareerCoreReadBundle = Readonly<{
-  base: CareerData;
+  base: CareerUiData;
   all: CareerLifecycleSnapshot;
   scoped: CareerLifecycleSnapshot;
   expectedSet: CareerCoreWriteExpectedSet;
@@ -683,7 +683,7 @@ function createBindings(
  * snapshots reuse E2 objects, so click handlers can require object identity.
  */
 export function createCareerCoreReadBundle(
-  base: CareerData,
+  base: CareerUiData,
   all: CareerLifecycleSnapshot,
   scoped: CareerLifecycleSnapshot,
   expectedBefore: CareerCoreWriteExpectedSet,

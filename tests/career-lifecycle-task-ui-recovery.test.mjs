@@ -319,8 +319,7 @@ test("owner claims cover legacy recovery mutations while pure inspections stay r
   for (const mutation of [
     "exportBackup", "recoverPreparation", "prepareSelectedBackup",
     "activateCandidate", "discardCandidate", "cleanPreparedAttachments",
-    "retryAttachmentCleanup", "performDeletion", "commitPreview",
-    "handleContactUndo", "finishMutation", "changeArchive",
+    "finishMutation",
   ]) {
     const start = appSource.indexOf(`function ${mutation}`) >= 0
       ? appSource.indexOf(`function ${mutation}`)
@@ -330,16 +329,24 @@ test("owner claims cover legacy recovery mutations while pure inspections stay r
     const block = appSource.slice(start, next < 0 ? start + 12_000 : next);
     assert.match(block, /claimDatabaseMutation\(|onExternalMutationChange\(true\)/, mutation);
   }
+  for (const mutation of [
+    "performDeletion", "commitPreview", "handleContactUndo", "changeArchive",
+  ]) {
+    const start = appSource.indexOf(`function ${mutation}`) >= 0
+      ? appSource.indexOf(`function ${mutation}`)
+      : appSource.indexOf(`async function ${mutation}`);
+    assert.notEqual(start, -1, mutation);
+    const next = appSource.indexOf("\n  async function ", start + 1);
+    const block = appSource.slice(start, next < 0 ? start + 12_000 : next);
+    assert.match(block, /submit(?:Contact|Import|Material)/, mutation);
+    assert.doesNotMatch(block, /onExternalMutationChange\(true\)/, mutation);
+  }
   const inspectCandidate = appSource.slice(
     appSource.indexOf("async function inspectCandidate"),
     appSource.indexOf("async function recoverPreparation"),
   );
   assert.doesNotMatch(inspectCandidate, /onExternalMutationChange\(true\)|claimDatabaseMutation\(/);
-  const inspectMaterial = appSource.slice(
-    appSource.indexOf("async function inspectUncertainDeletion"),
-    appSource.indexOf("function materialDeletionSuccessMessage"),
-  );
-  assert.doesNotMatch(inspectMaterial, /onExternalMutationChange\(true\)/);
+  assert.match(appSource, /contactImportMaterialWrites\.inspectActive\(\)/);
 });
 
 test("broadcast, focus, exit guards, recovery focus and 319px controls close the loop", () => {
@@ -348,7 +355,7 @@ test("broadcast, focus, exit guards, recovery focus and 319px controls close the
   assert.match(appSource, /recheckCareerTruthOnFocus/);
   assert.match(appSource, /hasCareerVolatileWork/);
   assert.match(appSource, /className="career-lifecycle-task-recovery"/);
-  assert.match(css, /\.career-lifecycle-task-recovery[\s\S]*?overflow: hidden/);
-  assert.match(css, /\.career-lifecycle-task-recovery \.career-button \{ min-height: 44px; \}/);
-  assert.match(css, /@media \(max-width: 520px\)[\s\S]*?\.career-lifecycle-task-recovery > footer \.career-button[\s\S]*?width: 100%/);
+  assert.match(css, /\.career-lifecycle-task-recovery,[\s\S]*?overflow: hidden/);
+  assert.match(css, /\.career-lifecycle-task-recovery \.career-button,[\s\S]*?min-height: 44px/);
+  assert.match(css, /@media \(max-width: 520px\)[\s\S]*?\.career-lifecycle-task-recovery > footer \.career-button,[\s\S]*?width: 100%/);
 });

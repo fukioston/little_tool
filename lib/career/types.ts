@@ -152,6 +152,11 @@ export type Material = {
   byte_size: number | null;
 };
 
+/** Material facts safe for React state, diagnostics, and UI rendering. */
+export type CareerMaterialUi = Omit<Material, "file_key"> & {
+  has_attachment: boolean;
+};
+
 export type Activity = {
   id: string;
   job_id: string | null;
@@ -168,6 +173,10 @@ export type CareerData = {
   contacts: Contact[];
   materials: Material[];
   activities: Activity[];
+};
+
+export type CareerUiData = Omit<CareerData, "materials"> & {
+  materials: CareerMaterialUi[];
 };
 
 export type Notice = {

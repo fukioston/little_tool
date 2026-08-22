@@ -846,8 +846,14 @@ test("external mutation claims close the reverse core gate in the same tick", ()
   );
   assert.match(getter, /databaseMutationRegistryRef\.current\.isActiveExcept\("core"\)/);
   assert.doesNotMatch(getter, /modal ===|contactEditorId|selectedContactId|taskSheet/);
+  for (const functionName of ["TaskDetailSheet"]) {
+    const start = appSource.indexOf(`function ${functionName}`);
+    const next = appSource.indexOf("\nfunction ", start + 1);
+    const component = appSource.slice(start, next < 0 ? appSource.length : next);
+    assert.match(component, /onExternalMutationChange\(true\)[\s\S]*?await/);
+    assert.match(component, /onExternalMutationChange\(false\)/);
+  }
   for (const functionName of [
-    "TaskDetailSheet",
     "ContactDrawer",
     "ContactModal",
     "ContactInteractionModal",
@@ -859,8 +865,8 @@ test("external mutation claims close the reverse core gate in the same tick", ()
     const start = appSource.indexOf(`function ${functionName}`);
     const next = appSource.indexOf("\nfunction ", start + 1);
     const component = appSource.slice(start, next < 0 ? appSource.length : next);
-    assert.match(component, /onExternalMutationChange\(true\)[\s\S]*?await/);
-    assert.match(component, /onExternalMutationChange\(false\)/);
+    assert.match(component, /writes\.submit(?:Contact|Import|Material)/);
+    assert.doesNotMatch(component, /onExternalMutationChange\(true\)/);
   }
 });
 
@@ -1157,10 +1163,11 @@ test("lifecycle collisions close both ways while recovery-only paths stay reacha
 
   const materialDelete = appSource.slice(
     appSource.indexOf("async function performDeletion"),
-    appSource.indexOf("async function inspectUncertainDeletion"),
+    appSource.indexOf("type CareerImportMode"),
   );
   assert.match(materialDelete, /if \(newWritesBlockedNow\(\)\)/);
-  assert.match(materialDelete, /if \(!onExternalMutationChange\(true\)\)/);
+  assert.match(materialDelete, /writes\.submitMaterialDelete/);
+  assert.doesNotMatch(materialDelete, /onExternalMutationChange\(true\)/);
 });
 
 test("dirty and volatile exit protection plus 319px recovery controls remain operable", () => {

@@ -27,7 +27,7 @@ import {
 import Link from "next/link";
 import {
   CAREER_LEGACY_DEMO_REVIEW_NEEDED, getCareerLegacyDemoResolution, initializeCareerDb,
-  loadCareerData, newId,
+  loadCareerUiData, newId, openCareerMaterialAttachmentById,
 } from "@/lib/career/db";
 import {
   loadCareerCoreWriteExpectedSet,
@@ -39,24 +39,12 @@ import {
   type UpdateCareerJobCoreInput,
 } from "@/lib/career/core-writes";
 import {
-  archiveCareerContactSafely,
-  createCareerContactSafely,
-  createCareerContactTaskSafely,
   inspectCareerContactWrite,
   loadCareerContactDetail,
-  loadCareerContactExpectedState,
   loadCareerContacts,
-  recordCareerContactInteractionSafely,
-  restoreCareerContactSafely,
-  updateCareerContactSafely,
-  CareerContactMutationError,
   type CareerContactDetail,
-  type CareerContactExpectedState,
   type CareerContactWriteInspection,
   type CareerContactWriteReceipt,
-  type CreateCareerContactSafeInput,
-  type CreateCareerContactTaskSafeInput,
-  type RecordCareerContactInteractionSafeInput,
 } from "@/lib/career/contacts";
 import {
   CareerActivationUncertainError,
@@ -105,13 +93,10 @@ import {
   type CareerTaskDetail,
 } from "@/lib/career/tasks";
 import {
-  CareerImportCommitUncertainError,
   CareerImportError,
-  commitCareerJobImports,
   createCareerJobImportPreview,
   fingerprintCareerImportSource,
   forkCareerJobImportPreview,
-  inspectCareerImportCommit,
   parseCareerCsvImportPreview,
   reviseCareerJobImportPreview,
   type CareerImportCandidate,
@@ -121,37 +106,29 @@ import {
   type CareerJobImportPreview,
 } from "@/lib/career/imports";
 import { careerJobIsWatched, resolveCareerJobNextItem, type CareerJobNextItem } from "@/lib/career/calm-view";
-import {
-  CareerMaterialSaveError,
-  inspectCareerMaterialSaveCleanup,
-  inspectCareerMaterialSave,
-  retryCareerMaterialSaveCleanup,
-  saveCareerMaterial,
-  type CareerMaterialSaveCleanupBlockedReason,
-  type CareerMaterialSaveCleanupReceipt,
-  type CareerMaterialSaveExpectedSnapshot,
-  type CareerMaterialSaveInput,
-} from "@/lib/career/material-save";
-import {
-  CareerMaterialDeletionError,
-  deleteCareerMaterial,
-  loadCareerMaterialDeletionState,
-  type CareerMaterialDeletedFileAction,
-  type CareerMaterialDeletionPendingReason,
-  type CareerMaterialDeletionReceipt,
-  type CareerMaterialDeletionState,
-} from "@/lib/career/materials";
 import { subscribeToCareerDataChanges, subscribeToCareerGenerationChanges } from "@/lib/career/lock";
-import { createLocalFileObjectUrl } from "@/lib/local-db/files";
 import type {
-  AiAction, CareerData, CareerView, Contact, Interview, InterviewQuestion,
-  Job, Material, Notice, Stage, Task,
+  AiAction, CareerMaterialUi, CareerUiData, CareerView, Contact, Interview,
+  InterviewQuestion, Job, Notice, Stage, Task,
 } from "@/lib/career/types";
 import { useCareerCoreWriteFlow } from "./CareerCoreWriteFlow";
 import {
   useCareerLifecycleTaskWriteFlow,
   type CareerLifecycleTaskSubmitResult,
 } from "./CareerLifecycleTaskWriteFlow";
+import { useCareerContactImportMaterialWriteFlow } from
+  "./CareerContactImportMaterialWriteFlow";
+import {
+  careerContactDisplayedExpected,
+  careerContactImportMaterialReadApplyDecision,
+  careerImportDisplayedExpected,
+  careerMaterialDeleteDisplayedExpected,
+  careerMaterialSaveDisplayedExpected,
+  createCareerContactImportMaterialReadEnvelope,
+  type CareerContactImportMaterialReadEnvelope,
+} from "./contact-import-material-write-state";
+import type { CareerContactImportMaterialWriteReceipt } from
+  "./contact-import-material-write-journal";
 import {
   careerCoreBundleApplyDecision,
   careerCoreGenerationChangeBarrier,
@@ -184,17 +161,18 @@ const navItems: Array<{ id: CareerView; label: string; compact: string; icon: ty
   { id: "settings", label: "设置", compact: "设置", icon: Settings },
 ];
 
-const emptyData: CareerData = { stages: [], jobs: [], tasks: [], interviews: [], contacts: [], materials: [], activities: [] };
+const emptyData: CareerUiData = { stages: [], jobs: [], tasks: [], interviews: [], contacts: [], materials: [], activities: [] };
 const emptyLifecycleSnapshot: CareerLifecycleSnapshot = { jobs: [], tasks: [], interviews: [] };
 type CareerJobScope = Exclude<CareerLifecycleScope, "all">;
 type CareerCoreWriteController = ReturnType<typeof useCareerCoreWriteFlow>;
+type CareerContactImportMaterialWriteController = ReturnType<
+  typeof useCareerContactImportMaterialWriteFlow
+>;
 type CareerLifecycleChoice = CareerLifecycleWriteChoice;
 type CareerLifecycleImpactItem = CareerLifecycleWriteImpactItem;
 type CareerLifecycleIntent = CareerLifecycleWriteIntent;
 type CareerPreparedLifecycleChange = CareerLifecycleWritePreview;
 
-const CAREER_MATERIAL_SAVE_RECOVERY_PREFIX = "career.material-save-recovery.v1:";
-const CAREER_MATERIAL_SAVE_RECOVERY_MAX_BYTES = 256 * 1024;
 const CAREER_MATERIAL_ATTACHMENT_MAX_BYTES = 512 * 1024 * 1024;
 const CAREER_SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const CAREER_UUID_V4_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -250,45 +228,10 @@ type CareerBackupFlow =
   | Readonly<{ phase: "refresh-only"; receipt: CareerRestoreReceipt; message: string }>
   | Readonly<{ phase: "error"; title: string; message: string }>;
 
-type CareerMaterialSaveRecoveryTicket =
-  | Readonly<{
-      version: 1;
-      kind: "uncertain-save";
-      materialId: string;
-      expectedSnapshot: CareerMaterialSaveExpectedSnapshot;
-      cleanupReceipt: CareerMaterialSaveCleanupReceipt | null;
-      recordedAt: string;
-    }>
-  | Readonly<{
-      version: 1;
-      kind: "cleanup-only";
-      cleanupReceipt: CareerMaterialSaveCleanupReceipt;
-      recordedAt: string;
-    }>;
-
-type CareerMaterialSaveRecoveryEntry = Readonly<{
-  ticket: CareerMaterialSaveRecoveryTicket;
-  persisted: boolean;
-}>;
-
-function materialSaveRecoveryKey(ticket: CareerMaterialSaveRecoveryTicket) {
-  if (ticket.kind === "cleanup-only") return `attachment:${ticket.cleanupReceipt.digest}`;
-  if (ticket.cleanupReceipt) return `attachment:${ticket.cleanupReceipt.digest}`;
-  return `save:${ticket.materialId}`;
-}
-
 function hasExactObjectKeys(value: object, expected: readonly string[]) {
   const actual = Object.keys(value).sort();
   const sortedExpected = [...expected].sort();
   return actual.length === sortedExpected.length && actual.every((key, index) => key === sortedExpected[index]);
-}
-
-function isRecoveryIdentifier(value: unknown) {
-  return typeof value === "string" && value.length > 0 && value.length <= 240 &&
-    value === value.trim() && !Array.from(value).some((character) => {
-      const point = character.codePointAt(0) ?? 0;
-      return point <= 31 || point === 127;
-    });
 }
 
 function isRecoveryText(value: unknown, maximum: number, allowNewlines = false) {
@@ -298,80 +241,6 @@ function isRecoveryText(value: unknown, maximum: number, allowNewlines = false) 
       if (allowNewlines && (point === 9 || point === 10 || point === 13)) return false;
       return point <= 31 || point === 127;
     });
-}
-
-function isMaterialSaveExpectedSnapshot(value: unknown): value is CareerMaterialSaveExpectedSnapshot {
-  if (!value || typeof value !== "object" || Array.isArray(value) || !hasExactObjectKeys(value, [
-    "name", "kind", "version", "updatedAt", "linkedJobId", "status", "notes", "attachment",
-  ])) return false;
-  const snapshot = value as Record<string, unknown>;
-  if (!isRecoveryText(snapshot.name, 240) || !String(snapshot.name).trim() ||
-    !isRecoveryText(snapshot.kind, 80) || !String(snapshot.kind).trim() ||
-    !isRecoveryText(snapshot.version, 80) || !String(snapshot.version).trim() ||
-    typeof snapshot.updatedAt !== "string" || !Number.isFinite(Date.parse(snapshot.updatedAt)) ||
-    (snapshot.linkedJobId !== null && !isRecoveryIdentifier(snapshot.linkedJobId)) ||
-    (snapshot.status !== "ready" && snapshot.status !== "draft" && snapshot.status !== "sent") ||
-    !isRecoveryText(snapshot.notes, 20_000, true)) return false;
-  if (snapshot.attachment === null) return true;
-  if (!snapshot.attachment || typeof snapshot.attachment !== "object" || Array.isArray(snapshot.attachment) ||
-    !hasExactObjectKeys(snapshot.attachment, ["originalName", "mimeType", "byteSize", "sha256"])) return false;
-  const attachment = snapshot.attachment as Record<string, unknown>;
-  return isRecoveryText(attachment.originalName, 255) && Boolean(String(attachment.originalName).trim()) &&
-    isRecoveryText(attachment.mimeType, 127) && Boolean(String(attachment.mimeType).includes("/")) &&
-    Number.isSafeInteger(attachment.byteSize) && Number(attachment.byteSize) > 0 &&
-    Number(attachment.byteSize) <= CAREER_MATERIAL_ATTACHMENT_MAX_BYTES &&
-    typeof attachment.sha256 === "string" && CAREER_SHA256_PATTERN.test(attachment.sha256);
-}
-
-function isMaterialCleanupReceipt(value: unknown): value is CareerMaterialSaveCleanupReceipt {
-  if (!value || typeof value !== "object" || Array.isArray(value) ||
-    !hasExactObjectKeys(value, ["purpose", "version", "opaquePayload", "digest"])) return false;
-  const receipt = value as Record<string, unknown>;
-  return receipt.purpose === "career-material-save-cleanup" && receipt.version === 1 &&
-    typeof receipt.opaquePayload === "string" && receipt.opaquePayload.length > 0 &&
-    receipt.opaquePayload.length <= CAREER_MATERIAL_SAVE_RECOVERY_MAX_BYTES &&
-    typeof receipt.digest === "string" && CAREER_SHA256_PATTERN.test(receipt.digest);
-}
-
-function isMaterialSaveRecoveryTicket(value: unknown): value is CareerMaterialSaveRecoveryTicket {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const ticket = value as Record<string, unknown>;
-  if (ticket.version !== 1 || typeof ticket.recordedAt !== "string" ||
-    !Number.isFinite(Date.parse(ticket.recordedAt))) return false;
-  if (ticket.kind === "cleanup-only") {
-    return hasExactObjectKeys(ticket, ["version", "kind", "cleanupReceipt", "recordedAt"]) &&
-      isMaterialCleanupReceipt(ticket.cleanupReceipt);
-  }
-  return ticket.kind === "uncertain-save" &&
-    hasExactObjectKeys(ticket, ["version", "kind", "materialId", "expectedSnapshot", "cleanupReceipt", "recordedAt"]) &&
-    isRecoveryIdentifier(ticket.materialId) && isMaterialSaveExpectedSnapshot(ticket.expectedSnapshot) &&
-    (ticket.cleanupReceipt === null || isMaterialCleanupReceipt(ticket.cleanupReceipt));
-}
-
-function readMaterialSaveRecoveryStorage() {
-  const tickets: CareerMaterialSaveRecoveryTicket[] = [];
-  const unreadableKeys: string[] = [];
-  if (typeof window === "undefined") return { tickets, unreadableKeys, storageUnavailable: false };
-  try {
-    for (let index = 0; index < window.localStorage.length; index += 1) {
-      const key = window.localStorage.key(index);
-      if (!key?.startsWith(CAREER_MATERIAL_SAVE_RECOVERY_PREFIX)) continue;
-      try {
-        const raw = window.localStorage.getItem(key);
-        if (!raw || raw.length > CAREER_MATERIAL_SAVE_RECOVERY_MAX_BYTES) throw new Error("invalid recovery size");
-        const parsed: unknown = JSON.parse(raw);
-        if (!isMaterialSaveRecoveryTicket(parsed)) throw new Error("invalid recovery ticket");
-        if (key !== `${CAREER_MATERIAL_SAVE_RECOVERY_PREFIX}${materialSaveRecoveryKey(parsed)}`) throw new Error("misbound recovery key");
-        tickets.push(parsed);
-      } catch {
-        unreadableKeys.push(key);
-      }
-    }
-  } catch {
-    return { tickets, unreadableKeys, storageUnavailable: true };
-  }
-  tickets.sort((left, right) => left.recordedAt.localeCompare(right.recordedAt));
-  return { tickets, unreadableKeys, storageUnavailable: false };
 }
 
 function isBackupRecord(value: unknown): value is Record<string, unknown> {
@@ -750,14 +619,29 @@ export function isCareerLifecyclePaused(item: Pick<Task | Interview, "status" | 
     (item.cancellation_reason === "job_ended" || item.cancellation_reason === "job_archived");
 }
 
-async function loadCareerUiState(scope: CareerJobScope): Promise<CareerCoreReadBundle> {
+type CareerUiReadBundle = CareerCoreReadBundle & Readonly<{
+  contactImportMaterial: CareerContactImportMaterialReadEnvelope;
+}>;
+
+async function loadCareerUiState(scope: CareerJobScope): Promise<CareerUiReadBundle> {
   const expectedBefore = await loadCareerCoreWriteExpectedSet();
   const [base, all, scoped] = await Promise.all([
-    loadCareerData(),
+    loadCareerUiData(),
     loadCareerLifecycleScope("all"),
     loadCareerLifecycleScope(scope),
   ]);
   const expectedAfter = await loadCareerCoreWriteExpectedSet();
+  const contactImportMaterial = createCareerContactImportMaterialReadEnvelope(
+    {
+      generationId: expectedBefore.generationId,
+      generationSequence: expectedBefore.generationSequence,
+    },
+    base,
+    {
+      generationId: expectedAfter.generationId,
+      generationSequence: expectedAfter.generationSequence,
+    },
+  );
   const bundle = createCareerCoreReadBundle(
     base,
     all,
@@ -765,13 +649,13 @@ async function loadCareerUiState(scope: CareerJobScope): Promise<CareerCoreReadB
     expectedBefore,
     expectedAfter,
   );
-  if (!bundle) {
+  if (!bundle || !contactImportMaterial) {
     throw new Error("读取期间职迹核心资料发生变化；没有把混合版本显示为可写画面。");
   }
-  return bundle;
+  return { ...bundle, contactImportMaterial };
 }
 
-export function resolveCareerTodayFocus(data: CareerData, now: number) {
+export function resolveCareerTodayFocus(data: CareerUiData, now: number) {
   const terminalStages = new Set(data.stages.filter((stage) => stage.is_terminal === 1).map((stage) => stage.id));
   const eligibleJobs = data.jobs.filter((job) => job.archived !== 1 && !terminalStages.has(job.stage_id));
   const eligibleJobsById = new Map(eligibleJobs.map((job) => [job.id, job]));
@@ -943,7 +827,7 @@ function useDialogA11y(onClose: () => void, inertToasts = false) {
 type CareerContactUndoState = Readonly<{
   id: string;
   name: string;
-  expected: CareerContactExpectedState;
+  expected: ReturnType<typeof careerContactDisplayedExpected>;
   phase: "ready" | "writing" | "refresh-only";
   message: string;
 }>;
@@ -951,13 +835,18 @@ type CareerContactUndoState = Readonly<{
 export default function CareerApp() {
   const careerClock = useCareerClock();
   const mobileLayout = useCareerMobileLayout();
-  const [data, setData] = useState<CareerData>(emptyData);
+  const [data, setData] = useState<CareerUiData>(emptyData);
   const [coreBindings, setCoreBindings] = useState<CareerCoreBindings | null>(null);
   const [coreSnapshotStale, setCoreSnapshotStale] = useState(true);
   const coreSnapshotStaleRef = useRef(true);
   const coreExpectedSetRef = useRef<CareerCoreWriteExpectedSet | null>(null);
   const [coreDirtyEditorCount, setCoreDirtyEditorCount] = useState(0);
   const coreDirtyEditorsRef = useRef(new Set<string>());
+  const [contactImportMaterialDirtyEditorCount,
+    setContactImportMaterialDirtyEditorCount] = useState(0);
+  const contactImportMaterialDirtyEditorsRef = useRef(new Set<string>());
+  const contactImportMaterialReadRef =
+    useRef<CareerContactImportMaterialReadEnvelope | null>(null);
   const [backupMutationActive, setBackupMutationActive] = useState(false);
   const backupMutationActiveRef = useRef(false);
   const [loading, setLoading] = useState(true);
@@ -981,14 +870,9 @@ export default function CareerApp() {
   const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
   const [selectedInterviewId, setSelectedInterviewId] = useState<string | null>(null);
   const [selectedContactId, setSelectedContactId] = useState<string | null>(null);
-  const [materialRemoval, setMaterialRemoval] = useState<Pick<Material, "id" | "name" | "file_key"> | null>(null);
+  const [materialRemoval, setMaterialRemoval] = useState<CareerMaterialUi | null>(null);
   const [materialListStale, setMaterialListStale] = useState(false);
   const [materialRefreshBusy, setMaterialRefreshBusy] = useState(false);
-  const [materialRecoveryLoaded, setMaterialRecoveryLoaded] = useState(false);
-  const [materialRecoveryStorageUnavailable, setMaterialRecoveryStorageUnavailable] = useState(false);
-  const [materialRecoveryUnreadableKeys, setMaterialRecoveryUnreadableKeys] = useState<string[]>([]);
-  const [persistedMaterialRecoveries, setPersistedMaterialRecoveries] = useState<CareerMaterialSaveRecoveryTicket[]>([]);
-  const [volatileMaterialRecoveries, setVolatileMaterialRecoveries] = useState<CareerMaterialSaveRecoveryTicket[]>([]);
   const [contactEditorId, setContactEditorId] = useState<string | null | undefined>(undefined);
   const [contactAction, setContactAction] = useState<{ kind: "interaction" | "task"; contactId: string } | null>(null);
   const [contactRevision, setContactRevision] = useState(0);
@@ -1030,69 +914,14 @@ export default function CareerApp() {
   const historyConfirmAfterRestoreRef = useRef(false);
   const historyExitOpenerRef = useRef<HTMLElement | null>(null);
 
-  const materialSaveRecoveryEntries = useMemo<CareerMaterialSaveRecoveryEntry[]>(() => {
-    const entries = new Map<string, CareerMaterialSaveRecoveryEntry>();
-    persistedMaterialRecoveries.forEach((ticket) => entries.set(materialSaveRecoveryKey(ticket), { ticket, persisted: true }));
-    volatileMaterialRecoveries.forEach((ticket) => {
-      const key = materialSaveRecoveryKey(ticket);
-      if (!entries.has(key)) entries.set(key, { ticket, persisted: false });
-    });
-    return Array.from(entries.values()).sort((left, right) => left.ticket.recordedAt.localeCompare(right.ticket.recordedAt));
-  }, [persistedMaterialRecoveries, volatileMaterialRecoveries]);
-
-  const reloadMaterialSaveRecoveries = useCallback(() => {
-    const stored = readMaterialSaveRecoveryStorage();
-    const storedKeys = new Set(stored.tickets.map(materialSaveRecoveryKey));
-    setPersistedMaterialRecoveries(stored.tickets);
-    setVolatileMaterialRecoveries((current) => current.filter((ticket) => !storedKeys.has(materialSaveRecoveryKey(ticket))));
-    setMaterialRecoveryUnreadableKeys(stored.unreadableKeys);
-    setMaterialRecoveryStorageUnavailable(stored.storageUnavailable);
-    setMaterialRecoveryLoaded(true);
-  }, []);
-
-  const persistMaterialSaveRecovery = useCallback((ticket: CareerMaterialSaveRecoveryTicket) => {
-    const logicalKey = materialSaveRecoveryKey(ticket);
-    const storageKey = `${CAREER_MATERIAL_SAVE_RECOVERY_PREFIX}${logicalKey}`;
-    try {
-      window.localStorage.setItem(storageKey, JSON.stringify(ticket));
-      setPersistedMaterialRecoveries((current) => [...current.filter((item) => materialSaveRecoveryKey(item) !== logicalKey), ticket]);
-      setVolatileMaterialRecoveries((current) => current.filter((item) => materialSaveRecoveryKey(item) !== logicalKey));
-      setMaterialRecoveryUnreadableKeys((current) => current.filter((key) => key !== storageKey));
-      setMaterialRecoveryStorageUnavailable(false);
-      return true;
-    } catch {
-      setVolatileMaterialRecoveries((current) => [...current.filter((item) => materialSaveRecoveryKey(item) !== logicalKey), ticket]);
-      setMaterialRecoveryStorageUnavailable(true);
-      return false;
-    }
-  }, []);
-
-  const clearMaterialSaveRecovery = useCallback((ticket: CareerMaterialSaveRecoveryTicket, persisted: boolean) => {
-    const logicalKey = materialSaveRecoveryKey(ticket);
-    const storageKey = `${CAREER_MATERIAL_SAVE_RECOVERY_PREFIX}${logicalKey}`;
-    if (!persisted) {
-      try { window.localStorage.removeItem(storageKey); } catch { /* No durable entry was created for this volatile ticket. */ }
-      setVolatileMaterialRecoveries((current) => current.filter((item) => materialSaveRecoveryKey(item) !== logicalKey));
-      setPersistedMaterialRecoveries((current) => current.filter((item) => materialSaveRecoveryKey(item) !== logicalKey));
-      return true;
-    }
-    try {
-      window.localStorage.removeItem(storageKey);
-      setPersistedMaterialRecoveries((current) => current.filter((item) => materialSaveRecoveryKey(item) !== logicalKey));
-      setVolatileMaterialRecoveries((current) => current.filter((item) => materialSaveRecoveryKey(item) !== logicalKey));
-      setMaterialRecoveryUnreadableKeys((current) => current.filter((key) => key !== storageKey));
-      return true;
-    } catch {
-      setMaterialRecoveryStorageUnavailable(true);
-      return false;
-    }
-  }, []);
-
   const applyCareerCoreBundle = useCallback((
-    next: CareerCoreReadBundle,
+    next: CareerUiReadBundle,
     requestedScope: CareerJobScope,
     committedReceipt?: CareerCoreWriteReceipt,
     committedReceiptOwned = false,
+    committedContactImportMaterialReceipt?:
+      CareerContactImportMaterialWriteReceipt,
+    committedContactImportMaterialReceiptOwned = false,
   ) => {
     if (careerCoreBundleApplyDecision({
       current: coreExpectedSetRef.current,
@@ -1105,11 +934,23 @@ export default function CareerApp() {
       setCoreSnapshotStale(true);
       return false;
     }
+    if (careerContactImportMaterialReadApplyDecision({
+      current: contactImportMaterialReadRef.current,
+      next: next.contactImportMaterial,
+      dirtyEditorCount: contactImportMaterialDirtyEditorsRef.current.size,
+      committedReceipt: committedContactImportMaterialReceipt,
+      committedReceiptOwned: committedContactImportMaterialReceiptOwned,
+    }) === "defer") {
+      coreSnapshotStaleRef.current = true;
+      setCoreSnapshotStale(true);
+      return false;
+    }
     setData(next.base);
     setAllLifecycle(next.all);
     if (jobScopeRef.current === requestedScope) setScopedLifecycle(next.scoped);
     setCoreBindings(next.bindings);
     coreExpectedSetRef.current = next.expectedSet;
+    contactImportMaterialReadRef.current = next.contactImportMaterial;
     coreSnapshotStaleRef.current = false;
     setCoreSnapshotStale(false);
     return true;
@@ -1119,11 +960,14 @@ export default function CareerApp() {
     requestedScope: CareerJobScope = jobScopeRef.current,
     committedReceipt?: CareerCoreWriteReceipt,
     committedReceiptOwned = false,
+    committedContactImportMaterialReceipt?:
+      CareerContactImportMaterialWriteReceipt,
+    committedContactImportMaterialReceiptOwned = false,
   ) => {
     const requestToken = ++uiReadRequestRef.current;
     coreSnapshotStaleRef.current = true;
     setCoreSnapshotStale(true);
-    let next: CareerCoreReadBundle;
+    let next: CareerUiReadBundle;
     try {
       next = await loadCareerUiState(requestedScope);
     } catch (error) {
@@ -1139,6 +983,8 @@ export default function CareerApp() {
       requestedScope,
       committedReceipt,
       committedReceiptOwned,
+      committedContactImportMaterialReceipt,
+      committedContactImportMaterialReceiptOwned,
     )
       ? "applied" as const
       : "deferred" as const;
@@ -1183,29 +1029,6 @@ export default function CareerApp() {
   }, [applyCareerCoreBundle, refreshKey]);
 
   useEffect(() => () => aiRequestRef.current?.controller.abort(), []);
-
-  useEffect(() => {
-    reloadMaterialSaveRecoveries();
-    function handleRecoveryStorage(event: StorageEvent) {
-      if (event.key === null || event.key.startsWith(CAREER_MATERIAL_SAVE_RECOVERY_PREFIX)) reloadMaterialSaveRecoveries();
-    }
-    window.addEventListener("storage", handleRecoveryStorage);
-    window.addEventListener("focus", reloadMaterialSaveRecoveries);
-    return () => {
-      window.removeEventListener("storage", handleRecoveryStorage);
-      window.removeEventListener("focus", reloadMaterialSaveRecoveries);
-    };
-  }, [reloadMaterialSaveRecoveries]);
-
-  useEffect(() => {
-    if (volatileMaterialRecoveries.length === 0) return;
-    function protectVolatileMaterialRecovery(event: BeforeUnloadEvent) {
-      event.preventDefault();
-      event.returnValue = "";
-    }
-    window.addEventListener("beforeunload", protectVolatileMaterialRecovery);
-    return () => window.removeEventListener("beforeunload", protectVolatileMaterialRecovery);
-  }, [volatileMaterialRecoveries.length]);
 
   useEffect(() => {
     if (modal === "import" || !importFocusReturnPendingRef.current) return;
@@ -1268,6 +1091,10 @@ export default function CareerApp() {
   useEffect(() => subscribeToCareerDataChanges((reason) => {
     const coreReason = /^career-(?:stage-renamed|job-(?:created|updated)|interview-(?:created|updated))$/.test(reason);
     const lifecycleTaskReason = /^career-(?:job-(?:stage-transitioned|archived|restored)|task-(?:created|completed))$/.test(reason);
+    const contactImportMaterialReason = reason.startsWith("career-contact") ||
+      reason === "career-job-imported" ||
+      reason === "career-material-saved" ||
+      reason === "career-material-deleted";
     if (coreReason || lifecycleTaskReason) {
       coreSnapshotStaleRef.current = true;
       setCoreSnapshotStale(true);
@@ -1280,29 +1107,50 @@ export default function CareerApp() {
       }
       return;
     }
-    if (!reason.startsWith("career-contact")) return;
-    if (contactEditorId !== undefined || contactAction) {
-      setContactDataHint("联系人资料刚在另一个页面发生了变化。当前输入没有被替换；保存时会先核对版本。");
-      return;
+    if (!contactImportMaterialReason) return;
+    const contactReason = reason.startsWith("career-contact");
+    if (contactImportMaterialDirtyEditorsRef.current.size > 0) {
+      if (contactReason) {
+        setContactDataHint("联系人资料刚在另一个页面发生了变化。当前输入没有被替换；保存时会先核对版本。");
+      }
+      notify("联系人、导入或材料刚在另一页变化；当前输入仍保留，写入已暂停。", "info");
     }
-    if (view === "contacts" || selectedContactId || contactUndo) {
-      void refreshContacts().catch(() => {
+    void refresh().then((outcome) => {
+      if (outcome === "applied" && contactReason) {
+        setContactRevision((current) => current + 1);
+        setContactDataHint("");
+      } else if (outcome !== "applied") {
+        coreSnapshotStaleRef.current = true;
+        setCoreSnapshotStale(true);
+      }
+    }).catch(() => {
+      coreSnapshotStaleRef.current = true;
+      setCoreSnapshotStale(true);
+      if (contactReason) {
         setContactDataHint("另一个页面更新了联系人，但这里暂时没有重新读到。现有画面没有被当成最新版本。");
-      });
-    }
-  }), [contactAction, contactEditorId, contactUndo, lifecycleDialog, modal, notify, refresh, refreshContacts, selectedContactId, taskSheet, view]);
+      }
+    });
+  }), [lifecycleDialog, modal, notify, refresh, taskSheet]);
 
   useEffect(() => {
-    function refreshVisibleContactsOnFocus() {
-      if (contactEditorId !== undefined || contactAction) return;
-      if (view !== "contacts" && !selectedContactId && !contactUndo) return;
-      void refreshContacts().catch(() => {
-        setContactDataHint("回到页面后暂时没有重新读到联系人资料；现有画面没有被当成最新版本。");
+    function refreshContactImportMaterialOnFocus() {
+      if (databaseMutationRegistryRef.current.count() > 0) return;
+      const contactVisible = view === "contacts" || Boolean(selectedContactId) ||
+        Boolean(contactUndo);
+      void refresh().then((outcome) => {
+        if (outcome === "applied" && contactVisible) {
+          setContactRevision((current) => current + 1);
+          setContactDataHint("");
+        }
+      }).catch(() => {
+        if (contactVisible) {
+          setContactDataHint("回到页面后暂时没有重新读到联系人资料；现有画面没有被当成最新版本。");
+        }
       });
     }
-    window.addEventListener("focus", refreshVisibleContactsOnFocus);
-    return () => window.removeEventListener("focus", refreshVisibleContactsOnFocus);
-  }, [contactAction, contactEditorId, contactUndo, refreshContacts, selectedContactId, view]);
+    window.addEventListener("focus", refreshContactImportMaterialOnFocus);
+    return () => window.removeEventListener("focus", refreshContactImportMaterialOnFocus);
+  }, [contactUndo, refresh, selectedContactId, view]);
 
   useEffect(() => {
     if (!contactUndo || contactUndo.phase !== "ready") return;
@@ -1421,69 +1269,28 @@ export default function CareerApp() {
     }
   }
 
-  function clearUnreadableMaterialRecoveryEntries() {
-    let failed = false;
-    for (const key of materialRecoveryUnreadableKeys) {
-      try { window.localStorage.removeItem(key); }
-      catch { failed = true; }
-    }
-    if (failed) {
-      setMaterialRecoveryStorageUnavailable(true);
-      notify("浏览器暂时无法清除这条提醒；没有自动删除任何原件。", "error");
-      return;
-    }
-    setMaterialRecoveryUnreadableKeys([]);
-    notify("无法读取的收尾提醒已清除；没有自动删除任何原件。", "info");
-    window.requestAnimationFrame(() => {
-      document.querySelector<HTMLButtonElement>("[data-material-add]:not(:disabled)")?.focus({ preventScroll: true });
-    });
-  }
-
-  function retryMaterialRecoveryStorage() {
-    reloadMaterialSaveRecoveries();
-    window.requestAnimationFrame(() => {
-      const target = document.querySelector<HTMLButtonElement>("[data-material-recovery-retry]") ??
-        document.querySelector<HTMLButtonElement>("[data-material-recover]") ??
-        document.querySelector<HTMLButtonElement>("[data-material-recovery-clear]") ??
-        document.querySelector<HTMLButtonElement>("[data-material-add]:not(:disabled)");
-      target?.focus({ preventScroll: true });
-    });
-  }
-
-  function closeMaterialWithStaleList() {
-    materialModalFocusPendingRef.current = false;
-    materialStaleFocusPendingRef.current = true;
-    setMaterialListStale(true);
-    setModal(null);
-  }
-
   function closeMaterialModal() {
     materialModalFocusPendingRef.current = true;
     setModal(null);
-  }
-
-  function closeRemovalWithStaleList() {
-    setMaterialListStale(true);
-    closeMaterialRemoval();
   }
 
   const activeLifecycle = useMemo(
     () => projectCareerLifecycleScope(allLifecycle, data.stages, "active"),
     [allLifecycle, data.stages],
   );
-  const allData = useMemo<CareerData>(() => ({
+  const allData = useMemo<CareerUiData>(() => ({
     ...data,
     jobs: allLifecycle.jobs,
     tasks: allLifecycle.tasks,
     interviews: allLifecycle.interviews,
   }), [allLifecycle, data]);
-  const boardData = useMemo<CareerData>(() => ({
+  const boardData = useMemo<CareerUiData>(() => ({
     ...data,
     jobs: activeLifecycle.jobs,
     tasks: activeLifecycle.tasks,
     interviews: activeLifecycle.interviews,
   }), [activeLifecycle, data]);
-  const scopedData = useMemo<CareerData>(() => ({
+  const scopedData = useMemo<CareerUiData>(() => ({
     ...data,
     jobs: scopedLifecycle.jobs,
     tasks: scopedLifecycle.tasks,
@@ -1511,6 +1318,16 @@ export default function CareerApp() {
     if (dirty) coreDirtyEditorsRef.current.add(key);
     else coreDirtyEditorsRef.current.delete(key);
     setCoreDirtyEditorCount(coreDirtyEditorsRef.current.size);
+  }, []);
+  const setContactImportMaterialEditorDirty = useCallback((
+    key: string,
+    dirty: boolean,
+  ) => {
+    if (dirty) contactImportMaterialDirtyEditorsRef.current.add(key);
+    else contactImportMaterialDirtyEditorsRef.current.delete(key);
+    setContactImportMaterialDirtyEditorCount(
+      contactImportMaterialDirtyEditorsRef.current.size,
+    );
   }, []);
 
   const setBackupMutationGate = useCallback((active: boolean) => {
@@ -1614,21 +1431,49 @@ export default function CareerApp() {
     onToast: (message) => notify(message),
     onAttention: () => undefined,
   });
+  const contactImportMaterialWrites =
+    useCareerContactImportMaterialWriteFlow({
+      refresh: (receipt, reason, owned) => refresh(
+        jobScopeRef.current,
+        undefined,
+        false,
+        receipt,
+        reason === "committed" && owned === true,
+      ),
+      snapshotStale: coreSnapshotStale,
+      snapshotStaleNow: () => coreSnapshotStaleRef.current,
+      externalBlockedNow: () => backupMutationActiveRef.current ||
+        coreWrites.isWriteInProgress() ||
+        lifecycleTaskWrites.isWriteInProgress(),
+      claimDatabaseMutation: (owner) => claimDatabaseMutation(owner),
+      releaseDatabaseMutation,
+      databaseMutationActiveExcept: (owner) =>
+        databaseMutationActiveExcept(owner),
+      dirtyEditorCount: contactImportMaterialDirtyEditorCount,
+      onToast: (message) => notify(message),
+      onAttention: () => undefined,
+    });
   const coreDatabaseMutationLockedNow = useCallback((owner?: CareerDatabaseMutationOwner) =>
     coreSnapshotStaleRef.current || coreWrites.databaseMutationLocked ||
-      lifecycleTaskWrites.databaseMutationLocked || coreWrites.isWriteInProgress() ||
+      lifecycleTaskWrites.databaseMutationLocked ||
+      contactImportMaterialWrites.databaseMutationLocked ||
+      coreWrites.isWriteInProgress() ||
       lifecycleTaskWrites.isWriteInProgress() ||
+      contactImportMaterialWrites.isWriteInProgress() ||
       (owner
         ? databaseMutationRegistryRef.current.isActiveExcept(owner)
         : databaseMutationRegistryRef.current.isActive()),
-  [coreWrites, lifecycleTaskWrites]);
+  [contactImportMaterialWrites, coreWrites, lifecycleTaskWrites]);
   const hasCareerVolatileWork = coreWrites.hasVolatileWork ||
-    lifecycleTaskWrites.hasVolatileWork;
+    lifecycleTaskWrites.hasVolatileWork ||
+    contactImportMaterialWrites.hasVolatileWork;
 
   useEffect(() => {
     function recheckCareerTruthOnFocus() {
       if (!coreSnapshotStaleRef.current || coreDirtyEditorsRef.current.size > 0 ||
-        coreWrites.isWriteInProgress() || lifecycleTaskWrites.isWriteInProgress()) return;
+        contactImportMaterialDirtyEditorsRef.current.size > 0 ||
+        coreWrites.isWriteInProgress() || lifecycleTaskWrites.isWriteInProgress() ||
+        contactImportMaterialWrites.isWriteInProgress()) return;
       void refresh().catch(() => {
         coreSnapshotStaleRef.current = true;
         setCoreSnapshotStale(true);
@@ -1636,11 +1481,13 @@ export default function CareerApp() {
     }
     window.addEventListener("focus", recheckCareerTruthOnFocus);
     return () => window.removeEventListener("focus", recheckCareerTruthOnFocus);
-  }, [coreWrites, lifecycleTaskWrites, refresh]);
+  }, [contactImportMaterialWrites, coreWrites, lifecycleTaskWrites, refresh]);
 
   useEffect(() => {
     function protectSpaExit(event: MouseEvent) {
-      if (coreDirtyEditorsRef.current.size === 0 && !hasCareerVolatileWork) return;
+      if (coreDirtyEditorsRef.current.size === 0 &&
+        contactImportMaterialDirtyEditorsRef.current.size === 0 &&
+        !hasCareerVolatileWork) return;
       const target = event.target instanceof Element ? event.target.closest<HTMLAnchorElement>("a[href]") : null;
       if (!target || target.target === "_blank" || target.hasAttribute("download")) return;
       const destination = new URL(target.href, window.location.href);
@@ -1654,7 +1501,8 @@ export default function CareerApp() {
   }, [hasCareerVolatileWork, notify]);
 
   useEffect(() => {
-    const hasRisk = coreDirtyEditorCount > 0 || hasCareerVolatileWork;
+    const hasRisk = coreDirtyEditorCount > 0 ||
+      contactImportMaterialDirtyEditorCount > 0 || hasCareerVolatileWork;
     if (hasRisk && historyGuardRef.current === null) {
       const token = typeof crypto.randomUUID === "function"
         ? crypto.randomUUID()
@@ -1701,7 +1549,8 @@ export default function CareerApp() {
         current.careerCoreHistoryGuard === token) return;
       const decision = careerCoreHistoryBackDecision(
         hasCareerVolatileWork,
-        coreDirtyEditorsRef.current.size,
+        coreDirtyEditorsRef.current.size +
+          contactImportMaterialDirtyEditorsRef.current.size,
       );
       if (decision === "continue") {
         historyGuardRef.current = null;
@@ -1717,7 +1566,8 @@ export default function CareerApp() {
     }
     window.addEventListener("popstate", onPopState);
     return () => window.removeEventListener("popstate", onPopState);
-  }, [coreDirtyEditorCount, hasCareerVolatileWork, notify]);
+  }, [contactImportMaterialDirtyEditorCount, coreDirtyEditorCount,
+    hasCareerVolatileWork, notify]);
 
   const stayAfterHistoryExit = useCallback(() => {
     setHistoryExitPrompt(false);
@@ -1733,6 +1583,8 @@ export default function CareerApp() {
     if (hasCareerVolatileWork) return;
     coreDirtyEditorsRef.current.clear();
     setCoreDirtyEditorCount(0);
+    contactImportMaterialDirtyEditorsRef.current.clear();
+    setContactImportMaterialDirtyEditorCount(0);
     setHistoryExitPrompt(false);
     const guarded = historyGuardRef.current !== null;
     historyGuardRef.current = null;
@@ -2030,30 +1882,15 @@ export default function CareerApp() {
       document.querySelector<HTMLElement>(".career-segmented button[aria-pressed='true']");
   }
 
-  async function handleContactUndo() {
+  async function handleContactUndo(trigger: HTMLElement) {
     const ticket = contactUndo;
     if (!ticket || contactUndoWriteRef.current) return;
     contactUndoWriteRef.current = true;
     if (ticket.phase === "refresh-only") {
-      setContactUndo({ ...ticket, phase: "writing", message: "正在只读核对联系人状态…" });
-      try {
-        await refreshContacts();
-        const latest = await loadCareerContactExpectedState(ticket.id);
-        if (!latest || !latest.expectedArchived) {
-          setContactUndo(null);
-          notify(latest ? `已确认恢复「${ticket.name}」` : `「${ticket.name}」已在别处变化`, "info");
-        } else {
-          setContactUndo({ ...ticket, phase: "refresh-only", message: "仍无法确认恢复结果；再次核对只会读取，不会重复恢复。" });
-        }
-      } catch {
-        setContactUndo({ ...ticket, phase: "refresh-only", message: "暂时没有读到最新状态；再次核对不会重复恢复。" });
-      } finally { contactUndoWriteRef.current = false; }
-      return;
-    }
-    const mutationToken = claimDatabaseMutation("contact");
-    if (!mutationToken) {
+      contactImportMaterialWrites.attentionRef.current?.focus({
+        preventScroll: true,
+      });
       contactUndoWriteRef.current = false;
-      notify("另一笔数据库操作已经开始；联系人恢复没有提交。", "info");
       return;
     }
     setContactUndo({ ...ticket, phase: "writing", message: "正在恢复联系人…" });
@@ -2061,42 +1898,39 @@ export default function CareerApp() {
       if (coreDatabaseMutationLockedNow("contact")) {
         throw new Error("另一笔数据库操作已经开始；联系人恢复没有提交。");
       }
-      const result = await restoreCareerContactSafely(ticket.id, ticket.expected);
-      if (result.outcome === "saved" || result.outcome === "already_saved") {
-        setContactUndo({ ...ticket, phase: "refresh-only", message: "恢复写入已结束，正在只读刷新…" });
-        try {
-          await refreshContacts();
-          setContactUndo(null);
-          notify(`已恢复「${ticket.name}」`, "info");
-        } catch {
-          setContactUndo({ ...ticket, phase: "refresh-only", message: "联系人已恢复，但画面还没有重新读到；这里只会继续核对。" });
-        }
+      const result = await contactImportMaterialWrites.submitContactRestore(
+        ticket.expected,
+        trigger,
+      );
+      if (result.outcome === "saved") {
+        setContactUndo(null);
+        notify(`已恢复「${ticket.name}」`, "info");
       } else if (result.outcome === "changed") {
-        setContactUndo({ ...ticket, phase: "refresh-only", message: "联系人已在别处变化。旧恢复命令已停止；这里只会重新读取。" });
-        try {
-          await refreshContacts();
-          setContactUndo(null);
-          notify(`「${ticket.name}」已在别处变化，没有依据旧状态恢复`, "info");
-        } catch { /* The refresh-only ticket remains visible and cannot write again. */ }
+        setContactUndo(null);
+        notify(`「${ticket.name}」已在别处变化，没有依据旧状态恢复`, "info");
+      } else if (result.outcome === "attention") {
+        setContactUndo({
+          ...ticket,
+          phase: "refresh-only",
+          message: "恢复结果需要安全核对；请使用页面顶部的同一张收据。",
+        });
       } else {
-        setContactUndo({ ...ticket, phase: "refresh-only", message: "恢复结果暂时无法确认；接下来只核对，不会重复恢复。" });
+        setContactUndo({
+          ...ticket,
+          phase: "ready",
+          message: "另一笔数据库操作已经开始；联系人恢复没有提交。",
+        });
       }
     } catch (error) {
-      if (error instanceof CareerContactMutationError && error.code === "changed") {
-        try { await refreshContacts(); } catch { /* The stale command still stays stopped. */ }
-        setContactUndo(null);
-        notify(`「${ticket.name}」已在别处变化，没有覆盖新状态`, "info");
-      } else {
-        setContactUndo({ ...ticket, phase: "ready", message: error instanceof Error ? error.message : "这次没有恢复，归档状态保持不变。" });
-      }
+      setContactUndo({ ...ticket, phase: "ready", message: error instanceof Error ? error.message : "这次没有恢复，归档状态保持不变。" });
     } finally {
       contactUndoWriteRef.current = false;
-      releaseDatabaseMutation(mutationToken);
     }
   }
 
   function navigate(next: CareerView) {
-    if (next !== view && coreDirtyEditorsRef.current.size > 0) {
+    if (next !== view && (coreDirtyEditorsRef.current.size > 0 ||
+      contactImportMaterialDirtyEditorsRef.current.size > 0)) {
       notify("当前画面还有未保存输入；请先继续保存或明确放弃，再切换页面。", "info");
       return;
     }
@@ -2140,11 +1974,16 @@ export default function CareerApp() {
   if (loading) return <CareerLoading />;
   if (loadError) return <CareerError message={loadError} onRetry={() => { setLoading(true); setLoadError(""); setRefreshKey((key) => key + 1); }} />;
   if (!coreBindings) return <CareerError message="核心资料没有形成稳定的显示绑定；没有开放写入。" onRetry={() => { setLoading(true); setRefreshKey((key) => key + 1); }} />;
+  const contactImportMaterialGeneration =
+    contactImportMaterialReadRef.current?.generation ?? {
+      generationId: coreBindings.generationId,
+      generationSequence: coreBindings.generationSequence,
+    };
 
   return <main className="career-app">
     <Sidebar sidebarRef={sidebarRef} view={view} open={sidebarOpen} mobile={mobileLayout} onNavigate={navigate} onClose={() => setSidebarOpen(false)} />
     <section className="career-main">
-      <Topbar title={navItems.find((item) => item.id === view)?.label ?? "职迹"} query={query} menuOpen={sidebarOpen} addLocked={coreWrites.writeLocked} onQuery={setQuery} onSearch={() => setSearchOpen(true)} onMenu={() => setSidebarOpen(true)} onAdd={openJobCreation} onSettings={() => navigate("settings")} />
+      <Topbar title={navItems.find((item) => item.id === view)?.label ?? "职迹"} query={query} menuOpen={sidebarOpen} addLocked={coreWrites.writeLocked || contactImportMaterialWrites.databaseMutationLocked} onQuery={setQuery} onSearch={() => setSearchOpen(true)} onMenu={() => setSidebarOpen(true)} onAdd={openJobCreation} onSettings={() => navigate("settings")} />
       <div className="career-content">
         {coreSnapshotStale && <div className="career-core-stale" role="status"><ShieldCheck size={19} /><div><b>核心资料需要重新读取</b><p>读取完成前不会依据旧画面保存阶段、职位或面试。</p></div><button className="career-button secondary" disabled={coreWrites.busy} onClick={() => { void requireRefresh().catch(() => notify("核心资料暂时没有读到稳定版本；写入仍保持暂停。", "error")); }}><RotateCcw size={16} />重新读取</button></div>}
         {(coreWrites.flow.phase !== "idle" || coreWrites.journal.unreadable.length > 0 || coreWrites.journal.storageUnavailable || coreWrites.journal.lockUnavailable) && <div ref={coreWrites.attentionRef} className={`career-core-recovery ${coreWrites.flow.phase}`} tabIndex={-1} role={coreWrites.error ? "alert" : "status"}>
@@ -2192,6 +2031,54 @@ export default function CareerApp() {
             {lifecycleTaskWrites.flow.phase === "idle" && lifecycleTaskWrites.journal.entries.length > 0 && <button className="career-button primary" onClick={lifecycleTaskWrites.retryStorage}>打开核对提醒</button>}
           </footer>
         </div>}
+        {(contactImportMaterialWrites.flow.phase !== "idle" ||
+          contactImportMaterialWrites.error ||
+          contactImportMaterialWrites.hasRecoveryAttention) && <div
+          ref={contactImportMaterialWrites.attentionRef}
+          className="career-contact-import-material-recovery"
+          tabIndex={-1}
+          role={contactImportMaterialWrites.error ? "alert" : "status"}
+          aria-live="polite"
+        >
+          <div><b>联系人 / 导入 / 材料安全核对</b><p>{
+            contactImportMaterialWrites.error ||
+            ("message" in contactImportMaterialWrites.flow
+              ? contactImportMaterialWrites.flow.message
+              : contactImportMaterialWrites.journal.entries.length > 0 ||
+                  contactImportMaterialWrites.hasHeldReceipt
+                ? "有一张写入收据仍需核对；数据库写入保持暂停。"
+                : contactImportMaterialWrites.journal.peerEntries.length > 0
+                  ? "另一类职迹写入仍有收据需要核对；数据库写入保持暂停。"
+                  : contactImportMaterialWrites.journal.unreadable.length > 0
+                    ? "有一条核对提醒无法验证；没有据此写入。"
+                    : contactImportMaterialWrites.journal.storageUnavailable
+                      ? "浏览器暂时无法完整读取核对线索；数据库写入保持暂停。"
+                      : contactImportMaterialWrites.journal.lockUnavailable
+                        ? "当前浏览器缺少安全的跨页面锁；数据库写入保持暂停。"
+                        : contactImportMaterialWrites.status) ||
+              "正在安全确认本地写入。"
+          }</p></div>
+          <footer>
+            {contactImportMaterialWrites.journal.storageUnavailable &&
+              <button className="career-button primary" onClick={contactImportMaterialWrites.retryStorage}>重试读取提醒</button>}
+            {contactImportMaterialWrites.journal.unreadable.length > 0 &&
+              <button className="career-button ghost" onClick={() => void contactImportMaterialWrites.removeFirstUnreadable()}>只清除无法验证的提醒</button>}
+            {contactImportMaterialWrites.flow.phase === "check" &&
+              <button className="career-button primary" onClick={() => void contactImportMaterialWrites.inspectActive()}><Search size={16} />只读核对</button>}
+            {contactImportMaterialWrites.flow.phase === "expected" && <>
+              <button className="career-button ghost" onClick={() => void contactImportMaterialWrites.discardTerminal()}>放弃未写入收据</button>
+              <button className="career-button primary" onClick={() => void contactImportMaterialWrites.continueActive()}>继续同一次写入</button>
+            </>}
+            {contactImportMaterialWrites.flow.phase === "cleanup" &&
+              <button className="career-button primary" onClick={() => void contactImportMaterialWrites.continueActive()}>继续安全收尾</button>}
+            {contactImportMaterialWrites.flow.phase === "refresh-only" &&
+              <button className="career-button primary" onClick={() => void contactImportMaterialWrites.retryRefresh()}>只重新读取</button>}
+            {contactImportMaterialWrites.flow.phase === "changed" &&
+              <button className="career-button primary" onClick={() => void contactImportMaterialWrites.abandonChangedAndRefresh()}>放弃旧输入并读取新版本</button>}
+            {contactImportMaterialWrites.flow.phase === "invalid" &&
+              <button className="career-button ghost" onClick={() => void contactImportMaterialWrites.discardTerminal()}>只清除无效提醒</button>}
+          </footer>
+        </div>}
         {legacyReviewNeeded && <div className="career-legacy-review-note" role="status"><ShieldCheck size={19} /><div><b>旧版资料需要你看一眼</b><p>旧版可能含示例内容，未自动删除以保护你的编辑。我们不会替你判断哪些记录属于你，也不会自行清理。</p></div></div>}
         {view === "today" && <TodayView data={allData} now={careerClock} onNavigate={navigate} onSelectJob={setSelectedJobId} onSelectInterview={setSelectedInterviewId} onOpenTask={openTask} onCompleteTask={completeTask} onAddJob={openJobCreation} onAi={runAi} />}
         {view === "board" && <BoardView data={boardData} jobs={boardJobs} now={careerClock} query={query} sourceFilter={sourceFilter} priorityOnly={priorityOnly} onSourceFilter={setSourceFilter} onPriorityOnly={setPriorityOnly} onClear={() => { setQuery(""); setSourceFilter("all"); setPriorityOnly(false); }} onSelectJob={setSelectedJobId} onAddJob={openJobCreation} onMove={async (jobId, stageId) => { await requestLifecycleChange({ kind: "stage", jobId, nextStageId: stageId }); }} lifecycleLocked={lifecycleLocked || coreWrites.databaseMutationLocked} sensors={sensors} activeJob={activeJob} onDragStart={(event) => { if (!lifecycleWriteRef.current && !lifecycleRefreshOnlyRef.current && !coreDatabaseMutationLockedNow()) setActiveDragId(String(event.active.id)); }} onDragEnd={async (event) => { setActiveDragId(null); if (!event.over || lifecycleWriteRef.current || lifecycleRefreshOnlyRef.current || coreDatabaseMutationLockedNow()) return; const stageId = String(event.over.id).replace(/^stage:/, ""); if (data.stages.some((stage) => stage.id === stageId)) await requestLifecycleChange({ kind: "stage", jobId: String(event.active.id), nextStageId: stageId }); }} />}
@@ -2203,21 +2090,25 @@ export default function CareerApp() {
           data={data}
           stale={materialListStale}
           refreshBusy={materialRefreshBusy}
-          recoveryLoaded={materialRecoveryLoaded}
-          recoveryCount={materialSaveRecoveryEntries.length}
-          recoveryUnreadable={materialRecoveryUnreadableKeys.length > 0}
-          recoveryStorageUnavailable={materialRecoveryStorageUnavailable || volatileMaterialRecoveries.length > 0}
-          newWritesLocked={coreWrites.databaseMutationLocked}
+          recoveryLoaded={contactImportMaterialWrites.journal.loaded}
+          recoveryCount={contactImportMaterialWrites.journal.entries.length +
+            contactImportMaterialWrites.journal.peerEntries.length +
+            (contactImportMaterialWrites.hasHeldReceipt ? 1 : 0)}
+          recoveryUnreadable={contactImportMaterialWrites.journal.unreadable.length > 0}
+          recoveryStorageUnavailable={contactImportMaterialWrites.journal.storageUnavailable ||
+            contactImportMaterialWrites.journal.lockUnavailable}
+          newWritesLocked={coreWrites.databaseMutationLocked ||
+            contactImportMaterialWrites.databaseMutationLocked}
           onRefresh={refreshMaterials}
           onAdd={() => { if (!coreDatabaseMutationLockedNow()) setModal("material"); }}
-          onRecover={() => setModal("material")}
-          onClearUnreadable={clearUnreadableMaterialRecoveryEntries}
-          onRetryRecoveryStorage={retryMaterialRecoveryStorage}
-          onRemove={(material, opener) => { if (material.status !== "deleting" && coreDatabaseMutationLockedNow()) return; materialRemovalOpenerRef.current = opener; materialRemovalFocusPendingRef.current = false; setMaterialRemoval({ id: material.id, name: material.name, file_key: material.file_key }); }}
+          onRecover={() => contactImportMaterialWrites.attentionRef.current?.focus({ preventScroll: true })}
+          onClearUnreadable={() => { void contactImportMaterialWrites.removeFirstUnreadable(); }}
+          onRetryRecoveryStorage={contactImportMaterialWrites.retryStorage}
+          onRemove={(material, opener) => { if (coreDatabaseMutationLockedNow("material")) return; materialRemovalOpenerRef.current = opener; materialRemovalFocusPendingRef.current = false; setMaterialRemoval(material); }}
           notify={notify}
         />}
         {view === "analytics" && <AnalyticsView data={allData} now={careerClock} />}
-        {view === "settings" && <SettingsView data={data} coreBindings={coreBindings} coreWrites={coreWrites} onDirtyChange={(dirty) => setCoreEditorDirty("stage:rename", dirty)} newDatabaseWritesLocked={coreWrites.databaseMutationLocked || lifecycleTaskWrites.databaseMutationLocked} newDatabaseWritesLockedNow={() => coreDatabaseMutationLockedNow("backup")} onExternalMutationChange={setBackupMutationGate} onRefresh={requireRefresh} onExport={async () => {
+        {view === "settings" && <SettingsView data={data} coreBindings={coreBindings} coreWrites={coreWrites} onDirtyChange={(dirty) => setCoreEditorDirty("stage:rename", dirty)} newDatabaseWritesLocked={coreWrites.databaseMutationLocked || lifecycleTaskWrites.databaseMutationLocked || contactImportMaterialWrites.databaseMutationLocked} newDatabaseWritesLockedNow={() => coreDatabaseMutationLockedNow("backup")} onExternalMutationChange={setBackupMutationGate} onRefresh={requireRefresh} onExport={async () => {
           try {
             const exported = await exportCompleteCareerBackup();
             const url = URL.createObjectURL(exported.blob);
@@ -2257,9 +2148,10 @@ export default function CareerApp() {
       contactId={selectedContactId}
       revision={contactRevision}
       now={careerClock}
-      newWritesBlocked={coreWrites.databaseMutationLocked}
+      generation={contactImportMaterialGeneration}
+      writes={contactImportMaterialWrites}
+      newWritesBlocked={coreWrites.databaseMutationLocked || contactImportMaterialWrites.databaseMutationLocked}
       newWritesBlockedNow={() => coreDatabaseMutationLockedNow("contact")}
-      onExternalMutationChange={(active) => setExternalMutationClaim("contact-archive", active)}
       onClose={() => setSelectedContactId(null)}
       onEdit={() => { if (!coreDatabaseMutationLockedNow()) setContactEditorId(selectedContactId); }}
       onRecord={() => { if (!coreDatabaseMutationLockedNow()) setContactAction({ kind: "interaction", contactId: selectedContactId }); }}
@@ -2303,29 +2195,54 @@ export default function CareerApp() {
     }} />}
     {modal === "interview" && <InterviewModal data={data} coreBindings={coreBindings} coreWrites={coreWrites} onDirtyChange={(dirty) => setCoreEditorDirty("interview:create", dirty)} onClose={() => setModal(null)} onSaved={(id) => { setModal(null); setSelectedInterviewId(id); }} notify={notify} />}
     {modal === "material" && <MaterialModal
-      data={data}
-      initialRecovery={materialSaveRecoveryEntries[0] ?? null}
-      otherRecoveryPending={materialSaveRecoveryEntries.length > (materialSaveRecoveryEntries[0] ? 1 : 0) || materialRecoveryUnreadableKeys.length > 0}
-      newWritesBlocked={coreWrites.databaseMutationLocked}
+      data={allData}
+      generation={contactImportMaterialGeneration}
+      writes={contactImportMaterialWrites}
+      newWritesBlocked={coreWrites.databaseMutationLocked ||
+        contactImportMaterialWrites.databaseMutationLocked}
       newWritesBlockedNow={() => coreDatabaseMutationLockedNow("material")}
-      onExternalMutationChange={(active) => setExternalMutationClaim("material-save", active)}
-      onRecoveryUpsert={persistMaterialSaveRecovery}
-      onRecoveryClear={clearMaterialSaveRecovery}
+      onDirtyChange={(dirty) => setContactImportMaterialEditorDirty(
+        "material:create",
+        dirty,
+      )}
       onClose={closeMaterialModal}
-      onStaleClose={closeMaterialWithStaleList}
-      onRefresh={refreshMaterials}
-      notify={notify}
     />}
-    {materialRemoval && <MaterialDeletionModal material={materialRemoval} newWritesBlocked={coreWrites.databaseMutationLocked} newWritesBlockedNow={() => coreDatabaseMutationLockedNow("material")} onExternalMutationChange={(active) => setExternalMutationClaim("material-delete", active)} onClose={closeMaterialRemoval} onStaleClose={closeRemovalWithStaleList} onRefresh={refreshMaterials} notify={notify} />}
-    {modal === "import" && <CareerImportModal data={allData} initialCapture={importInitial} newWritesBlocked={coreWrites.databaseMutationLocked} newWritesBlockedNow={() => coreDatabaseMutationLockedNow("import")} onExternalMutationChange={(active) => setExternalMutationClaim("career-import", active)} onClose={closeCareerImport} onRefresh={requireRefresh} notify={notify} />}
+    {materialRemoval && <MaterialDeletionModal
+      material={materialRemoval}
+      data={allData}
+      generation={contactImportMaterialGeneration}
+      writes={contactImportMaterialWrites}
+      newWritesBlocked={coreWrites.databaseMutationLocked ||
+        contactImportMaterialWrites.databaseMutationLocked}
+      newWritesBlockedNow={() => coreDatabaseMutationLockedNow("material")}
+      onClose={closeMaterialRemoval}
+    />}
+    {modal === "import" && <CareerImportModal
+      data={allData}
+      generation={contactImportMaterialGeneration}
+      writes={contactImportMaterialWrites}
+      initialCapture={importInitial}
+      newWritesBlocked={coreWrites.databaseMutationLocked || contactImportMaterialWrites.databaseMutationLocked}
+      newWritesBlockedNow={() => coreDatabaseMutationLockedNow("import")}
+      onDirtyChange={(dirty) => setContactImportMaterialEditorDirty(
+        "import",
+        dirty,
+      )}
+      onClose={closeCareerImport}
+    />}
     {searchOpen && <CommandPalette data={data} onClose={() => setSearchOpen(false)} onNavigate={navigate} onSelectJob={(id) => { setSearchOpen(false); setSelectedJobId(id); }} onAdd={() => { setSearchOpen(false); openJobCreation(); }} />}
     {contactEditorId !== undefined && <ContactModal
       contactId={contactEditorId}
       data={data}
+      generation={contactImportMaterialGeneration}
+      writes={contactImportMaterialWrites}
       externalHint={contactDataHint}
-      newWritesBlocked={coreWrites.databaseMutationLocked}
+      newWritesBlocked={coreWrites.databaseMutationLocked || contactImportMaterialWrites.databaseMutationLocked}
       newWritesBlockedNow={() => coreDatabaseMutationLockedNow("contact")}
-      onExternalMutationChange={(active) => setExternalMutationClaim("contact-save", active)}
+      onDirtyChange={(dirty) => setContactImportMaterialEditorDirty(
+        `contact:${contactEditorId ?? "create"}`,
+        dirty,
+      )}
       onClose={() => setContactEditorId(undefined)}
       onRefresh={refreshContacts}
       onSaved={(id) => {
@@ -2338,10 +2255,15 @@ export default function CareerApp() {
     {contactAction?.kind === "interaction" && <ContactInteractionModal
       contactId={contactAction.contactId}
       data={data}
+      generation={contactImportMaterialGeneration}
+      writes={contactImportMaterialWrites}
       externalHint={contactDataHint}
-      newWritesBlocked={coreWrites.databaseMutationLocked}
+      newWritesBlocked={coreWrites.databaseMutationLocked || contactImportMaterialWrites.databaseMutationLocked}
       newWritesBlockedNow={() => coreDatabaseMutationLockedNow("contact")}
-      onExternalMutationChange={(active) => setExternalMutationClaim("contact-interaction", active)}
+      onDirtyChange={(dirty) => setContactImportMaterialEditorDirty(
+        `contact-interaction:${contactAction.contactId}`,
+        dirty,
+      )}
       onClose={() => setContactAction(null)}
       onRefresh={refreshContacts}
       onSaved={() => {
@@ -2353,10 +2275,15 @@ export default function CareerApp() {
     {contactAction?.kind === "task" && <ContactTaskModal
       contactId={contactAction.contactId}
       data={data}
+      generation={contactImportMaterialGeneration}
+      writes={contactImportMaterialWrites}
       externalHint={contactDataHint}
-      newWritesBlocked={coreWrites.databaseMutationLocked}
+      newWritesBlocked={coreWrites.databaseMutationLocked || contactImportMaterialWrites.databaseMutationLocked}
       newWritesBlockedNow={() => coreDatabaseMutationLockedNow("contact")}
-      onExternalMutationChange={(active) => setExternalMutationClaim("contact-task", active)}
+      onDirtyChange={(dirty) => setContactImportMaterialEditorDirty(
+        `contact-task:${contactAction.contactId}`,
+        dirty,
+      )}
       onClose={() => setContactAction(null)}
       onRefresh={refreshTasks}
       onSaved={() => {
@@ -2403,7 +2330,7 @@ export default function CareerApp() {
       applyLabel={aiState.applyLabel}
     />}
     {historyExitPrompt && <Modal title="放弃未保存的职迹输入？" description="浏览器返回不会替你保存当前表单。" onClose={() => undefined} dismissible={false} inertToasts><div className="career-draft-choice career-history-exit"><p>继续编辑是安全的默认选择。只有明确放弃，才会离开并让下一次打开重新读取资料。</p><div><button type="button" className="career-button primary" data-dialog-initial onClick={stayAfterHistoryExit}>继续编辑</button><button type="button" className="career-button danger" disabled={hasCareerVolatileWork} onClick={abandonDirtyEditorsAndContinueHistory}>放弃输入并返回</button></div></div></Modal>}
-    <div className="career-toast-stack" aria-live="polite">{contactUndo && <button className="career-toast undo career-contact-undo" disabled={contactUndo.phase === "writing"} onClick={() => void handleContactUndo()} aria-label={contactUndo.phase === "refresh-only" ? `核对恢复「${contactUndo.name}」` : `撤销归档「${contactUndo.name}」`}>{contactUndo.phase === "writing" ? <LoaderCircle className="spin" size={16} /> : <RotateCcw size={16} />}<span>{contactUndo.message}</span> <b>{contactUndo.phase === "refresh-only" ? "只读核对" : contactUndo.phase === "writing" ? "请稍候" : "撤销"}</b></button>}{undo && <button className="career-toast undo" onClick={handleUndo}><RotateCcw size={16} />阶段已更新 <b>撤销</b></button>}{notices.map((notice) => <div className={`career-toast ${notice.tone}`} key={notice.id}>{notice.tone === "success" ? <Check size={16} /> : notice.tone === "error" ? <X size={16} /> : <Bell size={16} />}{notice.text}</div>)}</div>
+    <div className="career-toast-stack" aria-live="polite">{contactUndo && <button className="career-toast undo career-contact-undo" disabled={contactUndo.phase === "writing"} onClick={(event) => void handleContactUndo(event.currentTarget)} aria-label={contactUndo.phase === "refresh-only" ? `核对恢复「${contactUndo.name}」` : `撤销归档「${contactUndo.name}」`}>{contactUndo.phase === "writing" ? <LoaderCircle className="spin" size={16} /> : <RotateCcw size={16} />}<span>{contactUndo.message}</span> <b>{contactUndo.phase === "refresh-only" ? "只读核对" : contactUndo.phase === "writing" ? "请稍候" : "撤销"}</b></button>}{undo && <button className="career-toast undo" onClick={handleUndo}><RotateCcw size={16} />阶段已更新 <b>撤销</b></button>}{notices.map((notice) => <div className={`career-toast ${notice.tone}`} key={notice.id}>{notice.tone === "success" ? <Check size={16} /> : notice.tone === "error" ? <X size={16} /> : <Bell size={16} />}{notice.text}</div>)}</div>
   </main>;
 }
 
@@ -2446,7 +2373,7 @@ function careerTaskStatusCopy(task: Task) {
 
 function CareerTaskRow({ task, data, now, onOpen, onComplete, compact = false }: {
   task: Task;
-  data: CareerData;
+  data: CareerUiData;
   now: number;
   onOpen: (taskId: string) => void;
   onComplete: (task: Task) => void | Promise<void>;
@@ -2470,7 +2397,7 @@ function CareerTaskRow({ task, data, now, onOpen, onComplete, compact = false }:
   </article>;
 }
 
-function TodayView({ data, now, onNavigate, onSelectJob, onSelectInterview, onOpenTask, onCompleteTask, onAddJob, onAi }: { data: CareerData; now: number; onNavigate: (view: CareerView) => void; onSelectJob: (id: string) => void; onSelectInterview: (id: string) => void; onOpenTask: (id: string) => void; onCompleteTask: (task: Task) => void | Promise<void>; onAddJob: () => void; onAi: (action: AiAction, title: string, payload: unknown) => void }) {
+function TodayView({ data, now, onNavigate, onSelectJob, onSelectInterview, onOpenTask, onCompleteTask, onAddJob, onAi }: { data: CareerUiData; now: number; onNavigate: (view: CareerView) => void; onSelectJob: (id: string) => void; onSelectInterview: (id: string) => void; onOpenTask: (id: string) => void; onCompleteTask: (task: Task) => void | Promise<void>; onAddJob: () => void; onAi: (action: AiAction, title: string, payload: unknown) => void }) {
   const today = new Date(now);
   const date = new Intl.DateTimeFormat("zh-CN", { month: "long", day: "numeric", weekday: "long" }).format(today);
   const greeting = today.getHours() < 11 ? "早上好" : today.getHours() < 14 ? "中午好" : today.getHours() < 18 ? "下午好" : "晚上好";
@@ -2519,19 +2446,19 @@ function TodayView({ data, now, onNavigate, onSelectJob, onSelectInterview, onOp
 }
 
 type SensorValue = ReturnType<typeof useSensors>;
-function BoardView({ data, jobs, now, query, sourceFilter, priorityOnly, onSourceFilter, onPriorityOnly, onClear, onSelectJob, onAddJob, onMove, lifecycleLocked, sensors, activeJob, onDragStart, onDragEnd }: { data: CareerData; jobs: Job[]; now: number; query: string; sourceFilter: string; priorityOnly: boolean; onSourceFilter: (value: string) => void; onPriorityOnly: (value: boolean) => void; onClear: () => void; onSelectJob: (id: string) => void; onAddJob: () => void; onMove: (jobId: string, stageId: string) => Promise<void>; lifecycleLocked: boolean; sensors: SensorValue; activeJob: Job | null; onDragStart: (event: DragStartEvent) => void; onDragEnd: (event: DragEndEvent) => void }) {
+function BoardView({ data, jobs, now, query, sourceFilter, priorityOnly, onSourceFilter, onPriorityOnly, onClear, onSelectJob, onAddJob, onMove, lifecycleLocked, sensors, activeJob, onDragStart, onDragEnd }: { data: CareerUiData; jobs: Job[]; now: number; query: string; sourceFilter: string; priorityOnly: boolean; onSourceFilter: (value: string) => void; onPriorityOnly: (value: boolean) => void; onClear: () => void; onSelectJob: (id: string) => void; onAddJob: () => void; onMove: (jobId: string, stageId: string) => Promise<void>; lifecycleLocked: boolean; sensors: SensorValue; activeJob: Job | null; onDragStart: (event: DragStartEvent) => void; onDragEnd: (event: DragEndEvent) => void }) {
   const stages = data.stages.filter((stage) => !stage.hidden && stage.is_terminal !== 1);
   return <div className="career-view career-board-view"><SectionHeading eyebrow="PIPELINE" title="求职看板" description="只放还在进行中的职位；拖动或阶段菜单都会先让你看清影响。" action={<div className="career-view-actions"><button className={`career-chip ${priorityOnly ? "active" : ""}`} aria-pressed={priorityOnly} onClick={() => onPriorityOnly(!priorityOnly)}><Target size={14} />只看已关注</button><select className="career-select compact" value={sourceFilter} onChange={(event) => onSourceFilter(event.target.value)} aria-label="来源筛选"><option value="all">全部来源</option>{[...new Set(data.jobs.map((job) => job.source))].map((source) => <option key={source}>{source}</option>)}</select><button className="career-icon-button" onClick={onClear} aria-label="清除筛选"><RotateCcw size={16} /></button></div>} />{(query || sourceFilter !== "all" || priorityOnly) && <div className="career-filter-summary"><Filter size={14} />已按当前条件筛选<button onClick={onClear}>清除全部</button></div>}
     <DndContext sensors={sensors} onDragStart={onDragStart} onDragEnd={onDragEnd}><div className="career-board-scroll">{stages.map((stage) => <BoardColumn key={stage.id} stage={stage} jobs={jobs.filter((job) => job.stage_id === stage.id)} data={data} now={now} onSelectJob={onSelectJob} onAddJob={onAddJob} onMove={onMove} lifecycleLocked={lifecycleLocked} />)}</div><DragOverlay>{activeJob ? <div aria-hidden="true"><JobCard job={activeJob} data={data} now={now} overlay onSelect={() => undefined} /></div> : null}</DragOverlay></DndContext>
   </div>;
 }
 
-function BoardColumn({ stage, jobs, data, now, onSelectJob, onAddJob, onMove, lifecycleLocked }: { stage: Stage; jobs: Job[]; data: CareerData; now: number; onSelectJob: (id: string) => void; onAddJob: () => void; onMove: (jobId: string, stageId: string) => Promise<void>; lifecycleLocked: boolean }) {
+function BoardColumn({ stage, jobs, data, now, onSelectJob, onAddJob, onMove, lifecycleLocked }: { stage: Stage; jobs: Job[]; data: CareerUiData; now: number; onSelectJob: (id: string) => void; onAddJob: () => void; onMove: (jobId: string, stageId: string) => Promise<void>; lifecycleLocked: boolean }) {
   const { isOver, setNodeRef } = useDroppable({ id: `stage:${stage.id}` });
   return <section ref={setNodeRef} className={`career-board-column ${isOver ? "over" : ""}`}><header><div><i style={{ background: stage.color }} /><b>{stage.name}</b><span>{jobs.length}</span></div><button onClick={onAddJob} aria-label={`在${stage.name}添加职位`}><Plus size={16} /></button></header><div className="career-board-cards">{jobs.map((job) => <DraggableJobCard key={job.id} job={job} data={data} now={now} onSelect={() => onSelectJob(job.id)} onMove={onMove} pending={lifecycleLocked} />)}{jobs.length === 0 && <div className="career-board-empty">拖到这里</div>}</div><button className="career-add-inline" onClick={onAddJob}><Plus size={15} />添加职位</button></section>;
 }
 
-function DraggableJobCard({ job, data, now, onSelect, onMove, pending }: { job: Job; data: CareerData; now: number; onSelect: () => void; onMove: (jobId: string, stageId: string) => Promise<void>; pending: boolean }) {
+function DraggableJobCard({ job, data, now, onSelect, onMove, pending }: { job: Job; data: CareerUiData; now: number; onSelect: () => void; onMove: (jobId: string, stageId: string) => Promise<void>; pending: boolean }) {
   const { listeners, setNodeRef, transform, isDragging } = useDraggable({ id: job.id, disabled: pending });
   const style = transform ? { transform: `translate3d(${transform.x}px, ${transform.y}px, 0)` } : undefined;
   return <div ref={setNodeRef} style={style} className={isDragging ? "dragging" : ""}><JobCard job={job} data={data} now={now} onSelect={onSelect} onMove={onMove} pending={pending} dragProps={listeners ?? {}} /></div>;
@@ -2543,14 +2470,14 @@ function careerJobNextLabel(next: CareerJobNextItem, now: number) {
   return null;
 }
 
-function JobCard({ job, data, now, onSelect, onMove, overlay = false, pending = false, dragProps = {} }: { job: Job; data: CareerData; now: number; onSelect: () => void; onMove?: (jobId: string, stageId: string) => Promise<void>; overlay?: boolean; pending?: boolean; dragProps?: Record<string, unknown> }) {
+function JobCard({ job, data, now, onSelect, onMove, overlay = false, pending = false, dragProps = {} }: { job: Job; data: CareerUiData; now: number; onSelect: () => void; onMove?: (jobId: string, stageId: string) => Promise<void>; overlay?: boolean; pending?: boolean; dragProps?: Record<string, unknown> }) {
   const next = resolveCareerJobNextItem(job.id, data.tasks, data.interviews, now);
   const draggable = Object.keys(dragProps).length > 0;
   const nextCopy = careerJobNextLabel(next, now) ?? "还没有明确安排下一步";
   return <article className={`career-job-card ${overlay ? "overlay" : ""}`}><div className="career-job-card-top"><CompanyMark company={job.company} small />{draggable && <span className="career-grip" {...dragProps} tabIndex={-1} aria-hidden="true"><GripVertical size={16} /></span>}</div><button className="career-job-card-open" onClick={onSelect} aria-label={`打开 ${job.company} ${job.role}`}><h3>{job.role}</h3><p>{job.company}</p><div className="career-card-meta"><span>{job.location || "地点待定"}</span>{job.work_mode && <span>{job.work_mode}</span>}</div><div className="career-card-tags">{job.tags.split(",").filter(Boolean).slice(0, 2).map((tag) => <i key={tag}>{tag}</i>)}</div><div className="career-next"><Clock3 size={13} /><span>{nextCopy}</span></div></button><footer><SourceBadge source={job.source} />{onMove ? <select value={job.stage_id} disabled={pending} onChange={(event) => void onMove(job.id, event.target.value)} aria-label={`移动 ${job.company} ${job.role} 到阶段`}>{data.stages.filter((stage) => !stage.hidden).map((stage) => <option value={stage.id} key={stage.id}>{stage.name}</option>)}</select> : careerJobIsWatched(job.priority) ? <span className="career-watch"><Target size={13} />已关注</span> : <span className="career-watch quiet">普通记录</span>}</footer></article>;
 }
 
-function JobsView({ data, jobs, now, scope, scopeLoading, scopeError, stageFilter, sourceFilter, priorityOnly, onScope, onStageFilter, onSourceFilter, onPriorityOnly, onSelectJob, onImport }: { data: CareerData; jobs: Job[]; now: number; scope: CareerJobScope; scopeLoading: boolean; scopeError: string; stageFilter: string; sourceFilter: string; priorityOnly: boolean; onScope: (value: CareerJobScope) => void; onStageFilter: (value: string) => void; onSourceFilter: (value: string) => void; onPriorityOnly: (value: boolean) => void; onSelectJob: (id: string) => void; onImport: (opener: HTMLButtonElement) => void }) {
+function JobsView({ data, jobs, now, scope, scopeLoading, scopeError, stageFilter, sourceFilter, priorityOnly, onScope, onStageFilter, onSourceFilter, onPriorityOnly, onSelectJob, onImport }: { data: CareerUiData; jobs: Job[]; now: number; scope: CareerJobScope; scopeLoading: boolean; scopeError: string; stageFilter: string; sourceFilter: string; priorityOnly: boolean; onScope: (value: CareerJobScope) => void; onStageFilter: (value: string) => void; onSourceFilter: (value: string) => void; onPriorityOnly: (value: boolean) => void; onSelectJob: (id: string) => void; onImport: (opener: HTMLButtonElement) => void }) {
   const emptyCopy = scope === "active"
     ? { title: "没有匹配的进行中职位", text: "可以调整筛选，也可以在遇到合适机会时再记录。" }
     : scope === "ended"
@@ -2566,7 +2493,7 @@ function JobsView({ data, jobs, now, scope, scopeLoading, scopeError, stageFilte
   </div>;
 }
 
-function CalendarView({ data: sourceData, now, onOpenTask, onCompleteTask, onAddTask, onAddInterview, onSelectInterview }: { data: CareerData; now: number; onOpenTask: (id: string) => void; onCompleteTask: (task: Task) => void | Promise<void>; onAddTask: () => void; onAddInterview: () => void; onSelectInterview: (id: string) => void }) {
+function CalendarView({ data: sourceData, now, onOpenTask, onCompleteTask, onAddTask, onAddInterview, onSelectInterview }: { data: CareerUiData; now: number; onOpenTask: (id: string) => void; onCompleteTask: (task: Task) => void | Promise<void>; onAddTask: () => void; onAddInterview: () => void; onSelectInterview: (id: string) => void }) {
   const data = { ...sourceData, interviews: sourceData.interviews.filter((item) => item.status === "scheduled") };
   const [mode, setMode] = useState<"agenda" | "week">("agenda");
   const [showCompleted, setShowCompleted] = useState(false);
@@ -2590,7 +2517,7 @@ function CalendarView({ data: sourceData, now, onOpenTask, onCompleteTask, onAdd
   </div>;
 }
 
-function InterviewsView({ data, now, onAdd, onSelect, onAi }: { data: CareerData; now: number; onAdd: () => void; onSelect: (id: string) => void; onAi: (action: AiAction, title: string, payload: unknown) => void }) {
+function InterviewsView({ data, now, onAdd, onSelect, onAi }: { data: CareerUiData; now: number; onAdd: () => void; onSelect: (id: string) => void; onAi: (action: AiAction, title: string, payload: unknown) => void }) {
   const [tab, setTab] = useState<"upcoming" | "archive">("upcoming");
   const shown = data.interviews.filter((item) => tab === "archive" ? item.status !== "scheduled" : item.status === "scheduled");
   return <div className="career-view">
@@ -2611,7 +2538,7 @@ function InterviewsView({ data, now, onAdd, onSelect, onAi }: { data: CareerData
   </div>;
 }
 
-function ContactsView({ data, now, revision, externalHint, onAdd, onSelect }: { data: CareerData; now: number; revision: number; externalHint: string; onAdd: () => void; onSelect: (contactId: string, opener: HTMLButtonElement) => void }) {
+function ContactsView({ data, now, revision, externalHint, onAdd, onSelect }: { data: CareerUiData; now: number; revision: number; externalHint: string; onAdd: () => void; onSelect: (contactId: string, opener: HTMLButtonElement) => void }) {
   const [scope, setScope] = useState<"active" | "archived">("active");
   const [archived, setArchived] = useState<Contact[]>([]);
   const [details, setDetails] = useState<Record<string, CareerContactDetail>>({});
@@ -2663,16 +2590,16 @@ function careerMaterialFileDetails(fileName: string, byteSize: number | null | u
   return `${fileName} · ${kilobytes >= 10 ? Math.round(kilobytes) : Number(kilobytes.toFixed(1))} KB`;
 }
 
-function MaterialsView({ data, stale, refreshBusy, recoveryLoaded, recoveryCount, recoveryUnreadable, recoveryStorageUnavailable, newWritesLocked, onRefresh, onAdd, onRecover, onClearUnreadable, onRetryRecoveryStorage, onRemove, notify }: { data: CareerData; stale: boolean; refreshBusy: boolean; recoveryLoaded: boolean; recoveryCount: number; recoveryUnreadable: boolean; recoveryStorageUnavailable: boolean; newWritesLocked: boolean; onRefresh: () => Promise<void>; onAdd: () => void; onRecover: () => void; onClearUnreadable: () => void; onRetryRecoveryStorage: () => void; onRemove: (material: Material, opener: HTMLButtonElement) => void; notify: (text: string, tone?: Notice["tone"]) => void }) {
+function MaterialsView({ data, stale, refreshBusy, recoveryLoaded, recoveryCount, recoveryUnreadable, recoveryStorageUnavailable, newWritesLocked, onRefresh, onAdd, onRecover, onClearUnreadable, onRetryRecoveryStorage, onRemove, notify }: { data: CareerUiData; stale: boolean; refreshBusy: boolean; recoveryLoaded: boolean; recoveryCount: number; recoveryUnreadable: boolean; recoveryStorageUnavailable: boolean; newWritesLocked: boolean; onRefresh: () => Promise<void>; onAdd: () => void; onRecover: () => void; onClearUnreadable: () => void; onRetryRecoveryStorage: () => void; onRemove: (material: CareerMaterialUi, opener: HTMLButtonElement) => void; notify: (text: string, tone?: Notice["tone"]) => void }) {
   const recoveryLocked = !recoveryLoaded || recoveryCount > 0 || recoveryUnreadable || recoveryStorageUnavailable;
   const actionsLocked = stale || recoveryLocked;
   const newActionsLocked = actionsLocked || newWritesLocked;
-  async function openFile(fileKey: string) {
+  async function openFile(materialId: string) {
     try {
-      const object = await createLocalFileObjectUrl("career", fileKey);
+      const object = await openCareerMaterialAttachmentById(materialId);
       const anchor = document.createElement("a");
       anchor.href = object.url;
-      anchor.download = object.metadata.originalName;
+      anchor.download = object.originalName;
       anchor.target = "_blank";
       anchor.rel = "noreferrer";
       anchor.click();
@@ -2696,7 +2623,7 @@ function MaterialsView({ data, stale, refreshBusy, recoveryLoaded, recoveryCount
         return <article className={`career-material-card ${cleanupPending ? "cleanup-pending" : ""}`} key={material.id}>
           <span className={`career-file-icon ${material.kind}`}><FileText size={23} /></span>
           <div>
-            <header><span>{material.kind}</span><em className={material.status}>{statusText}</em>{material.file_key && !cleanupPending && <em className="attached">已关联本机原件</em>}</header>
+            <header><span>{material.kind}</span><em className={material.status}>{statusText}</em>{material.has_attachment && !cleanupPending && <em className="attached">已关联本机原件</em>}</header>
             <h3>{material.name}</h3>
             <p>{cleanupPending ? "上次移除还在收尾；继续时会重新核对原件状态与其他引用。" : material.notes}</p>
             <footer><span>{material.version} · 更新于 {formatDate(material.updated_at)}</span>{job && <small>用于 {job.company}</small>}{material.file_name && !cleanupPending && <small>{careerMaterialFileDetails(material.file_name, material.byte_size)}</small>}{cleanupPending && <small>原件状态会在继续收尾时核对</small>}</footer>
@@ -2704,8 +2631,8 @@ function MaterialsView({ data, stale, refreshBusy, recoveryLoaded, recoveryCount
           <div className="career-material-actions">
             {cleanupPending
               ? <button className="career-button secondary" disabled={actionsLocked} onClick={(event) => onRemove(material, event.currentTarget)}><RotateCcw size={15} />继续收尾</button>
-              : <>{material.file_key
-                ? <button className="career-icon-button" disabled={stale} onClick={() => void openFile(material.file_key!)} aria-label={`打开 ${material.file_name ?? material.name}`}><Download size={17} /></button>
+              : <>{material.has_attachment
+                ? <button className="career-icon-button" disabled={stale} onClick={() => void openFile(material.id)} aria-label={`打开 ${material.file_name ?? material.name}`}><Download size={17} /></button>
                 : <button className="career-button ghost" disabled={newActionsLocked} onClick={onAdd}>新建带附件版本</button>}
                 <button className="career-icon-button danger" disabled={newActionsLocked} onClick={(event) => onRemove(material, event.currentTarget)} aria-label={`移除 ${material.name}`}><Trash2 size={16} /></button></>}
           </div>
@@ -2716,7 +2643,7 @@ function MaterialsView({ data, stale, refreshBusy, recoveryLoaded, recoveryCount
   </div>;
 }
 
-function AnalyticsView({ data, now }: { data: CareerData; now: number }) {
+function AnalyticsView({ data, now }: { data: CareerUiData; now: number }) {
   const jobsById = new Map(data.jobs.map((job) => [job.id, job]));
   const stagesById = new Map(data.stages.map((stage) => [stage.id, stage]));
   const terminalStageIds = new Set(data.stages.filter((stage) => stage.is_terminal === 1).map((stage) => stage.id));
@@ -2761,7 +2688,7 @@ function AnalyticsView({ data, now }: { data: CareerData; now: number }) {
 }
 
 function SettingsView({ data, coreBindings, coreWrites, onDirtyChange, newDatabaseWritesLocked, newDatabaseWritesLockedNow, onExternalMutationChange, onRefresh, onExport, notify }: {
-  data: CareerData;
+  data: CareerUiData;
   coreBindings: CareerCoreBindings;
   coreWrites: CareerCoreWriteController;
   onDirtyChange: (dirty: boolean) => void;
@@ -3728,7 +3655,7 @@ function CareerAiDisclosure({ action, className = "" }: { action: AiAction; clas
   return <p className={`career-ai-disclosure ${className}`.trim()}><ShieldCheck size={15} /><span>{careerAiDisclosureText(action)}</span></p>;
 }
 
-function JobDrawer({ job, data, now, lifecyclePending, coreBindings, coreWrites, onDirtyChange, onClose, onLifecycle, onOpenTask, onCompleteTask, onAi, onSelectContact, notify }: { job: Job; data: CareerData; now: number; lifecyclePending: boolean; coreBindings: CareerCoreBindings; coreWrites: CareerCoreWriteController; onDirtyChange: (dirty: boolean) => void; onClose: () => void; onLifecycle: (intent: CareerLifecycleIntent) => Promise<boolean>; onOpenTask: (taskId: string) => void; onCompleteTask: (task: Task) => void | Promise<void>; onAi: (action: AiAction, title: string, payload: unknown) => void; onSelectContact: (contactId: string) => void; notify: (text: string, tone?: Notice["tone"]) => void }) {
+function JobDrawer({ job, data, now, lifecyclePending, coreBindings, coreWrites, onDirtyChange, onClose, onLifecycle, onOpenTask, onCompleteTask, onAi, onSelectContact, notify }: { job: Job; data: CareerUiData; now: number; lifecyclePending: boolean; coreBindings: CareerCoreBindings; coreWrites: CareerCoreWriteController; onDirtyChange: (dirty: boolean) => void; onClose: () => void; onLifecycle: (intent: CareerLifecycleIntent) => Promise<boolean>; onOpenTask: (taskId: string) => void; onCompleteTask: (task: Task) => void | Promise<void>; onAi: (action: AiAction, title: string, payload: unknown) => void; onSelectContact: (contactId: string) => void; notify: (text: string, tone?: Notice["tone"]) => void }) {
   const [tab, setTab] = useState<"overview" | "tasks" | "interviews" | "materials">("overview");
   const [editing, setEditing] = useState(false);
   const [dirty, setDirty] = useState(false);
@@ -3869,7 +3796,7 @@ export function resolveInterviewDraftRestoreMode(draftSourceUpdatedAt: string, c
 
 function InterviewDrawer({ interview, data, coreBindings, coreWrites, onDirtyChange, onClose, onAi, notify }: {
   interview: Interview;
-  data: CareerData;
+  data: CareerUiData;
   coreBindings: CareerCoreBindings;
   coreWrites: CareerCoreWriteController;
   onDirtyChange: (dirty: boolean) => void;
@@ -4161,24 +4088,6 @@ function careerContactInspectionDecision(inspection: CareerContactWriteInspectio
   return "inspect-only" as const;
 }
 
-function careerContactExpectedState(detail: CareerContactDetail): CareerContactExpectedState {
-  return {
-    expectedUpdatedAt: detail.contact.updated_at,
-    expectedArchived: detail.contact.archived === 1,
-    expectedJobIds: detail.associations.map((association) => association.job_id),
-  };
-}
-
-function careerContactErrorText(error: unknown, fallback: string) {
-  if (error instanceof CareerContactMutationError) {
-    if (error.code === "changed") return "联系人刚在另一个页面发生了变化。没有依据旧资料继续写入。";
-    if (error.code === "conflict") return "这个操作标识已对应另一份内容。没有覆盖，也不会换一个标识重试。";
-    if (error.code === "inspect_failed") return "暂时无法核对当前资料，因此没有开始写入。";
-    if (error.code === "write_failed") return "已确认这次没有写入；表单内容和原操作标识仍保留。";
-  }
-  return error instanceof Error ? error.message : fallback;
-}
-
 function useCareerContactWorkProtection(protectedWork: boolean) {
   useEffect(() => {
     if (!protectedWork) return;
@@ -4218,14 +4127,15 @@ function ContactDiscardPrompt({ noun, onKeep, onDiscard }: { noun: string; onKee
   return <div className="career-contact-discard" role="status"><ShieldCheck size={23} /><h3>放下还没保存的{noun}？</h3><p>只有表单里的输入会被放下；已经保存的联系人资料不会改变。</p><div><button type="button" className="career-button primary" data-contact-safe-focus onClick={onKeep}>继续填写</button><button type="button" className="career-button ghost" onClick={onDiscard}>放下输入</button></div></div>;
 }
 
-function ContactDrawer({ contactId, revision, now, externalHint, newWritesBlocked, newWritesBlockedNow, onExternalMutationChange, onClose, onEdit, onRecord, onAddTask, onOpenTask, onCompleteTask, onRefresh, onArchived, onRestored, notify }: {
+function ContactDrawer({ contactId, revision, now, generation, writes, externalHint, newWritesBlocked, newWritesBlockedNow, onClose, onEdit, onRecord, onAddTask, onOpenTask, onCompleteTask, onRefresh, onArchived, onRestored, notify }: {
   contactId: string;
   revision: number;
   now: number;
+  generation: CareerContactImportMaterialReadEnvelope["generation"];
+  writes: CareerContactImportMaterialWriteController;
   externalHint: string;
   newWritesBlocked: boolean;
   newWritesBlockedNow: () => boolean;
-  onExternalMutationChange: (active: boolean) => boolean;
   onClose: () => void;
   onEdit: () => void;
   onRecord: () => void;
@@ -4233,7 +4143,10 @@ function ContactDrawer({ contactId, revision, now, externalHint, newWritesBlocke
   onOpenTask: (taskId: string) => void;
   onCompleteTask: (task: Task) => void | Promise<void>;
   onRefresh: () => Promise<void>;
-  onArchived: (contact: Contact, expected: CareerContactExpectedState) => void;
+  onArchived: (
+    contact: Contact,
+    expected: ReturnType<typeof careerContactDisplayedExpected>,
+  ) => void;
   onRestored: (contact: Contact) => void;
   notify: (text: string, tone?: Notice["tone"]) => void;
 }) {
@@ -4273,12 +4186,17 @@ function ContactDrawer({ contactId, revision, now, externalHint, newWritesBlocke
     setMessage("");
     try {
       await onRefresh();
-      const latest = await loadCareerContactExpectedState(contactId);
+      const latest = await loadCareerContactDetail(contactId);
       if (!latest) {
         onClose();
         notify("联系人已在另一个页面移除；这里没有继续更改", "info");
-      } else if (latest.expectedArchived === targetArchived) {
-        if (targetArchived) onArchived(contact, latest);
+      } else if ((latest.contact.archived === 1) === targetArchived) {
+        if (targetArchived) {
+          onArchived(
+            latest.contact,
+            careerContactDisplayedExpected(generation, latest),
+          );
+        }
         else onRestored(contact);
       } else {
         setPhase("ready");
@@ -4291,55 +4209,62 @@ function ContactDrawer({ contactId, revision, now, externalHint, newWritesBlocke
     } finally { writeRef.current = false; }
   }
 
-  async function changeArchive(targetArchived: boolean) {
+  async function changeArchive(
+    targetArchived: boolean,
+    trigger: HTMLElement,
+  ) {
     if (!detail || writeRef.current) return;
     if (newWritesBlockedNow()) {
       setPhase("ready");
       setMessage("核心资料需要先完成核对；联系人状态没有改变。");
       return;
     }
-    if (!onExternalMutationChange(true)) {
-      setMessage("另一笔数据库操作已经开始；联系人状态没有改变。");
-      return;
-    }
     writeRef.current = true;
     targetArchivedRef.current = targetArchived;
     setPhase("writing");
     setMessage("");
-    const expected = careerContactExpectedState(detail);
+    const expected = careerContactDisplayedExpected(generation, detail);
     try {
       const result = targetArchived
-        ? await archiveCareerContactSafely(contactId, expected)
-        : await restoreCareerContactSafely(contactId, expected);
-      if (result.outcome === "changed") {
-        setPhase("refresh-only");
-        setMessage("联系人刚在另一个页面发生了变化。没有依据旧状态继续；接下来只重新读取。");
-      } else if (result.outcome === "outcome_uncertain") {
-        setPhase("refresh-only");
-        setMessage("本机是否完成状态更新暂时无法确认。接下来只重新读取，不会重复提交。");
+        ? await writes.submitContactArchive(expected, trigger)
+        : await writes.submitContactRestore(expected, trigger);
+      if (result.outcome === "saved" &&
+        result.receipt.purpose === "career-contact-write") {
+        const nextExpected = {
+          generationId: result.receipt.generationId,
+          generationSequence: result.receipt.generationSequence,
+          contact: result.receipt.after.contact,
+          associations: result.receipt.after.associations,
+          jobs: result.receipt.before.jobs,
+        };
+        if (targetArchived) {
+          onArchived(result.receipt.after.contact, nextExpected);
+        } else {
+          onRestored(result.receipt.after.contact);
+        }
+      } else if (result.outcome === "changed") {
+        setPhase("ready");
+        setMessage("联系人刚在另一个页面发生了变化；没有依据旧状态继续。");
+      } else if (result.outcome === "attention") {
+        onClose();
       } else {
-        writeRef.current = false;
-        await refreshArchiveResult();
-        return;
+        setPhase("ready");
+        setMessage("另一笔数据库操作已经开始；联系人状态没有改变。");
       }
     } catch (error) {
-      if (error instanceof CareerContactMutationError && error.code === "changed") {
-        setPhase("refresh-only");
-        setMessage("联系人刚在另一个页面发生了变化。没有覆盖新状态；接下来只重新读取。");
-      } else {
-        targetArchivedRef.current = null;
-        setPhase("ready");
-        setMessage(careerContactErrorText(error, "这次没有更新联系人状态，原记录仍保持不变。"));
-      }
+      targetArchivedRef.current = null;
+      setPhase("ready");
+      setMessage(error instanceof Error
+        ? error.message
+        : "这次没有更新联系人状态，原记录仍保持不变。");
     } finally {
       writeRef.current = false;
-      onExternalMutationChange(false);
     }
   }
   return <Drawer label={`${contact.name} · 联系人详情`} onClose={onClose} dismissible={!locked} inertToasts={locked} wide>
     <div ref={phaseRootRef} className="career-contact-drawer-phase" tabIndex={-1}>
       <div className="career-contact-drawer-head"><span className="career-contact-avatar large">{initials(contact.name)}</span><div><span>{archived ? "已归档联系人" : "联系人"}</span><h2>{contact.name}</h2>{identity && <p>{identity}</p>}</div>{!locked && <button className="career-icon-button" onClick={onClose} aria-label="关闭联系人详情"><X size={19} /></button>}</div>
-      {phase === "confirm-archive" ? <div className="career-contact-archive-confirm" role="status"><Archive size={23} /><h3>把这位联系人移入归档？</h3><p>只会把联系人从常用列表收起。联系历史和职位关联会保留；已经安排的待办仍会出现在“今日”和日历，不会被取消。</p><div><button className="career-button primary" data-contact-safe-focus onClick={() => setPhase("ready")}>继续保留</button><button className="career-button ghost" disabled={newWritesBlocked} onClick={() => void changeArchive(true)}>确认移入归档</button></div></div> : phase === "writing" || phase === "refreshing" ? <ContactWriteStatus icon="busy" title={phase === "writing" ? "正在核对并保存" : "已经停止写入，正在重新读取"} message={phase === "writing" ? "会先核对联系人版本；这时不能关闭，以免失去结果。" : "这里只刷新画面，不会再次提交状态更改。"} /> : phase === "refresh-only" ? <ContactWriteStatus icon="safe" title="只重新读取联系人状态" message={message} action={<button className="career-button primary" data-contact-safe-focus onClick={() => void refreshArchiveResult()}><RotateCcw size={16} />只读核对</button>} /> : <>
+      {phase === "confirm-archive" ? <div className="career-contact-archive-confirm" role="status"><Archive size={23} /><h3>把这位联系人移入归档？</h3><p>只会把联系人从常用列表收起。联系历史和职位关联会保留；已经安排的待办仍会出现在“今日”和日历，不会被取消。</p><div><button className="career-button primary" data-contact-safe-focus onClick={() => setPhase("ready")}>继续保留</button><button className="career-button ghost" disabled={newWritesBlocked} onClick={(event) => void changeArchive(true, event.currentTarget)}>确认移入归档</button></div></div> : phase === "writing" || phase === "refreshing" ? <ContactWriteStatus icon="busy" title={phase === "writing" ? "正在核对并保存" : "已经停止写入，正在重新读取"} message={phase === "writing" ? "会先核对联系人版本；这时不能关闭，以免失去结果。" : "这里只刷新画面，不会再次提交状态更改。"} /> : phase === "refresh-only" ? <ContactWriteStatus icon="safe" title="只重新读取联系人状态" message={message} action={<button className="career-button primary" data-contact-safe-focus onClick={() => void refreshArchiveResult()}><RotateCcw size={16} />只读核对</button>} /> : <>
         <div className="career-contact-drawer-actions">{!archived && <button className="career-button primary" disabled={newWritesBlocked} onClick={onRecord}><MessageSquareText size={16} />记录联系</button>}<button className="career-button secondary" disabled={newWritesBlocked} onClick={onEdit}><Pencil size={15} />编辑</button></div>
         {externalHint && <div className="career-contact-external-hint" role="status"><ShieldCheck size={16} /><span>{externalHint}</span></div>}
         {message && <div className="career-contact-read-warning" role="status"><ShieldCheck size={16} /><span>{message}</span></div>}
@@ -4350,13 +4275,13 @@ function ContactDrawer({ contactId, revision, now, externalHint, newWritesBlocke
           <section><header><div><span>HISTORY</span><h3>联系记录</h3></div>{!archived && <button className="career-text-button" disabled={newWritesBlocked} onClick={onRecord}>记录一次 <Plus size={14} /></button>}</header>{detail.interactions.length > 0 ? <div className="career-contact-timeline">{detail.interactions.map((interaction) => <article key={interaction.id}><i /><div><header><b>{interaction.summary}</b><time>{formatDate(interaction.occurred_at, true)}</time></header><p>{interaction.channel || "未注明渠道"} · {interaction.direction === "outbound" ? "我发出" : interaction.direction === "inbound" ? "对方发来" : "双方交流"}{interaction.job_id ? ` · ${detail.jobs.find((job) => job.id === interaction.job_id)?.role ?? "关联职位"}` : ""}</p>{interaction.notes && <small>{interaction.notes}</small>}</div></article>)}</div> : <p className="career-contact-calm-copy">还没有联系记录。不需要为了填满而补写；下次真实交流后再记。</p>}</section>
           <section><header><div><span>CONTACT</span><h3>联系方式</h3></div></header><div className="career-contact-channels">{contact.email && <a href={`mailto:${contact.email}`}><ContactRound size={16} /><span><b>邮箱</b><small>{contact.email}</small></span><ExternalLink size={14} /></a>}{contact.phone && <a href={`tel:${contact.phone.replace(/[^+\d*#,;]/g, "")}`}><Phone size={16} /><span><b>电话</b><small>{contact.phone}</small></span><ExternalLink size={14} /></a>}{!contact.email && !contact.phone && <p className="career-contact-calm-copy">还没有保存邮箱或电话。</p>}</div>{contact.notes && <p className="career-contact-notes">{contact.notes}</p>}</section>
         </div>
-        <footer className="career-drawer-footer"><button className={archived ? "career-button secondary" : "career-button ghost"} disabled={newWritesBlocked} onClick={() => archived ? void changeArchive(false) : setPhase("confirm-archive")}>{archived ? <RotateCcw size={15} /> : <Archive size={15} />}{archived ? "恢复联系人" : "移入归档"}</button></footer>
+        <footer className="career-drawer-footer"><button className={archived ? "career-button secondary" : "career-button ghost"} disabled={newWritesBlocked} onClick={(event) => archived ? void changeArchive(false, event.currentTarget) : setPhase("confirm-archive")}>{archived ? <RotateCcw size={15} /> : <Archive size={15} />}{archived ? "恢复联系人" : "移入归档"}</button></footer>
       </>}
     </div>
   </Drawer>;
 }
 
-function JobModal({ data, coreBindings, coreWrites, onDirtyChange, onClose, onSaved, notify }: { data: CareerData; coreBindings: CareerCoreBindings; coreWrites: CareerCoreWriteController; onDirtyChange: (dirty: boolean) => void; onClose: () => void; onSaved: (id: string) => void; notify: (text: string, tone?: Notice["tone"]) => void }) {
+function JobModal({ data, coreBindings, coreWrites, onDirtyChange, onClose, onSaved, notify }: { data: CareerUiData; coreBindings: CareerCoreBindings; coreWrites: CareerCoreWriteController; onDirtyChange: (dirty: boolean) => void; onClose: () => void; onSaved: (id: string) => void; notify: (text: string, tone?: Notice["tone"]) => void }) {
   const [saving, setSaving] = useState(false);
   const [activeCoreOperationId, setActiveCoreOperationId] = useState<string | null>(null);
   const [dirty, setDirty] = useState(false);
@@ -4424,7 +4349,7 @@ function JobModal({ data, coreBindings, coreWrites, onDirtyChange, onClose, onSa
   return <><Modal title="记录一个新职位" description="先写下关键信息，细节可以随时补充。" onClose={requestClose} wide><form className="career-form" onChange={markDirty} onSubmit={submit}><fieldset className="career-core-write-fields" disabled={saving || Boolean(activeCoreOperationId)}><div className="career-form-row"><Field label="公司"><input name="company" required placeholder="例如：Linear" /></Field><Field label="职位"><input name="role" required placeholder="例如：Product Designer" /></Field></div><div className="career-form-row thirds"><Field label="当前阶段"><select name="stage_id" defaultValue="stage_saved">{data.stages.filter((stage) => !stage.is_terminal).map((stage) => <option key={stage.id} value={stage.id}>{stage.name}</option>)}</select></Field><Field label="是否关注" hint="只是方便筛选，不是优先级评分"><select name="priority" defaultValue="1"><option value="1">普通记录</option><option value="2">已关注</option></select></Field><Field label="来源"><select name="source" defaultValue="手动记录"><option>手动记录</option><option>LinkedIn</option><option>BOSS直聘</option><option>官网</option><option>内推</option></select></Field></div><div className="career-form-row"><Field label="地点"><input name="location" placeholder="上海 / 远程" /></Field><Field label="工作方式"><select name="work_mode"><option value="">待确认</option><option>现场办公</option><option>混合办公</option><option>远程</option></select></Field></div><div className="career-form-row"><Field label="薪资"><input name="salary" placeholder="¥30k–45k / 月" /></Field><Field label="截止时间"><input name="deadline" type="datetime-local" /></Field></div><Field label="原职位链接"><input name="source_url" type="url" placeholder="https://" /></Field><Field label="标签" hint="用逗号分隔"><input name="tags" placeholder="AI, 产品设计, 远程" /></Field><Field label="职位描述"><textarea name="description" rows={5} placeholder="粘贴岗位职责和要求…" /></Field><Field label="个人备注"><textarea name="note" rows={3} placeholder="为什么感兴趣？下一步要确认什么？" /></Field></fieldset><CareerCoreEditorRecovery coreWrites={coreWrites} />{(coreWrites.error || coreWrites.status) && <div className="career-inline-error" role="status"><ShieldCheck size={15} />{coreWrites.error || coreWrites.status}</div>}<div className="career-form-actions"><button type="button" className="career-button ghost" disabled={saving} onClick={requestClose}>取消</button><button type="submit" className="career-button primary" disabled={saving || Boolean(activeCoreOperationId) || coreWrites.writeLocked}>{saving || activeCoreOperationId ? <LoaderCircle className="spin" size={16} /> : <Plus size={16} />}{saving || activeCoreOperationId ? "等待核对…" : "保存职位"}</button></div></form></Modal>{closePrompt && <Modal title="保留这份职位输入吗？" description="这些内容还没有写入职迹 SQLite。" onClose={() => setClosePrompt(false)}><div className="career-draft-choice"><p>继续编辑会完整保留当前表单；只有明确放弃才会关闭。</p><div><button type="button" className="career-button primary" data-dialog-initial onClick={() => setClosePrompt(false)}>继续编辑</button><button type="button" className="career-button danger" onClick={() => { clearDirty(); setClosePrompt(false); onClose(); }}>放弃输入</button></div></div></Modal>}</>;
 }
 
-function TaskModal({ data, initialJobId, newWritesBlocked, onClose, onSubmit }: { data: CareerData; initialJobId: string | null; newWritesBlocked: boolean; onClose: () => void; onSubmit: (input: import("@/lib/career/task-writes").CreateCareerTaskWriteInput, job: Job | null, trigger: HTMLElement) => Promise<CareerLifecycleTaskSubmitResult>; }) {
+function TaskModal({ data, initialJobId, newWritesBlocked, onClose, onSubmit }: { data: CareerUiData; initialJobId: string | null; newWritesBlocked: boolean; onClose: () => void; onSubmit: (input: import("@/lib/career/task-writes").CreateCareerTaskWriteInput, job: Job | null, trigger: HTMLElement) => Promise<CareerLifecycleTaskSubmitResult>; }) {
   const [phase, setPhase] = useState<"idle" | "writing">("idle");
   const [error, setError] = useState("");
   const savingRef = useRef(false);
@@ -4465,7 +4390,7 @@ function TaskModal({ data, initialJobId, newWritesBlocked, onClose, onSubmit }: 
   return <Modal title="新建待办" description="记录你主动决定的下一步；计划时间可以留空。" onClose={phase === "writing" ? () => undefined : onClose}><form className="career-form" onSubmit={submit}><Field label="要做什么"><input name="title" required placeholder="例如：发送面试感谢邮件" /></Field><Field label="关联职位" hint="可选"><select name="job_id" defaultValue={initialJobId ?? ""}><option value="">个人待办</option>{availableJobs.map((job) => <option key={job.id} value={job.id}>{job.company} · {job.role}</option>)}</select></Field><div className="career-form-row"><Field label="计划时间（可选）" hint="不设时间会放在“以后再说”"><input name="due_at" type="datetime-local" /></Field><Field label="类型"><select name="kind"><option>跟进</option><option>面试准备</option><option>材料</option><option>截止事项</option><option>其他</option></select></Field></div><Field label="优先级"><select name="priority" defaultValue="1"><option value="1">普通</option><option value="2">重点</option><option value="3">时间敏感</option></select></Field>{error && <div className="career-inline-error" role="alert"><X size={15} />{error}</div>}<div className="career-form-actions"><button type="button" className="career-button ghost" disabled={phase === "writing"} onClick={onClose}>取消</button><button className="career-button primary" disabled={phase === "writing" || newWritesBlocked}>{phase === "writing" ? <LoaderCircle className="spin" size={16} /> : <ListTodo size={16} />}{phase === "writing" ? "正在创建…" : "创建待办"}</button></div></form></Modal>;
 }
 
-function InterviewModal({ data, coreBindings, coreWrites, onDirtyChange, onClose, onSaved, notify }: { data: CareerData; coreBindings: CareerCoreBindings; coreWrites: CareerCoreWriteController; onDirtyChange: (dirty: boolean) => void; onClose: () => void; onSaved: (id: string) => void; notify: (text: string, tone?: Notice["tone"]) => void }) {
+function InterviewModal({ data, coreBindings, coreWrites, onDirtyChange, onClose, onSaved, notify }: { data: CareerUiData; coreBindings: CareerCoreBindings; coreWrites: CareerCoreWriteController; onDirtyChange: (dirty: boolean) => void; onClose: () => void; onSaved: (id: string) => void; notify: (text: string, tone?: Notice["tone"]) => void }) {
   const [saving, setSaving] = useState(false);
   const [activeCoreOperationId, setActiveCoreOperationId] = useState<string | null>(null);
   const [dirty, setDirty] = useState(false);
@@ -4543,7 +4468,7 @@ function InterviewModal({ data, coreBindings, coreWrites, onDirtyChange, onClose
   return <><Modal title="安排面试轮次" description="时间、面试官和会议入口都放在一起。" onClose={requestClose}><form className="career-form" onChange={markDirty} onSubmit={submit}><fieldset className="career-core-write-fields" disabled={saving || Boolean(activeCoreOperationId)}><Field label="关联职位"><select required name="job_id" defaultValue=""><option value="" disabled>选择职位</option>{availableJobs.map((job) => <option key={job.id} value={job.id}>{job.company} · {job.role}</option>)}</select></Field><div className="career-form-row"><Field label="轮次名称"><input name="round_name" required placeholder="技术二面" /></Field><Field label="形式"><select name="interview_type"><option>视频面试</option><option>电话沟通</option><option>现场面试</option><option>笔试复盘</option></select></Field></div><div className="career-form-row"><Field label="时间"><input name="scheduled_at" type="datetime-local" required /></Field><Field label="时长"><select name="duration" defaultValue="45"><option value="30">30 分钟</option><option value="45">45 分钟</option><option value="60">60 分钟</option><option value="90">90 分钟</option></select></Field></div><Field label="面试官"><input name="interviewer" placeholder="姓名 · 职位" /></Field><Field label="会议链接"><input name="meeting_url" type="url" placeholder="https://" /></Field></fieldset><CareerCoreEditorRecovery coreWrites={coreWrites} />{(error || coreWrites.error || coreWrites.status) && <div className="career-inline-error" role="status"><ShieldCheck size={15} />{error || coreWrites.error || coreWrites.status}</div>}<div className="career-form-actions"><button type="button" className="career-button ghost" disabled={saving} onClick={requestClose}>取消</button><button type="submit" className="career-button primary" disabled={saving || Boolean(activeCoreOperationId) || coreWrites.writeLocked}>{saving || activeCoreOperationId ? <LoaderCircle className="spin" size={16} /> : <CalendarDays size={16} />}{saving || activeCoreOperationId ? "等待核对…" : "保存日程"}</button></div></form></Modal>{closePrompt && <Modal title="保留这份面试输入吗？" description="这些内容还没有写入职迹 SQLite。" onClose={() => setClosePrompt(false)}><div className="career-draft-choice"><p>继续编辑会完整保留当前表单；只有明确放弃才会关闭。</p><div><button type="button" className="career-button primary" data-dialog-initial onClick={() => setClosePrompt(false)}>继续编辑</button><button type="button" className="career-button danger" onClick={() => { clearDirty(); setClosePrompt(false); onClose(); }}>放弃输入</button></div></div></Modal>}</>;
 }
 
-function ContactModal({ contactId, data, externalHint, newWritesBlocked, newWritesBlockedNow, onExternalMutationChange, onClose, onRefresh, onSaved, notify }: { contactId: string | null; data: CareerData; externalHint: string; newWritesBlocked: boolean; newWritesBlockedNow: () => boolean; onExternalMutationChange: (active: boolean) => boolean; onClose: () => void; onRefresh: () => Promise<void>; onSaved: (contactId: string) => void; notify: (text: string, tone?: Notice["tone"]) => void }) {
+function ContactModal({ contactId, data, generation, writes, externalHint, newWritesBlocked, newWritesBlockedNow, onDirtyChange, onClose, onRefresh, onSaved, notify }: { contactId: string | null; data: CareerUiData; generation: CareerContactImportMaterialReadEnvelope["generation"]; writes: CareerContactImportMaterialWriteController; externalHint: string; newWritesBlocked: boolean; newWritesBlockedNow: () => boolean; onDirtyChange: (dirty: boolean) => void; onClose: () => void; onRefresh: () => Promise<void>; onSaved: (contactId: string) => void; notify: (text: string, tone?: Notice["tone"]) => void }) {
   const [detail, setDetail] = useState<CareerContactDetail | null>(null);
   const [loading, setLoading] = useState(Boolean(contactId));
   const [readError, setReadError] = useState("");
@@ -4554,13 +4479,13 @@ function ContactModal({ contactId, data, externalHint, newWritesBlocked, newWrit
   const [error, setError] = useState("");
   const [receipt, setReceipt] = useState<CareerContactWriteReceipt | null>(null);
   const [stableContactId] = useState(() => newId("contact"));
-  const [stableCreatedAt] = useState(() => new Date().toISOString());
-  const commandRef = useRef<CreateCareerContactSafeInput | null>(null);
   const writeRef = useRef(false);
   const refreshOutcomeRef = useRef<"saved" | "changed">("saved");
   const phaseRootRef = useCareerContactPhaseFocus(phase, discardPrompt);
   const locked = phase === "writing" || phase === "checking" || phase === "refreshing" || phase === "refresh-only" || phase === "uncertain";
   useCareerContactWorkProtection(dirty || locked);
+  useEffect(() => { onDirtyChange(dirty || locked); }, [dirty, locked, onDirtyChange]);
+  useEffect(() => () => onDirtyChange(false), [onDirtyChange]);
   useEffect(() => {
     if (!contactId) return;
     let live = true;
@@ -4640,10 +4565,6 @@ function ContactModal({ contactId, data, externalHint, newWritesBlocked, newWrit
       setError("核心资料需要先完成核对；联系人输入仍保留，没有保存。");
       return;
     }
-    if (!onExternalMutationChange(true)) {
-      setError("另一笔数据库操作已经开始；联系人输入仍保留。");
-      return;
-    }
     writeRef.current = true;
     setPhase("writing");
     setError("");
@@ -4658,51 +4579,59 @@ function ContactModal({ contactId, data, externalHint, newWritesBlocked, newWrit
       notes: String(form.get("notes") ?? ""),
       jobIds: form.getAll("jobIds").map(String),
     };
+    const trigger = event.currentTarget.querySelector<HTMLButtonElement>(
+      'button[type="submit"]',
+    );
     try {
-      if (contactId && detail) {
-        const result = await updateCareerContactSafely(contactId, input, careerContactExpectedState(detail));
-        if (result.outcome === "changed" || result.outcome === "outcome_uncertain") {
-          refreshOutcomeRef.current = "changed";
-          setPhase("refresh-only");
-          setError(result.outcome === "changed"
-            ? "联系人刚在另一个页面发生了变化。没有覆盖新版本；接下来只重新读取。"
-            : "是否完成更新暂时无法确认。接下来只重新读取，不会再次保存表单。");
-        } else {
-          refreshOutcomeRef.current = "saved";
-          writeRef.current = false;
-          await refreshOnly(contactId);
-          return;
-        }
-      } else if (!contactId) {
-        const command: CreateCareerContactSafeInput = { ...input, contactId: stableContactId, createdAt: stableCreatedAt };
-        commandRef.current = command;
-        const result = await createCareerContactSafely(command);
-        if (result.outcome === "outcome_uncertain") {
-          setReceipt(result.receipt);
-          setPhase("uncertain");
-          setError("本机是否完成保存暂时无法确认。下一步只能核对同一份凭据，不能直接再创建。");
-        } else {
-          refreshOutcomeRef.current = "saved";
-          writeRef.current = false;
-          await refreshOnly(stableContactId);
-          return;
-        }
+      if (!trigger || contactId && !detail) {
+        throw new Error("联系人显示快照已经变化；输入仍保留。");
+      }
+      const selectedJobs = data.jobs.filter((job) =>
+        input.jobIds.includes(job.id));
+      const expected = careerContactDisplayedExpected(
+        generation,
+        contactId ? detail : null,
+        selectedJobs,
+      );
+      const lifecycle = {
+        onSettled: ({ outcome, receipt }: {
+          outcome: "saved" | "changed" | "discarded";
+          receipt: CareerContactImportMaterialWriteReceipt;
+        }) => {
+          if (outcome === "saved" &&
+            receipt.purpose === "career-contact-write") {
+            setDirty(false);
+            onDirtyChange(false);
+            onSaved(receipt.after.contact.id);
+          } else if (outcome === "changed") {
+            setPhase("editing");
+            setError("联系人刚在另一个页面发生了变化；当前输入仍保留。");
+          }
+        },
+        onAbandonChanged: () => {
+          setDirty(false);
+          onDirtyChange(false);
+          onClose();
+        },
+      };
+      const result = contactId
+        ? await writes.submitContactUpdate(input, expected, trigger, lifecycle)
+        : await writes.submitContactCreate(input, expected, trigger, lifecycle);
+      if (result.outcome === "attention") {
+        setDirty(false);
+        onDirtyChange(false);
+        onClose();
+      } else if (result.outcome === "blocked") {
+        setPhase("editing");
+        setError("另一笔数据库操作已经开始；联系人输入仍保留。");
       }
     } catch (caught) {
-      if (caught instanceof CareerContactMutationError && caught.code === "changed") {
-        refreshOutcomeRef.current = "changed";
-        setPhase("refresh-only");
-        setError("联系人刚在另一个页面发生了变化。没有覆盖新版本；接下来只重新读取。");
-      } else if (caught instanceof CareerContactMutationError && caught.code === "conflict") {
-        setPhase("blocked");
-        setError(careerContactErrorText(caught, "操作标识发生冲突，没有覆盖已有记录。"));
-      } else {
-        setPhase("editing");
-        setError(careerContactErrorText(caught, "这次没有保存，表单内容仍保留。"));
-      }
+      setPhase("editing");
+      setError(caught instanceof Error
+        ? caught.message
+        : "这次没有保存，表单内容仍保留。");
     } finally {
       writeRef.current = false;
-      onExternalMutationChange(false);
     }
   }
   const contact = detail?.contact;
@@ -4716,7 +4645,7 @@ function ContactModal({ contactId, data, externalHint, newWritesBlocked, newWrit
   return <Modal title={contactId ? "编辑联系人" : "添加联系人"} description="只保存你确认过的资料与职位关系；联系事实需要单独记录。" onClose={requestClose} dismissible={canDismiss} inertToasts={!canDismiss} wide><div ref={phaseRootRef} className="career-contact-modal-phase" tabIndex={-1}>{loading ? <div className="career-modal-loading"><LoaderCircle className="spin" size={20} />正在打开资料…</div> : contactId && (!detail || readError) ? <div className="career-drawer-read-error" role="status"><ShieldCheck size={22} /><h3>联系人资料暂时没有打开</h3><p>{readError || "没有把它显示成一份可覆盖的空表单。"}</p><div><button type="button" className="career-button primary" data-dialog-initial onClick={retryRead}><RotateCcw size={16} />重新读取</button><button type="button" className="career-button ghost" onClick={onClose}>关闭</button></div></div> : <>{phase === "writing" || phase === "checking" || phase === "refreshing" ? <ContactWriteStatus icon="busy" title={phase === "writing" ? "正在核对并保存" : phase === "checking" ? "正在只读核对保存结果" : "已经停止写入，正在重新读取"} message={phase === "checking" ? "只核对原凭据，不会再次创建联系人。" : phase === "refreshing" ? "这一步只刷新画面，不会再次保存。" : "写入期间会保留表单，暂时不能关闭。"} /> : phase === "uncertain" ? <ContactWriteStatus icon="safe" title="先核对这次保存" message={error} action={<button className="career-button primary" data-contact-safe-focus onClick={() => void inspectUncertain()}><Search size={16} />只读核对</button>} /> : phase === "refresh-only" ? <ContactWriteStatus icon="safe" title="只重新读取联系人" message={error} action={<button className="career-button primary" data-contact-safe-focus onClick={() => void refreshOnly(contactId ?? stableContactId)}><RotateCcw size={16} />重新读取</button>} /> : phase === "blocked" ? <ContactWriteStatus icon="safe" title="没有覆盖已有记录" message={error} action={<button className="career-button primary" data-contact-safe-focus onClick={onClose}>返回联系人</button>} /> : null}{phase === "editing" && discardPrompt && <ContactDiscardPrompt noun="联系人输入" onKeep={() => setDiscardPrompt(false)} onDiscard={() => { setDirty(false); onClose(); }} />}<form hidden={phase !== "editing" || discardPrompt} className="career-form" onChange={() => setDirty(true)} onSubmit={submit}>{externalHint && <div className="career-contact-external-hint" role="status"><ShieldCheck size={16} /><span>{externalHint}</span></div>}<div className="career-form-row"><Field label="姓名"><input name="name" required defaultValue={contact?.name ?? ""} /></Field><Field label="公司" hint="可选"><input name="company" defaultValue={contact?.company ?? ""} /></Field></div><div className="career-form-row"><Field label="身份 / 关系" hint="可选"><input name="role" defaultValue={contact?.role ?? ""} placeholder="Recruiter / 内推人" /></Field><Field label="常用渠道" hint="可选"><select name="channel" defaultValue={contact?.channel ?? ""}><option value="">不设置</option><option>LinkedIn</option><option>BOSS直聘</option><option>邮件</option><option>微信</option><option>电话</option><option>其他</option></select></Field></div><div className="career-form-row"><Field label="邮箱" hint="可选"><input name="email" type="email" defaultValue={contact?.email ?? ""} /></Field><Field label="电话" hint="可选"><input name="phone" defaultValue={contact?.phone ?? ""} /></Field></div><fieldset className="career-contact-job-picker"><legend>关联职位 <small>只建立你明确选择的关系</small></legend>{jobsForPicker.length > 0 ? <div>{jobsForPicker.map((job) => { const stage = data.stages.find((item) => item.id === job.stage_id); const context = job.archived === 1 ? "已归档" : stage?.is_terminal ? "已结束" : "进行中"; return <label key={job.id}><input type="checkbox" name="jobIds" value={job.id} defaultChecked={linked.has(job.id)} /><span><b>{job.role}</b><small>{job.company} · {context}</small></span></label>; })}</div> : <p>还没有可关联的职位。</p>}</fieldset><Field label="备注" hint="可选"><textarea name="notes" rows={4} defaultValue={contact?.notes ?? ""} placeholder="怎么认识、希望记住什么；不用重复写沟通记录。" /></Field>{error && <div className="career-inline-error" role="status"><ShieldCheck size={15} />{error}</div>}<div className="career-form-actions"><button type="button" className="career-button ghost" onClick={requestClose}>取消</button><button className="career-button primary" disabled={newWritesBlocked}><Check size={16} />保存联系人</button></div></form></>}</div></Modal>;
 }
 
-function ContactInteractionModal({ contactId, data, externalHint, newWritesBlocked, newWritesBlockedNow, onExternalMutationChange, onClose, onRefresh, onSaved, notify }: { contactId: string; data: CareerData; externalHint: string; newWritesBlocked: boolean; newWritesBlockedNow: () => boolean; onExternalMutationChange: (active: boolean) => boolean; onClose: () => void; onRefresh: () => Promise<void>; onSaved: () => void; notify: (text: string, tone?: Notice["tone"]) => void }) {
+function ContactInteractionModal({ contactId, data, generation, writes, externalHint, newWritesBlocked, newWritesBlockedNow, onDirtyChange, onClose, onRefresh, onSaved, notify }: { contactId: string; data: CareerUiData; generation: CareerContactImportMaterialReadEnvelope["generation"]; writes: CareerContactImportMaterialWriteController; externalHint: string; newWritesBlocked: boolean; newWritesBlockedNow: () => boolean; onDirtyChange: (dirty: boolean) => void; onClose: () => void; onRefresh: () => Promise<void>; onSaved: () => void; notify: (text: string, tone?: Notice["tone"]) => void }) {
   const [detail, setDetail] = useState<CareerContactDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [scheduleNext, setScheduleNext] = useState(false);
@@ -4730,12 +4659,13 @@ function ContactInteractionModal({ contactId, data, externalHint, newWritesBlock
   const [stableInteractionId] = useState(() => newId("interaction"));
   const [stableFollowUpTaskId] = useState(() => newId("task"));
   const [stableCreatedAt] = useState(() => new Date().toISOString());
-  const commandRef = useRef<RecordCareerContactInteractionSafeInput | null>(null);
   const writeRef = useRef(false);
   const refreshOutcomeRef = useRef<"saved" | "changed">("saved");
   const phaseRootRef = useCareerContactPhaseFocus(phase, discardPrompt);
   const locked = phase === "writing" || phase === "checking" || phase === "refreshing" || phase === "refresh-only" || phase === "uncertain";
   useCareerContactWorkProtection(dirty || locked);
+  useEffect(() => { onDirtyChange(dirty || locked); }, [dirty, locked, onDirtyChange]);
+  useEffect(() => () => onDirtyChange(false), [onDirtyChange]);
   useEffect(() => {
     let live = true;
     void loadCareerContactDetail(contactId).then((next) => {
@@ -4814,10 +4744,6 @@ function ContactInteractionModal({ contactId, data, externalHint, newWritesBlock
       setError("核心资料需要先完成核对；联系记录输入仍保留，没有保存。");
       return;
     }
-    if (!onExternalMutationChange(true)) {
-      setError("另一笔数据库操作已经开始；联系记录输入仍保留。");
-      return;
-    }
     writeRef.current = true;
     setPhase("writing");
     setError("");
@@ -4830,19 +4756,18 @@ function ContactInteractionModal({ contactId, data, externalHint, newWritesBlock
       if (scheduleNext && !followUpDueAt) throw new Error("请为下一步选择时间");
       const direction = String(form.get("direction") ?? "");
       if (direction !== "outbound" && direction !== "inbound" && direction !== "mutual") throw new Error("请选择这次联系的真实方向");
-      const command: RecordCareerContactInteractionSafeInput = {
+      const command = {
         contactId,
         interactionId: stableInteractionId,
         createdAt: stableCreatedAt,
         occurredAt: fromDateInput(String(form.get("occurred_at") ?? "")) ?? stableCreatedAt,
         interactionType: "conversation",
-        direction,
+        direction: direction as "outbound" | "inbound" | "mutual",
         channel: String(form.get("channel") ?? ""),
         summary: String(form.get("summary") ?? ""),
         notes: String(form.get("notes") ?? ""),
         jobId,
         associatedJobIds: jobId ? [jobId] : [],
-        expectedContact: careerContactExpectedState(detail),
         followUp: scheduleNext ? {
           taskId: stableFollowUpTaskId,
           title: String(form.get("follow_up_title") ?? ""),
@@ -4852,33 +4777,55 @@ function ContactInteractionModal({ contactId, data, externalHint, newWritesBlock
           jobId,
         } : undefined,
       };
-      commandRef.current = command;
-      const result = await recordCareerContactInteractionSafely(command);
-      if (result.outcome === "outcome_uncertain") {
-        setReceipt(result.receipt);
-        setPhase("uncertain");
-        setError("本机是否完成保存暂时无法确认。下一步只能核对同一份凭据，不能直接再创建。");
-      } else {
-        refreshOutcomeRef.current = "saved";
-        writeRef.current = false;
-        await refreshOnly();
-        return;
+      const trigger = event.currentTarget.querySelector<HTMLButtonElement>(
+        'button[type="submit"]',
+      );
+      if (!trigger) throw new Error("保存按钮已经变化；输入仍保留。");
+      const selectedJob = jobId
+        ? data.jobs.find((job) => job.id === jobId) ?? null
+        : null;
+      const expected = careerContactDisplayedExpected(
+        generation,
+        detail,
+        selectedJob ? [selectedJob] : [],
+      );
+      const result = await writes.submitContactInteraction(
+        command,
+        expected,
+        trigger,
+        {
+          onSettled: ({ outcome }) => {
+            if (outcome === "saved") {
+              setDirty(false);
+              onDirtyChange(false);
+              onSaved();
+            } else if (outcome === "changed") {
+              setPhase("editing");
+              setError("联系人资料已变化；联系记录输入仍保留。");
+            }
+          },
+          onAbandonChanged: () => {
+            setDirty(false);
+            onDirtyChange(false);
+            onClose();
+          },
+        },
+      );
+      if (result.outcome === "attention") {
+        setDirty(false);
+        onDirtyChange(false);
+        onClose();
+      } else if (result.outcome === "blocked") {
+        setPhase("editing");
+        setError("另一笔数据库操作已经开始；联系记录输入仍保留。");
       }
     } catch (caught) {
-      if (caught instanceof CareerContactMutationError && caught.code === "changed") {
-        refreshOutcomeRef.current = "changed";
-        setPhase("refresh-only");
-        setError("联系人刚在另一个页面发生了变化。没有补写这次联系；接下来只重新读取。");
-      } else if (caught instanceof CareerContactMutationError && caught.code === "conflict") {
-        setPhase("blocked");
-        setError(careerContactErrorText(caught, "操作标识发生冲突，没有覆盖已有记录。"));
-      } else {
-        setPhase("editing");
-        setError(careerContactErrorText(caught, "这次没有保存，表单内容仍保留。"));
-      }
+      setPhase("editing");
+      setError(caught instanceof Error
+        ? caught.message
+        : "这次没有保存，表单内容仍保留。");
     } finally {
       writeRef.current = false;
-      onExternalMutationChange(false);
     }
   }
   if (loading) return <Modal title="记录一次真实联系" description="只记录已经发生的沟通。" onClose={onClose} wide><div className="career-modal-loading"><LoaderCircle className="spin" size={20} />正在打开联系人…</div></Modal>;
@@ -4891,7 +4838,7 @@ function ContactInteractionModal({ contactId, data, externalHint, newWritesBlock
   return <Modal title="记录一次真实联系" description={`记录与 ${contact.name} 已经发生的沟通；不会自动发送消息。`} onClose={requestClose} dismissible={canDismiss} inertToasts={!canDismiss} wide><div ref={phaseRootRef} className="career-contact-modal-phase" tabIndex={-1}>{discardPrompt ? <ContactDiscardPrompt noun="联系记录" onKeep={() => setDiscardPrompt(false)} onDiscard={() => { setDirty(false); onClose(); }} /> : <>{phase === "writing" || phase === "checking" || phase === "refreshing" ? <ContactWriteStatus icon="busy" title={phase === "writing" ? "正在核对并保存" : phase === "checking" ? "正在只读核对保存结果" : "已经停止写入，正在重新读取"} message={phase === "checking" ? "只核对原凭据，不会再次创建联系记录或待办。" : phase === "refreshing" ? "这一步只刷新画面，不会再次保存。" : "写入期间会保留表单，暂时不能关闭。"} /> : phase === "uncertain" ? <ContactWriteStatus icon="safe" title="先核对这次联系" message={error} action={<button className="career-button primary" data-contact-safe-focus onClick={() => void inspectUncertain()}><Search size={16} />只读核对</button>} /> : phase === "refresh-only" ? <ContactWriteStatus icon="safe" title="只重新读取联系人" message={error} action={<button className="career-button primary" data-contact-safe-focus onClick={() => void refreshOnly()}><RotateCcw size={16} />重新读取</button>} /> : phase === "blocked" ? <ContactWriteStatus icon="safe" title="没有覆盖已有记录" message={error} action={<button className="career-button primary" data-contact-safe-focus onClick={onClose}>返回联系历史</button>} /> : null}{phase === "editing" && discardPrompt && <ContactDiscardPrompt noun="联系记录" onKeep={() => setDiscardPrompt(false)} onDiscard={() => { setDirty(false); onClose(); }} />}<form hidden={phase !== "editing" || discardPrompt} className="career-form" onChange={() => setDirty(true)} onSubmit={submit}>{externalHint && <div className="career-contact-external-hint" role="status"><ShieldCheck size={16} /><span>{externalHint}</span></div>}<div className="career-form-row thirds"><Field label="发生时间"><input name="occurred_at" type="datetime-local" required defaultValue={dateInputValue(stableCreatedAt)} /></Field><Field label="方向"><select name="direction" required defaultValue=""><option value="" disabled>请选择</option><option value="outbound">我发出</option><option value="inbound">对方发来</option><option value="mutual">双方交流</option></select></Field><Field label="渠道"><select name="channel" defaultValue=""><option value="">未注明</option><option>LinkedIn</option><option>BOSS直聘</option><option>邮件</option><option>微信</option><option>电话</option><option>当面</option><option>其他</option></select></Field></div><Field label="沟通摘要" hint="必填，写事实而不是评价"><input name="summary" required placeholder="例如：确认了作品集评审时间" /></Field><Field label="关联职位" hint="可选；选择即明确建立关系"><select name="job_id" defaultValue=""><option value="">不关联职位</option>{jobsForPicker.map((job) => <option key={job.id} value={job.id}>{job.company} · {job.role}{job.archived === 1 ? "（已归档）" : ""}</option>)}</select></Field><Field label="补充备注" hint="可选"><textarea name="notes" rows={4} placeholder="关键信息、对方提到的事项…" /></Field><label className="career-contact-follow-toggle"><input type="checkbox" checked={scheduleNext} onChange={(event) => setScheduleNext(event.target.checked)} /><span><b>顺手安排下一步</b><small>只有你选择后才创建待办</small></span></label>{scheduleNext && <div className="career-contact-follow-fields"><Field label="下一步动作"><input name="follow_up_title" required placeholder="例如：发送更新后的案例页" /></Field><Field label="时间"><input name="follow_up_due_at" type="datetime-local" required /></Field></div>}{error && <div className="career-inline-error" role="status"><ShieldCheck size={15} />{error}</div>}<div className="career-form-actions"><button type="button" className="career-button ghost" onClick={requestClose}>取消</button><button className="career-button primary" disabled={newWritesBlocked}><MessageSquareText size={16} />保存联系记录</button></div></form></>}</div></Modal>;
 }
 
-function ContactTaskModal({ contactId, data, externalHint, newWritesBlocked, newWritesBlockedNow, onExternalMutationChange, onClose, onRefresh, onSaved, notify }: { contactId: string; data: CareerData; externalHint: string; newWritesBlocked: boolean; newWritesBlockedNow: () => boolean; onExternalMutationChange: (active: boolean) => boolean; onClose: () => void; onRefresh: () => Promise<void>; onSaved: () => void; notify: (text: string, tone?: Notice["tone"]) => void }) {
+function ContactTaskModal({ contactId, data, generation, writes, externalHint, newWritesBlocked, newWritesBlockedNow, onDirtyChange, onClose, onRefresh, onSaved, notify }: { contactId: string; data: CareerUiData; generation: CareerContactImportMaterialReadEnvelope["generation"]; writes: CareerContactImportMaterialWriteController; externalHint: string; newWritesBlocked: boolean; newWritesBlockedNow: () => boolean; onDirtyChange: (dirty: boolean) => void; onClose: () => void; onRefresh: () => Promise<void>; onSaved: () => void; notify: (text: string, tone?: Notice["tone"]) => void }) {
   const [detail, setDetail] = useState<CareerContactDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [readError, setReadError] = useState("");
@@ -4903,12 +4850,13 @@ function ContactTaskModal({ contactId, data, externalHint, newWritesBlocked, new
   const [receipt, setReceipt] = useState<CareerContactWriteReceipt | null>(null);
   const [stableTaskId] = useState(() => newId("task"));
   const [stableCreatedAt] = useState(() => new Date().toISOString());
-  const commandRef = useRef<CreateCareerContactTaskSafeInput | null>(null);
   const writeRef = useRef(false);
   const refreshOutcomeRef = useRef<"saved" | "changed">("saved");
   const phaseRootRef = useCareerContactPhaseFocus(phase, discardPrompt);
   const locked = phase === "writing" || phase === "checking" || phase === "refreshing" || phase === "refresh-only" || phase === "uncertain";
   useCareerContactWorkProtection(dirty || locked);
+  useEffect(() => { onDirtyChange(dirty || locked); }, [dirty, locked, onDirtyChange]);
+  useEffect(() => () => onDirtyChange(false), [onDirtyChange]);
   useEffect(() => {
     let live = true;
     void loadCareerContactDetail(contactId).then((next) => {
@@ -4987,16 +4935,12 @@ function ContactTaskModal({ contactId, data, externalHint, newWritesBlocked, new
       setError("核心资料需要先完成核对；待办输入仍保留，没有创建。");
       return;
     }
-    if (!onExternalMutationChange(true)) {
-      setError("另一笔数据库操作已经开始；待办输入仍保留。");
-      return;
-    }
     writeRef.current = true;
     setPhase("writing");
     setError("");
     const form = new FormData(event.currentTarget);
     try {
-      const command: CreateCareerContactTaskSafeInput = {
+      const command = {
         taskId: stableTaskId,
         createdAt: stableCreatedAt,
         contactId,
@@ -5005,35 +4949,56 @@ function ContactTaskModal({ contactId, data, externalHint, newWritesBlocked, new
         dueAt: fromDateInput(String(form.get("due_at") ?? "")),
         kind: String(form.get("kind") ?? "跟进"),
         priority: Number(form.get("priority") ?? 1),
-        expectedContact: careerContactExpectedState(detail),
       };
-      commandRef.current = command;
-      const result = await createCareerContactTaskSafely(command);
-      if (result.outcome === "outcome_uncertain") {
-        setReceipt(result.receipt);
-        setPhase("uncertain");
-        setError("本机是否完成保存暂时无法确认。下一步只能核对同一份凭据，不能直接再创建。");
-      } else {
-        refreshOutcomeRef.current = "saved";
-        writeRef.current = false;
-        await refreshOnly();
-        return;
+      const trigger = event.currentTarget.querySelector<HTMLButtonElement>(
+        'button[type="submit"]',
+      );
+      if (!trigger) throw new Error("保存按钮已经变化；输入仍保留。");
+      const selectedJob = command.jobId
+        ? data.jobs.find((job) => job.id === command.jobId) ?? null
+        : null;
+      const expected = careerContactDisplayedExpected(
+        generation,
+        detail,
+        selectedJob ? [selectedJob] : [],
+      );
+      const result = await writes.submitContactTask(
+        command,
+        expected,
+        trigger,
+        {
+          onSettled: ({ outcome }) => {
+            if (outcome === "saved") {
+              setDirty(false);
+              onDirtyChange(false);
+              onSaved();
+            } else if (outcome === "changed") {
+              setPhase("editing");
+              setError("联系人资料已变化；待办输入仍保留。");
+            }
+          },
+          onAbandonChanged: () => {
+            setDirty(false);
+            onDirtyChange(false);
+            onClose();
+          },
+        },
+      );
+      if (result.outcome === "attention") {
+        setDirty(false);
+        onDirtyChange(false);
+        onClose();
+      } else if (result.outcome === "blocked") {
+        setPhase("editing");
+        setError("另一笔数据库操作已经开始；待办输入仍保留。");
       }
     } catch (caught) {
-      if (caught instanceof CareerContactMutationError && caught.code === "changed") {
-        refreshOutcomeRef.current = "changed";
-        setPhase("refresh-only");
-        setError("联系人刚在另一个页面发生了变化。没有补建下一步；接下来只重新读取。");
-      } else if (caught instanceof CareerContactMutationError && caught.code === "conflict") {
-        setPhase("blocked");
-        setError(careerContactErrorText(caught, "操作标识发生冲突，没有覆盖已有待办。"));
-      } else {
-        setPhase("editing");
-        setError(careerContactErrorText(caught, "这次没有保存，表单内容仍保留。"));
-      }
+      setPhase("editing");
+      setError(caught instanceof Error
+        ? caught.message
+        : "这次没有保存，表单内容仍保留。");
     } finally {
       writeRef.current = false;
-      onExternalMutationChange(false);
     }
   }
   if (loading) return <Modal title="安排下一步" description="先确认联系人资料，再安排你主动选择的提醒。" onClose={onClose}><div className="career-modal-loading"><LoaderCircle className="spin" size={20} />正在打开联系人…</div></Modal>;
@@ -5043,42 +5008,7 @@ function ContactTaskModal({ contactId, data, externalHint, newWritesBlocked, new
   return <Modal title="安排下一步" description="这是你主动选择的提醒；计划时间可以留空。" onClose={requestClose} dismissible={canDismiss} inertToasts={!canDismiss} wide><div ref={phaseRootRef} className="career-contact-modal-phase" tabIndex={-1}>{discardPrompt ? <ContactDiscardPrompt noun="下一步" onKeep={() => setDiscardPrompt(false)} onDiscard={() => { setDirty(false); onClose(); }} /> : <>{phase === "writing" || phase === "checking" || phase === "refreshing" ? <ContactWriteStatus icon="busy" title={phase === "writing" ? "正在核对并保存" : phase === "checking" ? "正在只读核对保存结果" : "已经停止写入，正在重新读取"} message={phase === "checking" ? "只核对原凭据，不会再次创建待办。" : phase === "refreshing" ? "这一步只刷新画面，不会再次保存。" : "写入期间会保留表单，暂时不能关闭。"} /> : phase === "uncertain" ? <ContactWriteStatus icon="safe" title="先核对这条待办" message={error} action={<button className="career-button primary" data-contact-safe-focus onClick={() => void inspectUncertain()}><Search size={16} />只读核对</button>} /> : phase === "refresh-only" ? <ContactWriteStatus icon="safe" title="只重新读取联系人" message={error} action={<button className="career-button primary" data-contact-safe-focus onClick={() => void refreshOnly()}><RotateCcw size={16} />重新读取</button>} /> : phase === "blocked" ? <ContactWriteStatus icon="safe" title="没有覆盖已有待办" message={error} action={<button className="career-button primary" data-contact-safe-focus onClick={onClose}>返回联系人</button>} /> : null}{phase === "editing" && discardPrompt && <ContactDiscardPrompt noun="下一步" onKeep={() => setDiscardPrompt(false)} onDiscard={() => { setDirty(false); onClose(); }} />}<form hidden={phase !== "editing" || discardPrompt} className="career-form" onChange={() => setDirty(true)} onSubmit={submit}>{externalHint && <div className="career-contact-external-hint" role="status"><ShieldCheck size={16} /><span>{externalHint}</span></div>}<Field label="要做什么"><input name="title" required placeholder="例如：确认下一轮时间" /></Field><Field label="关联职位" hint="可选；不会按公司自动猜"><select name="job_id" defaultValue=""><option value="">不关联职位</option>{jobsForPicker.map((job) => <option key={job.id} value={job.id}>{job.company} · {job.role}{job.archived === 1 ? "（已归档）" : ""}</option>)}</select></Field><div className="career-form-row"><Field label="计划时间（可选）" hint="不设时间会放在“以后再说”"><input name="due_at" type="datetime-local" /></Field><Field label="类型"><select name="kind" defaultValue="跟进"><option>跟进</option><option>材料</option><option>面试准备</option><option>其他</option></select></Field></div><Field label="优先级"><select name="priority" defaultValue="1"><option value="1">普通</option><option value="2">重点</option><option value="3">时间敏感</option></select></Field>{error && <div className="career-inline-error" role="status"><ShieldCheck size={15} />{error}</div>}<div className="career-form-actions"><button type="button" className="career-button ghost" onClick={requestClose}>取消</button><button className="career-button primary" disabled={newWritesBlocked}><CalendarDays size={16} />创建待办</button></div></form></>}</div></Modal>;
 }
 
-type CareerMaterialSavePhase =
-  | "editing"
-  | "saving"
-  | "uncertain"
-  | "checking"
-  | "refreshing"
-  | "refresh-only"
-  | "conflict"
-  | "cleanup-review"
-  | "cleanup-checking"
-  | "cleanup-ready"
-  | "cleanup-running"
-  | "cleanup-pending"
-  | "cleanup-blocked"
-  | "cleanup-unavailable";
-type CareerMaterialDeletionPhase = "loading" | "ready" | "deleting" | "cleanup" | "uncertain" | "checking" | "refreshing" | "changed" | "refresh-only";
-
-function materialDeletionPendingMessage(reason: CareerMaterialDeletionPendingReason) {
-  if (reason === "reference_check_failed") return "本机暂时无法确认这个原件是否仍被其他版本使用，因此没有删除原件。";
-  if (reason === "file_cleanup_failed") return "材料记录还在等待收尾，本地原件暂时没有清理完成。";
-  return "本地原件已经处理，材料记录还在等待收尾。";
-}
-
-function materialDeletionSuccessMessage(action: CareerMaterialDeletedFileAction) {
-  if (action === "retained_shared") return "材料记录已移除；同一原件仍被其他版本使用，因此完整保留。";
-  if (action === "removed") return "材料记录与这份本地原件已移除。";
-  if (action === "already_absent") return "材料记录已移除；本地原件此前已经不存在。";
-  return "材料记录已移除。";
-}
-
-function materialSaveCleanupBlockedMessage(reason: CareerMaterialSaveCleanupBlockedReason) {
-  if (reason === "material_present") return "这个附件现在对应一份材料记录，因此系统保留了原件。";
-  if (reason === "file_referenced") return "这个附件仍被其他材料版本使用，因此系统保留了原件。";
-  if (reason === "file_changed") return "本机原件与收尾记录已不完全一致，系统没有删除它。";
-  return "职迹数据版本已经变化，系统停止了自动清理，也没有删除原件。";
-}
+type CareerMaterialEditorPhase = "editing" | "writing";
 
 function useMaterialPhaseFocus(phase: string, enabled = true) {
   const phaseRootRef = useRef<HTMLDivElement | null>(null);
@@ -5086,8 +5016,15 @@ function useMaterialPhaseFocus(phase: string, enabled = true) {
     if (!enabled) return;
     const frame = window.requestAnimationFrame(() => {
       const root = phaseRootRef.current;
-      const target = Array.from(root?.querySelectorAll<HTMLElement>("[data-dialog-initial]:not(:disabled)") ?? [])
-        .find((element) => !element.hidden && element.getAttribute("aria-hidden") !== "true" && element.getClientRects().length > 0) ?? root;
+      const target = Array.from(
+        root?.querySelectorAll<HTMLElement>(
+          "[data-dialog-initial]:not(:disabled)",
+        ) ?? [],
+      ).find((element) =>
+        !element.hidden &&
+        element.getAttribute("aria-hidden") !== "true" &&
+        element.getClientRects().length > 0,
+      ) ?? root;
       target?.focus({ preventScroll: true });
     });
     return () => window.cancelAnimationFrame(frame);
@@ -5095,747 +5032,426 @@ function useMaterialPhaseFocus(phase: string, enabled = true) {
   return phaseRootRef;
 }
 
-function MaterialModal({ data, initialRecovery, otherRecoveryPending, newWritesBlocked, newWritesBlockedNow, onExternalMutationChange, onRecoveryUpsert, onRecoveryClear, onClose, onStaleClose, onRefresh, notify }: { data: CareerData; initialRecovery: CareerMaterialSaveRecoveryEntry | null; otherRecoveryPending: boolean; newWritesBlocked: boolean; newWritesBlockedNow: () => boolean; onExternalMutationChange: (active: boolean) => boolean; onRecoveryUpsert: (ticket: CareerMaterialSaveRecoveryTicket) => boolean; onRecoveryClear: (ticket: CareerMaterialSaveRecoveryTicket, persisted: boolean) => boolean; onClose: () => void; onStaleClose: () => void; onRefresh: () => Promise<void>; notify: (text: string, tone?: Notice["tone"]) => void }) {
-  const initialSnapshot = initialRecovery?.ticket.kind === "uncertain-save" ? initialRecovery.ticket.expectedSnapshot : null;
-  const [materialId] = useState(() => initialRecovery?.ticket.kind === "uncertain-save" ? initialRecovery.ticket.materialId : newId("material"));
-  const [phase, setPhase] = useState<CareerMaterialSavePhase>(() => initialRecovery?.ticket.kind === "uncertain-save" ? "uncertain" : initialRecovery ? "cleanup-review" : "editing");
-  const [error, setError] = useState(() => initialRecovery?.ticket.kind === "uncertain-save"
-    ? "上次保存结果需要继续核对。核对只读取本机记录，不会再次保存。"
-    : initialRecovery ? "有一份未关联的暂存附件等待核对；只有确认安全后才会清理。" : "");
+function MaterialModal({
+  data,
+  generation,
+  writes,
+  newWritesBlocked,
+  newWritesBlockedNow,
+  onDirtyChange,
+  onClose,
+}: {
+  data: CareerUiData;
+  generation: CareerContactImportMaterialReadEnvelope["generation"];
+  writes: CareerContactImportMaterialWriteController;
+  newWritesBlocked: boolean;
+  newWritesBlockedNow: () => boolean;
+  onDirtyChange: (dirty: boolean) => void;
+  onClose: () => void;
+}) {
+  const [phase, setPhase] = useState<CareerMaterialEditorPhase>("editing");
   const [dirty, setDirty] = useState(false);
   const [closeConfirm, setCloseConfirm] = useState(false);
-  const [refreshContext, setRefreshContext] = useState<"saved" | "conflict" | "recovery">("saved");
-  const [allowStaleExit, setAllowStaleExit] = useState(false);
-  const [activeRecovery, setActiveRecovery] = useState<CareerMaterialSaveRecoveryTicket | null>(initialRecovery?.ticket ?? null);
-  const [recoveryPersisted, setRecoveryPersisted] = useState(initialRecovery?.persisted ?? false);
-  const [cleanupReceipt, setCleanupReceipt] = useState<CareerMaterialSaveCleanupReceipt | null>(() => initialRecovery?.ticket.cleanupReceipt ?? null);
-  const [cleanupBlockedReason, setCleanupBlockedReason] = useState<CareerMaterialSaveCleanupBlockedReason | null>(null);
-  const [cleanupContinuation, setCleanupContinuation] = useState<"editing" | "refresh">(initialRecovery ? "refresh" : "editing");
-  const expectedRef = useRef<CareerMaterialSaveExpectedSnapshot | null>(initialRecovery?.ticket.kind === "uncertain-save" ? initialRecovery.ticket.expectedSnapshot : null);
-  const activeRecoveryRef = useRef<CareerMaterialSaveRecoveryTicket | null>(initialRecovery?.ticket ?? null);
-  const recoveryPersistedRef = useRef(initialRecovery?.persisted ?? false);
-  const boundRecoveryKeyRef = useRef(initialRecovery ? materialSaveRecoveryKey(initialRecovery.ticket) : null);
-  const savingRef = useRef(false);
-  const refreshingRef = useRef(false);
-  const savedOutcomeRef = useRef<"saved" | "already_saved">("saved");
-  const preparedTicketRef = useRef<CareerMaterialSaveRecoveryTicket | null>(null);
-  const finalClosePendingRef = useRef(false);
-  const resumeEditingFocusPendingRef = useRef(false);
-  const closeConfirmReturnRef = useRef<HTMLElement | null>(null);
-  const updatedAtRef = useRef<string | null>(initialSnapshot?.updatedAt ?? null);
+  const [error, setError] = useState("");
+  const writeRef = useRef(false);
+  const mountedRef = useRef(true);
   const phaseRootRef = useMaterialPhaseFocus(phase);
-  const incomingRecoveryKey = initialRecovery ? materialSaveRecoveryKey(initialRecovery.ticket) : null;
-  const unboundRecoveryPending = otherRecoveryPending || incomingRecoveryKey !== boundRecoveryKeyRef.current;
-  const materialKinds = ["简历", "求职信", "作品集", "案例", "其他"] as const;
-  const initialLinkedJobUnavailable = Boolean(initialSnapshot?.linkedJobId && !data.jobs.some((job) => job.id === initialSnapshot.linkedJobId));
+  const writing = phase === "writing";
 
   useEffect(() => {
-    if (closeConfirm || !finalClosePendingRef.current) return;
-    finalClosePendingRef.current = false;
-    const frame = window.requestAnimationFrame(onClose);
-    return () => window.cancelAnimationFrame(frame);
-  }, [closeConfirm, onClose]);
-
-  useEffect(() => {
-    if (closeConfirm || !resumeEditingFocusPendingRef.current) return;
-    resumeEditingFocusPendingRef.current = false;
-    const frame = window.requestAnimationFrame(() => {
-      const previous = closeConfirmReturnRef.current;
-      const fallback = phaseRootRef.current?.querySelector<HTMLInputElement>('input[name="name"]');
-      const target = previous?.isConnected && previous.getClientRects().length > 0 ? previous : fallback;
-      target?.focus({ preventScroll: true });
-      closeConfirmReturnRef.current = null;
-    });
-    return () => window.cancelAnimationFrame(frame);
-  }, [closeConfirm, phaseRootRef]);
-
-  useEffect(() => {
-    const writeInFlight = phase === "saving" || phase === "checking" || phase === "refreshing" || phase === "cleanup-checking" || phase === "cleanup-running";
-    if (!dirty && !writeInFlight && !(activeRecovery && !recoveryPersisted)) return;
-    function protectMaterialWork(event: BeforeUnloadEvent) {
-      event.preventDefault();
-      event.returnValue = "";
-    }
-    window.addEventListener("beforeunload", protectMaterialWork);
-    return () => window.removeEventListener("beforeunload", protectMaterialWork);
-  }, [activeRecovery, dirty, phase, recoveryPersisted]);
-
-  function rememberRecovery(ticket: CareerMaterialSaveRecoveryTicket) {
-    const persisted = onRecoveryUpsert(ticket);
-    boundRecoveryKeyRef.current = materialSaveRecoveryKey(ticket);
-    setActiveRecovery(ticket);
-    activeRecoveryRef.current = ticket;
-    setRecoveryPersisted(persisted);
-    recoveryPersistedRef.current = persisted;
-    return persisted;
-  }
-
-  function forgetRecovery(ticket: CareerMaterialSaveRecoveryTicket | null = activeRecoveryRef.current) {
-    if (!ticket) return true;
-    const cleared = onRecoveryClear(ticket, recoveryPersistedRef.current);
-    if (cleared) {
-      if (!activeRecoveryRef.current || materialSaveRecoveryKey(activeRecoveryRef.current) === materialSaveRecoveryKey(ticket)) {
-        setActiveRecovery(null);
-        activeRecoveryRef.current = null;
-        boundRecoveryKeyRef.current = null;
-        setRecoveryPersisted(false);
-        recoveryPersistedRef.current = false;
-      }
-    }
-    return cleared;
-  }
+    onDirtyChange(dirty || writing);
+  }, [dirty, onDirtyChange, writing]);
+  useEffect(() => () => {
+    mountedRef.current = false;
+    onDirtyChange(false);
+  }, [onDirtyChange]);
 
   function requestClose() {
-    if (phase !== "editing") {
-      if (activeRecovery && recoveryPersisted && (phase === "uncertain" || phase === "cleanup-review" || phase === "cleanup-pending" || phase === "cleanup-ready" || phase === "cleanup-blocked")) onClose();
-      return;
-    }
+    if (writing) return;
     if (dirty) {
-      closeConfirmReturnRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
       setCloseConfirm(true);
       return;
     }
     onClose();
   }
 
-  function resumeMaterialEditing() {
-    resumeEditingFocusPendingRef.current = true;
-    setCloseConfirm(false);
-  }
-
-  function recoveryWithCleanupReceipt(receipt: CareerMaterialSaveCleanupReceipt) : CareerMaterialSaveRecoveryTicket {
-    if (activeRecoveryRef.current?.kind === "uncertain-save") return { ...activeRecoveryRef.current, cleanupReceipt: receipt };
-    return {
-      version: 1,
-      kind: "cleanup-only",
-      cleanupReceipt: receipt,
-      recordedAt: activeRecoveryRef.current?.recordedAt ?? new Date().toISOString(),
-    };
-  }
-
-  function enterCleanupBlocked(receipt: CareerMaterialSaveCleanupReceipt, reason: CareerMaterialSaveCleanupBlockedReason | null, message?: string) {
-    const ticket = recoveryWithCleanupReceipt(receipt);
-    rememberRecovery(ticket);
-    setCleanupReceipt(receipt);
-    setCleanupBlockedReason(reason);
-    setPhase("cleanup-blocked");
-    setError(message ?? (reason ? materialSaveCleanupBlockedMessage(reason) : "这条收尾线索无法继续验证；系统没有删除任何原件。"));
-  }
-
-  function finishUnavailableRecovery() {
-    const ticket = activeRecoveryRef.current;
-    if (ticket && !forgetRecovery(ticket)) {
-      setError("系统仍会保留原件，但浏览器暂时无法清除这条提醒。请稍后再试；这里不会删除或重新保存。");
-      return;
-    }
-    expectedRef.current = null;
-    setCleanupReceipt(null);
-    setDirty(false);
-    onClose();
-  }
-
-  async function inspectAttachmentCleanup(receiptInput: CareerMaterialSaveCleanupReceipt = cleanupReceipt!) {
-    if (savingRef.current || !receiptInput) return;
-    savingRef.current = true;
-    setPhase("cleanup-checking");
-    setError("");
-    try {
-      const inspected = await inspectCareerMaterialSaveCleanup(receiptInput);
-      const ticket = recoveryWithCleanupReceipt(inspected.receipt);
-      rememberRecovery(ticket);
-      setCleanupReceipt(inspected.receipt);
-      if (inspected.state === "cleanup_ready") {
-        setPhase("cleanup-ready");
-        setError("已确认这是一份未被材料记录引用的暂存附件；只有你继续，才会清理它。");
-      } else if (inspected.state === "blocked") {
-        enterCleanupBlocked(inspected.receipt, inspected.reason);
-      } else {
-        setPhase("cleanup-pending");
-        setError("本机暂时还无法确认附件状态。稍后继续只读核对，不会重复上传或盲目删除。");
-      }
-    } catch (caught) {
-      if (caught instanceof CareerMaterialSaveError && caught.code === "invalid_cleanup_receipt") {
-        setPhase("cleanup-unavailable");
-        setError("这条附件收尾线索已经损坏，无法继续验证。系统没有删除任何原件；你可以明确保留原件并结束这条提醒。");
-      } else {
-        setPhase("cleanup-pending");
-        setError(caught instanceof Error ? caught.message : "本机暂时无法核对附件收尾状态；没有删除任何原件。");
-      }
-    } finally {
-      savingRef.current = false;
-    }
-  }
-
-  async function retryAttachmentCleanup() {
-    if (savingRef.current || !cleanupReceipt) return;
-    if (!onExternalMutationChange(true)) {
-      setError("另一笔数据库操作已经开始；附件收尾没有执行。");
-      return;
-    }
-    savingRef.current = true;
-    setPhase("cleanup-running");
-    setError("");
-    try {
-      const result = await retryCareerMaterialSaveCleanup(cleanupReceipt);
-      if (result.outcome === "cleaned" || result.outcome === "already_cleaned") {
-        if (!forgetRecovery()) {
-          setPhase("cleanup-pending");
-          setError("附件已经收尾，但浏览器暂时没有清除恢复提醒。请留在这里再试一次；不会重复清理。");
-          return;
-        }
-        expectedRef.current = null;
-        setCleanupReceipt(null);
-        setCleanupBlockedReason(null);
-        if (cleanupContinuation === "editing") {
-          setDirty(true);
-          setPhase("editing");
-          setError(unboundRecoveryPending
-            ? "上次未关联的暂存附件已经收尾，文字内容仍保留在表单中。另一份材料还在等待核对；你可以先查看或复制当前内容，再明确关闭。"
-            : "上次未关联的暂存附件已经收尾。文字内容仍保留；需要时可重新选择文件并保存。");
-          notify("未关联的暂存附件已收尾。", "info");
-        } else {
-          setDirty(false);
-          await refreshAfterRecovery();
-        }
-      } else if (result.outcome === "blocked") {
-        enterCleanupBlocked(result.receipt, result.reason);
-      } else if ("receipt" in result) {
-        const ticket = recoveryWithCleanupReceipt(result.receipt);
-        rememberRecovery(ticket);
-        setCleanupReceipt(result.receipt);
-        setPhase("cleanup-pending");
-        setError("附件收尾暂时没有完成。恢复线索仍保留；稍后继续不会重复保存材料。");
-      }
-    } catch (caught) {
-      setPhase("cleanup-pending");
-      setError(caught instanceof Error ? caught.message : "附件收尾暂时没有完成；恢复线索仍保留。");
-    } finally {
-      savingRef.current = false;
-      onExternalMutationChange(false);
-    }
-  }
-
-  async function keepAttachmentAndFinishRecovery() {
-    if (!activeRecoveryRef.current || refreshingRef.current) return;
-    if (!forgetRecovery()) {
-      setError("原件仍会保留，但浏览器暂时无法清除这条提醒。请稍后再试。");
-      return;
-    }
-    refreshingRef.current = true;
-    setRefreshContext("recovery");
-    setAllowStaleExit(false);
-    setPhase("refreshing");
-    try {
-      await onRefresh();
-      notify("已保留本机原件，并结束这条收尾提醒。", "info");
-      onClose();
-    } catch {
-      setPhase("refresh-only");
-      setAllowStaleExit(true);
-      setError("原件已经保留、收尾提醒已经结束；材料列表暂时没有重新读取。这里只需要刷新画面。");
-    } finally {
-      refreshingRef.current = false;
-    }
-  }
-
-  async function refreshAfterRecovery() {
-    if (refreshingRef.current) return;
-    refreshingRef.current = true;
-    setRefreshContext("recovery");
-    setAllowStaleExit(false);
-    setPhase("refreshing");
-    setError("");
-    try {
-      await onRefresh();
-      notify("附件收尾已完成，材料列表已重新读取。", "info");
-      onClose();
-    } catch {
-      setPhase("refresh-only");
-      setAllowStaleExit(true);
-      setError("附件收尾已经完成，但材料列表暂时没有重新读取。这里只需要刷新画面。");
-    } finally {
-      refreshingRef.current = false;
-    }
-  }
-
-  async function refreshAfterSave() {
-    if (refreshingRef.current) return;
-    refreshingRef.current = true;
-    setAllowStaleExit(false);
-    setRefreshContext("saved");
-    setPhase("refreshing");
-    setError("");
-    try {
-      await onRefresh();
-      notify(savedOutcomeRef.current === "already_saved" ? "这份材料已经保存在本机，没有重复创建。" : "材料已保存在本机。");
-      onClose();
-    } catch {
-      setPhase("refresh-only");
-      setAllowStaleExit(true);
-      setError("材料已经写入本机 SQLite，但画面暂时没有重新读取。请只重新读取，不要再次保存。");
-    } finally {
-      refreshingRef.current = false;
-    }
-  }
-
-  async function inspectUncertainSave() {
-    if (savingRef.current || !expectedRef.current) return;
-    savingRef.current = true;
-    setPhase("checking");
-    setError("");
-    try {
-      const inspection = await inspectCareerMaterialSave(materialId, expectedRef.current);
-      if (inspection === "exact_saved") {
-        if (!forgetRecovery()) {
-          setPhase("uncertain");
-          setError("已经确认材料保存在本机，但浏览器暂时没有清除核对提醒。不会重复保存；请稍后再核对一次。");
-          return;
-        }
-        savedOutcomeRef.current = "saved";
-        await refreshAfterSave();
-      } else if (inspection === "absent") {
-        if (cleanupReceipt) {
-          setCleanupContinuation("editing");
-          setPhase("cleanup-review");
-          setError("已确认材料记录没有写入。先核对并收尾这次暂存附件，完成后才会重新开放保存。");
-        } else if (forgetRecovery()) {
-          expectedRef.current = null;
-          setDirty(true);
-          setPhase("editing");
-          setError(initialSnapshot?.attachment
-            ? `已确认材料记录没有写入。文字内容已恢复；浏览器不能重新填入“${initialSnapshot.attachment.originalName}”，请重新选择文件后再保存。`
-            : "已确认材料记录没有写入。文字内容已恢复，可以在准备好时重试。");
-        } else {
-          setPhase("uncertain");
-          setError("已确认材料记录没有写入，但浏览器暂时没有清除核对提醒。这里不会重新保存。");
-        }
-      } else if (inspection === "conflict") {
-        if (cleanupReceipt) {
-          setCleanupContinuation("refresh");
-          setPhase("cleanup-review");
-          setError("同一材料标识现在对应不同内容，没有覆盖它。先核对这次暂存附件，再重新读取列表。");
-        } else if (forgetRecovery()) {
-          setPhase("conflict");
-          setError("同一材料标识现在对应不同内容。没有覆盖任何记录，请只重新读取材料列表后再决定。");
-        } else {
-          setPhase("uncertain");
-          setError("没有覆盖另一份内容，但浏览器暂时没有清除核对提醒。这里不会重新保存。");
-        }
-      } else {
-        setPhase("uncertain");
-        setError("本机仍无法确认是否已经保存。继续核对不会重复写入，也不会重新上传附件。");
-      }
-    } catch (caught) {
-      if (caught instanceof CareerMaterialSaveError &&
-        (caught.code === "invalid_input" || caught.code === "invalid_cleanup_receipt")) {
-        setPhase("cleanup-unavailable");
-        setError("这条保存核对线索已经损坏，无法继续验证。系统不会重新保存或删除原件；你可以明确保留原件并结束这条提醒。");
-      } else {
-        setPhase("uncertain");
-        setError("本机暂时无法核对保存结果。这里不会重新提交；稍后可以继续只读核对。");
-      }
-    } finally {
-      savingRef.current = false;
-    }
-  }
-
-  async function refreshAfterConflict() {
-    if (refreshingRef.current) return;
-    refreshingRef.current = true;
-    setAllowStaleExit(false);
-    setRefreshContext("conflict");
-    setPhase("refreshing");
-    try {
-      await onRefresh();
-      notify("材料列表已重新读取；没有覆盖另一份内容。", "info");
-      onClose();
-    } catch {
-      setPhase("conflict");
-      setAllowStaleExit(true);
-      setError("没有覆盖另一份内容，但材料列表暂时没有重新读取。请稍后只重试读取；这里不会覆盖或重新保存。");
-    } finally {
-      refreshingRef.current = false;
-    }
-  }
-
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (savingRef.current) return;
-    if (!activeRecoveryRef.current && newWritesBlockedNow()) {
-      setError("先处理当前核心保存或核对提醒；材料输入仍完整保留。");
+    if (writeRef.current) return;
+    if (newWritesBlockedNow()) {
+      setError("先处理当前数据库操作；材料输入仍完整保留。");
       return;
     }
-    if (unboundRecoveryPending) {
-      setError("还有一份材料保存等待核对。先完成已有收尾，再添加新的附件。");
-      return;
-    }
-    if (!onExternalMutationChange(true)) {
-      setError("另一笔数据库操作已经开始；材料输入仍保留。");
-      return;
-    }
-    savingRef.current = true;
-    setPhase("saving");
-    setError("");
     const form = new FormData(event.currentTarget);
     const selected = form.get("attachment");
-    const file = selected instanceof File && selected.size > 0 ? selected : null;
-    updatedAtRef.current ??= new Date().toISOString();
-    const input: CareerMaterialSaveInput = {
-      materialId,
-      name: String(form.get("name") ?? ""),
-      kind: String(form.get("kind") ?? ""),
-      version: String(form.get("version") ?? ""),
-      updatedAt: updatedAtRef.current,
-      linkedJobId: String(form.get("linked_job_id") ?? "") || null,
-      status: String(form.get("status") ?? "ready") as CareerMaterialSaveInput["status"],
-      notes: String(form.get("notes") ?? ""),
-      attachment: file ? { blob: file, originalName: file.name, mimeType: file.type } : null,
-    };
-    preparedTicketRef.current = null;
+    const file = selected instanceof File && selected.size > 0
+      ? selected
+      : null;
+    if (file && file.size > CAREER_MATERIAL_ATTACHMENT_MAX_BYTES) {
+      setError("附件超过 512 MB；没有开始保存。");
+      return;
+    }
+    const linkedJobId =
+      String(form.get("linked_job_id") ?? "") || null;
+    const linkedJob = linkedJobId
+      ? data.jobs.find((job) => job.id === linkedJobId) ?? null
+      : null;
+    if (linkedJobId && !linkedJob) {
+      setError("关联职位已经变化；请按最新列表重新选择。");
+      return;
+    }
+    const status = String(form.get("status") ?? "ready");
+    if (status !== "ready" && status !== "draft" && status !== "sent") {
+      setError("请选择有效的材料状态。");
+      return;
+    }
+    const trigger = event.currentTarget.querySelector<HTMLButtonElement>(
+      'button[type="submit"]',
+    );
+    if (!trigger) {
+      setError("保存按钮已经变化；输入仍保留。");
+      return;
+    }
+
+    writeRef.current = true;
+    setPhase("writing");
+    setError("");
     try {
-      const result = await saveCareerMaterial(input, {
-        onRecoveryPrepared(prepared) {
-          const ticket: CareerMaterialSaveRecoveryTicket = {
-            version: 1,
-            kind: "uncertain-save",
-            materialId: prepared.materialId,
-            expectedSnapshot: prepared.expectedSnapshot,
-            cleanupReceipt: prepared.cleanupReceipt,
-            recordedAt: new Date().toISOString(),
-          };
-          preparedTicketRef.current = ticket;
-          expectedRef.current = prepared.expectedSnapshot;
-          setCleanupReceipt(prepared.cleanupReceipt);
-          if (!rememberRecovery(ticket)) throw new Error("recovery storage unavailable");
+      const result = await writes.submitMaterialSave({
+        name: String(form.get("name") ?? ""),
+        kind: String(form.get("kind") ?? ""),
+        version: String(form.get("version") ?? ""),
+        linkedJobId,
+        status,
+        notes: String(form.get("notes") ?? ""),
+        attachment: file
+          ? {
+              blob: file,
+              originalName: file.name,
+              mimeType: file.type,
+            }
+          : null,
+      }, careerMaterialSaveDisplayedExpected(
+        generation,
+        linkedJob,
+      ), trigger, {
+        onSettled(settlement) {
+          if (settlement.outcome === "saved") {
+            onDirtyChange(false);
+            onClose();
+          } else if (settlement.outcome === "changed" &&
+            mountedRef.current) {
+            setPhase("editing");
+            setError(
+              "关联职位或资料版本已经变化；旧输入没有覆盖当前内容。",
+            );
+          }
+        },
+        onAbandonChanged() {
+          onDirtyChange(false);
+          onClose();
         },
       });
-      const preparedTicket = preparedTicketRef.current as CareerMaterialSaveRecoveryTicket | null;
-      if (result.outcome === "outcome_uncertain") {
-        expectedRef.current = result.expectedSnapshot;
-        setCleanupReceipt(result.cleanupReceipt);
-        const ticket = preparedTicket ?? {
-          version: 1 as const,
-          kind: "uncertain-save" as const,
-          materialId: result.materialId,
-          expectedSnapshot: result.expectedSnapshot,
-          cleanupReceipt: result.cleanupReceipt,
-          recordedAt: new Date().toISOString(),
-        };
-        const persisted = preparedTicket ? recoveryPersistedRef.current : rememberRecovery(ticket);
-        setPhase("uncertain");
-        setError(persisted
-          ? "附件与记录可能已经保存在本机，但最终回执没有返回。请先只读核对，不要再次保存。"
-          : "保存结果需要核对，恢复线索目前只留在本次打开的页面。请不要刷新，先继续只读核对。");
+      if (!mountedRef.current) return;
+      if (result.outcome === "saved") {
+        setDirty(false);
+        onDirtyChange(false);
+        onClose();
+      } else if (result.outcome === "changed") {
+        setPhase("editing");
+        setError(
+          "关联职位或资料版本已经变化；旧输入没有覆盖当前内容。",
+        );
+      } else if (result.outcome === "attention") {
+        setDirty(false);
+        onDirtyChange(false);
+        onClose();
       } else {
-        if (preparedTicket && !forgetRecovery(preparedTicket)) {
-          setPhase("uncertain");
-          setError("材料已经保存在本机，但浏览器暂时没有清除核对提醒。不会重复保存；请只读核对。");
-          return;
-        }
-        savedOutcomeRef.current = result.outcome;
-        await refreshAfterSave();
+        setPhase("editing");
+        setError(
+          "另一笔数据库操作已经开始；材料输入仍保留。",
+        );
       }
     } catch (caught) {
-      const preparedTicket = preparedTicketRef.current as CareerMaterialSaveRecoveryTicket | null;
-      if (caught instanceof CareerMaterialSaveError && caught.code === "temporary_file_cleanup_failed") {
-        if (caught.cleanupReceipt) {
-          const ticket: CareerMaterialSaveRecoveryTicket = preparedTicket
-            ? { ...preparedTicket, cleanupReceipt: caught.cleanupReceipt }
-            : {
-                version: 1,
-                kind: "cleanup-only",
-                cleanupReceipt: caught.cleanupReceipt,
-                recordedAt: new Date().toISOString(),
-              };
-          const persisted = rememberRecovery(ticket);
-          setCleanupReceipt(caught.cleanupReceipt);
-          if (ticket.kind === "uncertain-save") {
-            expectedRef.current = ticket.expectedSnapshot;
-            setPhase("uncertain");
-            setError(persisted
-              ? "这次写入没有拿到完整回执。先只读核对材料记录，再决定是否需要收尾附件；不会重新保存。"
-              : "写入结果需要核对，线索目前只留在本次打开的页面。请不要刷新，先继续只读核对。");
-          } else {
-            setCleanupContinuation("refresh");
-            setPhase("cleanup-review");
-            setError(persisted
-              ? "材料记录没有写入；有一份未关联的暂存附件等待核对。不会重新保存，只有确认安全后才会清理。"
-              : "材料记录没有写入；收尾线索目前只留在本次打开的页面。请不要刷新，先继续核对附件。");
-          }
-        } else {
-          if (preparedTicket) forgetRecovery(preparedTicket);
-          setPhase("cleanup-unavailable");
-          setError("材料记录没有写入，但浏览器没有返回可验证的附件收尾线索。系统不会猜测或删除原件；请保留原件并结束这次操作。");
-        }
-      } else if (caught instanceof CareerMaterialSaveError && caught.code === "recovery_prepare_failed") {
-        if (preparedTicket && forgetRecovery(preparedTicket)) {
-          setPhase("editing");
-          setError("浏览器没能保留恢复线索，因此没有写入材料；已安全收尾的暂存附件不会显示成材料记录。稍后可以再试。");
-        } else {
-          setPhase("uncertain");
-          setError("材料没有继续写入，但恢复提醒暂时无法清除。这里不会重复保存；请继续只读核对。");
-        }
-      } else if (caught instanceof CareerMaterialSaveError && caught.code === "conflict") {
-        if (preparedTicket && !forgetRecovery(preparedTicket)) {
-          setPhase("uncertain");
-          setError("没有覆盖另一份内容，但浏览器暂时没有清除核对提醒。请只读核对，不要再次保存。");
-        } else {
-          setPhase("conflict");
-          setAllowStaleExit(true);
-          setError(caught.message);
-        }
-      } else {
-        if (preparedTicket && !forgetRecovery(preparedTicket)) {
-          setPhase("uncertain");
-          setError("这次写入没有继续，但浏览器暂时没有清除核对提醒。请只读核对，不要再次保存。");
-          return;
-        }
-        setPhase("editing");
-        setError(caught instanceof Error ? caught.message : "这次没有确认写入；表单内容仍保留。请稍后重试。");
-      }
+      if (!mountedRef.current) return;
+      setPhase("editing");
+      setError(caught instanceof Error
+        ? caught.message
+        : "这次没有确认写入；表单内容仍保留。");
     } finally {
-      savingRef.current = false;
-      onExternalMutationChange(false);
+      writeRef.current = false;
     }
   }
 
-  const canPauseRecovery = Boolean(activeRecovery && recoveryPersisted && (phase === "uncertain" || phase === "cleanup-review" || phase === "cleanup-pending" || phase === "cleanup-ready" || phase === "cleanup-blocked"));
-  const dismissible = phase === "editing" || canPauseRecovery;
-  const cleanupPhase = phase.startsWith("cleanup-");
-  const recoveryRefreshPhase = (phase === "refreshing" || phase === "refresh-only") && refreshContext !== "saved";
-  const modalTitle = cleanupPhase || (recoveryRefreshPhase && refreshContext === "recovery")
-    ? "附件收尾"
-    : phase === "uncertain" || phase === "checking"
-      ? "核对材料保存"
-      : recoveryRefreshPhase || phase === "conflict"
-        ? "核对材料列表"
-        : phase === "refreshing" || phase === "refresh-only"
-          ? "材料已保存在本机"
-          : "添加求职材料";
-  return <><Modal title={modalTitle} description={cleanupPhase || refreshContext === "recovery" ? "只处理上次未完成的本机附件，不会新增或覆盖材料。" : "记录版本与用途；可选文件会保存到当前完整网址与浏览器资料对应的私有存储。"} onClose={requestClose} dismissible={dismissible} inertToasts={phase !== "editing"}>
-    <div ref={phaseRootRef} className="career-material-modal-body" data-material-phase-focus tabIndex={-1}>
-    <form className="career-form" hidden={phase !== "editing"} aria-hidden={phase !== "editing"} onChange={() => setDirty(true)} onSubmit={submit}><Field label="材料名称"><input name="name" data-dialog-initial defaultValue={initialSnapshot?.name ?? ""} required placeholder="产品设计主简历" /></Field><div className="career-form-row"><Field label="类型"><select name="kind" defaultValue={initialSnapshot?.kind ?? "简历"}>{initialSnapshot && !materialKinds.includes(initialSnapshot.kind as typeof materialKinds[number]) && <option value={initialSnapshot.kind}>{initialSnapshot.kind}（已恢复）</option>}{materialKinds.map((kind) => <option key={kind}>{kind}</option>)}</select></Field><Field label="版本"><input name="version" defaultValue={initialSnapshot?.version ?? "v1.0"} required /></Field></div><Field label="本地文件" hint="可选；SQLite 只保存文件索引，原件留在浏览器私有存储"><input name="attachment" type="file" accept=".pdf,.doc,.docx,.ppt,.pptx,.txt,.md,application/pdf" />{initialSnapshot?.attachment && <small className="career-field-recovery-note">上次选择过“{initialSnapshot.attachment.originalName}”。浏览器不会自动重新选取文件；若核对确认未保存，请重新选择。</small>}</Field><Field label="关联职位"><select name="linked_job_id" defaultValue={initialSnapshot?.linkedJobId ?? ""}><option value="">主材料 / 不关联</option>{initialLinkedJobUnavailable && <option value={initialSnapshot!.linkedJobId!}>原关联职位（当前列表不可用）</option>}{data.jobs.map((job) => <option key={job.id} value={job.id}>{job.company} · {job.role}</option>)}</select></Field><Field label="状态"><select name="status" defaultValue={initialSnapshot?.status ?? "ready"}><option value="ready">可使用</option><option value="draft">编辑中</option><option value="sent">已发送</option></select></Field><Field label="备注"><textarea name="notes" rows={4} defaultValue={initialSnapshot?.notes ?? ""} placeholder="这版材料做了哪些调整？" /></Field>{unboundRecoveryPending && <div className="career-inline-error" role="status"><ShieldCheck size={15} />另一份材料保存正在等待核对。当前输入会保留；请先关闭并处理已有收尾。</div>}{error && <div className="career-inline-error" role="alert"><X size={15} />{error}</div>}<div className="career-form-actions"><button type="button" className="career-button ghost" onClick={requestClose}>取消</button><button className="career-button primary" disabled={unboundRecoveryPending || (!activeRecovery && newWritesBlocked)}><Upload size={16} />保存材料</button></div></form>
-    {phase === "saving" && <div className="career-material-recovery" role="status"><LoaderCircle className="spin" size={23} /><h3>正在保存到本机</h3><p>先写入附件，再写入材料记录；完成前不会让重复提交。</p></div>}
-    {phase === "uncertain" && <div className="career-material-recovery uncertain" role="status" aria-live="polite"><ShieldCheck size={24} /><h3>需要核对保存结果</h3><p>{error}</p><div className="career-material-recovery-actions">{recoveryPersisted && <button className="career-button secondary" onClick={onClose}>稍后继续</button>}<button className="career-button primary" data-dialog-initial onClick={() => void inspectUncertainSave()}><Search size={16} />只读核对</button></div><small>{recoveryPersisted ? "核对线索已留在当前网址的浏览器存储；核对只读取 SQLite 与附件校验值。" : "核对线索只在本次打开期间可用；请先不要刷新或关闭页面。"}</small></div>}
-    {phase === "checking" && <div className="career-material-recovery" role="status"><LoaderCircle className="spin" size={23} /><h3>正在只读核对</h3><p>不会再次保存，也不会换一个材料标识。</p></div>}
-    {phase === "cleanup-review" && <div className="career-material-recovery cleanup" role="status" aria-live="polite"><ShieldCheck size={24} /><h3>先核对这份暂存附件</h3><p>{error}</p><div className="career-material-recovery-actions">{recoveryPersisted && <button className="career-button secondary" onClick={onClose}>稍后继续</button>}<button className="career-button primary" data-dialog-initial onClick={() => void inspectAttachmentCleanup()}><Search size={16} />只读核对附件</button></div><small>这里只确认附件是否未被材料使用；还不会删除它。</small></div>}
-    {phase === "cleanup-checking" && <div className="career-material-recovery" role="status"><LoaderCircle className="spin" size={23} /><h3>正在核对附件状态</h3><p>会再次确认数据版本、材料引用与原件校验值；不会写入材料。</p></div>}
-    {phase === "cleanup-ready" && <div className="career-material-recovery cleanup" role="status" aria-live="polite"><ShieldCheck size={24} /><h3>可以安全收尾</h3><p>{error}</p><div className="career-material-recovery-actions">{recoveryPersisted && <button className="career-button secondary" onClick={onClose}>稍后继续</button>}<button className="career-button primary" data-dialog-initial onClick={() => void retryAttachmentCleanup()}><Trash2 size={16} />清理未关联附件</button></div><small>执行前还会重新检查一次；条件变化就会停止，不会盲目删除。</small></div>}
-    {phase === "cleanup-running" && <div className="career-material-recovery" role="status"><LoaderCircle className="spin" size={23} /><h3>正在完成附件收尾</h3><p>只处理恢复凭据绑定的那一份未关联附件。</p></div>}
-    {phase === "cleanup-pending" && <div className="career-material-recovery cleanup" role="status" aria-live="polite"><ShieldCheck size={24} /><h3>附件暂时还不能收尾</h3><p>{error}</p><div className="career-material-recovery-actions">{recoveryPersisted && <button className="career-button secondary" onClick={onClose}>稍后继续</button>}<button className="career-button primary" data-dialog-initial onClick={() => void inspectAttachmentCleanup()}><RotateCcw size={16} />再次只读核对</button></div><small>{recoveryPersisted ? "恢复线索会保留；页面关闭后也不会把它当作已完成。" : "恢复线索只在本次打开期间可用，请先不要刷新。"}</small></div>}
-    {phase === "cleanup-blocked" && <div className="career-material-recovery conflict" role="status" aria-live="polite"><ShieldCheck size={24} /><h3>这份原件会保留</h3><p>{error}</p><div className="career-material-recovery-actions">{recoveryPersisted && <button className="career-button secondary" onClick={onClose}>先保留提醒</button>}<button className="career-button primary" data-dialog-initial onClick={() => void keepAttachmentAndFinishRecovery()}><ShieldCheck size={16} />保留原件并结束提醒</button></div><small>{cleanupBlockedReason === "material_present" || cleanupBlockedReason === "file_referenced" ? "原件与现有材料有关联，保留它是安全默认。" : "无法证明安全时，系统不会删除原件。"}</small></div>}
-    {phase === "cleanup-unavailable" && <div className="career-material-recovery conflict" role="status" aria-live="polite"><ShieldCheck size={24} /><h3>这份原件会保留</h3><p>{error}</p><div className="career-material-recovery-actions"><button className="career-button primary" data-dialog-initial onClick={finishUnavailableRecovery}><ShieldCheck size={16} />保留原件并结束提醒</button></div><small>这不会声称原件已清理；也不会自动删除任何本机文件。</small></div>}
-    {phase === "refreshing" && <div className="career-material-recovery" role="status"><LoaderCircle className="spin" size={23} /><h3>正在重新读取材料列表</h3><p>{refreshContext === "saved" ? "材料已经写入；这里只更新画面，不会再次保存。" : refreshContext === "conflict" ? "只读取最新内容，不会覆盖或重新保存。" : "附件处理结果已经确定；这里只更新画面。"}</p></div>}
-    {phase === "refresh-only" && <div className="career-material-recovery" role="status"><ShieldCheck size={24} /><h3>{refreshContext === "saved" ? "材料已经保存在本机" : "材料状态需要重新读取"}</h3><p>{error || "现在只需重新读取画面；这一步不会创建新材料或再次写入附件。"}</p><div className="career-material-recovery-actions">{allowStaleExit && <button className="career-button secondary" onClick={onStaleClose}>先回材料页</button>}<button className="career-button primary" data-dialog-initial onClick={() => void (refreshContext === "saved" ? refreshAfterSave() : refreshContext === "conflict" ? refreshAfterConflict() : refreshAfterRecovery())}><RotateCcw size={16} />只重新读取</button></div></div>}
-    {phase === "conflict" && <div className="career-material-recovery conflict" role="alert"><ShieldCheck size={24} /><h3>没有覆盖另一份内容</h3><p>{error}</p><div className="career-material-recovery-actions">{allowStaleExit && <button className="career-button secondary" onClick={onStaleClose}>先回材料页</button>}<button className="career-button primary" data-dialog-initial onClick={() => void refreshAfterConflict()}><RotateCcw size={16} />重新读取材料列表</button></div></div>}
+  return <><Modal
+    title="添加求职材料"
+    description="记录版本与用途；可选文件只进入当前浏览器的私有存储。"
+    onClose={requestClose}
+    dismissible={!writing}
+    inertToasts={writing}
+    wide
+  >
+    <div
+      ref={phaseRootRef}
+      className="career-material-modal-body"
+      data-material-phase-focus
+      tabIndex={-1}
+    >
+      {writing
+        ? <div className="career-material-recovery" role="status">
+            <LoaderCircle className="spin" size={23} />
+            <h3>正在核对并保存材料</h3>
+            <p>
+              附件能力会先写入同一张安全收据；结果不确定时由页面顶部继续核对。
+            </p>
+          </div>
+        : <form
+            className="career-form"
+            onChange={() => setDirty(true)}
+            onSubmit={submit}
+          >
+            <div className="career-form-row">
+              <Field label="材料名称">
+                <input
+                  data-dialog-initial
+                  name="name"
+                  required
+                  placeholder="例如：产品经理简历"
+                />
+              </Field>
+              <Field label="类型">
+                <select name="kind" defaultValue="简历">
+                  <option>简历</option>
+                  <option>求职信</option>
+                  <option>作品集</option>
+                  <option>案例</option>
+                  <option>其他</option>
+                </select>
+              </Field>
+            </div>
+            <div className="career-form-row">
+              <Field label="版本">
+                <input name="version" required placeholder="例如：v3" />
+              </Field>
+              <Field label="状态">
+                <select name="status" defaultValue="ready">
+                  <option value="ready">可使用</option>
+                  <option value="draft">编辑中</option>
+                  <option value="sent">已发送</option>
+                </select>
+              </Field>
+            </div>
+            <Field label="关联职位" hint="可选">
+              <select name="linked_job_id" defaultValue="">
+                <option value="">不关联职位</option>
+                {data.jobs.map((job) =>
+                  <option key={job.id} value={job.id}>
+                    {job.company} · {job.role}
+                  </option>,
+                )}
+              </select>
+            </Field>
+            <Field label="本机原件" hint="可选，最大 512 MB">
+              <input
+                name="attachment"
+                type="file"
+                accept=".pdf,.doc,.docx,.txt,.md,image/*"
+              />
+            </Field>
+            <Field label="备注" hint="可选">
+              <textarea
+                name="notes"
+                rows={4}
+                placeholder="这份版本适合什么场景…"
+              />
+            </Field>
+            {error && <div className="career-inline-error" role="alert">
+              <ShieldCheck size={15} />
+              {error}
+            </div>}
+            <div className="career-form-actions">
+              <button
+                type="button"
+                className="career-button ghost"
+                onClick={requestClose}
+              >
+                取消
+              </button>
+              <button
+                type="submit"
+                className="career-button primary"
+                disabled={newWritesBlocked}
+              >
+                <Check size={16} />
+                保存材料
+              </button>
+            </div>
+          </form>}
     </div>
-  </Modal>{closeConfirm && <Modal title="放弃这份材料草稿吗？" description="表单和所选文件还没有写入职迹。" onClose={resumeMaterialEditing} inertToasts><div className="career-material-close-choice"><p>继续编辑会保留当前输入；明确放弃只关闭表单，不会影响已经存在的材料。</p><div><button className="career-button primary" data-dialog-initial onClick={resumeMaterialEditing}>继续编辑</button><button className="career-button danger" onClick={() => { resumeEditingFocusPendingRef.current = false; finalClosePendingRef.current = true; setCloseConfirm(false); }}>放弃这次输入</button></div></div></Modal>}</>;
+  </Modal>{closeConfirm && <Modal
+    title="放弃这份材料草稿吗？"
+    description="表单与所选文件尚未写入职迹。"
+    onClose={() => setCloseConfirm(false)}
+    inertToasts
+  >
+    <div className="career-material-close-choice">
+      <p>继续编辑会保留当前输入；明确放弃不会影响已有材料。</p>
+      <div>
+        <button
+          className="career-button primary"
+          data-dialog-initial
+          onClick={() => setCloseConfirm(false)}
+        >
+          继续编辑
+        </button>
+        <button
+          className="career-button danger"
+          onClick={() => {
+            setDirty(false);
+            onDirtyChange(false);
+            onClose();
+          }}
+        >
+          放弃这次输入
+        </button>
+      </div>
+    </div>
+  </Modal>}</>;
 }
 
-function MaterialDeletionModal({ material, newWritesBlocked, newWritesBlockedNow, onExternalMutationChange, onClose, onStaleClose, onRefresh, notify }: { material: Pick<Material, "id" | "name" | "file_key">; newWritesBlocked: boolean; newWritesBlockedNow: () => boolean; onExternalMutationChange: (active: boolean) => boolean; onClose: () => void; onStaleClose: () => void; onRefresh: () => Promise<void>; notify: (text: string, tone?: Notice["tone"]) => void }) {
-  const [phase, setPhase] = useState<CareerMaterialDeletionPhase>("loading");
-  const [state, setState] = useState<CareerMaterialDeletionState | null>(null);
+function MaterialDeletionModal({
+  material,
+  data,
+  generation,
+  writes,
+  newWritesBlocked,
+  newWritesBlockedNow,
+  onClose,
+}: {
+  material: CareerMaterialUi;
+  data: CareerUiData;
+  generation: CareerContactImportMaterialReadEnvelope["generation"];
+  writes: CareerContactImportMaterialWriteController;
+  newWritesBlocked: boolean;
+  newWritesBlockedNow: () => boolean;
+  onClose: () => void;
+}) {
+  const [phase, setPhase] =
+    useState<"ready" | "writing" | "changed">("ready");
   const [message, setMessage] = useState("");
-  const [allowStaleExit, setAllowStaleExit] = useState(false);
-  const mutationRef = useRef(false);
-  const successMessageRef = useRef("材料记录已经不在当前列表中。");
+  const writeRef = useRef(false);
+  const mountedRef = useRef(true);
   const phaseRootRef = useMaterialPhaseFocus(phase);
 
-  useEffect(() => {
-    let live = true;
-    void (async () => {
-      try {
-        const inspected = await loadCareerMaterialDeletionState(material.id);
-        if (!live) return;
-        setState(inspected);
-        setPhase(inspected.state === "already_absent" ? "refresh-only" : inspected.state === "cleanup_pending" ? "cleanup" : "ready");
-        if (inspected.state === "already_absent") setMessage("这份材料记录已经不存在；现在只需重新读取列表。");
-        if (inspected.state === "cleanup_pending") setMessage("这份材料还在等待收尾。继续处理会重新核对引用，不会盲目删除原件。");
-      } catch (caught) {
-        if (!live) return;
-        setPhase("changed");
-        setMessage(caught instanceof Error ? caught.message : "暂时无法核对这份材料；没有开始删除。请重新读取后再试。");
-      }
-    })();
-    return () => { live = false; };
-  }, [material.id]);
+  useEffect(() => () => {
+    mountedRef.current = false;
+  }, []);
 
-  useEffect(() => {
-    if (phase === "loading" || phase === "ready") return;
-    function protectDeletionCheck(event: BeforeUnloadEvent) {
-      event.preventDefault();
-      event.returnValue = "";
-    }
-    window.addEventListener("beforeunload", protectDeletionCheck);
-    return () => window.removeEventListener("beforeunload", protectDeletionCheck);
-  }, [phase]);
-
-  async function closeAfterRead() {
-    if (mutationRef.current) return;
-    mutationRef.current = true;
-    setAllowStaleExit(false);
-    const returnPhase = phase;
-    setPhase("refreshing");
-    try {
-      await onRefresh();
-      onClose();
-    } catch {
-      setPhase(returnPhase);
-      setAllowStaleExit(true);
-      setMessage("材料状态暂时没有重新读取。请留在这里稍后再试；不会重复删除或清理。");
-    } finally {
-      mutationRef.current = false;
-    }
-  }
-
-  async function refreshAfterDeletion() {
-    if (mutationRef.current) return;
-    mutationRef.current = true;
-    setAllowStaleExit(false);
-    setPhase("refreshing");
-    try {
-      await onRefresh();
-      notify(successMessageRef.current, "info");
-      onClose();
-    } catch {
-      setPhase("refresh-only");
-      setAllowStaleExit(true);
-      setMessage("删除结果已经写入本机，但画面暂时没有重新读取。请只重新读取，不要再次删除。");
-    } finally {
-      mutationRef.current = false;
-    }
-  }
-
-  async function performDeletion() {
-    if (mutationRef.current) return;
+  async function performDeletion(trigger: HTMLElement) {
+    if (writeRef.current) return;
     if (newWritesBlockedNow()) {
-      setMessage("先处理当前数据库操作；没有开始材料移除或附件收尾。");
+      setMessage("先处理当前数据库操作；没有移除材料或附件。");
       return;
     }
-    const receipt: CareerMaterialDeletionReceipt | null = state?.state === "present" || state?.state === "cleanup_pending" ? state.receipt : null;
-    if (!receipt) {
-      setPhase("changed");
-      setMessage("这份材料的确认信息已经变化。没有开始移除，请重新读取后再决定。");
-      return;
-    }
-    if (!onExternalMutationChange(true)) {
-      setMessage("另一笔数据库操作已经开始；没有移除材料或附件。");
-      return;
-    }
-    mutationRef.current = true;
-    setPhase("deleting");
+    const linkedJob = material.linked_job_id
+      ? data.jobs.find((job) => job.id === material.linked_job_id) ?? null
+      : null;
+    writeRef.current = true;
+    setPhase("writing");
     setMessage("");
     try {
-      const result = await deleteCareerMaterial(receipt);
-      if (result.outcome === "deleted") {
-        successMessageRef.current = materialDeletionSuccessMessage(result.fileAction);
-        mutationRef.current = false;
-        await refreshAfterDeletion();
-        return;
-      }
-      if (result.outcome === "already_absent") {
-        successMessageRef.current = "这份材料记录已经不存在，没有重复删除。";
-        mutationRef.current = false;
-        await refreshAfterDeletion();
-        return;
-      }
-      if (result.outcome === "changed") {
-        setPhase("changed");
-        setAllowStaleExit(true);
-        setMessage("材料或本地数据版本刚发生了变化。没有依据旧确认继续移除，请重新读取后再决定。");
-        return;
-      }
-      if (result.outcome === "cleanup_pending") {
-        const pendingMessage = materialDeletionPendingMessage(result.reason);
-        setState((current) => current?.state === "present" || current?.state === "cleanup_pending"
-          ? { ...current, state: "cleanup_pending", receipt: result.receipt, retryable: true }
-          : current);
-        setPhase("refreshing");
-        setMessage(pendingMessage);
-        try { await onRefresh(); }
-        catch { setAllowStaleExit(true); setMessage(`${pendingMessage} 材料列表暂时没有重新读取；可以稍后只重试读取。`); }
-        setPhase("cleanup");
-        return;
-      }
-      setPhase("uncertain");
-      setAllowStaleExit(true);
-      setMessage("最终删除回执没有返回。本机可能已经完成，也可能仍在清理；请先只读核对，不要再次删除。");
-    } catch (caught) {
-      if (caught instanceof CareerMaterialDeletionError && (caught.code === "inspect_failed" || caught.code === "mark_failed")) {
+      const result = await writes.submitMaterialDelete(
+        careerMaterialDeleteDisplayedExpected(
+          generation,
+          material,
+          linkedJob,
+        ),
+        trigger,
+        {
+          onSettled() { onClose(); },
+          onAbandonChanged() { onClose(); },
+        },
+      );
+      if (!mountedRef.current) return;
+      if (result.outcome === "attention" ||
+        result.outcome === "saved" ||
+        result.outcome === "changed") {
+        onClose();
+      } else {
         setPhase("ready");
-        setMessage(caught.message);
-      } else if (caught instanceof CareerMaterialDeletionError && caught.code === "invalid_receipt") {
-        setPhase("changed");
-        setAllowStaleExit(true);
-        setMessage("这份移除确认已经变化。没有依据旧确认继续处理，请重新读取后再决定。");
-      } else {
-        setPhase("uncertain");
-        setAllowStaleExit(true);
-        setMessage("移除过程没有返回可确认的结果。请先只读核对，不要复用刚才的确认再次删除。");
+        setMessage(
+          "另一笔数据库操作已经开始；材料与附件保持不变。",
+        );
       }
+    } catch (caught) {
+      if (!mountedRef.current) return;
+      setPhase("ready");
+      setMessage(caught instanceof Error
+        ? caught.message
+        : "这次没有确认移除；材料与附件保持不变。");
     } finally {
-      mutationRef.current = false;
-      onExternalMutationChange(false);
+      writeRef.current = false;
     }
   }
 
-  async function inspectUncertainDeletion() {
-    if (mutationRef.current) return;
-    mutationRef.current = true;
-    setPhase("checking");
-    setMessage("");
-    try {
-      const inspected = await loadCareerMaterialDeletionState(material.id);
-      setState(inspected);
-      if (inspected.state === "already_absent") {
-        successMessageRef.current = "核对后确认材料记录已经移除，没有重复删除。";
-        mutationRef.current = false;
-        await refreshAfterDeletion();
-        return;
-      }
-      let refreshed = true;
-      try { await onRefresh(); }
-      catch { refreshed = false; setAllowStaleExit(true); }
-      if (inspected.state === "cleanup_pending") {
-        setPhase("cleanup");
-        setMessage(refreshed ? "核对后确认记录仍在等待收尾。可以继续收尾，也可以稍后再回来。" : "核对到记录仍在等待收尾，但材料列表暂时没有重新读取。请留在这里稍后再试。");
-      } else {
-        setPhase("changed");
-        setMessage(refreshed ? "核对后确认材料记录仍在。为避免依据旧信息删除，请回到最新材料卡片重新决定。" : "核对后确认材料记录仍在，但材料列表暂时没有重新读取。请先只重试读取，再重新决定。");
-      }
-    } catch {
-      setPhase("uncertain");
-      setAllowStaleExit(true);
-      setMessage("本机暂时仍无法确认删除结果。继续核对不会重复删除；也可以稍后再回来。");
-    } finally {
-      mutationRef.current = false;
-    }
-  }
-
-  const canClose = phase === "loading" || phase === "ready" || phase === "cleanup" || phase === "uncertain" || phase === "changed";
-  const closeSafely = phase === "loading" || phase === "ready" ? onClose : allowStaleExit ? onStaleClose : canClose ? () => { void closeAfterRead(); } : () => undefined;
-  const hasAttachment = state?.state === "present" || state?.state === "cleanup_pending" ? state.hasAttachment : Boolean(material.file_key);
-  const sharesAttachment = state?.state === "present" || state?.state === "cleanup_pending" ? state.sharesAttachment : false;
-  const confirmation = !hasAttachment
-    ? "只移除这条材料记录；没有本地原件需要处理。"
-    : sharesAttachment
-      ? "当前同一原件仍被其他版本使用；移除时会在锁内再次核对，仍共享就保留，只有最后一个引用才会清理原件。"
-      : "移除这条材料记录，并在确认没有其他引用后清理本地原件。";
-  return <Modal title={phase === "cleanup" ? "继续完成收尾" : `移除「${material.name}」？`} description="这里只整理你选择的这一份材料，不影响职位、投递或其他版本。" onClose={closeSafely} dismissible={canClose} inertToasts>
-    <div ref={phaseRootRef} className="career-material-modal-body" data-material-phase-focus tabIndex={-1}>
-    {phase === "loading" && <div className="career-material-recovery" role="status"><LoaderCircle className="spin" size={23} /><h3>正在核对材料与原件</h3><p>先确认是否共享同一个本地文件，再显示会发生什么。</p></div>}
-    {phase === "ready" && <div className="career-material-delete-confirm" role={message ? "alert" : undefined}><ShieldCheck size={24} /><h3>先看清这次会处理什么</h3><p>{message || confirmation}</p><div><button className="career-button primary" data-dialog-initial onClick={onClose}>继续保留</button><button className="career-button danger" disabled={newWritesBlocked} onClick={() => void performDeletion()}><Trash2 size={16} />确认移除</button></div></div>}
-    {phase === "deleting" && <div className="career-material-recovery" role="status"><LoaderCircle className="spin" size={23} /><h3>正在安全移除</h3><p>会先留下可重试状态，再核对引用与原件，完成前不会开放重复操作。</p></div>}
-    {phase === "cleanup" && <div className="career-material-recovery cleanup" role="status" aria-live="polite"><RotateCcw size={24} /><h3>还有一步没有收尾</h3><p>{message}</p><div className="career-material-recovery-actions"><button className="career-button secondary" data-dialog-initial onClick={allowStaleExit ? onStaleClose : () => void closeAfterRead()}>稍后处理</button><button className="career-button primary" onClick={() => void performDeletion()}><RotateCcw size={16} />继续收尾</button></div><small>材料卡会保留“待收尾”，不会把尚未完成的状态伪装成已删除。</small></div>}
-    {phase === "uncertain" && <div className="career-material-recovery uncertain" role="status" aria-live="polite"><ShieldCheck size={24} /><h3>需要核对删除结果</h3><p>{message}</p><div className="career-material-recovery-actions"><button className="career-button secondary" data-dialog-initial onClick={allowStaleExit ? onStaleClose : () => void closeAfterRead()}>稍后再核对</button><button className="career-button primary" onClick={() => void inspectUncertainDeletion()}><Search size={16} />只读核对</button></div></div>}
-    {phase === "checking" && <div className="career-material-recovery" role="status"><LoaderCircle className="spin" size={23} /><h3>正在只读核对</h3><p>不会再次删除原件或材料记录。</p></div>}
-    {phase === "refreshing" && <div className="career-material-recovery" role="status"><LoaderCircle className="spin" size={23} /><h3>正在重新读取材料状态</h3><p>只更新画面，不会重复删除或清理。</p></div>}
-    {phase === "changed" && <div className="career-material-recovery conflict" role="alert"><ShieldCheck size={24} /><h3>没有依据旧信息继续删除</h3><p>{message}</p><button className="career-button primary" data-dialog-initial onClick={allowStaleExit ? onStaleClose : () => void closeAfterRead()}>回到最新材料列表</button></div>}
-    {phase === "refresh-only" && <div className="career-material-recovery" role="status"><ShieldCheck size={24} /><h3>删除结果已写入本机</h3><p>{message || "现在只需重新读取画面；不会再次删除记录或原件。"}</p><div className="career-material-recovery-actions">{allowStaleExit && <button className="career-button secondary" onClick={onStaleClose}>先回材料页</button>}<button className="career-button primary" data-dialog-initial onClick={() => void refreshAfterDeletion()}><RotateCcw size={16} />只重新读取</button></div></div>}
+  const confirmation = material.has_attachment
+    ? "移除材料记录；服务会在锁内重新核对所有引用，只有安全时才清理对应本机原件。"
+    : "只移除这条材料记录；没有本机原件需要处理。";
+  const writing = phase === "writing";
+  return <Modal
+    title={"移除「" + material.name + "」？"}
+    description="这里只处理你选择的这一份材料，不影响职位或其他版本。"
+    onClose={writing ? () => undefined : onClose}
+    dismissible={!writing}
+    inertToasts={writing}
+  >
+    <div
+      ref={phaseRootRef}
+      className="career-material-modal-body"
+      data-material-phase-focus
+      tabIndex={-1}
+    >
+      {writing
+        ? <div className="career-material-recovery" role="status">
+            <LoaderCircle className="spin" size={23} />
+            <h3>正在安全移除</h3>
+            <p>
+              材料记录、附件引用与私有清理能力会作为同一次可恢复操作处理。
+            </p>
+          </div>
+        : <div
+            className={
+              phase === "changed"
+                ? "career-material-delete-confirm conflict"
+                : "career-material-delete-confirm"
+            }
+            role={message ? "alert" : undefined}
+          >
+            <ShieldCheck size={24} />
+            <h3>先看清这次会处理什么</h3>
+            <p>{message || confirmation}</p>
+            <div>
+              <button
+                className="career-button primary"
+                data-dialog-initial
+                onClick={onClose}
+              >
+                继续保留
+              </button>
+              <button
+                className="career-button danger"
+                disabled={newWritesBlocked}
+                onClick={(event) =>
+                  void performDeletion(event.currentTarget)}
+              >
+                <Trash2 size={16} />
+                确认移除
+              </button>
+            </div>
+          </div>}
     </div>
   </Modal>;
 }
-
 type CareerImportMode = "paste" | "capture" | "csv";
 type CareerImportPhase = "input" | "fingerprinting" | "requesting-ai" | "preview" | "revising" | "committing" | "commit-check" | "refreshing" | "refresh-only" | "complete" | "conflict";
 type CareerImportEditableField = CareerImportCandidateField | "priority";
@@ -5913,7 +5529,7 @@ function CareerImportWarningGroup({ warnings }: { warnings: readonly CareerImpor
 function CareerImportPreviewEditor({ row, draft, data, sameName, sameNameDecision, busy, csv, selectionLocked, onDraft, onApply, onInclude, onSameNameDecision }: {
   row: CareerImportUiRow;
   draft: CareerImportCandidate;
-  data: CareerData;
+  data: CareerUiData;
   sameName: Job | undefined;
   sameNameDecision: "pending" | "save" | "skip";
   busy: boolean;
@@ -5955,7 +5571,7 @@ function CareerImportPreviewEditor({ row, draft, data, sameName, sameNameDecisio
   </article>;
 }
 
-function CareerImportModal({ data, initialCapture, newWritesBlocked, newWritesBlockedNow, onExternalMutationChange, onClose, onRefresh, notify }: { data: CareerData; initialCapture: CareerCapturedSource | null; newWritesBlocked: boolean; newWritesBlockedNow: () => boolean; onExternalMutationChange: (active: boolean) => boolean; onClose: () => void; onRefresh: () => Promise<void>; notify: (text: string, tone?: Notice["tone"]) => void }) {
+function CareerImportModal({ data, generation, writes, initialCapture, newWritesBlocked, newWritesBlockedNow, onDirtyChange, onClose }: { data: CareerUiData; generation: CareerContactImportMaterialReadEnvelope["generation"]; writes: CareerContactImportMaterialWriteController; initialCapture: CareerCapturedSource | null; newWritesBlocked: boolean; newWritesBlockedNow: () => boolean; onDirtyChange: (dirty: boolean) => void; onClose: () => void }) {
   const [mode, setMode] = useState<CareerImportMode>(initialCapture ? "capture" : "paste");
   const [paste, setPaste] = useState("");
   const [capture, setCapture] = useState<CareerCapturedSource>(initialCapture ?? { url: "", selectedText: "" });
@@ -5971,14 +5587,11 @@ function CareerImportModal({ data, initialCapture, newWritesBlocked, newWritesBl
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
   const [closeConfirm, setCloseConfirm] = useState(false);
-  const [checking, setChecking] = useState(false);
   const [absentRowIds, setAbsentRowIds] = useState<ReadonlySet<string> | null>(null);
   const [committedRowIds, setCommittedRowIds] = useState<ReadonlySet<string>>(new Set());
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const rowsRef = useRef<CareerImportUiRow[]>([]);
   const commitRef = useRef(false);
-  const checkRef = useRef(false);
-  const uncertainRowsRef = useRef<CareerImportUiRow[]>([]);
   const finalClosePendingRef = useRef(false);
   const requestRef = useRef<{ token: number; controller: AbortController | null }>({ token: 0, controller: null });
   const valuesRef = useRef({ paste: "", capture: initialCapture ?? { url: "", selectedText: "" }, csv: "" });
@@ -6219,27 +5832,11 @@ function CareerImportModal({ data, initialCapture, newWritesBlocked, newWritesBl
     setSameNameDecisions((current) => ({ ...current, [rowId]: decision }));
   }
 
-  async function refreshAfterCommit() {
-    setPhase("refreshing");
-    setError("");
-    try {
-      await onRefresh();
-      setPhase("complete");
-      notify("职位已保存在本机");
-    } catch {
-      setPhase("refresh-only");
-      setError("职位可能已经保存在本机，只是画面还没重新读取。这里只会刷新画面，不会再次创建。");
-    }
-  }
-  async function commitPreview() {
+  async function commitPreview(trigger: HTMLElement) {
     if (commitRef.current || phase !== "preview" || !previewSource) return;
     if (!newImportOperationOpen()) return;
     const selected = selectCareerImportCommitRows(rowsRef.current, absentRowIds);
     if (selected.length === 0) return;
-    if (!onExternalMutationChange(true)) {
-      setError("另一笔数据库操作已经开始；没有保存导入职位。");
-      return;
-    }
     commitRef.current = true;
     setPhase("committing");
     setError("");
@@ -6250,69 +5847,47 @@ function CareerImportModal({ data, initialCapture, newWritesBlocked, newWritesBl
       if (modeRef.current !== previewSource.mode || snapshot !== previewSource.snapshot || fingerprint !== previewSource.fingerprint) {
         throw new CareerImportError("source_changed", "原文或文件已经变化，请按当前内容重新预览；这次没有保存。");
       }
-      await commitCareerJobImports({ items: selected.map((row) => ({ preview: row.preview, currentSourceFingerprint: fingerprint })) });
-      await refreshAfterCommit();
-    } catch (caught) {
-      if (caught instanceof CareerImportCommitUncertainError || (caught instanceof CareerImportError && caught.code === "commit_uncertain")) {
-        uncertainRowsRef.current = selected;
-        setMessage("本机是否完成写入暂时无法确认。接下来只核对已有记录，不会重新提交。");
-        setPhase("commit-check");
-      } else if (caught instanceof CareerImportError && caught.code === "operation_conflict") {
-        setMessage("这份导入标识对应了不同内容。这里已经停止写入，现有记录不会被覆盖。");
-        setPhase("conflict");
+      const items = selected.map((row) => ({
+        preview: row.preview,
+        currentSourceFingerprint: fingerprint,
+      }));
+      const expected = careerImportDisplayedExpected(generation, data, items);
+      const result = await writes.submitImport(items, expected, trigger, {
+        onSettled(settlement) {
+          if (settlement.outcome === "saved") {
+            onDirtyChange(false);
+            setPhase("complete");
+          } else if (settlement.outcome === "changed") {
+            setPhase("preview");
+            setError("职位资料已经变化；旧预览没有覆盖当前内容。");
+          } else {
+            setPhase("preview");
+            setError("这次确定没有写入；原预览仍可重新核对后保存。");
+          }
+        },
+        onAbandonChanged() {
+          onDirtyChange(false);
+          onClose();
+        },
+      });
+      if (result.outcome === "saved") {
+        onDirtyChange(false);
+        setPhase("complete");
+      } else if (result.outcome === "changed") {
+        setPhase("preview");
+        setError("职位资料已经变化；旧预览没有覆盖当前内容。");
+      } else if (result.outcome === "attention") {
+        onDirtyChange(false);
+        onClose();
       } else {
         setPhase("preview");
-        setError(caught instanceof Error ? caught.message : "这次没有保存，预览仍保留在这里。");
+        setError("另一笔数据库操作已经开始；预览仍保留，没有保存。");
       }
+    } catch (caught) {
+      setPhase("preview");
+      setError(caught instanceof Error ? caught.message : "这次没有保存，预览仍保留在这里。");
     } finally {
       commitRef.current = false;
-      onExternalMutationChange(false);
-    }
-  }
-  async function inspectUncertainCommit() {
-    if (checkRef.current || uncertainRowsRef.current.length === 0) return;
-    checkRef.current = true;
-    setChecking(true);
-    setError("");
-    try {
-      const inspections = await Promise.all(uncertainRowsRef.current.map((row) => inspectCareerImportCommit(row.preview)));
-      if (inspections.some((item) => item.status === "conflict")) {
-        setMessage("核对发现这份导入标识对应了不同内容。这里已经停止写入，现有记录不会被覆盖。");
-        setPhase("conflict");
-      } else if (inspections.some((item) => item.status === "still_unknown")) {
-        setMessage("本机暂时仍无法确认。可以稍后继续核对；这里不会重新提交或换一个标识。");
-      } else if (inspections.some((item) => item.status === "absent")) {
-        const { absentRows, exactRows } = partitionCareerImportInspectionRows(uncertainRowsRef.current, inspections);
-        const absentIds = new Set(absentRows.map((row) => row.id));
-        const exactIds = new Set(exactRows.map((row) => row.id));
-        setAbsentRowIds(absentIds);
-        setCommittedRowIds(exactIds);
-        setRows(rowsRef.current.map((row) => exactIds.has(row.id) ? { ...row, included: false } : row));
-        uncertainRowsRef.current = [];
-        setMessage(exactRows.length > 0
-          ? "核对完成：已保存的项目不会再次写入；未写入的原预览和原操作标识仍保留，只能修改并再次保存这些项目。"
-          : "核对确认这次没有写入。原预览和原操作标识都已保留；这次只能修改并再次保存原来的选择。");
-        setPhase("preview");
-      } else {
-        await refreshAfterCommit();
-      }
-    } catch {
-      setMessage("本机暂时仍无法确认。可以稍后继续核对；这里不会重新提交或换一个标识。");
-    } finally {
-      checkRef.current = false;
-      setChecking(false);
-    }
-  }
-  async function retryRefreshOnly() {
-    setPhase("refreshing");
-    setError("");
-    try {
-      await onRefresh();
-      setPhase("complete");
-      notify("职位已保存在本机");
-    } catch {
-      setPhase("refresh-only");
-      setError("记录仍保存在本机。可以稍后再重新读取；这里不会重复创建。");
     }
   }
 
@@ -6330,8 +5905,11 @@ function CareerImportModal({ data, initialCapture, newWritesBlocked, newWritesBl
   const originalRecoverySelection = absentRowIds === null || selectedRows.every((row) => absentRowIds.has(row.id));
   const canCommit = phase === "preview" && selectedRows.length > 0 && originalRecoverySelection && !sourceChanged && !hasGlobalBlocking && !hasBlocking && !hasUnappliedDraft && !sameNamePending && !sameNameSkipped && !newWritesBlocked;
   const dirty = Boolean(paste.trim() || capture.url.trim() || capture.selectedText.trim() || csvText || rows.length > 0);
-  const closeLocked = phase === "committing" || phase === "commit-check" || phase === "refreshing" || phase === "refresh-only";
-  const recoveryActive = closeLocked || phase === "conflict" || phase === "complete";
+  const closeLocked = phase === "committing";
+  const recoveryActive = closeLocked || phase === "complete";
+  const reportedDirty = (dirty && phase !== "complete") || closeLocked;
+  useEffect(() => { onDirtyChange(reportedDirty); }, [onDirtyChange, reportedDirty]);
+  useEffect(() => () => onDirtyChange(false), [onDirtyChange]);
   const statusText = phase === "fingerprinting" ? "正在核对当前原文…" : phase === "requesting-ai" ? "DeepSeek 正在整理你明确提供的内容…" : phase === "revising" ? "正在更新可核对的预览…" : "";
   function requestClose() {
     if (closeLocked) return;
@@ -6367,19 +5945,15 @@ function CareerImportModal({ data, initialCapture, newWritesBlocked, newWritesBl
       {sourceChanged && rows.length > 0 && <div className="career-import-source-changed" role="status"><FileText size={17} /><div><b>原文已经变化</b><p>旧预览仍完整保留，但不能按新原文保存。请按当前内容重新生成预览。</p></div></div>}
       {globalWarnings.length > 0 && previewSource?.mode === "csv" && <CareerImportWarningGroup warnings={globalWarnings} />}
       {rows.length > 0 && <div className={`career-import-preview-list ${previewSource?.mode === "csv" ? "csv" : "single"}`}>{rows.map((row) => committedRowIds.has(row.id) ? <article className="career-import-folded-row committed" key={row.id}><div><CheckCircle2 size={17} /><span><b>{row.preview.candidate.company} · {row.preview.candidate.role} 已确认保存在本机</b><small>这条只显示核对结果，不会再次编辑、选择或写入。</small></span></div></article> : row.preview.duplicateOfRowNumber !== undefined ? <article className="career-import-folded-row" key={row.id}><div><FileArchive size={17} /><span><b>第 {row.preview.rowNumber} 行与第 {row.preview.duplicateOfRowNumber} 行内容相同</b><small>默认合并，只保存一条；这不是错误。</small></span></div><button type="button" className="career-button secondary" disabled={newWritesBlocked || revisingRowId !== null || absentRowIds !== null} onClick={() => void forkDuplicate(row.id)}>仍另存</button></article> : <CareerImportPreviewEditor key={row.id} row={row} draft={drafts[row.id] ?? row.preview.candidate} data={data} sameName={data.jobs.find((job) => sameCareerJobName(job, row.preview.candidate))} sameNameDecision={sameNameDecisions[row.id] ?? "pending"} busy={newWritesBlocked || revisingRowId === row.id} csv={previewSource?.mode === "csv"} selectionLocked={newWritesBlocked || Boolean(absentRowIds && !absentRowIds.has(row.id))} onDraft={(field, value) => updateDraft(row.id, field, value)} onApply={() => void applyRowChanges(row.id)} onInclude={(included) => setRowIncluded(row.id, included)} onSameNameDecision={(decision) => setSameNameDecision(row.id, decision)} />)}</div>}
-      {rows.length > 0 && <footer className="career-import-actions"><div>{hasUnappliedDraft ? "先确认表单里的修改" : sameNamePending ? "请先决定同名记录是否保存" : sameNameSkipped ? "你选择了这次不保存；也可以改回“仍保存这份”" : hasGlobalBlocking || hasBlocking ? "补充必要信息后即可保存" : sourceChanged ? "请按当前原文重新生成预览" : selectedRows.length === 0 ? "可以选择要保存的预览" : "保存只会写入本机 SQLite"}</div><button type="button" className="career-button primary" disabled={!canCommit} onClick={() => void commitPreview()}><Check size={16} />{previewSource?.mode === "csv" ? "保存所选预览" : "保存到职迹"}</button></footer>}
+      {rows.length > 0 && <footer className="career-import-actions"><div>{hasUnappliedDraft ? "先确认表单里的修改" : sameNamePending ? "请先决定同名记录是否保存" : sameNameSkipped ? "你选择了这次不保存；也可以改回“仍保存这份”" : hasGlobalBlocking || hasBlocking ? "补充必要信息后即可保存" : sourceChanged ? "请按当前原文重新生成预览" : selectedRows.length === 0 ? "可以选择要保存的预览" : "保存只会写入本机 SQLite"}</div><button type="button" className="career-button primary" disabled={!canCommit} onClick={(event) => void commitPreview(event.currentTarget)}><Check size={16} />{previewSource?.mode === "csv" ? "保存所选预览" : "保存到职迹"}</button></footer>}
       </>}
       {phase === "committing" && <section className="career-import-recovery" role="status" aria-live="polite"><LoaderCircle className="spin" size={25} /><h3>正在保存到本机</h3><p>这份预览正在以原操作标识写入。为了避免重复记录，完成前不会接受第二次提交。</p></section>}
-      {phase === "refreshing" && <section className="career-import-recovery" role="status" aria-live="polite"><LoaderCircle className="spin" size={25} /><h3>正在重新读取画面</h3><p>写入步骤已经结束。现在只更新画面，不会再创建职位。</p></section>}
-      {phase === "commit-check" && <section className="career-import-recovery" role="status" aria-live="polite"><ShieldCheck size={24} /><h3>先核对，不重复提交</h3><p>{message}</p><button type="button" className="career-button primary" data-dialog-initial disabled={checking} onClick={() => void inspectUncertainCommit()}>{checking ? <LoaderCircle className="spin" size={16} /> : <Search size={16} />}{checking ? "正在核对本机记录…" : "核对本机记录"}</button><small>这一步只读取原操作标识，不会创建新职位。</small></section>}
-      {phase === "refresh-only" && <section className="career-import-recovery" role="status"><RotateCcw size={24} /><h3>记录已交给本机保存</h3><p>{error}</p><button type="button" className="career-button primary" data-dialog-initial onClick={() => void retryRefreshOnly()}><RotateCcw size={16} />只重新读取</button><small>不会再次提交，也不会创建另一个操作标识。</small></section>}
-      {phase === "conflict" && <section className="career-import-recovery neutral" role="status"><ShieldCheck size={24} /><h3>已经停止写入</h3><p>{message}</p><button type="button" className="career-button secondary" data-dialog-initial onClick={onClose}>关闭并稍后核对</button></section>}
       {phase === "complete" && <section className="career-import-recovery complete" role="status"><CheckCircle2 size={25} /><h3>职位已经安稳地留在职迹里</h3><p>预览已保存，画面也重新读取完成。没有自动投递或更改其他记录。</p><button type="button" className="career-button primary" data-dialog-initial onClick={onClose}>回到职位</button></section>}
     </div>
   </Modal>{closeConfirm && <Modal title="放弃这次导入吗？" description="原文、CSV 预览与尚未保存的修改只在当前窗口里。" onClose={() => setCloseConfirm(false)} inertToasts><div className="career-import-close-choice"><p>你可以继续核对；如果放弃，职迹里已经存在的记录不会受影响。</p><div><button type="button" className="career-button primary" data-dialog-initial onClick={() => setCloseConfirm(false)}>继续核对</button><button type="button" className="career-button danger" onClick={() => { cancelPendingRequest(); finalClosePendingRef.current = true; setCloseConfirm(false); }}>放弃这次输入</button></div></div></Modal>}</>;
 }
 
-function CommandPalette({ data, onClose, onNavigate, onSelectJob, onAdd }: { data: CareerData; onClose: () => void; onNavigate: (view: CareerView) => void; onSelectJob: (id: string) => void; onAdd: () => void }) {
+function CommandPalette({ data, onClose, onNavigate, onSelectJob, onAdd }: { data: CareerUiData; onClose: () => void; onNavigate: (view: CareerView) => void; onSelectJob: (id: string) => void; onAdd: () => void }) {
   const [value, setValue] = useState("");
   const dialogRef = useDialogA11y(onClose);
   const needle = value.toLowerCase(); const jobs = data.jobs.filter((job) => [job.company, job.role, job.tags].join(" ").toLowerCase().includes(needle)).slice(0, 6); const views = navItems.filter((item) => item.label.includes(value));

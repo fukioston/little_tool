@@ -14,6 +14,10 @@ import {
   CAREER_LIFECYCLE_TASK_WRITE_PREFIX,
 } from "./core-write-journal";
 
+const CONTACT_IMPORT_MATERIAL_WRITE_PREFIX =
+  "career.contact-import-material-write.v1:";
+const CONTACT_IMPORT_MATERIAL_WRITE_MAX_BYTES = 8 * 1024 * 1024;
+
 export type CareerLifecycleTaskWriteReceipt =
   | CareerLifecycleWriteReceipt
   | CareerTaskWriteReceipt;
@@ -156,13 +160,20 @@ export function readCareerLifecycleTaskWriteJournal(
       }
       seen.add(storageKey);
       const own = storageKey.startsWith(CAREER_LIFECYCLE_TASK_WRITE_PREFIX);
-      const peer = storageKey.startsWith(CAREER_CORE_WRITE_PREFIX);
+      const corePeer = storageKey.startsWith(CAREER_CORE_WRITE_PREFIX);
+      const contactImportMaterialPeer = storageKey.startsWith(
+        CONTACT_IMPORT_MATERIAL_WRITE_PREFIX,
+      );
+      const peer = corePeer || contactImportMaterialPeer;
       if (!own && !peer) continue;
       let raw = "";
       try {
         raw = storage.getItem(storageKey) ?? "";
         if (peer) {
-          if (!raw || raw.length > CAREER_CORE_WRITE_MAX_CHARS) {
+          const invalidSize = corePeer
+            ? raw.length > CAREER_CORE_WRITE_MAX_CHARS
+            : byteLength(raw) > CONTACT_IMPORT_MATERIAL_WRITE_MAX_BYTES;
+          if (!raw || invalidSize) {
             throw new Error("invalid peer size");
           }
           peerEntries.push({ storageKey, raw });

@@ -112,6 +112,16 @@ export type CareerMaterialDeleteDisplayedExpected = CareerWriteGenerationExpecta
   fileReferences: readonly Readonly<Material>[];
 }>;
 
+/**
+ * UI-safe delete snapshot. The storage service resolves the private attachment
+ * key, metadata, and complete reference set while it holds the prepare lock.
+ */
+export type CareerMaterialDeleteUiDisplayedExpected =
+  CareerWriteGenerationExpectation & Readonly<{
+    material: CareerMaterialProjection;
+    linkedJob: Readonly<Job> | null;
+  }>;
+
 export type CareerMaterialProjection = Readonly<Omit<Material, "file_key"> & {
   has_attachment: boolean;
 }>;
@@ -979,9 +989,9 @@ export function createCareerMaterialWriteStorageService(runtime: MaterialRuntime
     });
   }
 
-  async function prepareDelete(displayedValue: CareerMaterialDeleteDisplayedExpected): Promise<CareerMaterialDeleteWriteReceipt> {
-    const displayedInput = jsonClone<CareerMaterialDeleteDisplayedExpected>(displayedValue, CAREER_WRITE_RECEIPT_MAX_JSON_BYTES, "材料删除显示快照");
-    return withCareerWritePrepareLock(runtime, async () => {
+  async function prepareDeleteLocked(
+    displayedInput: CareerMaterialDeleteDisplayedExpected,
+  ): Promise<CareerMaterialDeleteWriteReceipt> {
       const displayed = { ...displayedInput, fileReferences: sortedMaterials(displayedInput.fileReferences) };
       const generation = await readCurrentCareerWriteGeneration(runtime);
       requireCurrentCareerWriteGeneration(generation, displayed);
@@ -1072,6 +1082,79 @@ export function createCareerMaterialWriteStorageService(runtime: MaterialRuntime
           fileReceipt,
         },
         after: { ...generation, materialId: displayed.material.id },
+      });
+  }
+
+  async function prepareDelete(
+    displayedValue: CareerMaterialDeleteDisplayedExpected,
+  ): Promise<CareerMaterialDeleteWriteReceipt> {
+    const displayed = jsonClone<CareerMaterialDeleteDisplayedExpected>(
+      displayedValue,
+      CAREER_WRITE_RECEIPT_MAX_JSON_BYTES,
+      "材料删除显示快照",
+    );
+    return withCareerWritePrepareLock(runtime, () => prepareDeleteLocked(displayed));
+  }
+
+  async function prepareDeleteForUi(
+    displayedValue: CareerMaterialDeleteUiDisplayedExpected,
+  ): Promise<CareerMaterialDeleteWriteReceipt> {
+    const displayed = jsonClone<CareerMaterialDeleteUiDisplayedExpected>(
+      displayedValue,
+      CAREER_WRITE_RECEIPT_MAX_JSON_BYTES,
+      "材料删除显示快照",
+    );
+    if (!displayed || typeof displayed !== "object" ||
+      !exactKeys(displayed, [
+        "generationId", "generationSequence", "material", "linkedJob",
+      ]) ||
+      !isCareerWriteGeneration({
+        generationId: displayed.generationId,
+        generationSequence: displayed.generationSequence,
+      }) ||
+      !isMaterialProjection(displayed.material) ||
+      !(displayed.linkedJob === null || isJob(displayed.linkedJob))) {
+      throw careerWriteError("invalid_input", "材料删除显示快照无效。");
+    }
+    return withCareerWritePrepareLock(runtime, async () => {
+      const generation = await readCurrentCareerWriteGeneration(runtime);
+      requireCurrentCareerWriteGeneration(generation, displayed);
+      const material = await readMaterial(runtime, displayed.material.id);
+      const linkedJob = material?.linked_job_id
+        ? await readJob(runtime, material.linked_job_id)
+        : null;
+      if (!material ||
+        !sameMaterialProjection(redactMaterial(material), displayed.material) ||
+        (material.linked_job_id !== null && linkedJob === null) ||
+        (displayed.linkedJob !== null &&
+          (!linkedJob || !sameRow(linkedJob, displayed.linkedJob, JOB_KEYS)))) {
+        throw careerWriteError(
+          "changed",
+          "材料或关联职位已经变化；没有准备删除。",
+        );
+      }
+      const fileReferences = material.file_key
+        ? await readReferences(runtime, material.file_key)
+        : [];
+      let file: LocalFileMetadata | null = null;
+      if (material.file_key) {
+        try {
+          file = (await runtime.getFile(material.file_key)).metadata;
+        } catch (error) {
+          if (!isLocalFileMissingError(error)) {
+            throw careerWriteError(
+              "inspect_failed",
+              "暂时无法读取附件快照；没有准备删除。",
+            );
+          }
+        }
+      }
+      return prepareDeleteLocked({
+        ...generation,
+        material,
+        linkedJob,
+        file,
+        fileReferences,
       });
     });
   }
@@ -1760,6 +1843,7 @@ export function createCareerMaterialWriteStorageService(runtime: MaterialRuntime
   return {
     prepareCareerMaterialSaveWrite: prepareSave,
     prepareCareerMaterialDeleteWrite: prepareDelete,
+    prepareCareerMaterialDeleteWriteForUi: prepareDeleteForUi,
     inspectCareerMaterialWrite: inspect,
     commitCareerMaterialWrite: commit,
     inspectCareerMaterialFileCleanup: cleanupSafety,
@@ -1769,8 +1853,16 @@ export function createCareerMaterialWriteStorageService(runtime: MaterialRuntime
 }
 
 const defaultService = createCareerMaterialWriteStorageService();
+/** Strict synchronous envelope validation for durable UI journals. */
+export function isCareerMaterialWriteReceipt(
+  value: unknown,
+): value is CareerMaterialWriteReceipt {
+  return isReceipt(value);
+}
 export const prepareCareerMaterialSaveWrite = defaultService.prepareCareerMaterialSaveWrite;
 export const prepareCareerMaterialDeleteWrite = defaultService.prepareCareerMaterialDeleteWrite;
+export const prepareCareerMaterialDeleteWriteForUi =
+  defaultService.prepareCareerMaterialDeleteWriteForUi;
 export const inspectCareerMaterialWrite = defaultService.inspectCareerMaterialWrite;
 export const commitCareerMaterialWrite = defaultService.commitCareerMaterialWrite;
 export const inspectCareerMaterialFileCleanup = defaultService.inspectCareerMaterialFileCleanup;

@@ -128,6 +128,9 @@ const dependencyUrls = {
   "@/lib/local-db/client": moduleUrl(
     "export const localDb = globalThis.__careerLocalDbProxy;",
   ),
+  "@/lib/local-db/files": moduleUrl(
+    "export async function createLocalFileObjectUrl(){ throw new Error('unexpected attachment open'); }",
+  ),
   "./lock": moduleUrl(lockJavaScript),
   "./backup-plan": backupPlanModuleUrl,
 };

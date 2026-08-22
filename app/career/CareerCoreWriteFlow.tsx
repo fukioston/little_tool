@@ -28,6 +28,7 @@ import {
   type UpdateCareerJobCoreInput,
 } from "@/lib/career/core-writes";
 import {
+  CAREER_CONTACT_IMPORT_MATERIAL_WRITE_PREFIX,
   CAREER_CORE_WRITE_PREFIX,
   CAREER_LIFECYCLE_TASK_WRITE_PREFIX,
   careerCoreHeldReceiptBarrier,
@@ -328,7 +329,8 @@ export function useCareerCoreWriteFlow({
       if (
         event.storageArea === window.localStorage &&
         (event.key === null || event.key.startsWith(CAREER_CORE_WRITE_PREFIX) ||
-          event.key.startsWith(CAREER_LIFECYCLE_TASK_WRITE_PREFIX))
+          event.key.startsWith(CAREER_LIFECYCLE_TASK_WRITE_PREFIX) ||
+          event.key.startsWith(CAREER_CONTACT_IMPORT_MATERIAL_WRITE_PREFIX))
       ) passiveScan();
     }
     const onFocus = () => passiveScan();

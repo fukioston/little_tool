@@ -1279,6 +1279,13 @@ export function createCareerContactWriteStorageService(
 
 const defaultService = createCareerContactWriteStorageService();
 
+/** Strict synchronous envelope validation for durable UI journals. */
+export function isCareerContactWriteReceipt(
+  value: unknown,
+): value is CareerContactWriteReceipt {
+  return isReceipt(value);
+}
+
 export const prepareCareerContactCreate = defaultService.prepareCareerContactCreate;
 export const prepareCareerContactUpdate = defaultService.prepareCareerContactUpdate;
 export const prepareCareerContactArchive = defaultService.prepareCareerContactArchive;

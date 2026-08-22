@@ -6,10 +6,13 @@ import {
 export const CAREER_CORE_WRITE_PREFIX = "career.core-write.v1:";
 export const CAREER_LIFECYCLE_TASK_WRITE_PREFIX =
   "career.lifecycle-task-write.v1:";
+export const CAREER_CONTACT_IMPORT_MATERIAL_WRITE_PREFIX =
+  "career.contact-import-material-write.v1:";
 export const CAREER_CORE_WRITE_JOURNAL_LOCK =
   "private-ai-suite:career:core-write-journal";
 export const CAREER_CORE_WRITE_MAX_CHARS = 1024 * 1024;
 export const CAREER_LIFECYCLE_TASK_WRITE_MAX_BYTES = 8 * 1024 * 1024;
+export const CAREER_CONTACT_IMPORT_MATERIAL_WRITE_MAX_BYTES = 8 * 1024 * 1024;
 
 export type CareerCoreWriteTicket = Readonly<{
   version: 1;
@@ -163,14 +166,22 @@ export function readCareerCoreWriteJournal(
       }
       seen.add(storageKey);
       const core = storageKey.startsWith(CAREER_CORE_WRITE_PREFIX);
-      const peer = storageKey.startsWith(CAREER_LIFECYCLE_TASK_WRITE_PREFIX);
+      const lifecyclePeer = storageKey.startsWith(
+        CAREER_LIFECYCLE_TASK_WRITE_PREFIX,
+      );
+      const contactImportMaterialPeer = storageKey.startsWith(
+        CAREER_CONTACT_IMPORT_MATERIAL_WRITE_PREFIX,
+      );
+      const peer = lifecyclePeer || contactImportMaterialPeer;
       if (!core && !peer) continue;
       let raw = "";
       try {
         raw = storage.getItem(storageKey) ?? "";
         if (peer) {
-          if (!raw || new TextEncoder().encode(raw).byteLength >
-              CAREER_LIFECYCLE_TASK_WRITE_MAX_BYTES) {
+          const maximumBytes = lifecyclePeer
+            ? CAREER_LIFECYCLE_TASK_WRITE_MAX_BYTES
+            : CAREER_CONTACT_IMPORT_MATERIAL_WRITE_MAX_BYTES;
+          if (!raw || new TextEncoder().encode(raw).byteLength > maximumBytes) {
             throw new Error("invalid peer ticket size");
           }
           peerEntries.push({ storageKey, raw });

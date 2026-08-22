@@ -146,7 +146,7 @@ test("job lifecycle scope is mutually exclusive and each surface uses its truthf
   assert.deepEqual(projectCareerLifecycleScope(snapshot, stages, "ended").jobs.map((item) => item.id), ["e"]);
   assert.deepEqual(projectCareerLifecycleScope(snapshot, stages, "archived").jobs.map((item) => item.id), ["r"]);
   assert.deepEqual(projectCareerLifecycleScope(snapshot, stages, "active").tasks.map((item) => item.id), ["general", "at"]);
-  assert.match(source, /Promise\.all\(\[\s*loadCareerData\(\),\s*loadCareerLifecycleScope\("all"\),\s*loadCareerLifecycleScope\(scope\)/);
+  assert.match(source, /Promise\.all\(\[\s*loadCareerUiData\(\),\s*loadCareerLifecycleScope\("all"\),\s*loadCareerLifecycleScope\(scope\)/);
   assert.match(source, /<BoardView data=\{boardData\} jobs=\{boardJobs\}/);
   assert.match(source, /<JobsView data=\{scopedData\} jobs=\{scopedJobs\}/);
   assert.match(source, /const selectedJob = allLifecycle\.jobs\.find/);

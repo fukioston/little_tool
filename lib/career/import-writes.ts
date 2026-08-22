@@ -497,6 +497,12 @@ export function createCareerImportWriteStorageService(
 }
 
 const defaultService = createCareerImportWriteStorageService();
+/** Strict synchronous envelope validation for durable UI journals. */
+export function isCareerImportWriteReceipt(
+  value: unknown,
+): value is CareerImportWriteReceipt {
+  return isReceipt(value);
+}
 export const prepareCareerImportWrite = defaultService.prepareCareerImportWrite;
 export const inspectCareerImportWrite = defaultService.inspectCareerImportWrite;
 export const commitCareerImportWrite = defaultService.commitCareerImportWrite;

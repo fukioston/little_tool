@@ -868,6 +868,44 @@ test("owned attachment deletion settles delete I/O response loss with the same r
   }
 });
 
+test("UI-safe material deletion accepts the displayed generation projection", async () => {
+  const value = fixture();
+  try {
+    const { receipt: saved } = await prepareSavedAttachment(value);
+    await value.service.commitCareerMaterialWrite(saved);
+    const receipt = await value.service.prepareCareerMaterialDeleteWriteForUi({
+      generationId: value.state.generationId,
+      generationSequence: value.state.generationSequence,
+      material: saved.after.material,
+      linkedJob: job(value.database),
+    });
+    const committed = await value.service.commitCareerMaterialWrite(receipt);
+    assert.equal(committed.outcome, "saved");
+    assert.equal(material(value.database, saved.after.material.id), null);
+  } finally { value.close(); }
+});
+
+test("UI-safe material deletion resolves an archived linked job under its prepare lock", async () => {
+  const value = fixture();
+  try {
+    const { receipt: saved } = await prepareSavedAttachment(value);
+    await value.service.commitCareerMaterialWrite(saved);
+    execute(value.database, [{
+      sql: "UPDATE career_jobs SET archived=1, archived_at=?, updated_at=? WHERE id='job'",
+      params: [NOW, NOW],
+    }]);
+    const receipt = await value.service.prepareCareerMaterialDeleteWriteForUi({
+      generationId: value.state.generationId,
+      generationSequence: value.state.generationSequence,
+      material: saved.after.material,
+      linkedJob: null,
+    });
+    assert.equal(receipt.before.linkedJob.archived, 1);
+    assert.equal((await value.service.commitCareerMaterialWrite(receipt)).outcome, "saved");
+    assert.equal(material(value.database, saved.after.material.id), null);
+  } finally { value.close(); }
+});
+
 test("ordinary legacy delete retains its claim across DB loss and releases only after marker", async () => {
   const value = fixture();
   try {

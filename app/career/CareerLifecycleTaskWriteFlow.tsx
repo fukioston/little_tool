@@ -33,6 +33,7 @@ import {
   type CareerDatabaseMutationToken,
 } from "./core-write-state";
 import {
+  CAREER_CONTACT_IMPORT_MATERIAL_WRITE_PREFIX,
   CAREER_LIFECYCLE_TASK_WRITE_PREFIX,
 } from "./core-write-journal";
 import {
@@ -227,7 +228,8 @@ export function useCareerLifecycleTaskWriteFlow({
     const storage = (event: StorageEvent) => {
       if (event.storageArea === window.localStorage &&
         (event.key === null || event.key.startsWith(CAREER_LIFECYCLE_TASK_WRITE_PREFIX) ||
-          event.key.startsWith("career.core-write.v1:"))) scan();
+          event.key.startsWith("career.core-write.v1:") ||
+          event.key.startsWith(CAREER_CONTACT_IMPORT_MATERIAL_WRITE_PREFIX))) scan();
     };
     const visible = () => { if (document.visibilityState === "visible") scan(); };
     window.addEventListener("storage", storage);

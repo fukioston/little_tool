@@ -1,4 +1,5 @@
 import { localDb } from "@/lib/local-db/client";
+import { createLocalFileObjectUrl } from "@/lib/local-db/files";
 import type { SqlStatement } from "@/lib/local-db/types";
 import {
   withCareerReadLock,
@@ -16,6 +17,8 @@ import {
 import type {
   Activity,
   CareerData,
+  CareerMaterialUi,
+  CareerUiData,
   Contact,
   Interview,
   Job,
@@ -510,6 +513,76 @@ export async function loadCareerData(context?: CareerLockContext): Promise<Caree
         ORDER BY activity.created_at DESC LIMIT 40`, [], lockContext),
     ]);
     return { stages, jobs, tasks, interviews, contacts, materials, activities };
+  }, context);
+}
+
+/**
+ * UI-safe Career read. Private attachment keys never cross this boundary.
+ */
+export async function loadCareerUiData(context?: CareerLockContext): Promise<CareerUiData> {
+  return withCareerReadLock(async (lockContext) => {
+    const [stages, jobs, tasks, interviews, contacts, materials, activities] = await Promise.all([
+      query<Stage>("SELECT * FROM career_stages ORDER BY position", [], lockContext),
+      query<Job>("SELECT * FROM career_jobs WHERE archived = 0 ORDER BY position, updated_at DESC", [], lockContext),
+      query<Task>(`SELECT task.* FROM career_tasks AS task
+        WHERE task.job_id IS NULL OR EXISTS (
+          SELECT 1 FROM career_jobs AS job
+          WHERE job.id = task.job_id AND job.archived = 0
+        )
+        ORDER BY task.status,task.due_at`, [], lockContext),
+      query<Interview>(`SELECT interview.* FROM career_interviews AS interview
+        WHERE EXISTS (
+          SELECT 1 FROM career_jobs AS job
+          WHERE job.id = interview.job_id AND job.archived = 0
+        )
+        ORDER BY interview.scheduled_at`, [], lockContext),
+      query<Contact>("SELECT * FROM career_contacts WHERE archived = 0 ORDER BY next_follow_up, name", [], lockContext),
+      query<CareerMaterialUi>(`SELECT
+          id,name,kind,version,updated_at,linked_job_id,status,notes,
+          file_name,mime_type,byte_size,
+          CASE WHEN file_key IS NULL THEN 0 ELSE 1 END AS has_attachment
+        FROM career_materials ORDER BY updated_at DESC`, [], lockContext),
+      query<Activity>(`SELECT activity.* FROM career_activity AS activity
+        WHERE activity.job_id IS NULL OR EXISTS (
+          SELECT 1 FROM career_jobs AS job
+          WHERE job.id = activity.job_id AND job.archived = 0
+        )
+        ORDER BY activity.created_at DESC LIMIT 40`, [], lockContext),
+    ]);
+    return { stages, jobs, tasks, interviews, contacts, materials, activities };
+  }, context);
+}
+
+export type CareerMaterialUiObjectUrl = Readonly<{
+  url: string;
+  originalName: string;
+  revoke(): void;
+}>;
+
+/** Resolve the private key and open the file while the shared Career read lock is held. */
+export async function openCareerMaterialAttachmentById(
+  materialId: string,
+  context?: CareerLockContext,
+): Promise<CareerMaterialUiObjectUrl> {
+  if (typeof materialId !== "string" || materialId.trim() !== materialId ||
+    !materialId || materialId.length > 240) {
+    throw new Error("材料标识无效。");
+  }
+  return withCareerReadLock(async (lockContext) => {
+    const rows = await query<{ file_key: string | null }>(
+      "SELECT file_key FROM career_materials WHERE id = ? LIMIT 2",
+      [materialId],
+      lockContext,
+    );
+    if (rows.length !== 1 || !rows[0].file_key) {
+      throw new Error("这份材料没有可打开的本机原件。");
+    }
+    const object = await createLocalFileObjectUrl(DB, rows[0].file_key);
+    return {
+      url: object.url,
+      originalName: object.metadata.originalName,
+      revoke: object.revoke,
+    };
   }, context);
 }
 

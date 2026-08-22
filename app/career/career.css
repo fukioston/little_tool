@@ -2298,7 +2298,8 @@
   min-width: 0;
 }
 
-.career-lifecycle-task-recovery {
+.career-lifecycle-task-recovery,
+.career-contact-import-material-recovery {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 12px;
@@ -2311,33 +2312,42 @@
   color: #405e51;
   overflow: hidden;
 }
-.career-lifecycle-task-recovery:focus-visible {
+.career-lifecycle-task-recovery:focus-visible,
+.career-contact-import-material-recovery:focus-visible {
   outline: 3px solid #8db09f45;
   outline-offset: 2px;
 }
-.career-lifecycle-task-recovery > div { min-width: 0; }
-.career-lifecycle-task-recovery b { color: var(--career-ink); font-size: 13px; }
-.career-lifecycle-task-recovery p {
+.career-lifecycle-task-recovery > div,
+.career-contact-import-material-recovery > div { min-width: 0; }
+.career-lifecycle-task-recovery b,
+.career-contact-import-material-recovery b { color: var(--career-ink); font-size: 13px; }
+.career-lifecycle-task-recovery p,
+.career-contact-import-material-recovery p {
   margin: 4px 0 0;
   font-size: 12px;
   line-height: 1.55;
   overflow-wrap: anywhere;
 }
-.career-lifecycle-task-recovery > footer {
+.career-lifecycle-task-recovery > footer,
+.career-contact-import-material-recovery > footer {
   display: flex;
   flex-wrap: wrap;
   justify-content: flex-end;
   gap: 8px;
 }
-.career-lifecycle-task-recovery .career-button { min-height: 44px; }
+.career-lifecycle-task-recovery .career-button,
+.career-contact-import-material-recovery .career-button { min-height: 44px; }
 
 @media (max-width: 520px) {
-  .career-lifecycle-task-recovery {
+  .career-lifecycle-task-recovery,
+  .career-contact-import-material-recovery {
     grid-template-columns: minmax(0, 1fr);
     padding: 13px;
   }
   .career-lifecycle-task-recovery > footer,
-  .career-lifecycle-task-recovery > footer .career-button {
+  .career-lifecycle-task-recovery > footer .career-button,
+  .career-contact-import-material-recovery > footer,
+  .career-contact-import-material-recovery > footer .career-button {
     width: 100%;
     min-width: 0;
     white-space: normal;

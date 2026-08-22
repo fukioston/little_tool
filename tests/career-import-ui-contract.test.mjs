@@ -8,6 +8,7 @@ const sourceUrl = new URL("../app/career/CareerApp.tsx", import.meta.url);
 const cssUrl = new URL("../app/career/career.css", import.meta.url);
 const source = await readFile(sourceUrl, "utf8");
 const css = await readFile(cssUrl, "utf8");
+const flowSource = await readFile(new URL("../app/career/CareerContactImportMaterialWriteFlow.tsx", import.meta.url), "utf8");
 
 async function loadImportHelpers() {
   const sourceFile = ts.createSourceFile(sourceUrl.pathname, source, ts.ScriptTarget.ES2022, true, ts.ScriptKind.TSX);
@@ -71,9 +72,10 @@ test("every import path creates a preview through the frozen storage boundary", 
     "reviseCareerJobImportPreview",
     "forkCareerJobImportPreview",
     "parseCareerCsvImportPreview",
-    "commitCareerJobImports",
-    "inspectCareerImportCommit",
   ]) assert.match(importSource, new RegExp(`${call}\\(`));
+  assert.match(importSource, /writes\.submitImport\(/);
+  assert.match(flowSource, /prepareCareerImportWrite/);
+  assert.match(flowSource, /inspectCareerContactImportMaterialWrite/);
   assert.doesNotMatch(importSource, /runCareerSql|runCareerBatch|INSERT INTO|FileReader|split\(\/\\r\?\\n\//);
   assert.match(source, />从原文添加<\/button>/);
   assert.match(source, /title="从职位原文建立记录"/);
@@ -140,25 +142,14 @@ test("folded CSV duplicates never enter selection, counts, or same-name gates un
 });
 
 test("an uncertain commit has a read-only reconciliation path", () => {
-  const inspectStart = importSource.indexOf("async function inspectUncertainCommit");
-  const inspectEnd = importSource.indexOf("async function retryRefreshOnly", inspectStart);
-  const inspectSource = importSource.slice(inspectStart, inspectEnd);
-  assert.match(inspectSource, /inspectCareerImportCommit\(row\.preview\)/);
-  assert.doesNotMatch(inspectSource, /commitCareerJobImport|createCareerJobImportPreview|forkCareerJobImportPreview/);
-  assert.match(inspectSource, /status === "exact_committed"|await refreshAfterCommit\(\)/);
-  assert.match(inspectSource, /status === "absent"/);
-  assert.match(inspectSource, /status === "still_unknown"/);
-  assert.match(inspectSource, /status === "conflict"/);
-  assert.match(inspectSource, /partitionCareerImportInspectionRows\(uncertainRowsRef\.current, inspections\)/);
-  assert.match(inspectSource, /setAbsentRowIds\(absentIds\)/);
-  assert.match(inspectSource, /setCommittedRowIds\(exactIds\)/);
-  assert.doesNotMatch(inspectSource, /setAbsentRowIds\(new Set\(uncertainRowsRef\.current/);
-  assert.match(importSource, /committedRowIds\.has\(row\.id\)/);
-  assert.match(importSource, /不会再次编辑、选择或写入/);
-  assert.match(importSource, /originalRecoverySelection/);
-  assert.match(importSource, /不能更换原文、文件或新增选择/);
-  assert.match(importSource, /phase === "commit-check"/);
-  assert.match(importSource, /这一步只读取原操作标识，不会创建新职位/);
+  assert.match(flowSource, /inspectCareerContactImportMaterialWrite/);
+  assert.match(flowSource, /inspected === "exact_saved"/);
+  assert.match(flowSource, /inspected === "expected"/);
+  assert.match(flowSource, /inspected === "changed"/);
+  assert.match(flowSource, /结果仍无法确认；只允许再次只读核对/);
+  assert.match(flowSource, /phase: "check"/);
+  assert.match(importSource, /result\.outcome === "attention"/);
+  assert.match(importSource, /onDirtyChange\(false\)[\s\S]*onClose\(\)/);
 });
 
 test("mixed exact and absent inspections retry only the original absent operations", () => {
@@ -177,21 +168,18 @@ test("mixed exact and absent inspections retry only the original absent operatio
     helpers.selectCareerImportCommitRows(rows, absentIds).map((row) => row.preview.importOperationId),
     ["op-absent"],
   );
-  const commitStart = importSource.indexOf("async function commitPreview");
-  const commitEnd = importSource.indexOf("async function inspectUncertainCommit", commitStart);
-  const commitSource = importSource.slice(commitStart, commitEnd);
-  assert.match(commitSource, /selectCareerImportCommitRows\(rowsRef\.current, absentRowIds\)/);
-  assert.match(commitSource, /selected\.map\(\(row\) => \(\{ preview: row\.preview/);
+  assert.match(importSource, /selectCareerImportCommitRows\(rowsRef\.current/);
+  assert.match(importSource, /const items = selected\.map/);
+  assert.match(importSource, /writes\.submitImport\(items, expected, trigger/);
 });
 
 test("post-write refresh recovery never repeats a write", () => {
-  const retryStart = importSource.indexOf("async function retryRefreshOnly");
-  const retryEnd = importSource.indexOf("const renderedSourceSnapshot", retryStart);
-  const retrySource = importSource.slice(retryStart, retryEnd);
-  assert.match(retrySource, /await onRefresh\(\)/);
-  assert.doesNotMatch(retrySource, /commitCareerJobImport|createCareerJobImportPreview|forkCareerJobImportPreview/);
-  assert.match(importSource, /phase === "refresh-only"/);
-  assert.match(importSource, />只重新读取<\/button>/);
+  assert.match(flowSource, /const finish = useCallback[\s\S]*await refresh\(receipt, reason, owned\)/);
+  assert.match(flowSource, /retryRefresh/);
+  assert.match(flowSource, /flow\.phase === "refresh-only"/);
+  const retryStart = flowSource.indexOf("const retryRefresh");
+  const retryEnd = flowSource.indexOf("const abandonChangedAndRefresh", retryStart);
+  assert.doesNotMatch(flowSource.slice(retryStart, retryEnd), /prepareCareerImportWrite|commitCareerContactImportMaterialWrite/);
 });
 
 test("dirty close, tab keyboard behavior, and mobile geometry remain explicit", () => {
@@ -209,7 +197,8 @@ test("dirty close, tab keyboard behavior, and mobile geometry remain explicit", 
   assert.ok(requestCloseSource.indexOf("cancelPendingRequest()") < requestCloseSource.indexOf("setCloseConfirm(true)"));
   assert.match(importSource, /useEffect\(\(\) => \(\) => \{[\s\S]*?requestRef\.current\.controller\?\.abort\(\)[\s\S]*?token: requestRef\.current\.token \+ 1/);
   assert.match(importSource, /title="放弃这次导入吗？"/);
-  assert.match(importSource, /phase === "committing" \|\| phase === "commit-check" \|\| phase === "refreshing" \|\| phase === "refresh-only"/);
+  assert.match(importSource, /phase === "committing"/);
+  assert.match(importSource, /newWritesBlocked/);
   assert.match(css, /\.career-import-preview-list\.csv \{ grid-template-columns: repeat\(2, minmax\(0, 1fr\)\)/);
   assert.match(css, /@media \(max-width: 760px\)[\s\S]*\.career-import-preview-list\.csv \{ grid-template-columns: minmax\(0, 1fr\); \}/);
   assert.match(css, /\.career-import-file-input \{[\s\S]*min-height: 48px/);
@@ -220,7 +209,7 @@ test("every final import close restores the stable trigger after unmount", () =>
   assert.match(source, /onClick=\{\(event\) => onImport\(event\.currentTarget\)\}/);
   assert.match(source, /const importOpenerRef = useRef<HTMLButtonElement \| null>\(null\)/);
   assert.match(source, /onImport=\{openCareerImport\}/);
-  assert.match(source, /<CareerImportModal data=\{allData\}[\s\S]*?onClose=\{closeCareerImport\}/);
+  assert.match(source, /<CareerImportModal\s+[\s\S]*?data=\{allData\}[\s\S]*?onClose=\{closeCareerImport\}/);
   const focusEffectStart = source.indexOf('if (modal === "import" || !importFocusReturnPendingRef.current) return');
   const focusEffectEnd = source.indexOf("}, [modal]);", focusEffectStart);
   const focusEffectSource = source.slice(focusEffectStart, focusEffectEnd);
@@ -252,7 +241,7 @@ test("same-name choices stay neutral, explicit, and reversible", () => {
   assert.doesNotMatch(importSource, /function setSameNameDecision[\s\S]*?setRowIncluded\(rowId, false\)/);
   assert.match(importSource, /sameNameSkipped/);
   assert.match(importSource, /也可以改回“仍保存这份”/);
-  assert.match(source, /<CareerImportModal data=\{allData\}/);
+  assert.match(source, /<CareerImportModal\s+[\s\S]*?data=\{allData\}/);
 });
 
 test("capture sends only URL and selected text, never a whole-page fallback", () => {
