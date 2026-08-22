@@ -2197,3 +2197,103 @@
   .career-material-delete-confirm .career-button,
   .career-material-close-choice .career-button { width: 100%; }
 }
+
+/* Core writes keep their stale and recovery truth visible without crowding content. */
+.career-core-stale,
+.career-core-recovery {
+  min-width: 0;
+  margin-bottom: 14px;
+  padding: 14px 16px;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  color: #586a61;
+  border: 1px solid #d3ddd7;
+  border-radius: 14px;
+  background: #f6f9f7;
+}
+.career-core-recovery {
+  border-color: #dcd8cc;
+  background: #faf9f5;
+  outline: none;
+}
+.career-core-recovery:focus-visible {
+  outline: 3px solid #8db09f45;
+  outline-offset: 2px;
+}
+.career-core-stale > div,
+.career-core-recovery > div { min-width: 0; }
+.career-core-stale b,
+.career-core-recovery b { color: var(--career-ink); font-size: 13px; }
+.career-core-stale p,
+.career-core-recovery p {
+  margin: 3px 0 0;
+  font-size: 12px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+.career-core-stale > .career-button,
+.career-core-recovery .career-button { min-height: 44px; }
+.career-core-recovery > footer {
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.career-core-write-fields {
+  display: contents;
+  min-inline-size: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+.career-core-editor-recovery {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  padding: 12px;
+  border: 1px solid #b9d2c6;
+  border-radius: 12px;
+  background: #f1f7f4;
+}
+.career-core-editor-recovery p { margin: 4px 0 0; }
+.career-core-editor-recovery footer {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+@media (max-width: 520px) {
+  .career-core-stale,
+  .career-core-recovery {
+    padding: 13px;
+    grid-template-columns: auto minmax(0, 1fr);
+    align-items: start;
+  }
+  .career-core-stale > .career-button,
+  .career-core-recovery > footer {
+    width: 100%;
+    grid-column: 1 / -1;
+  }
+  .career-core-stale > .career-button,
+  .career-core-recovery > footer .career-button {
+    width: 100%;
+    min-width: 0;
+    white-space: normal;
+  }
+}
+
+/* Settings controls remain real touch targets at the 319px supported edge. */
+.career-stage-settings input,
+.career-settings-card#capture > .career-button {
+  min-height: 44px;
+}
+.career-stage-settings input {
+  width: 100%;
+  min-width: 0;
+}

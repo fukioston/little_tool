@@ -120,7 +120,7 @@ test("committed refresh recovery cannot repeat a task write", () => {
 test("restore and cancel ask for a safe explicit decision", () => {
   assert.match(source, /type CareerTaskDueChoice = "later" \| "new" \| "original" \| null/);
   assert.match(source, /useState<CareerTaskDueChoice>\(null\)/);
-  assert.match(source, /disabled=\{!canSubmitDue \|\| busy\}/);
+  assert.match(source, /disabled=\{!canSubmitDue \|\| busy \|\| externalWriteLocked\}/);
   assert.match(source, /原计划时间已经过去。请选择新的时间/);
   assert.match(source, /data-task-safe-focus/);
   assert.match(source, /继续保留/);

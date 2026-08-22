@@ -176,7 +176,7 @@ test("a consequential lifecycle choice is never preselected", () => {
   assert.match(source, /return prepared\.requiresChoice \? null : prepared\.allowedChoices\[0\] \?\? null/);
   assert.match(source, /<fieldset className="career-lifecycle-choices">/);
   assert.match(source, /type="radio" name="career-lifecycle-choice"/);
-  assert.match(source, /disabled=\{busy \|\| !state\.choice\}/);
+  assert.match(source, /disabled=\{busy \|\| newWritesBlocked \|\| !state\.choice\}/);
   assert.match(source, /保留安排/);
   assert.match(source, /随职位暂停/);
   assert.match(source, /恢复仍合适的安排/);
@@ -247,7 +247,7 @@ test("scope read failures keep the previous truthful view and stale requests can
   assert.match(scopeSource, /const requestToken = \+\+scopeRequestRef\.current/);
   assert.match(scopeSource, /const uiReadToken = \+\+uiReadRequestRef\.current/);
   assert.match(scopeSource, /scopeRequestRef\.current !== requestToken \|\| uiReadRequestRef\.current !== uiReadToken/);
-  assert.match(scopeSource, /setScopedLifecycle\(next\.scoped\)/);
+  assert.match(scopeSource, /applyCareerCoreBundle\(next, nextScope\)/);
   assert.doesNotMatch(scopeSource, /setScopedLifecycle\(emptyLifecycleSnapshot\)/);
   assert.match(scopeSource, /原来的记录仍保留在画面上/);
   assert.match(source, /scopeError && <div className="career-scope-error" role="alert">/);
@@ -260,9 +260,11 @@ test("archived job details are read-only except for taking the job back", () => 
   const drawerSource = source.slice(start, end);
   assert.match(drawerSource, /archived \? <span className="career-archived-state"/);
   assert.match(drawerSource, /!archived && <div className="career-detail-actions">/);
-  assert.match(drawerSource, /if \(archived\) return/);
-  assert.match(drawerSource, /WHERE id=\? AND archived=0/);
-  assert.match(drawerSource, /if \(result\.changes === 0\)/);
+  assert.match(drawerSource, /if \(archived \|\| savingRef\.current\) return/);
+  assert.match(drawerSource, /getBoundCareerJobExpected\(coreBindings, job\)/);
+  assert.match(drawerSource, /coreWrites\.submitJobUpdate\(input, expected, trigger, \{/);
+  assert.match(drawerSource, /onSettled:[\s\S]*?outcome === "changed"/);
+  assert.doesNotMatch(drawerSource, /runCareerSql|runCareerBatch|WHERE id=\?/);
   assert.match(drawerSource, /kind: "restore", jobId: job\.id/);
   assert.match(drawerSource, /归档只是整理，不会删除职位或相关记录/);
 });
@@ -298,6 +300,7 @@ test("every dirty interview close path offers an explicit local-only choice", ()
   assert.match(drawerSource, /onClose=\{requestClose\}/);
   assert.ok((drawerSource.match(/onClick=\{requestClose\}/g) ?? []).length >= 2);
   assert.match(drawerSource, /window\.addEventListener\("beforeunload", protectUnsavedDraft\)/);
+  assert.match(source, /career\.interview-draft\.v2:/);
   assert.match(source, /career\.interview-draft\.v1:/);
   assert.match(drawerSource, />继续编辑<\/button>/);
   assert.match(drawerSource, /保存本机草稿并关闭/);
@@ -305,9 +308,10 @@ test("every dirty interview close path offers an explicit local-only choice", ()
   assert.match(drawerSource, /不进入 SQLite 或导出备份/);
   assert.match(drawerSource, /当前完整网址与浏览器资料对应的站点存储/);
   assert.doesNotMatch(drawerSource, /当前设备与此浏览器/);
-  assert.match(drawerSource, /setBaseline\(currentSnapshot\)/);
+  assert.match(drawerSource, /setBaseline\(savedSnapshot\)/);
   assert.match(drawerSource, /localStorage\.removeItem\(interviewDraftKey\(interview\.id\)\)/);
-  assert.match(source, /\["scheduled", "completed", "canceled"\]\.includes\(snapshot\.status\)/);
+  assert.match(source, /parseCareerInterviewLocalDraft\(JSON\.parse\(raw\) as unknown, interview\.id\)/);
+  assert.match(drawerSource, /version: 2,[\s\S]*?source: expectedInterview/);
   assert.match(drawerSource, /if \(draft\.summary !== null\) setSummary/);
   assert.match(css, /\.career-draft-choice\s*\{/);
   assert.match(css, /\.career-local-draft-note/);

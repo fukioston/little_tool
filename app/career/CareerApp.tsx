@@ -22,13 +22,22 @@ import {
   WandSparkles, X, Zap,
 } from "lucide-react";
 import {
-  FormEvent, ReactNode, useCallback, useEffect, useId, useMemo, useRef, useState,
+  FormEvent, ReactNode, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState,
 } from "react";
 import Link from "next/link";
 import {
   CAREER_LEGACY_DEMO_REVIEW_NEEDED, getCareerLegacyDemoResolution, initializeCareerDb,
-  loadCareerData, newId, runCareerBatch, runCareerSql,
+  loadCareerData, newId,
 } from "@/lib/career/db";
+import {
+  loadCareerCoreWriteExpectedSet,
+  type CareerCoreWriteExpectedSet,
+  type CareerCoreWriteReceipt,
+  type CreateCareerInterviewCoreInput,
+  type CreateCareerJobCoreInput,
+  type UpdateCareerInterviewCoreInput,
+  type UpdateCareerJobCoreInput,
+} from "@/lib/career/core-writes";
 import {
   archiveCareerContactSafely,
   createCareerContactSafely,
@@ -134,6 +143,24 @@ import type {
   AiAction, CareerData, CareerView, Contact, Interview, InterviewQuestion,
   Job, Material, Notice, Stage, Task,
 } from "@/lib/career/types";
+import { useCareerCoreWriteFlow } from "./CareerCoreWriteFlow";
+import {
+  careerCoreBundleApplyDecision,
+  careerCoreGenerationChangeBarrier,
+  careerCoreHistoryBackDecision,
+  careerCoreHistoryGuardResolution,
+  createCareerCoreExternalMutationGate,
+  careerInterviewDraftRestoreMode,
+  createCareerCoreReadBundle,
+  getBoundCareerInterviewExpected,
+  getBoundCareerJobExpected,
+  getBoundCareerStageExpected,
+  parseCareerInterviewLocalDraft,
+  type CareerCoreBindings,
+  type CareerCoreReadBundle,
+  type CareerInterviewEditorSnapshot,
+  type CareerInterviewLocalDraft,
+} from "./core-write-state";
 
 const navItems: Array<{ id: CareerView; label: string; compact: string; icon: typeof LayoutDashboard }> = [
   { id: "today", label: "今日", compact: "今日", icon: LayoutDashboard },
@@ -150,6 +177,7 @@ const navItems: Array<{ id: CareerView; label: string; compact: string; icon: ty
 const emptyData: CareerData = { stages: [], jobs: [], tasks: [], interviews: [], contacts: [], materials: [], activities: [] };
 const emptyLifecycleSnapshot: CareerLifecycleSnapshot = { jobs: [], tasks: [], interviews: [] };
 type CareerJobScope = Exclude<CareerLifecycleScope, "all">;
+type CareerCoreWriteController = ReturnType<typeof useCareerCoreWriteFlow>;
 
 const CAREER_MATERIAL_SAVE_RECOVERY_PREFIX = "career.material-save-recovery.v1:";
 const CAREER_MATERIAL_SAVE_RECOVERY_MAX_BYTES = 256 * 1024;
@@ -709,13 +737,25 @@ export function isCareerLifecyclePaused(item: Pick<Task | Interview, "status" | 
     (item.cancellation_reason === "job_ended" || item.cancellation_reason === "job_archived");
 }
 
-async function loadCareerUiState(scope: CareerJobScope) {
+async function loadCareerUiState(scope: CareerJobScope): Promise<CareerCoreReadBundle> {
+  const expectedBefore = await loadCareerCoreWriteExpectedSet();
   const [base, all, scoped] = await Promise.all([
     loadCareerData(),
     loadCareerLifecycleScope("all"),
     loadCareerLifecycleScope(scope),
   ]);
-  return { base, all, scoped };
+  const expectedAfter = await loadCareerCoreWriteExpectedSet();
+  const bundle = createCareerCoreReadBundle(
+    base,
+    all,
+    scoped,
+    expectedBefore,
+    expectedAfter,
+  );
+  if (!bundle) {
+    throw new Error("读取期间职迹核心资料发生变化；没有把混合版本显示为可写画面。");
+  }
+  return bundle;
 }
 
 export function resolveCareerTodayFocus(data: CareerData, now: number) {
@@ -899,6 +939,14 @@ export default function CareerApp() {
   const careerClock = useCareerClock();
   const mobileLayout = useCareerMobileLayout();
   const [data, setData] = useState<CareerData>(emptyData);
+  const [coreBindings, setCoreBindings] = useState<CareerCoreBindings | null>(null);
+  const [coreSnapshotStale, setCoreSnapshotStale] = useState(true);
+  const coreSnapshotStaleRef = useRef(true);
+  const coreExpectedSetRef = useRef<CareerCoreWriteExpectedSet | null>(null);
+  const [coreDirtyEditorCount, setCoreDirtyEditorCount] = useState(0);
+  const coreDirtyEditorsRef = useRef(new Set<string>());
+  const [backupMutationActive, setBackupMutationActive] = useState(false);
+  const backupMutationActiveRef = useRef(false);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState("");
   const [legacyReviewNeeded, setLegacyReviewNeeded] = useState(false);
@@ -958,8 +1006,15 @@ export default function CareerApp() {
   const materialStaleFocusPendingRef = useRef(false);
   const materialRefreshRef = useRef(false);
   const contactUndoWriteRef = useRef(false);
+  const externalMutationGateRef = useRef(createCareerCoreExternalMutationGate());
+  const [externalMutationClaimCount, setExternalMutationClaimCount] = useState(0);
   const contactRemovalFocusRef = useRef<HTMLElement | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
+  const [historyExitPrompt, setHistoryExitPrompt] = useState(false);
+  const historyGuardRef = useRef<string | null>(null);
+  const historyRestoringRef = useRef(false);
+  const historyConfirmAfterRestoreRef = useRef(false);
+  const historyExitOpenerRef = useRef<HTMLElement | null>(null);
 
   const materialSaveRecoveryEntries = useMemo<CareerMaterialSaveRecoveryEntry[]>(() => {
     const entries = new Map<string, CareerMaterialSaveRecoveryEntry>();
@@ -1019,17 +1074,68 @@ export default function CareerApp() {
     }
   }, []);
 
-  const refresh = useCallback(async (requestedScope: CareerJobScope = jobScopeRef.current) => {
-    const requestToken = ++uiReadRequestRef.current;
-    const next = await loadCareerUiState(requestedScope);
-    if (uiReadRequestRef.current !== requestToken) return false;
+  const applyCareerCoreBundle = useCallback((
+    next: CareerCoreReadBundle,
+    requestedScope: CareerJobScope,
+    committedReceipt?: CareerCoreWriteReceipt,
+    committedReceiptOwned = false,
+  ) => {
+    if (careerCoreBundleApplyDecision({
+      current: coreExpectedSetRef.current,
+      next: next.expectedSet,
+      dirtyEditorCount: coreDirtyEditorsRef.current.size,
+      committedReceipt,
+      committedReceiptOwned,
+    }) === "defer") {
+      coreSnapshotStaleRef.current = true;
+      setCoreSnapshotStale(true);
+      return false;
+    }
     setData(next.base);
     setAllLifecycle(next.all);
     if (jobScopeRef.current === requestedScope) setScopedLifecycle(next.scoped);
+    setCoreBindings(next.bindings);
+    coreExpectedSetRef.current = next.expectedSet;
+    coreSnapshotStaleRef.current = false;
+    setCoreSnapshotStale(false);
     return true;
   }, []);
+
+  const refresh = useCallback(async (
+    requestedScope: CareerJobScope = jobScopeRef.current,
+    committedReceipt?: CareerCoreWriteReceipt,
+    committedReceiptOwned = false,
+  ) => {
+    const requestToken = ++uiReadRequestRef.current;
+    coreSnapshotStaleRef.current = true;
+    setCoreSnapshotStale(true);
+    let next: CareerCoreReadBundle;
+    try {
+      next = await loadCareerUiState(requestedScope);
+    } catch (error) {
+      if (uiReadRequestRef.current === requestToken) {
+        coreSnapshotStaleRef.current = true;
+        setCoreSnapshotStale(true);
+      }
+      throw error;
+    }
+    if (uiReadRequestRef.current !== requestToken) return "superseded" as const;
+    return applyCareerCoreBundle(
+      next,
+      requestedScope,
+      committedReceipt,
+      committedReceiptOwned,
+    )
+      ? "applied" as const
+      : "deferred" as const;
+  }, [applyCareerCoreBundle]);
   const requireRefresh = useCallback(async (requestedScope: CareerJobScope = jobScopeRef.current) => {
-    if (!await refresh(requestedScope)) throw new Error("A newer Career read superseded this refresh.");
+    const outcome = await refresh(requestedScope);
+    if (outcome !== "applied") {
+      throw new Error(outcome === "deferred"
+        ? "Dirty Career editors kept their displayed core bindings."
+        : "A newer Career read superseded this refresh.");
+    }
   }, [refresh]);
   const refreshContacts = useCallback(async () => {
     await requireRefresh();
@@ -1051,9 +1157,7 @@ export default function CareerApp() {
         const next = await loadCareerUiState(requestedScope);
         const legacyResolution = await getCareerLegacyDemoResolution().catch(() => "none" as const);
         if (live && uiReadRequestRef.current === requestToken) {
-          setData(next.base);
-          setAllLifecycle(next.all);
-          setScopedLifecycle(next.scoped);
+          applyCareerCoreBundle(next, requestedScope);
           setLegacyReviewNeeded(legacyResolution === CAREER_LEGACY_DEMO_REVIEW_NEEDED);
         }
       } catch (error) {
@@ -1062,7 +1166,7 @@ export default function CareerApp() {
     }
     void boot();
     return () => { live = false; };
-  }, [refreshKey]);
+  }, [applyCareerCoreBundle, refreshKey]);
 
   useEffect(() => () => aiRequestRef.current?.controller.abort(), []);
 
@@ -1135,9 +1239,17 @@ export default function CareerApp() {
     return () => window.cancelAnimationFrame(focusFrame);
   }, [materialListStale, materialRemoval, modal]);
 
-  useEffect(() => subscribeToCareerGenerationChanges(() => window.location.reload()), []);
+  useEffect(() => subscribeToCareerGenerationChanges(() =>
+    careerCoreGenerationChangeBarrier(() => {
+      coreSnapshotStaleRef.current = true;
+      setCoreSnapshotStale(true);
+    }, () => window.location.reload())), []);
 
   useEffect(() => subscribeToCareerDataChanges((reason) => {
+    if (/^career-(?:stage-renamed|job-(?:created|updated)|interview-(?:created|updated))$/.test(reason)) {
+      coreSnapshotStaleRef.current = true;
+      setCoreSnapshotStale(true);
+    }
     if (!reason.startsWith("career-contact")) return;
     if (contactEditorId !== undefined || contactAction) {
       setContactDataHint("联系人资料刚在另一个页面发生了变化。当前输入没有被替换；保存时会先核对版本。");
@@ -1371,6 +1483,158 @@ export default function CareerApp() {
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 7 } }));
   const lifecycleLocked = lifecyclePendingJobId !== null || lifecycleBusy || lifecycleDialog !== null || lifecycleRefreshOnlyRef.current;
 
+  const setCoreEditorDirty = useCallback((key: string, dirty: boolean) => {
+    if (dirty) coreDirtyEditorsRef.current.add(key);
+    else coreDirtyEditorsRef.current.delete(key);
+    setCoreDirtyEditorCount(coreDirtyEditorsRef.current.size);
+  }, []);
+
+  const setBackupMutationGate = useCallback((active: boolean) => {
+    backupMutationActiveRef.current = active;
+    setBackupMutationActive(active);
+  }, []);
+
+  const setExternalMutationClaim = useCallback((key: string, active: boolean) => {
+    setExternalMutationClaimCount(externalMutationGateRef.current.set(key, active));
+  }, []);
+
+  const coreExternalWriteLocked = backupMutationActive || lifecycleLocked ||
+    externalMutationClaimCount > 0 || scopeLoading || materialRefreshBusy || materialRemoval !== null ||
+    modal === "task" || modal === "material" || modal === "import" ||
+    taskSheet !== null || contactEditorId !== undefined ||
+    contactAction !== null || selectedContactId !== null ||
+    contactUndo?.phase === "writing";
+  const coreExternalWriteInProgress = useCallback(() =>
+    backupMutationActiveRef.current || lifecycleWriteRef.current ||
+    taskCompletionRef.current.size > 0 || contactUndoWriteRef.current ||
+    externalMutationGateRef.current.isActive(),
+  []);
+  const refreshCoreAfterReceipt = useCallback(async (
+    receipt: CareerCoreWriteReceipt,
+    reason: "committed" | "changed",
+    ownedCommittedReceipt: boolean,
+  ) => refresh(
+    jobScopeRef.current,
+    reason === "committed" ? receipt : undefined,
+    reason === "committed" && ownedCommittedReceipt,
+  ),
+  [refresh]);
+  const coreWrites = useCareerCoreWriteFlow({
+    refresh: refreshCoreAfterReceipt,
+    snapshotStale: coreSnapshotStale,
+    snapshotStaleNow: () => coreSnapshotStaleRef.current,
+    externalWriteLocked: coreExternalWriteLocked,
+    externalWriteInProgress: coreExternalWriteInProgress,
+    dirtyEditorCount: coreDirtyEditorCount,
+    onToast: (message) => notify(message),
+    onAttention: () => undefined,
+  });
+  const coreDatabaseMutationLockedNow = useCallback(() =>
+    coreSnapshotStaleRef.current || coreWrites.databaseMutationLocked ||
+      coreWrites.isWriteInProgress(),
+  [coreWrites]);
+
+  useEffect(() => {
+    function protectSpaExit(event: MouseEvent) {
+      if (coreDirtyEditorsRef.current.size === 0 && !coreWrites.hasVolatileWork) return;
+      const target = event.target instanceof Element ? event.target.closest<HTMLAnchorElement>("a[href]") : null;
+      if (!target || target.target === "_blank" || target.hasAttribute("download")) return;
+      const destination = new URL(target.href, window.location.href);
+      if (destination.origin !== window.location.origin || destination.href === window.location.href) return;
+      event.preventDefault();
+      event.stopPropagation();
+      notify("当前还有未保存输入或仅留在本页的核对收据；先完成或明确放弃后再离开。", "info");
+    }
+    document.addEventListener("click", protectSpaExit, true);
+    return () => document.removeEventListener("click", protectSpaExit, true);
+  }, [coreWrites.hasVolatileWork, notify]);
+
+  useEffect(() => {
+    const hasRisk = coreDirtyEditorCount > 0 || coreWrites.hasVolatileWork;
+    if (hasRisk && historyGuardRef.current === null) {
+      const token = typeof crypto.randomUUID === "function"
+        ? crypto.randomUUID()
+        : `career-core-${Date.now()}`;
+      const current = window.history.state;
+      const state = current && typeof current === "object"
+        ? { ...current, careerCoreHistoryGuard: token }
+        : { careerCoreHistoryGuard: token };
+      window.history.pushState(state, "", window.location.href);
+      historyGuardRef.current = token;
+    }
+    if (careerCoreHistoryGuardResolution(
+      hasRisk,
+      historyGuardRef.current !== null,
+    ) === "consume") {
+      historyGuardRef.current = null;
+      historyRestoringRef.current = false;
+      historyConfirmAfterRestoreRef.current = false;
+      setHistoryExitPrompt(false);
+      window.queueMicrotask(() => window.history.back());
+      return;
+    }
+    const token = historyGuardRef.current;
+    if (!token) return;
+    // popstate cannot cancel an arbitrary multi-entry history.go jump. This
+    // sentinel protects normal Back/Forward; beforeunload covers document exit.
+    function onPopState() {
+      if (historyGuardRef.current !== token) return;
+      if (historyRestoringRef.current) {
+        historyRestoringRef.current = false;
+        if (historyConfirmAfterRestoreRef.current) {
+          historyConfirmAfterRestoreRef.current = false;
+          const active = document.activeElement;
+          historyExitOpenerRef.current = active instanceof HTMLElement &&
+              active !== document.body && !active.closest(".career-history-exit")
+            ? active
+            : null;
+          setHistoryExitPrompt(true);
+        }
+        return;
+      }
+      const current = window.history.state;
+      if (current && typeof current === "object" &&
+        current.careerCoreHistoryGuard === token) return;
+      const decision = careerCoreHistoryBackDecision(
+        coreWrites.hasVolatileWork,
+        coreDirtyEditorsRef.current.size,
+      );
+      if (decision === "continue") {
+        historyGuardRef.current = null;
+        window.queueMicrotask(() => window.history.back());
+        return;
+      }
+      historyRestoringRef.current = true;
+      historyConfirmAfterRestoreRef.current = decision === "restore-confirm";
+      window.history.forward();
+      if (decision === "restore-block") {
+        notify("正在安全确认职迹操作；结果明确前已阻止离开本页。", "info");
+      }
+    }
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, [coreDirtyEditorCount, coreWrites.hasVolatileWork, notify]);
+
+  const stayAfterHistoryExit = useCallback(() => {
+    setHistoryExitPrompt(false);
+    const opener = historyExitOpenerRef.current;
+    historyExitOpenerRef.current = null;
+    window.requestAnimationFrame(() => {
+      if (opener?.isConnected) opener.focus({ preventScroll: true });
+      else document.getElementById("career-page-title")?.focus({ preventScroll: true });
+    });
+  }, []);
+
+  const abandonDirtyEditorsAndContinueHistory = useCallback(() => {
+    if (coreWrites.hasVolatileWork) return;
+    coreDirtyEditorsRef.current.clear();
+    setCoreDirtyEditorCount(0);
+    setHistoryExitPrompt(false);
+    const guarded = historyGuardRef.current !== null;
+    historyGuardRef.current = null;
+    window.history.go(guarded ? -2 : -1);
+  }, [coreWrites.hasVolatileWork]);
+
   function lifecycleDefaultChoice(prepared: CareerPreparedLifecycleChange) {
     return prepared.requiresChoice ? null : prepared.allowedChoices[0] ?? null;
   }
@@ -1406,6 +1670,10 @@ export default function CareerApp() {
     choice: CareerLifecycleChoice,
     rememberUndo = true,
   ) {
+    if (coreDatabaseMutationLockedNow()) {
+      notify("先处理当前职迹保存或核对提醒，再变更职位状态。", "info");
+      return false;
+    }
     setLifecycleBusy(true);
     setLifecyclePendingJobId(prepared.job.id);
     try {
@@ -1459,7 +1727,8 @@ export default function CareerApp() {
     intent: CareerLifecycleIntent,
     options: { rememberUndo?: boolean; choice?: CareerLifecycleChoice; expectedUndo?: { from: string; to: string } } = {},
   ) {
-    if (lifecycleWriteRef.current || lifecycleRefreshOnlyRef.current) return false;
+    if (lifecycleWriteRef.current || lifecycleRefreshOnlyRef.current ||
+      coreDatabaseMutationLockedNow()) return false;
     const currentJob = allLifecycle.jobs.find((job) => job.id === intent.jobId);
     if (!currentJob) {
       notify("职位记录刚有变化，请重新打开后再试。", "info");
@@ -1475,6 +1744,10 @@ export default function CareerApp() {
     setLifecyclePendingJobId(intent.jobId);
     try {
       const prepared = await prepareCareerLifecycleChange(intent);
+      if (coreDatabaseMutationLockedNow()) {
+        notify("准备期间核心资料已需要核对；职位状态没有改变。", "info");
+        return false;
+      }
       if (options.expectedUndo && (
         prepared.transition !== "active-to-active" ||
         prepared.job.currentStage.id !== options.expectedUndo.to ||
@@ -1503,7 +1776,7 @@ export default function CareerApp() {
   }
 
   async function confirmLifecycleChange() {
-    if (!lifecycleDialog || lifecycleDialog.phase !== "decision" || !lifecycleDialog.choice || lifecycleWriteRef.current || lifecycleRefreshOnlyRef.current) return;
+    if (!lifecycleDialog || lifecycleDialog.phase !== "decision" || !lifecycleDialog.choice || lifecycleWriteRef.current || lifecycleRefreshOnlyRef.current || coreDatabaseMutationLockedNow()) return;
     lifecycleWriteRef.current = true;
     try { await finishPreparedLifecycle(lifecycleDialog.prepared, lifecycleDialog.choice, lifecycleDialog.rememberUndo); }
     finally { lifecycleWriteRef.current = false; }
@@ -1531,7 +1804,7 @@ export default function CareerApp() {
   }
 
   async function handleUndo() {
-    if (!undo || lifecycleWriteRef.current || lifecycleRefreshOnlyRef.current) return;
+    if (!undo || lifecycleWriteRef.current || lifecycleRefreshOnlyRef.current || coreDatabaseMutationLockedNow()) return;
     const item = undo;
     const currentJob = allLifecycle.jobs.find((job) => job.id === item.jobId);
     const currentStage = data.stages.find((stage) => stage.id === currentJob?.stage_id);
@@ -1552,12 +1825,17 @@ export default function CareerApp() {
   }
 
   async function completeTask(task: Task) {
+    if (coreDatabaseMutationLockedNow()) {
+      notify("先处理当前核心保存或核对提醒，再更改待办。", "info");
+      return;
+    }
     if (task.status !== "todo") { openTask(task.id); return; }
     const expectedUpdatedAt = task.updated_at;
     if (!expectedUpdatedAt) { openTask(task.id, "stale"); return; }
     await runCareerTaskUiOnce(taskCompletionRef.current, task.id, async () => {
       let committed = false;
       try {
+        if (coreDatabaseMutationLockedNow()) return;
         await careerTaskActions.complete(task.id, {
           expectedUpdatedAt,
           operationId: `task_complete_${crypto.randomUUID()}`,
@@ -1583,20 +1861,29 @@ export default function CareerApp() {
     if (nextScope === jobScopeRef.current || scopeLoading) return;
     const requestToken = ++scopeRequestRef.current;
     const uiReadToken = ++uiReadRequestRef.current;
+    coreSnapshotStaleRef.current = true;
+    setCoreSnapshotStale(true);
     setScopeLoading(true);
     setScopeError("");
     try {
       const next = await loadCareerUiState(nextScope);
       if (scopeRequestRef.current !== requestToken || uiReadRequestRef.current !== uiReadToken) return;
+      const previousScope = jobScopeRef.current;
       jobScopeRef.current = nextScope;
+      if (!applyCareerCoreBundle(next, nextScope)) {
+        jobScopeRef.current = previousScope;
+        setScopeError("当前还有未保存输入；仍保留原画面与绑定，请明确放弃后再切换范围。");
+        return;
+      }
       setJobScope(nextScope);
       setStageFilter("all");
       setSourceFilter("all");
-      setData(next.base);
-      setAllLifecycle(next.all);
-      setScopedLifecycle(next.scoped);
     } catch {
-      if (scopeRequestRef.current === requestToken) setScopeError("这个职位范围暂时没有打开。原来的记录仍保留在画面上，可以稍后重试。");
+      if (scopeRequestRef.current === requestToken) {
+        coreSnapshotStaleRef.current = true;
+        setCoreSnapshotStale(true);
+        setScopeError("这个职位范围暂时没有打开。原来的记录仍保留在画面上，可以稍后重试。");
+      }
     } finally {
       if (scopeRequestRef.current === requestToken) setScopeLoading(false);
     }
@@ -1687,12 +1974,34 @@ export default function CareerApp() {
   }
 
   function navigate(next: CareerView) {
+    if (next !== view && coreDirtyEditorsRef.current.size > 0) {
+      notify("当前画面还有未保存输入；请先继续保存或明确放弃，再切换页面。", "info");
+      return;
+    }
     setView(next);
     setSidebarOpen(false);
     const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     window.scrollTo({ top: 0, behavior: reducedMotion ? "auto" : "smooth" });
   }
+  function openJobCreation() {
+    if (coreWrites.writeLocked || coreWrites.isWriteInProgress()) {
+      notify("先处理当前职迹保存或核对提醒，再记录新职位。", "info");
+      return;
+    }
+    setModal("job");
+  }
+  function openInterviewCreation() {
+    if (coreWrites.writeLocked || coreWrites.isWriteInProgress()) {
+      notify("先处理当前职迹保存或核对提醒，再安排新面试。", "info");
+      return;
+    }
+    setModal("interview");
+  }
   function openCareerImport(opener: HTMLButtonElement) {
+    if (coreDatabaseMutationLockedNow()) {
+      notify("先处理当前核心保存或核对提醒，再开始新的职位导入。", "info");
+      return;
+    }
     importOpenerRef.current = opener;
     importFocusReturnPendingRef.current = false;
     setModal("import");
@@ -1708,19 +2017,34 @@ export default function CareerApp() {
   }
   if (loading) return <CareerLoading />;
   if (loadError) return <CareerError message={loadError} onRetry={() => { setLoading(true); setLoadError(""); setRefreshKey((key) => key + 1); }} />;
+  if (!coreBindings) return <CareerError message="核心资料没有形成稳定的显示绑定；没有开放写入。" onRetry={() => { setLoading(true); setRefreshKey((key) => key + 1); }} />;
 
   return <main className="career-app">
     <Sidebar sidebarRef={sidebarRef} view={view} open={sidebarOpen} mobile={mobileLayout} onNavigate={navigate} onClose={() => setSidebarOpen(false)} />
     <section className="career-main">
-      <Topbar title={navItems.find((item) => item.id === view)?.label ?? "职迹"} query={query} menuOpen={sidebarOpen} onQuery={setQuery} onSearch={() => setSearchOpen(true)} onMenu={() => setSidebarOpen(true)} onAdd={() => setModal("job")} onSettings={() => navigate("settings")} />
+      <Topbar title={navItems.find((item) => item.id === view)?.label ?? "职迹"} query={query} menuOpen={sidebarOpen} addLocked={coreWrites.writeLocked} onQuery={setQuery} onSearch={() => setSearchOpen(true)} onMenu={() => setSidebarOpen(true)} onAdd={openJobCreation} onSettings={() => navigate("settings")} />
       <div className="career-content">
+        {coreSnapshotStale && <div className="career-core-stale" role="status"><ShieldCheck size={19} /><div><b>核心资料需要重新读取</b><p>读取完成前不会依据旧画面保存阶段、职位或面试。</p></div><button className="career-button secondary" disabled={coreWrites.busy} onClick={() => { void requireRefresh().catch(() => notify("核心资料暂时没有读到稳定版本；写入仍保持暂停。", "error")); }}><RotateCcw size={16} />重新读取</button></div>}
+        {(coreWrites.flow.phase !== "idle" || coreWrites.journal.unreadable.length > 0 || coreWrites.journal.storageUnavailable || coreWrites.journal.lockUnavailable) && <div ref={coreWrites.attentionRef} className={`career-core-recovery ${coreWrites.flow.phase}`} tabIndex={-1} role={coreWrites.error ? "alert" : "status"}>
+          <span>{coreWrites.busy ? <LoaderCircle className="spin" size={20} /> : <ShieldCheck size={20} />}</span>
+          <div><b>{coreWrites.busy ? "正在安全处理同一次职迹操作" : "有一次职迹操作需要确认"}</b><p>{coreWrites.error || ("message" in coreWrites.flow ? coreWrites.flow.message : coreWrites.journal.storageUnavailable ? "浏览器暂时无法完整读取核对线索；所有核心写入保持暂停。" : coreWrites.journal.lockUnavailable ? "当前浏览器缺少安全的跨页面锁；没有开放核心写入。" : coreWrites.journal.unreadable.length > 0 ? "有一条核对提醒无法验证；没有据此写入。" : coreWrites.status)}</p></div>
+          <footer>
+            {coreWrites.flow.phase === "check" && <button className="career-button primary" onClick={() => void coreWrites.inspectActive()}><Search size={16} />只读核对</button>}
+            {coreWrites.flow.phase === "expected" && <><button className="career-button ghost" onClick={() => void coreWrites.discardTerminal()}>放弃这张收据</button><button className="career-button primary" disabled={coreExternalWriteLocked || coreSnapshotStale} onClick={() => void coreWrites.continueExpected()}>继续同一次写入</button></>}
+            {coreWrites.flow.phase === "refresh-only" && <button className="career-button primary" onClick={() => void coreWrites.retryTerminalRefresh()}><RotateCcw size={16} />只重新读取</button>}
+            {coreWrites.flow.phase === "changed" && <button className="career-button primary" onClick={() => void coreWrites.discardChangedAndRefresh()}><RotateCcw size={16} />放弃旧输入并读取新版本</button>}
+            {coreWrites.flow.phase === "invalid" && <button className="career-button ghost" onClick={() => void coreWrites.discardTerminal()}>只清除无效提醒</button>}
+            {coreWrites.journal.unreadable.length > 0 && <button className="career-button ghost" onClick={() => void coreWrites.removeFirstUnreadable()}>只清除无法验证的提醒</button>}
+            {(coreWrites.journal.storageUnavailable || coreWrites.journal.lockUnavailable) && <button className="career-button secondary" onClick={coreWrites.retryStorage}><RotateCcw size={16} />重新检查浏览器能力</button>}
+          </footer>
+        </div>}
         {legacyReviewNeeded && <div className="career-legacy-review-note" role="status"><ShieldCheck size={19} /><div><b>旧版资料需要你看一眼</b><p>旧版可能含示例内容，未自动删除以保护你的编辑。我们不会替你判断哪些记录属于你，也不会自行清理。</p></div></div>}
-        {view === "today" && <TodayView data={allData} now={careerClock} onNavigate={navigate} onSelectJob={setSelectedJobId} onSelectInterview={setSelectedInterviewId} onOpenTask={openTask} onCompleteTask={completeTask} onAddJob={() => setModal("job")} onAi={runAi} />}
-        {view === "board" && <BoardView data={boardData} jobs={boardJobs} now={careerClock} query={query} sourceFilter={sourceFilter} priorityOnly={priorityOnly} onSourceFilter={setSourceFilter} onPriorityOnly={setPriorityOnly} onClear={() => { setQuery(""); setSourceFilter("all"); setPriorityOnly(false); }} onSelectJob={setSelectedJobId} onAddJob={() => setModal("job")} onMove={async (jobId, stageId) => { await requestLifecycleChange({ kind: "stage", jobId, nextStageId: stageId }); }} lifecycleLocked={lifecycleLocked} sensors={sensors} activeJob={activeJob} onDragStart={(event) => { if (!lifecycleWriteRef.current && !lifecycleRefreshOnlyRef.current) setActiveDragId(String(event.active.id)); }} onDragEnd={async (event) => { setActiveDragId(null); if (!event.over || lifecycleWriteRef.current || lifecycleRefreshOnlyRef.current) return; const stageId = String(event.over.id).replace(/^stage:/, ""); if (data.stages.some((stage) => stage.id === stageId)) await requestLifecycleChange({ kind: "stage", jobId: String(event.active.id), nextStageId: stageId }); }} />}
+        {view === "today" && <TodayView data={allData} now={careerClock} onNavigate={navigate} onSelectJob={setSelectedJobId} onSelectInterview={setSelectedInterviewId} onOpenTask={openTask} onCompleteTask={completeTask} onAddJob={openJobCreation} onAi={runAi} />}
+        {view === "board" && <BoardView data={boardData} jobs={boardJobs} now={careerClock} query={query} sourceFilter={sourceFilter} priorityOnly={priorityOnly} onSourceFilter={setSourceFilter} onPriorityOnly={setPriorityOnly} onClear={() => { setQuery(""); setSourceFilter("all"); setPriorityOnly(false); }} onSelectJob={setSelectedJobId} onAddJob={openJobCreation} onMove={async (jobId, stageId) => { await requestLifecycleChange({ kind: "stage", jobId, nextStageId: stageId }); }} lifecycleLocked={lifecycleLocked || coreWrites.databaseMutationLocked} sensors={sensors} activeJob={activeJob} onDragStart={(event) => { if (!lifecycleWriteRef.current && !lifecycleRefreshOnlyRef.current && !coreDatabaseMutationLockedNow()) setActiveDragId(String(event.active.id)); }} onDragEnd={async (event) => { setActiveDragId(null); if (!event.over || lifecycleWriteRef.current || lifecycleRefreshOnlyRef.current || coreDatabaseMutationLockedNow()) return; const stageId = String(event.over.id).replace(/^stage:/, ""); if (data.stages.some((stage) => stage.id === stageId)) await requestLifecycleChange({ kind: "stage", jobId: String(event.active.id), nextStageId: stageId }); }} />}
         {view === "jobs" && <JobsView data={scopedData} jobs={scopedJobs} now={careerClock} scope={jobScope} scopeLoading={scopeLoading} scopeError={scopeError} stageFilter={stageFilter} sourceFilter={sourceFilter} priorityOnly={priorityOnly} onScope={(scope) => { void changeJobScope(scope); }} onStageFilter={setStageFilter} onSourceFilter={setSourceFilter} onPriorityOnly={setPriorityOnly} onSelectJob={setSelectedJobId} onImport={openCareerImport} />}
-        {view === "calendar" && <CalendarView data={allData} now={careerClock} onOpenTask={openTask} onCompleteTask={completeTask} onAddTask={() => setModal("task")} onAddInterview={() => setModal("interview")} onSelectInterview={setSelectedInterviewId} />}
-        {view === "interviews" && <InterviewsView data={data} now={careerClock} onAdd={() => setModal("interview")} onSelect={setSelectedInterviewId} onAi={runAi} />}
-        {view === "contacts" && <ContactsView data={data} now={careerClock} revision={contactRevision} externalHint={contactDataHint} onAdd={() => setContactEditorId(null)} onSelect={(contactId) => setSelectedContactId(contactId)} />}
+        {view === "calendar" && <CalendarView data={allData} now={careerClock} onOpenTask={openTask} onCompleteTask={completeTask} onAddTask={() => { if (!coreDatabaseMutationLockedNow()) setModal("task"); }} onAddInterview={openInterviewCreation} onSelectInterview={setSelectedInterviewId} />}
+        {view === "interviews" && <InterviewsView data={data} now={careerClock} onAdd={openInterviewCreation} onSelect={setSelectedInterviewId} onAi={runAi} />}
+        {view === "contacts" && <ContactsView data={data} now={careerClock} revision={contactRevision} externalHint={contactDataHint} onAdd={() => { if (!coreDatabaseMutationLockedNow()) setContactEditorId(null); }} onSelect={(contactId) => { if (!coreDatabaseMutationLockedNow()) setSelectedContactId(contactId); }} />}
         {view === "materials" && <MaterialsView
           data={data}
           stale={materialListStale}
@@ -1729,16 +2053,17 @@ export default function CareerApp() {
           recoveryCount={materialSaveRecoveryEntries.length}
           recoveryUnreadable={materialRecoveryUnreadableKeys.length > 0}
           recoveryStorageUnavailable={materialRecoveryStorageUnavailable || volatileMaterialRecoveries.length > 0}
+          newWritesLocked={coreWrites.databaseMutationLocked}
           onRefresh={refreshMaterials}
-          onAdd={() => setModal("material")}
+          onAdd={() => { if (!coreDatabaseMutationLockedNow()) setModal("material"); }}
           onRecover={() => setModal("material")}
           onClearUnreadable={clearUnreadableMaterialRecoveryEntries}
           onRetryRecoveryStorage={retryMaterialRecoveryStorage}
-          onRemove={(material, opener) => { materialRemovalOpenerRef.current = opener; materialRemovalFocusPendingRef.current = false; setMaterialRemoval({ id: material.id, name: material.name, file_key: material.file_key }); }}
+          onRemove={(material, opener) => { if (material.status !== "deleting" && coreDatabaseMutationLockedNow()) return; materialRemovalOpenerRef.current = opener; materialRemovalFocusPendingRef.current = false; setMaterialRemoval({ id: material.id, name: material.name, file_key: material.file_key }); }}
           notify={notify}
         />}
         {view === "analytics" && <AnalyticsView data={allData} now={careerClock} />}
-        {view === "settings" && <SettingsView data={data} onRefresh={requireRefresh} onExport={async () => {
+        {view === "settings" && <SettingsView data={data} coreBindings={coreBindings} coreWrites={coreWrites} onDirtyChange={(dirty) => setCoreEditorDirty("stage:rename", dirty)} newDatabaseWritesLocked={coreWrites.databaseMutationLocked} newDatabaseWritesLockedNow={coreDatabaseMutationLockedNow} onExternalMutationChange={setBackupMutationGate} onRefresh={requireRefresh} onExport={async () => {
           try {
             const exported = await exportCompleteCareerBackup();
             const url = URL.createObjectURL(exported.blob);
@@ -1754,11 +2079,12 @@ export default function CareerApp() {
       </div>
     </section>
     <MobileNav view={view} onNavigate={navigate} onMore={() => setSidebarOpen(true)} />
-    {selectedJob && <JobDrawer key={`${selectedJob.id}:${selectedJob.archived}`} job={selectedJob} data={allData} now={careerClock} lifecyclePending={lifecycleLocked} onClose={() => setSelectedJobId(null)} onLifecycle={(intent) => requestLifecycleChange(intent)} onRefresh={requireRefresh} onOpenTask={openTask} onCompleteTask={completeTask} onAi={runAi} onSelectContact={(contactId) => { setSelectedJobId(null); setSelectedContactId(contactId); }} notify={notify} />}
-    {selectedInterview && <InterviewDrawer interview={selectedInterview} data={allData} onClose={() => setSelectedInterviewId(null)} onRefresh={requireRefresh} onAi={runAi} notify={notify} />}
+    {selectedJob && <JobDrawer key={`${selectedJob.id}:${selectedJob.archived}`} job={selectedJob} data={allData} now={careerClock} lifecyclePending={lifecycleLocked} coreBindings={coreBindings} coreWrites={coreWrites} onDirtyChange={(dirty) => setCoreEditorDirty(`job:${selectedJob.id}`, dirty)} onClose={() => setSelectedJobId(null)} onLifecycle={(intent) => requestLifecycleChange(intent)} onOpenTask={openTask} onCompleteTask={completeTask} onAi={runAi} onSelectContact={(contactId) => { if (coreDatabaseMutationLockedNow()) return; setSelectedJobId(null); setSelectedContactId(contactId); }} notify={notify} />}
+    {selectedInterview && <InterviewDrawer interview={selectedInterview} data={allData} coreBindings={coreBindings} coreWrites={coreWrites} onDirtyChange={(dirty) => setCoreEditorDirty(`interview:${selectedInterview.id}`, dirty)} onClose={() => setSelectedInterviewId(null)} onAi={runAi} notify={notify} />}
     {lifecycleDialog && <CareerLifecycleModal
       state={lifecycleDialog}
       busy={lifecycleBusy}
+      newWritesBlocked={coreWrites.databaseMutationLocked}
       onChoice={(choice) => setLifecycleDialog((current) => current?.phase === "decision" ? { ...current, choice, error: "" } : current)}
       onClose={() => {
         if (!lifecycleBusy && lifecycleDialog.phase === "decision") {
@@ -1773,10 +2099,13 @@ export default function CareerApp() {
       contactId={selectedContactId}
       revision={contactRevision}
       now={careerClock}
+      newWritesBlocked={coreWrites.databaseMutationLocked}
+      newWritesBlockedNow={coreDatabaseMutationLockedNow}
+      onExternalMutationChange={(active) => setExternalMutationClaim("contact-archive", active)}
       onClose={() => setSelectedContactId(null)}
-      onEdit={() => setContactEditorId(selectedContactId)}
-      onRecord={() => setContactAction({ kind: "interaction", contactId: selectedContactId })}
-      onAddTask={() => setContactAction({ kind: "task", contactId: selectedContactId })}
+      onEdit={() => { if (!coreDatabaseMutationLockedNow()) setContactEditorId(selectedContactId); }}
+      onRecord={() => { if (!coreDatabaseMutationLockedNow()) setContactAction({ kind: "interaction", contactId: selectedContactId }); }}
+      onAddTask={() => { if (!coreDatabaseMutationLockedNow()) setContactAction({ kind: "task", contactId: selectedContactId }); }}
       onOpenTask={openTask}
       onCompleteTask={completeTask}
       onRefresh={refreshContacts}
@@ -1794,13 +2123,16 @@ export default function CareerApp() {
       }}
       notify={notify}
     />}
-    {modal === "job" && <JobModal data={data} onClose={() => setModal(null)} onSaved={async (id) => { setModal(null); await requireRefresh(); setSelectedJobId(id); notify("职位已加入职迹"); }} />}
-    {modal === "task" && <TaskModal data={data} initialJobId={selectedJobId} onClose={() => { setModal(null); setSelectedJobId(null); }} onSaved={async () => { await refreshTasks(); setModal(null); setSelectedJobId(null); notify("待办已创建"); }} />}
-    {modal === "interview" && <InterviewModal data={data} onClose={() => setModal(null)} onSaved={async () => { setModal(null); await requireRefresh(); notify("面试轮次已安排"); }} />}
+    {modal === "job" && <JobModal data={data} coreBindings={coreBindings} coreWrites={coreWrites} onDirtyChange={(dirty) => setCoreEditorDirty("job:create", dirty)} onClose={() => setModal(null)} onSaved={(id) => { setModal(null); setSelectedJobId(id); }} notify={notify} />}
+    {modal === "task" && <TaskModal data={data} initialJobId={selectedJobId} newWritesBlocked={coreWrites.databaseMutationLocked} newWritesBlockedNow={coreDatabaseMutationLockedNow} onExternalMutationChange={(active) => setExternalMutationClaim("task-create", active)} onClose={() => { setModal(null); setSelectedJobId(null); }} onSaved={async () => { await refreshTasks(); setModal(null); setSelectedJobId(null); notify("待办已创建"); }} />}
+    {modal === "interview" && <InterviewModal data={data} coreBindings={coreBindings} coreWrites={coreWrites} onDirtyChange={(dirty) => setCoreEditorDirty("interview:create", dirty)} onClose={() => setModal(null)} onSaved={(id) => { setModal(null); setSelectedInterviewId(id); }} notify={notify} />}
     {modal === "material" && <MaterialModal
       data={data}
       initialRecovery={materialSaveRecoveryEntries[0] ?? null}
       otherRecoveryPending={materialSaveRecoveryEntries.length > (materialSaveRecoveryEntries[0] ? 1 : 0) || materialRecoveryUnreadableKeys.length > 0}
+      newWritesBlocked={coreWrites.databaseMutationLocked}
+      newWritesBlockedNow={coreDatabaseMutationLockedNow}
+      onExternalMutationChange={(active) => setExternalMutationClaim("material-save", active)}
       onRecoveryUpsert={persistMaterialSaveRecovery}
       onRecoveryClear={clearMaterialSaveRecovery}
       onClose={closeMaterialModal}
@@ -1808,13 +2140,16 @@ export default function CareerApp() {
       onRefresh={refreshMaterials}
       notify={notify}
     />}
-    {materialRemoval && <MaterialDeletionModal material={materialRemoval} onClose={closeMaterialRemoval} onStaleClose={closeRemovalWithStaleList} onRefresh={refreshMaterials} notify={notify} />}
-    {modal === "import" && <CareerImportModal data={allData} initialCapture={importInitial} onClose={closeCareerImport} onRefresh={requireRefresh} notify={notify} />}
-    {searchOpen && <CommandPalette data={data} onClose={() => setSearchOpen(false)} onNavigate={navigate} onSelectJob={(id) => { setSearchOpen(false); setSelectedJobId(id); }} onAdd={() => { setSearchOpen(false); setModal("job"); }} />}
+    {materialRemoval && <MaterialDeletionModal material={materialRemoval} newWritesBlocked={coreWrites.databaseMutationLocked} newWritesBlockedNow={coreDatabaseMutationLockedNow} onExternalMutationChange={(active) => setExternalMutationClaim("material-delete", active)} onClose={closeMaterialRemoval} onStaleClose={closeRemovalWithStaleList} onRefresh={refreshMaterials} notify={notify} />}
+    {modal === "import" && <CareerImportModal data={allData} initialCapture={importInitial} newWritesBlocked={coreWrites.databaseMutationLocked} newWritesBlockedNow={coreDatabaseMutationLockedNow} onExternalMutationChange={(active) => setExternalMutationClaim("career-import", active)} onClose={closeCareerImport} onRefresh={requireRefresh} notify={notify} />}
+    {searchOpen && <CommandPalette data={data} onClose={() => setSearchOpen(false)} onNavigate={navigate} onSelectJob={(id) => { setSearchOpen(false); setSelectedJobId(id); }} onAdd={() => { setSearchOpen(false); openJobCreation(); }} />}
     {contactEditorId !== undefined && <ContactModal
       contactId={contactEditorId}
       data={data}
       externalHint={contactDataHint}
+      newWritesBlocked={coreWrites.databaseMutationLocked}
+      newWritesBlockedNow={coreDatabaseMutationLockedNow}
+      onExternalMutationChange={(active) => setExternalMutationClaim("contact-save", active)}
       onClose={() => setContactEditorId(undefined)}
       onRefresh={refreshContacts}
       onSaved={(id) => {
@@ -1828,6 +2163,9 @@ export default function CareerApp() {
       contactId={contactAction.contactId}
       data={data}
       externalHint={contactDataHint}
+      newWritesBlocked={coreWrites.databaseMutationLocked}
+      newWritesBlockedNow={coreDatabaseMutationLockedNow}
+      onExternalMutationChange={(active) => setExternalMutationClaim("contact-interaction", active)}
       onClose={() => setContactAction(null)}
       onRefresh={refreshContacts}
       onSaved={() => {
@@ -1840,6 +2178,9 @@ export default function CareerApp() {
       contactId={contactAction.contactId}
       data={data}
       externalHint={contactDataHint}
+      newWritesBlocked={coreWrites.databaseMutationLocked}
+      newWritesBlockedNow={coreDatabaseMutationLockedNow}
+      onExternalMutationChange={(active) => setExternalMutationClaim("contact-task", active)}
       onClose={() => setContactAction(null)}
       onRefresh={refreshTasks}
       onSaved={() => {
@@ -1852,6 +2193,9 @@ export default function CareerApp() {
       key={taskSheet.nonce}
       request={taskSheet}
       now={careerClock}
+      externalWriteLocked={coreWrites.databaseMutationLocked}
+      externalWriteLockedNow={coreDatabaseMutationLockedNow}
+      onExternalMutationChange={(active) => setExternalMutationClaim("task-detail", active)}
       onClose={() => setTaskSheet(null)}
       onRefresh={refreshTasks}
       notify={notify}
@@ -1872,6 +2216,7 @@ export default function CareerApp() {
       } : undefined}
       applyLabel={aiState.applyLabel}
     />}
+    {historyExitPrompt && <Modal title="放弃未保存的职迹输入？" description="浏览器返回不会替你保存当前表单。" onClose={() => undefined} dismissible={false} inertToasts><div className="career-draft-choice career-history-exit"><p>继续编辑是安全的默认选择。只有明确放弃，才会离开并让下一次打开重新读取资料。</p><div><button type="button" className="career-button primary" data-dialog-initial onClick={stayAfterHistoryExit}>继续编辑</button><button type="button" className="career-button danger" disabled={coreWrites.hasVolatileWork} onClick={abandonDirtyEditorsAndContinueHistory}>放弃输入并返回</button></div></div></Modal>}
     <div className="career-toast-stack" aria-live="polite">{contactUndo && <button className="career-toast undo career-contact-undo" disabled={contactUndo.phase === "writing"} onClick={() => void handleContactUndo()} aria-label={contactUndo.phase === "refresh-only" ? `核对恢复「${contactUndo.name}」` : `撤销归档「${contactUndo.name}」`}>{contactUndo.phase === "writing" ? <LoaderCircle className="spin" size={16} /> : <RotateCcw size={16} />}<span>{contactUndo.message}</span> <b>{contactUndo.phase === "refresh-only" ? "只读核对" : contactUndo.phase === "writing" ? "请稍候" : "撤销"}</b></button>}{undo && <button className="career-toast undo" onClick={handleUndo}><RotateCcw size={16} />阶段已更新 <b>撤销</b></button>}{notices.map((notice) => <div className={`career-toast ${notice.tone}`} key={notice.id}>{notice.tone === "success" ? <Check size={16} /> : notice.tone === "error" ? <X size={16} /> : <Bell size={16} />}{notice.text}</div>)}</div>
   </main>;
 }
@@ -1888,8 +2233,8 @@ function Sidebar({ sidebarRef, view, open, mobile, onNavigate, onClose }: { side
   </aside></>;
 }
 
-function Topbar({ title, query, menuOpen, onQuery, onSearch, onMenu, onAdd, onSettings }: { title: string; query: string; menuOpen: boolean; onQuery: (value: string) => void; onSearch: () => void; onMenu: () => void; onAdd: () => void; onSettings: () => void }) {
-  return <header className="career-topbar"><div className="career-topbar-title"><button className="career-icon-button mobile-only" onClick={onMenu} aria-label="打开导航" aria-expanded={menuOpen} aria-controls="career-sidebar"><Menu size={20} /></button><h1 id="career-page-title" tabIndex={-1}>{title}</h1></div><div className="career-topbar-actions"><label className="career-search"><Search size={16} /><input value={query} onChange={(event) => onQuery(event.target.value)} placeholder="搜索职位、公司、标签" aria-label="搜索" /><kbd>⌘ K</kbd></label><button className="career-icon-button command-compact" onClick={onSearch} aria-label="打开搜索"><Search size={18} /></button><button className="career-button primary" onClick={onAdd}><Plus size={17} />记录职位</button><button className="career-avatar" aria-label="个人设置" onClick={onSettings}>FK<span /></button></div></header>;
+function Topbar({ title, query, menuOpen, addLocked, onQuery, onSearch, onMenu, onAdd, onSettings }: { title: string; query: string; menuOpen: boolean; addLocked: boolean; onQuery: (value: string) => void; onSearch: () => void; onMenu: () => void; onAdd: () => void; onSettings: () => void }) {
+  return <header className="career-topbar"><div className="career-topbar-title"><button className="career-icon-button mobile-only" onClick={onMenu} aria-label="打开导航" aria-expanded={menuOpen} aria-controls="career-sidebar"><Menu size={20} /></button><h1 id="career-page-title" tabIndex={-1}>{title}</h1></div><div className="career-topbar-actions"><label className="career-search"><Search size={16} /><input value={query} onChange={(event) => onQuery(event.target.value)} placeholder="搜索职位、公司、标签" aria-label="搜索" /><kbd>⌘ K</kbd></label><button className="career-icon-button command-compact" onClick={onSearch} aria-label="打开搜索"><Search size={18} /></button><button className="career-button primary" data-career-core-focus disabled={addLocked} onClick={onAdd}><Plus size={17} />记录职位</button><button className="career-avatar" aria-label="个人设置" onClick={onSettings}>FK<span /></button></div></header>;
 }
 
 function MobileNav({ view, onNavigate, onMore }: { view: CareerView; onNavigate: (view: CareerView) => void; onMore: () => void }) {
@@ -2132,9 +2477,10 @@ function careerMaterialFileDetails(fileName: string, byteSize: number | null | u
   return `${fileName} · ${kilobytes >= 10 ? Math.round(kilobytes) : Number(kilobytes.toFixed(1))} KB`;
 }
 
-function MaterialsView({ data, stale, refreshBusy, recoveryLoaded, recoveryCount, recoveryUnreadable, recoveryStorageUnavailable, onRefresh, onAdd, onRecover, onClearUnreadable, onRetryRecoveryStorage, onRemove, notify }: { data: CareerData; stale: boolean; refreshBusy: boolean; recoveryLoaded: boolean; recoveryCount: number; recoveryUnreadable: boolean; recoveryStorageUnavailable: boolean; onRefresh: () => Promise<void>; onAdd: () => void; onRecover: () => void; onClearUnreadable: () => void; onRetryRecoveryStorage: () => void; onRemove: (material: Material, opener: HTMLButtonElement) => void; notify: (text: string, tone?: Notice["tone"]) => void }) {
+function MaterialsView({ data, stale, refreshBusy, recoveryLoaded, recoveryCount, recoveryUnreadable, recoveryStorageUnavailable, newWritesLocked, onRefresh, onAdd, onRecover, onClearUnreadable, onRetryRecoveryStorage, onRemove, notify }: { data: CareerData; stale: boolean; refreshBusy: boolean; recoveryLoaded: boolean; recoveryCount: number; recoveryUnreadable: boolean; recoveryStorageUnavailable: boolean; newWritesLocked: boolean; onRefresh: () => Promise<void>; onAdd: () => void; onRecover: () => void; onClearUnreadable: () => void; onRetryRecoveryStorage: () => void; onRemove: (material: Material, opener: HTMLButtonElement) => void; notify: (text: string, tone?: Notice["tone"]) => void }) {
   const recoveryLocked = !recoveryLoaded || recoveryCount > 0 || recoveryUnreadable || recoveryStorageUnavailable;
   const actionsLocked = stale || recoveryLocked;
+  const newActionsLocked = actionsLocked || newWritesLocked;
   async function openFile(fileKey: string) {
     try {
       const object = await createLocalFileObjectUrl("career", fileKey);
@@ -2150,7 +2496,7 @@ function MaterialsView({ data, stale, refreshBusy, recoveryLoaded, recoveryCount
     }
   }
   return <div className="career-view">
-    <SectionHeading eyebrow="MATERIALS" title="求职材料" description="保留每一个版本，也记住哪一份发给了谁" action={<button className="career-button primary" data-material-add disabled={actionsLocked} onClick={onAdd}><Plus size={16} />添加材料</button>} />
+    <SectionHeading eyebrow="MATERIALS" title="求职材料" description="保留每一个版本，也记住哪一份发给了谁" action={<button className="career-button primary" data-material-add disabled={newActionsLocked} onClick={onAdd}><Plus size={16} />添加材料</button>} />
     {stale && <div className="career-material-stale" role="status"><ShieldCheck size={20} /><div><b>材料列表需要重新读取</b><p>刚才的本机操作可能已完成；在读取最新状态前，材料按钮会暂时停用，避免重复保存或移除。</p></div><button className="career-button primary" data-material-refresh disabled={refreshBusy} onClick={() => { void onRefresh().catch(() => notify("材料列表暂时没有读到最新状态；不会重复保存或移除。", "error")); }}>{refreshBusy ? <LoaderCircle className="spin" size={16} /> : <RotateCcw size={16} />}{refreshBusy ? "正在读取…" : "重新读取"}</button></div>}
     {!stale && !recoveryLoaded && <div className="career-material-recovery-banner" role="status"><LoaderCircle className="spin" size={20} /><div><b>正在核对附件收尾记录</b><p>核对完成前先不开放新附件，避免重复写入。</p></div></div>}
     {!stale && recoveryLoaded && recoveryCount > 0 && <div className="career-material-recovery-banner" role="status"><ShieldCheck size={20} /><div><b>有材料保存需要继续核对</b><p>{recoveryStorageUnavailable ? "这条核对线索目前只留在本次打开的页面；刷新前请先继续收尾。" : "先把已有保存核对清楚，再开放新的附件；不会重复上传或盲目删除原件。"}</p></div><button className="career-button primary" data-material-recover onClick={onRecover}><RotateCcw size={16} />继续核对与收尾</button></div>}
@@ -2174,12 +2520,12 @@ function MaterialsView({ data, stale, refreshBusy, recoveryLoaded, recoveryCount
               ? <button className="career-button secondary" disabled={actionsLocked} onClick={(event) => onRemove(material, event.currentTarget)}><RotateCcw size={15} />继续收尾</button>
               : <>{material.file_key
                 ? <button className="career-icon-button" disabled={stale} onClick={() => void openFile(material.file_key!)} aria-label={`打开 ${material.file_name ?? material.name}`}><Download size={17} /></button>
-                : <button className="career-button ghost" disabled={actionsLocked} onClick={onAdd}>新建带附件版本</button>}
-                <button className="career-icon-button danger" disabled={actionsLocked} onClick={(event) => onRemove(material, event.currentTarget)} aria-label={`移除 ${material.name}`}><Trash2 size={16} /></button></>}
+                : <button className="career-button ghost" disabled={newActionsLocked} onClick={onAdd}>新建带附件版本</button>}
+                <button className="career-icon-button danger" disabled={newActionsLocked} onClick={(event) => onRemove(material, event.currentTarget)} aria-label={`移除 ${material.name}`}><Trash2 size={16} /></button></>}
           </div>
         </article>;
       })}
-      {!stale && !recoveryLocked && data.materials.length === 0 && <EmptyState icon={<FileText />} title="还没有材料版本" text="需要保存一份真实材料时再添加；空白不会影响其他求职记录。" action={<button className="career-button primary" data-material-add onClick={onAdd}>添加第一份材料</button>} />}
+      {!stale && !recoveryLocked && data.materials.length === 0 && <EmptyState icon={<FileText />} title="还没有材料版本" text="需要保存一份真实材料时再添加；空白不会影响其他求职记录。" action={<button className="career-button primary" data-material-add disabled={newWritesLocked} onClick={onAdd}>添加第一份材料</button>} />}
     </div>
   </div>;
 }
@@ -2228,13 +2574,23 @@ function AnalyticsView({ data, now }: { data: CareerData; now: number }) {
   </div>;
 }
 
-function SettingsView({ data, onRefresh, onExport, notify }: {
+function SettingsView({ data, coreBindings, coreWrites, onDirtyChange, newDatabaseWritesLocked, newDatabaseWritesLockedNow, onExternalMutationChange, onRefresh, onExport, notify }: {
   data: CareerData;
+  coreBindings: CareerCoreBindings;
+  coreWrites: CareerCoreWriteController;
+  onDirtyChange: (dirty: boolean) => void;
+  newDatabaseWritesLocked: boolean;
+  newDatabaseWritesLockedNow: () => boolean;
+  onExternalMutationChange: (active: boolean) => void;
   onRefresh: () => Promise<void>;
   onExport: () => Promise<void>;
   notify: (text: string, tone?: Notice["tone"]) => void;
 }) {
   const [savingStage, setSavingStage] = useState<string | null>(null);
+  const [activeStageOperation, setActiveStageOperation] = useState<Readonly<{
+    operationId: string;
+    stageId: string;
+  }> | null>(null);
   const [exportBusy, setExportBusy] = useState(false);
   const [backupPrepareStopping, setBackupPrepareStopping] = useState(false);
   const [backupFlow, setBackupFlow] = useState<CareerBackupFlow>({ phase: "idle" });
@@ -2252,6 +2608,17 @@ function SettingsView({ data, onRefresh, onExport, notify }: {
   const backupFileInputRef = useRef<HTMLInputElement>(null);
   const backupPickerButtonRef = useRef<HTMLButtonElement>(null);
   const durableBackupRecoveryKeysRef = useRef<Set<string>>(new Set());
+  const dirtyStageIdsRef = useRef(new Set<string>());
+  const stageDirtyChangeRef = useRef(onDirtyChange);
+
+  useLayoutEffect(() => { stageDirtyChangeRef.current = onDirtyChange; }, [onDirtyChange]);
+  useEffect(() => () => stageDirtyChangeRef.current(false), []);
+
+  function setStageDraftDirty(stageId: string, dirty: boolean) {
+    if (dirty) dirtyStageIdsRef.current.add(stageId);
+    else dirtyStageIdsRef.current.delete(stageId);
+    stageDirtyChangeRef.current(dirtyStageIdsRef.current.size > 0);
+  }
 
   const reloadBackupRecoveries = useCallback(() => {
     const result = readCareerBackupRecoveryStorage();
@@ -2281,6 +2648,11 @@ function SettingsView({ data, onRefresh, onExport, notify }: {
     backupFlow.phase === "activating" || backupFlow.phase === "discarding" || backupFlow.phase === "cleaning";
   const backupWriteLocked = !backupRecoveryLoaded || backupFlowBusy || Boolean(activeBackupRecovery) ||
     backupRecoveryUnreadableKeys.length > 0 || backupStorageNeedsAttention;
+
+  useLayoutEffect(() => {
+    onExternalMutationChange(backupFlowBusy || exportBusy);
+    return () => onExternalMutationChange(false);
+  }, [backupFlowBusy, exportBusy, onExternalMutationChange]);
 
   const persistBackupRecovery = useCallback((ticket: CareerBackupRecoveryTicket) => {
     const storageKey = careerBackupRecoveryStorageKey(ticket);
@@ -2389,12 +2761,45 @@ function SettingsView({ data, onRefresh, onExport, notify }: {
     return () => { active = false; };
   }, []);
 
-  async function rename(stage: Stage, name: string) {
-    if (!name.trim() || name === stage.name) return;
+  async function rename(stage: Stage, name: string, trigger: HTMLInputElement) {
+    const nextName = name.trim();
+    if (!nextName) {
+      setStageDraftDirty(stage.id, true);
+      return;
+    }
+    if (nextName === stage.name) {
+      setStageDraftDirty(stage.id, false);
+      return;
+    }
+    const expected = getBoundCareerStageExpected(coreBindings, stage);
+    if (!expected || coreWrites.writeLocked) {
+      notify("阶段资料不是当前可写版本；输入仍保留，请先重新读取。", "info");
+      return;
+    }
     setSavingStage(stage.id);
     try {
-      await runCareerSql("UPDATE career_stages SET name = ? WHERE id = ?", [name.trim(), stage.id]);
-      await onRefresh();
+      await coreWrites.submitStageRename(nextName, expected, trigger, {
+        onPrepared: (receipt) => setActiveStageOperation({
+          operationId: receipt.operationId,
+          stageId: stage.id,
+        }),
+        onSettled: ({ outcome, receipt }) => {
+          setActiveStageOperation((current) =>
+            current?.operationId === receipt.operationId ? null : current);
+          if (outcome === "saved" && receipt.kind === "stage-rename") {
+            trigger.value = receipt.after.stage.name;
+            setStageDraftDirty(stage.id, false);
+          } else if (outcome === "changed") {
+            notify("阶段已在别处变化；你的输入仍保留，没有覆盖当前名称。", "info");
+          }
+        },
+        onAbandonChanged: (receipt) => {
+          if (receipt.kind !== "stage-rename" || receipt.after.stage.id !== stage.id) return;
+          trigger.value = stage.name;
+          setStageDraftDirty(stage.id, false);
+          setActiveStageOperation(null);
+        },
+      });
     } finally {
       setSavingStage(null);
     }
@@ -2414,9 +2819,14 @@ function SettingsView({ data, onRefresh, onExport, notify }: {
   }
 
   async function exportBackup() {
+    if (newDatabaseWritesLockedNow()) {
+      notify("先处理当前核心保存或核对提醒，再开始新的备份导出。", "info");
+      return;
+    }
+    onExternalMutationChange(true);
     setExportBusy(true);
     try { await onExport(); }
-    finally { setExportBusy(false); }
+    finally { setExportBusy(false); onExternalMutationChange(false); }
   }
 
   function candidateTicket(receipt: CareerRestoreReceipt, mode: CareerBackupCandidateMode): CareerBackupRecoveryTicket {
@@ -2457,6 +2867,7 @@ function SettingsView({ data, onRefresh, onExport, notify }: {
     if (entry.ticket.kind !== "candidate") return;
     const { receipt, mode } = entry.ticket;
     backupOperationRef.current = true;
+    onExternalMutationChange(true);
     setBackupFlow({ phase: "checking", title: "正在核对当前版本", text: "只读取版本状态，不会再次启用或删除候选。" });
     try {
       const inspection = await inspectCareerRestoreActivation(receipt);
@@ -2489,12 +2900,14 @@ function SettingsView({ data, onRefresh, onExport, notify }: {
       }
     } finally {
       backupOperationRef.current = false;
+      onExternalMutationChange(false);
     }
   }
 
   async function recoverPreparation(entry: CareerBackupRecoveryEntry) {
     if (entry.ticket.kind !== "prepare") return;
     backupOperationRef.current = true;
+    onExternalMutationChange(true);
     setBackupFlow({ phase: "checking", title: "正在继续核对", text: "沿用上次留下的核对信息，不会重新读取或写入备份文件。" });
     try {
       const recovered = await recoverCareerBackupPrepare(entry.ticket.receipt);
@@ -2528,6 +2941,7 @@ function SettingsView({ data, onRefresh, onExport, notify }: {
       }
     } finally {
       backupOperationRef.current = false;
+      onExternalMutationChange(false);
     }
   }
 
@@ -2559,9 +2973,10 @@ function SettingsView({ data, onRefresh, onExport, notify }: {
   }, [activeBackupRecovery, backupFlow.phase, backupRecoveryLoaded]);
 
   async function prepareSelectedBackup(file: File) {
-    if (backupWriteLocked || backupOperationRef.current) return;
+    if (backupWriteLocked || backupOperationRef.current || newDatabaseWritesLockedNow()) return;
     allowInitialBackupResumeRef.current = false;
     backupOperationRef.current = true;
+    onExternalMutationChange(true);
     const controller = new AbortController();
     backupPrepareControllerRef.current = controller;
     setBackupPrepareStopping(false);
@@ -2611,6 +3026,7 @@ function SettingsView({ data, onRefresh, onExport, notify }: {
       if (backupPrepareControllerRef.current === controller) backupPrepareControllerRef.current = null;
       setBackupPrepareStopping(false);
       backupOperationRef.current = false;
+      onExternalMutationChange(false);
     }
   }
 
@@ -2621,13 +3037,14 @@ function SettingsView({ data, onRefresh, onExport, notify }: {
   }
 
   async function activateCandidate(receipt: CareerRestoreReceipt) {
-    if (backupOperationRef.current) return;
+    if (backupOperationRef.current || newDatabaseWritesLockedNow()) return;
     const checkingTicket = candidateTicket(receipt, "activation-check");
     if (!persistBackupRecovery(checkingTicket)) {
       setBackupFlow({ phase: "activation-check", receipt, message: "当前网址的浏览器存储暂时不能保存继续信息，因此没有启用。恢复存储后，只会先核对当前版本。" });
       return;
     }
     backupOperationRef.current = true;
+    onExternalMutationChange(true);
     setBackupFlow({ phase: "activating", receipt });
     try {
       await activatePreparedCareerRestore(receipt);
@@ -2644,6 +3061,7 @@ function SettingsView({ data, onRefresh, onExport, notify }: {
       }
     } finally {
       backupOperationRef.current = false;
+      onExternalMutationChange(false);
     }
   }
 
@@ -2655,6 +3073,7 @@ function SettingsView({ data, onRefresh, onExport, notify }: {
       return;
     }
     backupOperationRef.current = true;
+    onExternalMutationChange(true);
     setBackupFlow({ phase: "discarding", receipt });
     try {
       const discarded = await discardPreparedCareerRestore(receipt);
@@ -2679,12 +3098,14 @@ function SettingsView({ data, onRefresh, onExport, notify }: {
       }
     } finally {
       backupOperationRef.current = false;
+      onExternalMutationChange(false);
     }
   }
 
   async function cleanPreparedAttachments(receipt: CareerPrepareCleanupReceipt) {
     if (backupOperationRef.current) return;
     backupOperationRef.current = true;
+    onExternalMutationChange(true);
     setBackupFlow({ phase: "cleaning", receipt });
     try {
       await retryCareerPrepareCleanup(receipt);
@@ -2700,6 +3121,7 @@ function SettingsView({ data, onRefresh, onExport, notify }: {
       setBackupFlow({ phase: "prepare-cleanup", receipt, message: "临时内容暂时没有全部收尾。当前职迹没有改变，稍后继续即可。" });
     } finally {
       backupOperationRef.current = false;
+      onExternalMutationChange(false);
     }
   }
 
@@ -2775,7 +3197,7 @@ function SettingsView({ data, onRefresh, onExport, notify }: {
         {renderBackupSummary(backupFlow.receipt.summary)}
         {backupFlow.receipt.summary.kind === "legacy-career-sqlite" && <p className="career-backup-calm-note">旧版数据库不带材料原件；启用后会清空旧附件索引，避免显示并不存在的原件。</p>}
         <p className="career-backup-calm-note">当前职迹此刻还没有改变。只有你选择“启用这份备份”后，才会切换。</p>
-        <footer><button className="career-button ghost" onClick={() => void discardCandidate(backupFlow.receipt)}>暂不使用</button><button className="career-button primary" data-backup-initial onClick={() => void activateCandidate(backupFlow.receipt)}>启用这份备份</button></footer>
+        <footer><button className="career-button ghost" onClick={() => void discardCandidate(backupFlow.receipt)}>暂不使用</button><button className="career-button primary" data-backup-initial disabled={newDatabaseWritesLocked} onClick={() => void activateCandidate(backupFlow.receipt)}>启用这份备份</button></footer>
       </>}
       {backupFlow.phase === "activating" && <p>候选已经通过核对。这里只执行一次版本切换，完成后再单独刷新页面资料。</p>}
       {backupFlow.phase === "activation-check" && <><p>{backupFlow.message}</p><footer><button className="career-button primary" onClick={() => { const entry: CareerBackupRecoveryEntry = { storageKey: careerBackupRecoveryStorageKey(candidateTicket(backupFlow.receipt, "activation-check")), ticket: candidateTicket(backupFlow.receipt, "activation-check"), persisted: true }; void inspectCandidate(entry); }}>只核对当前版本</button></footer></>}
@@ -2793,14 +3215,14 @@ function SettingsView({ data, onRefresh, onExport, notify }: {
     <div className="career-settings-layout">
       <nav><a href="#workflow">求职流程</a><a href="#privacy">AI 与隐私</a><a href="#data">数据与备份</a><a href="#capture">浏览器采集器</a></nav>
       <div>
-        <section className="career-settings-card" id="workflow"><header><div><h3>看板阶段</h3><p>按你的求职习惯调整名称，工作台会保持一致。</p></div></header><div className="career-stage-settings">{data.stages.map((stage) => <label key={stage.id}><i style={{ background: stage.color }} /><input defaultValue={stage.name} onBlur={(event) => void rename(stage, event.target.value)} aria-label={`${stage.name}阶段名称`} /><span>{savingStage === stage.id ? <LoaderCircle className="spin" size={14} /> : stage.is_terminal ? "终态" : "进行中"}</span></label>)}</div></section>
+        <section className="career-settings-card" id="workflow"><header><div><h3>看板阶段</h3><p>按你的求职习惯调整名称，工作台会保持一致。</p></div></header><div className="career-stage-settings">{data.stages.map((stage) => <label key={stage.id}><i style={{ background: stage.color }} /><input defaultValue={stage.name} disabled={coreWrites.writeLocked || savingStage === stage.id || activeStageOperation?.stageId === stage.id} onChange={(event) => setStageDraftDirty(stage.id, event.target.value.trim() !== stage.name)} onBlur={(event) => void rename(stage, event.target.value, event.currentTarget)} aria-label={`${stage.name}阶段名称`} /><span>{savingStage === stage.id || activeStageOperation?.stageId === stage.id ? <LoaderCircle className="spin" size={14} /> : stage.is_terminal ? "终态" : "进行中"}</span></label>)}</div><CareerCoreEditorRecovery coreWrites={coreWrites} /></section>
         <section className="career-settings-card" id="privacy"><header><div><h3>AI 与隐私</h3><p>只有你主动使用 AI 时，所选内容才会发送至配置的服务。</p></div><span className={aiHealth.status === "configured" ? "career-status-good" : "career-status-neutral"} aria-live="polite"><i />{aiStatusLabel}</span></header><div className="career-setting-row"><span><b>当前模型</b><small>由服务器环境安全配置</small></span><code>{aiHealth.model || "DeepSeek"}</code></div><div className="career-setting-row"><span><b>结果保留方式</b><small>关闭预览不会自动保存，也不会留下隐藏副本</small></span><code>核对后复制或填入草稿</code></div><div className="career-privacy-note"><ShieldCheck size={18} /><p>API 密钥不会进入浏览器、本地数据库或备份。职位描述和面试笔记会被当作不可信数据处理。</p></div></section>
         <section className="career-settings-card career-backup-card" id="data">
           <header><div><h3>数据与备份</h3><p>一个文件带走结构化职迹与已关联的材料原件。</p></div></header>
           <div className="career-data-actions">
-            <button disabled={exportBusy || backupWriteLocked} onClick={() => void exportBackup()}><span>{exportBusy ? <LoaderCircle className="spin" size={19} /> : <Download size={19} />}</span><div><b>{exportBusy ? "正在校验并打包…" : "导出完整备份"}</b><small>SQLite、简历、作品集与案例附件</small></div><ChevronRight size={17} /></button>
-            <button ref={backupPickerButtonRef} type="button" disabled={backupWriteLocked || exportBusy} onClick={() => backupFileInputRef.current?.click()}><span>{backupFlow.phase === "preparing" ? <LoaderCircle className="spin" size={19} /> : <Upload size={19} />}</span><div><b>选择备份并核对</b><small>先识别与验证，确认前不会切换</small></div><ChevronRight size={17} /></button>
-            <input ref={backupFileInputRef} hidden aria-label="选择要核对的职迹备份" disabled={backupWriteLocked || exportBusy} type="file" accept=".career-backup,.sqlite,.sqlite3,.db,application/x-sqlite3,application/octet-stream" onChange={(event) => { const file = event.target.files?.[0]; event.currentTarget.value = ""; if (file) void prepareSelectedBackup(file); }} />
+            <button disabled={exportBusy || backupWriteLocked || newDatabaseWritesLocked} onClick={() => void exportBackup()}><span>{exportBusy ? <LoaderCircle className="spin" size={19} /> : <Download size={19} />}</span><div><b>{exportBusy ? "正在校验并打包…" : "导出完整备份"}</b><small>SQLite、简历、作品集与案例附件</small></div><ChevronRight size={17} /></button>
+            <button ref={backupPickerButtonRef} type="button" disabled={backupWriteLocked || exportBusy || newDatabaseWritesLocked} onClick={() => backupFileInputRef.current?.click()}><span>{backupFlow.phase === "preparing" ? <LoaderCircle className="spin" size={19} /> : <Upload size={19} />}</span><div><b>选择备份并核对</b><small>先识别与验证，确认前不会切换</small></div><ChevronRight size={17} /></button>
+            <input ref={backupFileInputRef} hidden aria-label="选择要核对的职迹备份" disabled={backupWriteLocked || exportBusy || newDatabaseWritesLocked} type="file" accept=".career-backup,.sqlite,.sqlite3,.db,application/x-sqlite3,application/octet-stream" onChange={(event) => { const file = event.target.files?.[0]; event.currentTarget.value = ""; if (file) void prepareSelectedBackup(file); }} />
           </div>
           {!backupRecoveryLoaded && <p className="career-backup-quiet-status" role="status"><LoaderCircle className="spin" size={15} />正在查看是否有上次未完成的核对</p>}
           {backupRecoveryEntries.length > 1 && <p className="career-backup-quiet-status" role="status"><ShieldCheck size={15} />还有 {backupRecoveryEntries.length} 次独立恢复需要依次确认；每次只处理自己的候选。</p>}
@@ -2831,9 +3253,12 @@ type CareerTaskSheetPhase = "idle" | "loading" | "ready" | "writing" | "refreshi
 type CareerTaskSheetMode = "summary" | "schedule" | "restore" | "cancel-confirm";
 type CareerTaskDueChoice = "later" | "new" | "original" | null;
 
-function TaskDetailSheet({ request, now, onClose, onRefresh, notify }: {
+function TaskDetailSheet({ request, now, externalWriteLocked, externalWriteLockedNow, onExternalMutationChange, onClose, onRefresh, notify }: {
   request: CareerTaskSheetRequest;
   now: number;
+  externalWriteLocked: boolean;
+  externalWriteLockedNow: () => boolean;
+  onExternalMutationChange: (active: boolean) => void;
   onClose: () => void;
   onRefresh: () => Promise<void>;
   notify: (text: string, tone?: Notice["tone"]) => void;
@@ -2907,13 +3332,19 @@ function TaskDetailSheet({ request, now, onClose, onRefresh, notify }: {
 
   async function finishMutation(action: () => Promise<unknown>, successMessage: string) {
     if (!detail || writeRef.current) return;
+    if (externalWriteLockedNow()) {
+      setMessage("先处理当前核心保存或核对提醒；没有开始更改待办。");
+      return;
+    }
     writeRef.current = true;
+    onExternalMutationChange(true);
     setPhase("writing");
     setMessage("");
     try {
       await action();
     } catch (error) {
       writeRef.current = false;
+      onExternalMutationChange(false);
       if (error instanceof CareerTaskError && error.code === "changed") {
         setPhase("stale");
         setMessage("这条待办刚在另一个页面发生了变化。这里没有继续保存。");
@@ -2939,7 +3370,10 @@ function TaskDetailSheet({ request, now, onClose, onRefresh, notify }: {
     } catch {
       setPhase("refresh-only");
       setMessage("更改已保存在本机，画面还没有重新读取。请只重新读取，不要重复提交。");
-    } finally { writeRef.current = false; }
+    } finally {
+      writeRef.current = false;
+      onExternalMutationChange(false);
+    }
   }
 
   async function retryRefreshOnly() {
@@ -3016,12 +3450,12 @@ function TaskDetailSheet({ request, now, onClose, onRefresh, notify }: {
         {lifecyclePaused && <div className="career-task-context"><Archive size={16} /><span><b>随职位暂停</b><small>{task.cancellation_reason === "job_archived" ? "这条安排随职位归档而暂停，记录仍完整保留。" : "这条安排随职位结束而暂停，记录仍完整保留。"}</small></span></div>}
         {mode === "summary" && phase !== "stale" && <div className="career-task-actions">
           {!taskVersion && <p className="career-task-blocked">这条记录缺少可确认的版本，请先查看最新状态。</p>}
-          {task.status === "todo" && taskVersion && <><button className="career-button primary" disabled={busy} onClick={() => void finishMutation(() => careerTaskActions.complete(task.id, { expectedUpdatedAt: taskVersion, operationId: `task_complete_${crypto.randomUUID()}` }), "待办已完成")}><Check size={16} />标记为已完成</button><button className="career-button secondary" disabled={busy} onClick={() => { setDueChoice(null); setNewDueAt(""); setMode("schedule"); }}><CalendarDays size={16} />调整安排</button>{task.due_at && <button className="career-button ghost" disabled={busy} onClick={() => void finishMutation(() => careerTaskActions.reschedule(task.id, { expectedUpdatedAt: taskVersion, dueAt: null, operationId: `task_later_${crypto.randomUUID()}` }), "已放到“以后再说”")}>以后再说</button>}<button className="career-button ghost" disabled={busy} onClick={() => setMode("cancel-confirm")}>放下这条待办</button></>}
-          {(task.status === "done" || task.status === "canceled") && taskVersion && !restoreBlockedCopy && (task.status === "done" || detail?.canRestoreWithNewDueAt) && <button className="career-button primary" disabled={busy} onClick={() => { setDueChoice(null); setNewDueAt(""); setMode("restore"); }}><RotateCcw size={16} />重新放回待办</button>}
+          {task.status === "todo" && taskVersion && <><button className="career-button primary" disabled={busy || externalWriteLocked} onClick={() => void finishMutation(() => careerTaskActions.complete(task.id, { expectedUpdatedAt: taskVersion, operationId: `task_complete_${crypto.randomUUID()}` }), "待办已完成")}><Check size={16} />标记为已完成</button><button className="career-button secondary" disabled={busy || externalWriteLocked} onClick={() => { setDueChoice(null); setNewDueAt(""); setMode("schedule"); }}><CalendarDays size={16} />调整安排</button>{task.due_at && <button className="career-button ghost" disabled={busy || externalWriteLocked} onClick={() => void finishMutation(() => careerTaskActions.reschedule(task.id, { expectedUpdatedAt: taskVersion, dueAt: null, operationId: `task_later_${crypto.randomUUID()}` }), "已放到“以后再说”")}>以后再说</button>}<button className="career-button ghost" disabled={busy || externalWriteLocked} onClick={() => setMode("cancel-confirm")}>放下这条待办</button></>}
+          {(task.status === "done" || task.status === "canceled") && taskVersion && !restoreBlockedCopy && (task.status === "done" || detail?.canRestoreWithNewDueAt) && <button className="career-button primary" disabled={busy || externalWriteLocked} onClick={() => { setDueChoice(null); setNewDueAt(""); setMode("restore"); }}><RotateCcw size={16} />重新放回待办</button>}
           {restoreBlockedCopy && <p className="career-task-blocked">{restoreBlockedCopy}</p>}
         </div>}
-        {(mode === "schedule" || mode === "restore") && <section className="career-task-due-choice"><header><h3>{mode === "restore" ? "重新放回待办" : "调整安排"}</h3><p>{mode === "restore" && task.due_at && !originalFuture ? "原计划时间已经过去。请选择新的时间，或选“以后再说”。" : "先明确选择；这里不会替你沿用旧时间。"}</p></header><fieldset><legend className="sr-only">选择新的计划时间</legend><label aria-label="以后再说"><input type="radio" name="task-due-choice" checked={dueChoice === "later"} onChange={() => setDueChoice("later")} /><span><b>以后再说</b><small>不设时间，记录仍会保留</small></span></label><label aria-label="选择新的时间"><input type="radio" name="task-due-choice" checked={dueChoice === "new"} onChange={() => setDueChoice("new")} /><span><b>选择新的时间</b><small>只接受现在之后的时间</small></span></label>{dueChoice === "new" && <input aria-label="新的计划时间" type="datetime-local" value={newDueAt} onChange={(event) => setNewDueAt(event.target.value)} />}{mode === "restore" && originalFuture && <label aria-label="沿用原计划"><input type="radio" name="task-due-choice" checked={dueChoice === "original"} onChange={() => setDueChoice("original")} /><span><b>沿用原计划</b><small>{formatCareerTaskDate(task.due_at, now)}</small></span></label>}</fieldset><footer><button className="career-button ghost" onClick={() => { setDueChoice(null); setNewDueAt(""); setMode("summary"); }}>先不调整</button><button className="career-button primary" disabled={!canSubmitDue || busy} onClick={submitDueChoice}>{busy ? <LoaderCircle className="spin" size={16} /> : <Check size={16} />}{busy ? "正在保存…" : "确认安排"}</button></footer></section>}
-        {mode === "cancel-confirm" && <section className="career-task-cancel-confirm"><ShieldCheck size={22} /><h3>放下这条待办？</h3><p>它会留在记录里，不会被删除，也不会被当作失败。</p><footer><button className="career-button primary" data-task-safe-focus onClick={() => setMode("summary")}>继续保留</button><button className="career-button secondary" disabled={busy || !taskVersion} onClick={() => void finishMutation(() => careerTaskActions.cancel(task.id, { expectedUpdatedAt: taskVersion, reason: "changed_plan", operationId: `task_cancel_${crypto.randomUUID()}` }), "待办已放下")}>确认放下</button></footer></section>}
+        {(mode === "schedule" || mode === "restore") && <section className="career-task-due-choice"><header><h3>{mode === "restore" ? "重新放回待办" : "调整安排"}</h3><p>{mode === "restore" && task.due_at && !originalFuture ? "原计划时间已经过去。请选择新的时间，或选“以后再说”。" : "先明确选择；这里不会替你沿用旧时间。"}</p></header><fieldset><legend className="sr-only">选择新的计划时间</legend><label aria-label="以后再说"><input type="radio" name="task-due-choice" checked={dueChoice === "later"} onChange={() => setDueChoice("later")} /><span><b>以后再说</b><small>不设时间，记录仍会保留</small></span></label><label aria-label="选择新的时间"><input type="radio" name="task-due-choice" checked={dueChoice === "new"} onChange={() => setDueChoice("new")} /><span><b>选择新的时间</b><small>只接受现在之后的时间</small></span></label>{dueChoice === "new" && <input aria-label="新的计划时间" type="datetime-local" value={newDueAt} onChange={(event) => setNewDueAt(event.target.value)} />}{mode === "restore" && originalFuture && <label aria-label="沿用原计划"><input type="radio" name="task-due-choice" checked={dueChoice === "original"} onChange={() => setDueChoice("original")} /><span><b>沿用原计划</b><small>{formatCareerTaskDate(task.due_at, now)}</small></span></label>}</fieldset><footer><button className="career-button ghost" onClick={() => { setDueChoice(null); setNewDueAt(""); setMode("summary"); }}>先不调整</button><button className="career-button primary" disabled={!canSubmitDue || busy || externalWriteLocked} onClick={submitDueChoice}>{busy ? <LoaderCircle className="spin" size={16} /> : <Check size={16} />}{busy ? "正在保存…" : "确认安排"}</button></footer></section>}
+        {mode === "cancel-confirm" && <section className="career-task-cancel-confirm"><ShieldCheck size={22} /><h3>放下这条待办？</h3><p>它会留在记录里，不会被删除，也不会被当作失败。</p><footer><button className="career-button primary" data-task-safe-focus onClick={() => setMode("summary")}>继续保留</button><button className="career-button secondary" disabled={busy || externalWriteLocked || !taskVersion} onClick={() => void finishMutation(() => careerTaskActions.cancel(task.id, { expectedUpdatedAt: taskVersion, reason: "changed_plan", operationId: `task_cancel_${crypto.randomUUID()}` }), "待办已放下")}>确认放下</button></footer></section>}
       </>}
     </div>
   </aside></div>;
@@ -3042,9 +3476,10 @@ function lifecycleImpactCopy(item: CareerLifecycleImpactItem) {
   return item.effect === "restore" ? "会按你的选择恢复" : "会按你的选择处理";
 }
 
-function CareerLifecycleModal({ state, busy, onChoice, onClose, onConfirm, onRetryRefresh }: {
+function CareerLifecycleModal({ state, busy, newWritesBlocked, onChoice, onClose, onConfirm, onRetryRefresh }: {
   state: CareerLifecycleDialogState;
   busy: boolean;
+  newWritesBlocked: boolean;
   onChoice: (choice: CareerLifecycleChoice) => void;
   onClose: () => void;
   onConfirm: () => void;
@@ -3093,18 +3528,37 @@ function CareerLifecycleModal({ state, busy, onChoice, onClose, onConfirm, onRet
       </section>
       {prepared.requiresChoice ? <fieldset className="career-lifecycle-choices"><legend>这些安排怎么处理？</legend>{prepared.allowedChoices.map((choice) => { const copy = lifecycleChoiceCopy(choice); return <label key={choice} className={state.choice === choice ? "selected" : ""}><input aria-label={copy.title} type="radio" name="career-lifecycle-choice" value={choice} checked={state.choice === choice} onChange={() => onChoice(choice)} /><span><b>{copy.title}</b><small>{copy.text}</small></span></label>; })}</fieldset> : <div className="career-lifecycle-single-choice"><ShieldCheck size={18} /><span><b>{lifecycleChoiceCopy(state.choice ?? prepared.allowedChoices[0]).title}</b><small>{lifecycleChoiceCopy(state.choice ?? prepared.allowedChoices[0]).text}</small></span></div>}
     </div>
-    <footer className="career-lifecycle-actions"><button className="career-button ghost" disabled={busy} onClick={onClose}>先不改</button><button className="career-button primary" disabled={busy || !state.choice} onClick={onConfirm}>{busy ? <LoaderCircle className="spin" size={16} /> : <Check size={16} />}{busy ? "正在保存…" : confirmLabel}</button></footer>
+    <footer className="career-lifecycle-actions"><button className="career-button ghost" disabled={busy} onClick={onClose}>先不改</button><button className="career-button primary" disabled={busy || newWritesBlocked || !state.choice} onClick={onConfirm}>{busy ? <LoaderCircle className="spin" size={16} /> : <Check size={16} />}{busy ? "正在保存…" : confirmLabel}</button></footer>
   </Modal>;
 }
 function Field({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) { return <label className="career-field"><span>{label}{hint && <small>{hint}</small>}</span>{children}</label>; }
+function CareerCoreEditorRecovery({ coreWrites }: { coreWrites: CareerCoreWriteController }) {
+  if (coreWrites.flow.phase === "idle" && !coreWrites.error) return null;
+  return <div className="career-core-editor-recovery" role={coreWrites.error ? "alert" : "status"}>
+    <ShieldCheck size={17} />
+    <div><b>这份输入仍由同一张收据保护</b><p>{coreWrites.error || ("message" in coreWrites.flow ? coreWrites.flow.message : coreWrites.status)}</p><footer>
+      {coreWrites.flow.phase === "check" && <button type="button" className="career-button primary" onClick={() => void coreWrites.inspectActive()}><Search size={15} />只读核对</button>}
+      {coreWrites.flow.phase === "expected" && <><button type="button" className="career-button ghost" onClick={() => void coreWrites.discardTerminal()}>放弃收据并继续编辑</button><button type="button" className="career-button primary" onClick={() => void coreWrites.continueExpected()}>继续同一次写入</button></>}
+      {coreWrites.flow.phase === "refresh-only" && <button type="button" className="career-button primary" onClick={() => void coreWrites.retryTerminalRefresh()}><RotateCcw size={15} />只重新读取</button>}
+      {coreWrites.flow.phase === "changed" && <button type="button" className="career-button primary" onClick={() => void coreWrites.discardChangedAndRefresh()}><RotateCcw size={15} />放弃旧输入并读取新版本</button>}
+      {coreWrites.flow.phase === "invalid" && <button type="button" className="career-button ghost" onClick={() => void coreWrites.discardTerminal()}>只清除无效提醒</button>}
+    </footer></div>
+  </div>;
+}
 function EmptyState({ icon, title, text, action }: { icon: ReactNode; title: string; text: string; action?: ReactNode }) { return <div className="career-empty"><span>{icon}</span><h3>{title}</h3><p>{text}</p>{action}</div>; }
 function CareerAiDisclosure({ action, className = "" }: { action: AiAction; className?: string }) {
   return <p className={`career-ai-disclosure ${className}`.trim()}><ShieldCheck size={15} /><span>{careerAiDisclosureText(action)}</span></p>;
 }
 
-function JobDrawer({ job, data, now, lifecyclePending, onClose, onLifecycle, onRefresh, onOpenTask, onCompleteTask, onAi, onSelectContact, notify }: { job: Job; data: CareerData; now: number; lifecyclePending: boolean; onClose: () => void; onLifecycle: (intent: CareerLifecycleIntent) => Promise<boolean>; onRefresh: () => Promise<void>; onOpenTask: (taskId: string) => void; onCompleteTask: (task: Task) => void | Promise<void>; onAi: (action: AiAction, title: string, payload: unknown) => void; onSelectContact: (contactId: string) => void; notify: (text: string, tone?: Notice["tone"]) => void }) {
+function JobDrawer({ job, data, now, lifecyclePending, coreBindings, coreWrites, onDirtyChange, onClose, onLifecycle, onOpenTask, onCompleteTask, onAi, onSelectContact, notify }: { job: Job; data: CareerData; now: number; lifecyclePending: boolean; coreBindings: CareerCoreBindings; coreWrites: CareerCoreWriteController; onDirtyChange: (dirty: boolean) => void; onClose: () => void; onLifecycle: (intent: CareerLifecycleIntent) => Promise<boolean>; onOpenTask: (taskId: string) => void; onCompleteTask: (task: Task) => void | Promise<void>; onAi: (action: AiAction, title: string, payload: unknown) => void; onSelectContact: (contactId: string) => void; notify: (text: string, tone?: Notice["tone"]) => void }) {
   const [tab, setTab] = useState<"overview" | "tasks" | "interviews" | "materials">("overview");
   const [editing, setEditing] = useState(false);
+  const [dirty, setDirty] = useState(false);
+  const [closePrompt, setClosePrompt] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [activeCoreOperationId, setActiveCoreOperationId] = useState<string | null>(null);
+  const savingRef = useRef(false);
+  const jobDirtyChangeRef = useRef(onDirtyChange);
   const [linkedContacts, setLinkedContacts] = useState<Contact[]>([]);
   const tasks = data.tasks.filter((task) => task.job_id === job.id);
   const interviews = data.interviews.filter((item) => item.job_id === job.id);
@@ -3122,26 +3576,79 @@ function JobDrawer({ job, data, now, lifecyclePending, onClose, onLifecycle, onR
     })().catch(() => { if (live) setLinkedContacts([]); });
     return () => { live = false; };
   }, [job.id]);
-  async function save(event: FormEvent<HTMLFormElement>) { event.preventDefault(); if (archived) return; const form = new FormData(event.currentTarget); const result = await runCareerSql("UPDATE career_jobs SET company=?,role=?,location=?,salary=?,work_mode=?,description=?,note=?,tags=?,deadline=?,updated_at=? WHERE id=? AND archived=0", [form.get("company"), form.get("role"), form.get("location"), form.get("salary"), form.get("work_mode"), form.get("description"), form.get("note"), form.get("tags"), fromDateInput(String(form.get("deadline") || "")), new Date().toISOString(), job.id]); await onRefresh(); setEditing(false); if (result.changes === 0) { notify("职位状态刚有变化，这次编辑没有保存。请重新打开后确认。", "info"); return; } notify("职位信息已保存"); }
-  return <Drawer label={`${job.company} · ${job.role}`} onClose={onClose} wide><div className="career-job-drawer-head"><CompanyMark company={job.company} /><div><SourceBadge source={job.source} /><h2>{job.role}</h2><p>{job.company} · {job.location || "地点待确认"}</p></div><button className="career-icon-button" onClick={onClose} aria-label="关闭职位详情"><X size={19} /></button></div><div className="career-job-status-row">{archived ? <span className="career-archived-state"><Archive size={14} />已归档 · {currentStage?.name ?? "原阶段"}</span> : <select value={job.stage_id} disabled={lifecyclePending} onChange={(event) => void onLifecycle({ kind: "stage", jobId: job.id, nextStageId: event.target.value })} aria-label="职位阶段">{data.stages.map((stage) => <option key={stage.id} value={stage.id}>{stage.name}</option>)}</select>}{ended && !archived && <span className="career-ended-state">已结束 · 只记录结果</span>}{careerJobIsWatched(job.priority) && <span><Target size={14} />已关注</span>}{safeLink(job.source_url) && <a href={job.source_url} target="_blank" rel="noreferrer">查看原职位 <ExternalLink size={14} /></a>}</div><div className="career-drawer-tabs">{[["overview", "职位概览"], ["tasks", `待办 ${tasks.length}`], ["interviews", `面试 ${interviews.length}`], ["materials", `材料 ${materials.length}`]].map(([id, label]) => <button className={tab === id ? "active" : ""} aria-pressed={tab === id} key={id} onClick={() => setTab(id as typeof tab)}>{label}</button>)}</div><div className="career-drawer-body">{tab === "overview" && (editing ? <form className="career-form" onSubmit={save}><Field label="公司"><input name="company" defaultValue={job.company} required /></Field><Field label="职位"><input name="role" defaultValue={job.role} required /></Field><div className="career-form-row"><Field label="地点"><input name="location" defaultValue={job.location} /></Field><Field label="工作方式"><input name="work_mode" defaultValue={job.work_mode} /></Field></div><div className="career-form-row"><Field label="薪资"><input name="salary" defaultValue={job.salary} /></Field><Field label="截止时间"><input name="deadline" type="datetime-local" defaultValue={dateInputValue(job.deadline)} /></Field></div><Field label="标签"><input name="tags" defaultValue={job.tags} /></Field><Field label="职位描述"><textarea name="description" rows={7} defaultValue={job.description} /></Field><Field label="个人备注"><textarea name="note" rows={4} defaultValue={job.note} /></Field><div className="career-form-actions"><button type="button" className="career-button ghost" onClick={() => setEditing(false)}>取消</button><button className="career-button primary">保存修改</button></div></form> : <>{!archived && <div className="career-detail-actions"><button className="career-button secondary career-ai-trigger" onClick={() => onAi("fit_analysis", "AI 职位要求拆解", { job })}><Sparkles size={15} />拆解职位要求</button><button className="career-button ghost" onClick={() => setEditing(true)}><Pencil size={15} />编辑</button><CareerAiDisclosure action="fit_analysis" className="in-job-actions" /></div>}<dl className="career-detail-grid"><div><dt>薪资范围</dt><dd>{job.salary || "未记录"}</dd></div><div><dt>工作方式</dt><dd>{job.work_mode || "未记录"}</dd></div><div><dt>申请来源</dt><dd>{job.source}</dd></div><div><dt>投递时间</dt><dd>{job.applied_at ? formatDate(job.applied_at) : "尚未投递"}</dd></div><div><dt>旧版联系人备注</dt><dd>{job.contact_name || "没有旧版备注"}</dd></div><div><dt>截止时间</dt><dd>{job.deadline ? formatDate(job.deadline, true) : "未记录"}</dd></div></dl><section className="career-detail-section"><h3>已关联联系人</h3>{linkedContacts.length > 0 ? <div className="career-job-contact-links">{linkedContacts.map((contact) => <button key={contact.id} onClick={() => onSelectContact(contact.id)}><span className="career-contact-avatar">{initials(contact.name)}</span><span><b>{contact.name}</b><small>{[contact.role, contact.company, contact.archived === 1 ? "已归档" : ""].filter(Boolean).join(" · ")}</small></span><ChevronRight size={16} /></button>)}</div> : <p className="career-contact-calm-copy">{job.contact_name ? `旧版备注写着“${job.contact_name}”，尚未确认成联系人关系。请从联系人页面明确关联。` : "还没有明确关联的联系人。可在联系人详情中管理职位关系。"}</p>}</section><section className="career-detail-section"><h3>职位描述</h3><p className="career-long-copy">{job.description || "还没有保存职位描述。"}</p></section><section className="career-detail-section"><h3>我的备注</h3><p className="career-long-copy">{job.note || "还没有添加备注。"}</p></section><div className="career-card-tags">{job.tags.split(",").filter(Boolean).map((tag) => <i key={tag}>{tag}</i>)}</div></>)}
-    {tab === "tasks" && <div className="career-drawer-list career-drawer-task-list">{tasks.map((task) => <CareerTaskRow key={task.id} task={task} data={data} now={now} onOpen={onOpenTask} onComplete={onCompleteTask} />)}{tasks.length === 0 && <EmptyState icon={<ListTodo />} title="还没有待办" text="为这个职位安排一个具体的下一步。" />}</div>}{tab === "interviews" && <div className="career-drawer-list">{interviews.map((item) => <article key={item.id}><span className="career-list-icon"><MessageSquareText size={16} /></span><div><b>{item.round_name}</b><small>{formatDate(item.scheduled_at, true)} · {item.interviewer || "面试官待确认"}{isCareerLifecyclePaused(item) ? " · 随职位暂停" : item.status === "canceled" ? " · 已取消" : ""}</small><p>{item.summary}</p></div></article>)}{interviews.length === 0 && <EmptyState icon={<MessageSquareText />} title="还没有面试轮次" text="推进到面试后，在这里完整记录每一轮。" />}</div>}{tab === "materials" && <div className="career-drawer-list">{materials.map((item) => <article key={item.id}><span className="career-list-icon"><FileText size={16} /></span><div><b>{item.name}</b><small>{item.kind} · {item.version}{item.status === "deleting" ? " · 等待收尾" : ""}</small><p>{item.status === "deleting" ? "原件状态尚未确认，请到材料页继续或稍后核对。" : item.notes}</p></div></article>)}{materials.length === 0 && <EmptyState icon={<FileText />} title="还没有关联材料" text="关联确切版本，之后随时知道发出的是哪一份。" />}</div>}</div><footer className="career-drawer-footer">{archived ? <button className="career-button secondary" disabled={lifecyclePending} onClick={() => void onLifecycle({ kind: "restore", jobId: job.id })}><RotateCcw size={15} />从归档取回</button> : <button className="career-button ghost" disabled={lifecyclePending} onClick={() => void onLifecycle({ kind: "archive", jobId: job.id })}><Archive size={15} />收进归档</button>}<span>{archived ? "取回不会自动恢复已经过去或后来修改过的安排。" : "归档只是整理，不会删除职位或相关记录。"}</span></footer></Drawer>;
+  useLayoutEffect(() => { jobDirtyChangeRef.current = onDirtyChange; }, [onDirtyChange]);
+  useEffect(() => { jobDirtyChangeRef.current(dirty || saving); }, [dirty, saving]);
+  useEffect(() => () => jobDirtyChangeRef.current(false), []);
+  useEffect(() => {
+    if (!dirty && !saving) return;
+    const protect = (event: BeforeUnloadEvent) => { event.preventDefault(); event.returnValue = ""; };
+    window.addEventListener("beforeunload", protect);
+    return () => window.removeEventListener("beforeunload", protect);
+  }, [dirty, saving]);
+  function markJobDirty() {
+    setDirty(true);
+    jobDirtyChangeRef.current(true);
+  }
+  function clearJobDirty() {
+    setDirty(false);
+    jobDirtyChangeRef.current(false);
+  }
+  function requestClose() {
+    if (savingRef.current) { notify("正在安全确认职位保存，请稍候", "info"); return; }
+    if (coreWrites.hasHeldReceipt) { notify("先核对当前职位保存；输入会继续留在这里。", "info"); return; }
+    if (dirty) { setClosePrompt(true); return; }
+    onClose();
+  }
+  async function save(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (archived || savingRef.current) return;
+    const expected = getBoundCareerJobExpected(coreBindings, job);
+    const trigger = event.currentTarget.querySelector<HTMLButtonElement>('button[type="submit"]');
+    if (!expected || !trigger || coreWrites.writeLocked) {
+      notify("职位资料不是当前可写版本；输入仍保留，请先重新读取。", "info");
+      return;
+    }
+    const form = new FormData(event.currentTarget);
+    const input: UpdateCareerJobCoreInput = {
+      company: String(form.get("company") ?? ""),
+      role: String(form.get("role") ?? ""),
+      location: String(form.get("location") ?? ""),
+      salary: String(form.get("salary") ?? ""),
+      workMode: String(form.get("work_mode") ?? ""),
+      description: String(form.get("description") ?? ""),
+      deadline: fromDateInput(String(form.get("deadline") || "")),
+      note: String(form.get("note") ?? ""),
+      tags: String(form.get("tags") ?? ""),
+    };
+    savingRef.current = true;
+    setSaving(true);
+    try {
+      await coreWrites.submitJobUpdate(input, expected, trigger, {
+        onPrepared: (receipt) => setActiveCoreOperationId(receipt.operationId),
+        onSettled: ({ outcome, receipt }) => {
+          setActiveCoreOperationId((current) =>
+            current === receipt.operationId ? null : current);
+          if (outcome === "saved") {
+            clearJobDirty();
+            setEditing(false);
+          } else if (outcome === "changed") {
+            notify("职位已在别处变化；当前输入仍保留，没有覆盖新资料。", "info");
+          }
+        },
+        onAbandonChanged: () => {
+          clearJobDirty();
+          setActiveCoreOperationId(null);
+          setEditing(false);
+        },
+      });
+    } finally { savingRef.current = false; setSaving(false); }
+  }
+  return <><Drawer label={`${job.company} · ${job.role}`} onClose={requestClose} wide><div className="career-job-drawer-head"><CompanyMark company={job.company} /><div><SourceBadge source={job.source} /><h2>{job.role}</h2><p>{job.company} · {job.location || "地点待确认"}</p></div><button className="career-icon-button" onClick={requestClose} aria-label="关闭职位详情"><X size={19} /></button></div><div className="career-job-status-row">{archived ? <span className="career-archived-state"><Archive size={14} />已归档 · {currentStage?.name ?? "原阶段"}</span> : <select value={job.stage_id} disabled={lifecyclePending || coreWrites.databaseMutationLocked} onChange={(event) => void onLifecycle({ kind: "stage", jobId: job.id, nextStageId: event.target.value })} aria-label="职位阶段">{data.stages.map((stage) => <option key={stage.id} value={stage.id}>{stage.name}</option>)}</select>}{ended && !archived && <span className="career-ended-state">已结束 · 只记录结果</span>}{careerJobIsWatched(job.priority) && <span><Target size={14} />已关注</span>}{safeLink(job.source_url) && <a href={job.source_url} target="_blank" rel="noreferrer">查看原职位 <ExternalLink size={14} /></a>}</div><div className="career-drawer-tabs">{[["overview", "职位概览"], ["tasks", `待办 ${tasks.length}`], ["interviews", `面试 ${interviews.length}`], ["materials", `材料 ${materials.length}`]].map(([id, label]) => <button className={tab === id ? "active" : ""} aria-pressed={tab === id} key={id} onClick={() => setTab(id as typeof tab)}>{label}</button>)}</div><div className="career-drawer-body">{tab === "overview" && (editing ? <form className="career-form" onChange={markJobDirty} onSubmit={save}><fieldset className="career-core-write-fields" disabled={saving || Boolean(activeCoreOperationId)}><Field label="公司"><input name="company" defaultValue={job.company} required /></Field><Field label="职位"><input name="role" defaultValue={job.role} required /></Field><div className="career-form-row"><Field label="地点"><input name="location" defaultValue={job.location} /></Field><Field label="工作方式"><input name="work_mode" defaultValue={job.work_mode} /></Field></div><div className="career-form-row"><Field label="薪资"><input name="salary" defaultValue={job.salary} /></Field><Field label="截止时间"><input name="deadline" type="datetime-local" defaultValue={dateInputValue(job.deadline)} /></Field></div><Field label="标签"><input name="tags" defaultValue={job.tags} /></Field><Field label="职位描述"><textarea name="description" rows={7} defaultValue={job.description} /></Field><Field label="个人备注"><textarea name="note" rows={4} defaultValue={job.note} /></Field></fieldset><CareerCoreEditorRecovery coreWrites={coreWrites} /><div className="career-form-actions"><button type="button" className="career-button ghost" disabled={saving} onClick={() => dirty ? setClosePrompt(true) : setEditing(false)}>取消</button><button type="submit" className="career-button primary" disabled={saving || Boolean(activeCoreOperationId) || coreWrites.writeLocked}>{saving || activeCoreOperationId ? <LoaderCircle className="spin" size={16} /> : <Check size={16} />}{saving || activeCoreOperationId ? "等待核对…" : "保存修改"}</button></div></form> : <>{!archived && <div className="career-detail-actions"><button className="career-button secondary career-ai-trigger" onClick={() => onAi("fit_analysis", "AI 职位要求拆解", { job })}><Sparkles size={15} />拆解职位要求</button><button className="career-button ghost" disabled={coreWrites.writeLocked} onClick={() => { clearJobDirty(); setEditing(true); }}><Pencil size={15} />编辑</button><CareerAiDisclosure action="fit_analysis" className="in-job-actions" /></div>}<dl className="career-detail-grid"><div><dt>薪资范围</dt><dd>{job.salary || "未记录"}</dd></div><div><dt>工作方式</dt><dd>{job.work_mode || "未记录"}</dd></div><div><dt>申请来源</dt><dd>{job.source}</dd></div><div><dt>投递时间</dt><dd>{job.applied_at ? formatDate(job.applied_at) : "尚未投递"}</dd></div><div><dt>旧版联系人备注</dt><dd>{job.contact_name || "没有旧版备注"}</dd></div><div><dt>截止时间</dt><dd>{job.deadline ? formatDate(job.deadline, true) : "未记录"}</dd></div></dl><section className="career-detail-section"><h3>已关联联系人</h3>{linkedContacts.length > 0 ? <div className="career-job-contact-links">{linkedContacts.map((contact) => <button key={contact.id} onClick={() => onSelectContact(contact.id)}><span className="career-contact-avatar">{initials(contact.name)}</span><span><b>{contact.name}</b><small>{[contact.role, contact.company, contact.archived === 1 ? "已归档" : ""].filter(Boolean).join(" · ")}</small></span><ChevronRight size={16} /></button>)}</div> : <p className="career-contact-calm-copy">{job.contact_name ? `旧版备注写着“${job.contact_name}”，尚未确认成联系人关系。请从联系人页面明确关联。` : "还没有明确关联的联系人。可在联系人详情中管理职位关系。"}</p>}</section><section className="career-detail-section"><h3>职位描述</h3><p className="career-long-copy">{job.description || "还没有保存职位描述。"}</p></section><section className="career-detail-section"><h3>我的备注</h3><p className="career-long-copy">{job.note || "还没有添加备注。"}</p></section><div className="career-card-tags">{job.tags.split(",").filter(Boolean).map((tag) => <i key={tag}>{tag}</i>)}</div></>)}
+    {tab === "tasks" && <div className="career-drawer-list career-drawer-task-list">{tasks.map((task) => <CareerTaskRow key={task.id} task={task} data={data} now={now} onOpen={onOpenTask} onComplete={onCompleteTask} />)}{tasks.length === 0 && <EmptyState icon={<ListTodo />} title="还没有待办" text="为这个职位安排一个具体的下一步。" />}</div>}{tab === "interviews" && <div className="career-drawer-list">{interviews.map((item) => <article key={item.id}><span className="career-list-icon"><MessageSquareText size={16} /></span><div><b>{item.round_name}</b><small>{formatDate(item.scheduled_at, true)} · {item.interviewer || "面试官待确认"}{isCareerLifecyclePaused(item) ? " · 随职位暂停" : item.status === "canceled" ? " · 已取消" : ""}</small><p>{item.summary}</p></div></article>)}{interviews.length === 0 && <EmptyState icon={<MessageSquareText />} title="还没有面试轮次" text="推进到面试后，在这里完整记录每一轮。" />}</div>}{tab === "materials" && <div className="career-drawer-list">{materials.map((item) => <article key={item.id}><span className="career-list-icon"><FileText size={16} /></span><div><b>{item.name}</b><small>{item.kind} · {item.version}{item.status === "deleting" ? " · 等待收尾" : ""}</small><p>{item.status === "deleting" ? "原件状态尚未确认，请到材料页继续或稍后核对。" : item.notes}</p></div></article>)}{materials.length === 0 && <EmptyState icon={<FileText />} title="还没有关联材料" text="关联确切版本，之后随时知道发出的是哪一份。" />}</div>}</div><footer className="career-drawer-footer">{archived ? <button className="career-button secondary" disabled={lifecyclePending || coreWrites.databaseMutationLocked} onClick={() => void onLifecycle({ kind: "restore", jobId: job.id })}><RotateCcw size={15} />从归档取回</button> : <button className="career-button ghost" disabled={lifecyclePending || coreWrites.databaseMutationLocked} onClick={() => void onLifecycle({ kind: "archive", jobId: job.id })}><Archive size={15} />收进归档</button>}<span>{archived ? "取回不会自动恢复已经过去或后来修改过的安排。" : "归档只是整理，不会删除职位或相关记录。"}</span></footer></Drawer>{closePrompt && <Modal title="保留这次职位编辑吗？" description="这些修改还没有写入职迹 SQLite。" onClose={() => setClosePrompt(false)}><div className="career-draft-choice"><p>当前输入会留在职位抽屉里，直到你明确继续或放弃。</p><div><button type="button" className="career-button primary" data-dialog-initial onClick={() => setClosePrompt(false)}>继续编辑</button><button type="button" className="career-button danger" onClick={() => { clearJobDirty(); setClosePrompt(false); setEditing(false); }}>放弃修改</button></div></div></Modal>}</>;
 }
 
-type InterviewEditorSnapshot = {
-  status: Interview["status"];
-  summary: string;
-  rawNotes: string;
-  questions: InterviewQuestion[];
-  reflection: string;
-};
-
-type InterviewLocalDraft = {
-  version: 1;
-  interviewId: string;
-  sourceUpdatedAt: string;
-  savedAt: string;
-  snapshot: InterviewEditorSnapshot;
-};
+type InterviewEditorSnapshot = CareerInterviewEditorSnapshot;
+type InterviewLocalDraft = CareerInterviewLocalDraft;
 
 function interviewSnapshot(interview: Interview): InterviewEditorSnapshot {
   return {
@@ -3154,6 +3661,10 @@ function interviewSnapshot(interview: Interview): InterviewEditorSnapshot {
 }
 
 function interviewDraftKey(interviewId: string) {
+  return `career.interview-draft.v2:${encodeURIComponent(interviewId)}`;
+}
+
+function legacyInterviewDraftKey(interviewId: string) {
   return `career.interview-draft.v1:${encodeURIComponent(interviewId)}`;
 }
 
@@ -3161,16 +3672,10 @@ function readInterviewLocalDraft(interview: Interview): InterviewLocalDraft | nu
   if (typeof window === "undefined") return null;
   const key = interviewDraftKey(interview.id);
   try {
-    const parsed = JSON.parse(window.localStorage.getItem(key) ?? "null") as Partial<InterviewLocalDraft> | null;
-    const snapshot = parsed?.snapshot;
-    const questionsAreValid = Array.isArray(snapshot?.questions) && snapshot.questions.every((question) =>
-      question && typeof question.question === "string" && typeof question.answer === "string" && typeof question.note === "string");
-    const statusIsValid = snapshot && ["scheduled", "completed", "canceled"].includes(snapshot.status);
-    if (parsed?.version !== 1 || parsed.interviewId !== interview.id || typeof parsed.savedAt !== "string" ||
-      typeof parsed.sourceUpdatedAt !== "string" || !snapshot || !statusIsValid ||
-      typeof snapshot.summary !== "string" || typeof snapshot.rawNotes !== "string" ||
-      typeof snapshot.reflection !== "string" || !questionsAreValid) return null;
-    return parsed as InterviewLocalDraft;
+    const raw = window.localStorage.getItem(key) ??
+      window.localStorage.getItem(legacyInterviewDraftKey(interview.id)) ?? "null";
+    if (raw.length > 1024 * 1024) return null;
+    return parseCareerInterviewLocalDraft(JSON.parse(raw) as unknown, interview.id);
   } catch {
     return null;
   }
@@ -3184,11 +3689,13 @@ export function resolveInterviewDraftRestoreMode(draftSourceUpdatedAt: string, c
   return draftSourceUpdatedAt === currentUpdatedAt ? "auto" as const : "confirm" as const;
 }
 
-function InterviewDrawer({ interview, data, onClose, onRefresh, onAi, notify }: {
+function InterviewDrawer({ interview, data, coreBindings, coreWrites, onDirtyChange, onClose, onAi, notify }: {
   interview: Interview;
   data: CareerData;
+  coreBindings: CareerCoreBindings;
+  coreWrites: CareerCoreWriteController;
+  onDirtyChange: (dirty: boolean) => void;
   onClose: () => void;
-  onRefresh: () => Promise<void>;
   onAi: (
     action: AiAction,
     title: string,
@@ -3211,6 +3718,8 @@ function InterviewDrawer({ interview, data, onClose, onRefresh, onAi, notify }: 
   const [closePrompt, setClosePrompt] = useState(false);
   const [saving, setSaving] = useState(false);
   const savingRef = useRef(false);
+  const [activeCoreOperationId, setActiveCoreOperationId] = useState<string | null>(null);
+  const interviewDirtyChangeRef = useRef(onDirtyChange);
   const restoredRef = useRef(false);
   const [structureUndo, setStructureUndo] = useState<{
     summary: string;
@@ -3225,6 +3734,11 @@ function InterviewDrawer({ interview, data, onClose, onRefresh, onAi, notify }: 
     reflection,
   }), [questions, rawNotes, reflection, status, summary]);
   const dirty = !sameInterviewSnapshot(currentSnapshot, baseline);
+  const expectedInterview = getBoundCareerInterviewExpected(coreBindings, interview);
+
+  useLayoutEffect(() => { interviewDirtyChangeRef.current = onDirtyChange; }, [onDirtyChange]);
+  useEffect(() => { interviewDirtyChangeRef.current(dirty || saving); }, [dirty, saving]);
+  useEffect(() => () => interviewDirtyChangeRef.current(false), []);
 
   useEffect(() => {
     if (restoredRef.current) return;
@@ -3232,7 +3746,7 @@ function InterviewDrawer({ interview, data, onClose, onRefresh, onAi, notify }: 
     const draft = readInterviewLocalDraft(interview);
     if (!draft) return;
     const restoreFrame = window.requestAnimationFrame(() => {
-      if (resolveInterviewDraftRestoreMode(draft.sourceUpdatedAt, interview.updated_at) === "confirm") {
+      if (draft.version === 1 || !expectedInterview || careerInterviewDraftRestoreMode(draft, expectedInterview) === "confirm") {
         setPendingStaleDraft(draft);
         return;
       }
@@ -3244,7 +3758,7 @@ function InterviewDrawer({ interview, data, onClose, onRefresh, onAi, notify }: 
       setDraftRestored({ savedAt: draft.savedAt, basedOnOlderVersion: false });
     });
     return () => window.cancelAnimationFrame(restoreFrame);
-  }, [interview]);
+  }, [expectedInterview, interview]);
 
   useEffect(() => {
     if (!dirty) return;
@@ -3256,6 +3770,29 @@ function InterviewDrawer({ interview, data, onClose, onRefresh, onAi, notify }: 
     return () => window.removeEventListener("beforeunload", protectUnsavedDraft);
   }, [dirty]);
 
+  function settleSavedInterview(receipt: CareerCoreWriteReceipt) {
+    if (receipt.kind !== "interview-update" ||
+      receipt.after.interview.id !== interview.id) {
+      notify("保存回执与当前面经不一致；请重新读取后核对。", "error");
+      return;
+    }
+    const savedSnapshot = interviewSnapshot(receipt.after.interview);
+    try { window.localStorage.removeItem(interviewDraftKey(interview.id)); }
+    catch { notify("面经已保存，但浏览器没能清理先前的本机草稿", "info"); }
+    try { window.localStorage.removeItem(legacyInterviewDraftKey(interview.id)); }
+    catch { notify("面经已保存，但浏览器没能清理先前的本机草稿", "info"); }
+    setStatus(savedSnapshot.status);
+    setSummary(savedSnapshot.summary);
+    setRawNotes(savedSnapshot.rawNotes);
+    setQuestions(savedSnapshot.questions.map((question) => ({ ...question })));
+    setReflection(savedSnapshot.reflection);
+    setBaseline(savedSnapshot);
+    setDraftRestored(null);
+    setPendingStaleDraft(null);
+    setStructureUndo(null);
+    interviewDirtyChangeRef.current(false);
+  }
+
   async function save(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (savingRef.current) return;
@@ -3266,22 +3803,34 @@ function InterviewDrawer({ interview, data, onClose, onRefresh, onAi, notify }: 
     savingRef.current = true;
     setSaving(true);
     try {
-      await runCareerSql(
-        "UPDATE career_interviews SET status=?,summary=?,raw_notes=?,questions_json=?,reflection=?,updated_at=? WHERE id=?",
-        [status, summary, rawNotes, JSON.stringify(questions), reflection, new Date().toISOString(), interview.id],
-      );
-      try { window.localStorage.removeItem(interviewDraftKey(interview.id)); }
-      catch { notify("面经已保存，但浏览器没能清理先前的本机草稿", "info"); }
-      setBaseline(currentSnapshot);
-      setDraftRestored(null);
-      setPendingStaleDraft(null);
-      setStructureUndo(null);
-      try {
-        await onRefresh();
-        notify("面经已保存");
-      } catch {
-        notify("面经已保存在本地；列表暂时没有刷新", "info");
+      const trigger = event.currentTarget.querySelector<HTMLButtonElement>('button[type="submit"]');
+      if (!expectedInterview || !trigger || coreWrites.writeLocked) {
+        notify("面经不是当前可写版本；输入仍保留，请先重新读取。", "info");
+        return;
       }
+      const input: UpdateCareerInterviewCoreInput = {
+        status,
+        summary,
+        rawNotes,
+        questions,
+        reflection,
+      };
+      await coreWrites.submitInterviewUpdate(input, expectedInterview, trigger, {
+        onPrepared: (receipt) => setActiveCoreOperationId(receipt.operationId),
+        onSettled: ({ outcome, receipt }) => {
+          setActiveCoreOperationId((current) =>
+            current === receipt.operationId ? null : current);
+          if (outcome === "saved") settleSavedInterview(receipt);
+          else if (outcome === "changed") {
+            notify("面经或关联职位已变化；当前输入仍保留，没有覆盖新资料。", "info");
+          }
+        },
+        onAbandonChanged: () => {
+          interviewDirtyChangeRef.current(false);
+          setActiveCoreOperationId(null);
+          onClose();
+        },
+      });
     } catch (error) {
       notify(error instanceof Error ? error.message : "面经保存失败", "error");
     } finally {
@@ -3295,15 +3844,24 @@ function InterviewDrawer({ interview, data, onClose, onRefresh, onAi, notify }: 
       notify("正在保存面经，请稍候", "info");
       return;
     }
+    if (coreWrites.hasHeldReceipt) {
+      notify("先核对当前面经保存；输入会继续留在这里。", "info");
+      return;
+    }
     if (!dirty) { onClose(); return; }
     setClosePrompt(true);
   }
 
   function saveLocalDraftAndClose() {
+    if (!expectedInterview) {
+      notify("当前面经绑定已失效，草稿仍留在画面上；请先重新读取。", "error");
+      setClosePrompt(false);
+      return;
+    }
     const localDraft: InterviewLocalDraft = {
-      version: 1,
+      version: 2,
       interviewId: interview.id,
-      sourceUpdatedAt: interview.updated_at,
+      source: expectedInterview,
       savedAt: new Date().toISOString(),
       snapshot: currentSnapshot,
     };
@@ -3320,6 +3878,7 @@ function InterviewDrawer({ interview, data, onClose, onRefresh, onAi, notify }: 
   function discardAndClose() {
     try {
       window.localStorage.removeItem(interviewDraftKey(interview.id));
+      window.localStorage.removeItem(legacyInterviewDraftKey(interview.id));
       setClosePrompt(false);
       onClose();
     } catch {
@@ -3342,6 +3901,7 @@ function InterviewDrawer({ interview, data, onClose, onRefresh, onAi, notify }: 
   function clearPendingLocalDraft() {
     try {
       window.localStorage.removeItem(interviewDraftKey(interview.id));
+      window.localStorage.removeItem(legacyInterviewDraftKey(interview.id));
       setPendingStaleDraft(null);
       notify("旧本机草稿已清理；SQLite 中的面经没有改动", "info");
     } catch {
@@ -3380,7 +3940,8 @@ function InterviewDrawer({ interview, data, onClose, onRefresh, onAi, notify }: 
       <div><span className="career-eyebrow">INTERVIEW EXPERIENCE</span><h2>{job?.company} · {interview.round_name}</h2><p>{formatDate(interview.scheduled_at, true)} · {interview.interviewer || "面试官待确认"}</p></div>
       <button className="career-icon-button" onClick={requestClose} aria-label="关闭面经"><X size={19} /></button>
     </div>
-    <form className="career-experience-form" onSubmit={save}>
+    <form className="career-experience-form" onChange={() => interviewDirtyChangeRef.current(true)} onSubmit={save}>
+      <fieldset className="career-core-write-fields" disabled={saving || Boolean(activeCoreOperationId)}>
       {pendingStaleDraft && <div className="career-stale-draft-note" role="status"><FileArchive size={17} /><div><b>发现一份基于较早面经的本机草稿</b><p>SQLite 里已有更新，因此没有自动覆盖。你可以先使用当前已保存内容，或明确载入旧草稿逐项核对。</p><div><button type="button" className="career-button ghost" onClick={() => setPendingStaleDraft(null)}>继续使用当前内容</button><button type="button" className="career-button secondary" onClick={loadPendingLocalDraft}>载入本机草稿核对</button><button type="button" className="career-button ghost danger" onClick={clearPendingLocalDraft}>清除旧草稿</button></div></div></div>}
       {draftRestored && <div className="career-local-draft-note" role="status"><FileArchive size={17} /><span><b>已恢复当前网址下的本机草稿</b><small>{formatDate(draftRestored.savedAt, true)} 保存{draftRestored.basedOnOlderVersion ? " · 原面经之后有过更新，请核对再正式保存" : ""}。它不在 SQLite 或导出备份中。</small></span></div>}
       <div className="career-experience-toolbar">
@@ -3405,7 +3966,10 @@ function InterviewDrawer({ interview, data, onClose, onRefresh, onAi, notify }: 
         </article>)}
       </div>
       <Field label="复盘与下一步"><textarea rows={5} value={reflection} onChange={(event) => { markStructuredFieldEdited(); setReflection(event.target.value); }} placeholder="这次想记住什么？以后遇到类似问题想怎样表达？" /></Field>
-      <div className="career-form-actions sticky"><button type="button" className="career-button ghost" disabled={saving} onClick={requestClose}>关闭</button><button className="career-button primary" disabled={saving}>{saving ? <LoaderCircle className="spin" size={16} /> : <Check size={16} />}{saving ? "正在保存…" : "保存面经"}</button></div>
+      </fieldset>
+      <CareerCoreEditorRecovery coreWrites={coreWrites} />
+      {(coreWrites.error || coreWrites.status) && <div className="career-inline-error" role="status"><ShieldCheck size={15} />{coreWrites.error || coreWrites.status}</div>}
+      <div className="career-form-actions sticky"><button type="button" className="career-button ghost" disabled={saving} onClick={requestClose}>关闭</button><button type="submit" className="career-button primary" disabled={saving || Boolean(activeCoreOperationId) || coreWrites.writeLocked}>{saving || activeCoreOperationId ? <LoaderCircle className="spin" size={16} /> : <Check size={16} />}{saving || activeCoreOperationId ? "等待核对…" : "保存面经"}</button></div>
     </form>
   </Drawer>{closePrompt && <Modal title="保留这次编辑吗？" description="这些修改还没有写入职迹的 SQLite 数据库。" onClose={() => setClosePrompt(false)}><div className="career-draft-choice"><p>你可以继续编辑、暂存在当前网址的浏览器存储，或明确放弃这次修改。</p><div><button type="button" className="career-button primary" data-dialog-initial onClick={() => setClosePrompt(false)}>继续编辑</button><button type="button" className="career-button secondary" onClick={saveLocalDraftAndClose}><FileArchive size={16} />保存本机草稿并关闭</button><button type="button" className="career-button danger" onClick={discardAndClose}><Trash2 size={16} />放弃修改</button></div><small><ShieldCheck size={14} />本机草稿只在当前完整网址与浏览器资料对应的站点存储中，不进入 SQLite 或导出备份；换网址、浏览器资料或清除该网址的站点数据都可能让这里看不到它。</small></div></Modal>}</>;
 }
@@ -3476,11 +4040,14 @@ function ContactDiscardPrompt({ noun, onKeep, onDiscard }: { noun: string; onKee
   return <div className="career-contact-discard" role="status"><ShieldCheck size={23} /><h3>放下还没保存的{noun}？</h3><p>只有表单里的输入会被放下；已经保存的联系人资料不会改变。</p><div><button type="button" className="career-button primary" data-contact-safe-focus onClick={onKeep}>继续填写</button><button type="button" className="career-button ghost" onClick={onDiscard}>放下输入</button></div></div>;
 }
 
-function ContactDrawer({ contactId, revision, now, externalHint, onClose, onEdit, onRecord, onAddTask, onOpenTask, onCompleteTask, onRefresh, onArchived, onRestored, notify }: {
+function ContactDrawer({ contactId, revision, now, externalHint, newWritesBlocked, newWritesBlockedNow, onExternalMutationChange, onClose, onEdit, onRecord, onAddTask, onOpenTask, onCompleteTask, onRefresh, onArchived, onRestored, notify }: {
   contactId: string;
   revision: number;
   now: number;
   externalHint: string;
+  newWritesBlocked: boolean;
+  newWritesBlockedNow: () => boolean;
+  onExternalMutationChange: (active: boolean) => void;
   onClose: () => void;
   onEdit: () => void;
   onRecord: () => void;
@@ -3548,7 +4115,13 @@ function ContactDrawer({ contactId, revision, now, externalHint, onClose, onEdit
 
   async function changeArchive(targetArchived: boolean) {
     if (!detail || writeRef.current) return;
+    if (newWritesBlockedNow()) {
+      setPhase("ready");
+      setMessage("核心资料需要先完成核对；联系人状态没有改变。");
+      return;
+    }
     writeRef.current = true;
+    onExternalMutationChange(true);
     targetArchivedRef.current = targetArchived;
     setPhase("writing");
     setMessage("");
@@ -3577,35 +4150,100 @@ function ContactDrawer({ contactId, revision, now, externalHint, onClose, onEdit
         setPhase("ready");
         setMessage(careerContactErrorText(error, "这次没有更新联系人状态，原记录仍保持不变。"));
       }
-    } finally { writeRef.current = false; }
+    } finally {
+      writeRef.current = false;
+      onExternalMutationChange(false);
+    }
   }
   return <Drawer label={`${contact.name} · 联系人详情`} onClose={onClose} dismissible={!locked} inertToasts={locked} wide>
     <div ref={phaseRootRef} className="career-contact-drawer-phase" tabIndex={-1}>
       <div className="career-contact-drawer-head"><span className="career-contact-avatar large">{initials(contact.name)}</span><div><span>{archived ? "已归档联系人" : "联系人"}</span><h2>{contact.name}</h2>{identity && <p>{identity}</p>}</div>{!locked && <button className="career-icon-button" onClick={onClose} aria-label="关闭联系人详情"><X size={19} /></button>}</div>
-      {phase === "confirm-archive" ? <div className="career-contact-archive-confirm" role="status"><Archive size={23} /><h3>把这位联系人移入归档？</h3><p>只会把联系人从常用列表收起。联系历史和职位关联会保留；已经安排的待办仍会出现在“今日”和日历，不会被取消。</p><div><button className="career-button primary" data-contact-safe-focus onClick={() => setPhase("ready")}>继续保留</button><button className="career-button ghost" onClick={() => void changeArchive(true)}>确认移入归档</button></div></div> : phase === "writing" || phase === "refreshing" ? <ContactWriteStatus icon="busy" title={phase === "writing" ? "正在核对并保存" : "已经停止写入，正在重新读取"} message={phase === "writing" ? "会先核对联系人版本；这时不能关闭，以免失去结果。" : "这里只刷新画面，不会再次提交状态更改。"} /> : phase === "refresh-only" ? <ContactWriteStatus icon="safe" title="只重新读取联系人状态" message={message} action={<button className="career-button primary" data-contact-safe-focus onClick={() => void refreshArchiveResult()}><RotateCcw size={16} />只读核对</button>} /> : <>
-        <div className="career-contact-drawer-actions">{!archived && <button className="career-button primary" onClick={onRecord}><MessageSquareText size={16} />记录联系</button>}<button className="career-button secondary" onClick={onEdit}><Pencil size={15} />编辑</button></div>
+      {phase === "confirm-archive" ? <div className="career-contact-archive-confirm" role="status"><Archive size={23} /><h3>把这位联系人移入归档？</h3><p>只会把联系人从常用列表收起。联系历史和职位关联会保留；已经安排的待办仍会出现在“今日”和日历，不会被取消。</p><div><button className="career-button primary" data-contact-safe-focus onClick={() => setPhase("ready")}>继续保留</button><button className="career-button ghost" disabled={newWritesBlocked} onClick={() => void changeArchive(true)}>确认移入归档</button></div></div> : phase === "writing" || phase === "refreshing" ? <ContactWriteStatus icon="busy" title={phase === "writing" ? "正在核对并保存" : "已经停止写入，正在重新读取"} message={phase === "writing" ? "会先核对联系人版本；这时不能关闭，以免失去结果。" : "这里只刷新画面，不会再次提交状态更改。"} /> : phase === "refresh-only" ? <ContactWriteStatus icon="safe" title="只重新读取联系人状态" message={message} action={<button className="career-button primary" data-contact-safe-focus onClick={() => void refreshArchiveResult()}><RotateCcw size={16} />只读核对</button>} /> : <>
+        <div className="career-contact-drawer-actions">{!archived && <button className="career-button primary" disabled={newWritesBlocked} onClick={onRecord}><MessageSquareText size={16} />记录联系</button>}<button className="career-button secondary" disabled={newWritesBlocked} onClick={onEdit}><Pencil size={15} />编辑</button></div>
         {externalHint && <div className="career-contact-external-hint" role="status"><ShieldCheck size={16} /><span>{externalHint}</span></div>}
         {message && <div className="career-contact-read-warning" role="status"><ShieldCheck size={16} /><span>{message}</span></div>}
         {readError && <div className="career-contact-read-warning" role="alert"><ShieldCheck size={16} /><span>相关记录暂时没有重新读到，画面保留上一次成功读取的内容。</span><button onClick={() => setReadRevision((current) => current + 1)}>重新读取</button></div>}
         <div className="career-drawer-body career-contact-detail">
-          <section><header><div><span>NEXT STEP</span><h3>下一步</h3></div>{!archived && <button className="career-text-button" onClick={onAddTask}>{nextTask ? "再安排一步" : "安排下一步"}<ChevronRight size={14} /></button>}</header>{nextTask ? <CareerTaskRow compact task={nextTask} data={{ ...emptyData, jobs: detail.jobs, stages: [] }} now={now} onOpen={onOpenTask} onComplete={onCompleteTask} /> : <p className="career-contact-calm-copy">没有安排下一步。需要时再决定，不必为了填满而创建提醒。</p>}</section>
-          <section><header><div><span>CONTEXT</span><h3>关联职位</h3></div><button className="career-text-button" onClick={onEdit}>管理关联 <ChevronRight size={14} /></button></header>{detail.jobs.length > 0 ? <div className="career-contact-related-jobs">{detail.jobs.map((job) => <span key={job.id}><CompanyMark company={job.company} small /><b>{job.role}</b><small>{job.company}</small></span>)}</div> : <p className="career-contact-calm-copy">还没有关联职位。只有你明确选择后，这里才会建立关系。</p>}</section>
-          <section><header><div><span>HISTORY</span><h3>联系记录</h3></div>{!archived && <button className="career-text-button" onClick={onRecord}>记录一次 <Plus size={14} /></button>}</header>{detail.interactions.length > 0 ? <div className="career-contact-timeline">{detail.interactions.map((interaction) => <article key={interaction.id}><i /><div><header><b>{interaction.summary}</b><time>{formatDate(interaction.occurred_at, true)}</time></header><p>{interaction.channel || "未注明渠道"} · {interaction.direction === "outbound" ? "我发出" : interaction.direction === "inbound" ? "对方发来" : "双方交流"}{interaction.job_id ? ` · ${detail.jobs.find((job) => job.id === interaction.job_id)?.role ?? "关联职位"}` : ""}</p>{interaction.notes && <small>{interaction.notes}</small>}</div></article>)}</div> : <p className="career-contact-calm-copy">还没有联系记录。不需要为了填满而补写；下次真实交流后再记。</p>}</section>
+          <section><header><div><span>NEXT STEP</span><h3>下一步</h3></div>{!archived && <button className="career-text-button" disabled={newWritesBlocked} onClick={onAddTask}>{nextTask ? "再安排一步" : "安排下一步"}<ChevronRight size={14} /></button>}</header>{nextTask ? <CareerTaskRow compact task={nextTask} data={{ ...emptyData, jobs: detail.jobs, stages: [] }} now={now} onOpen={onOpenTask} onComplete={onCompleteTask} /> : <p className="career-contact-calm-copy">没有安排下一步。需要时再决定，不必为了填满而创建提醒。</p>}</section>
+          <section><header><div><span>CONTEXT</span><h3>关联职位</h3></div><button className="career-text-button" disabled={newWritesBlocked} onClick={onEdit}>管理关联 <ChevronRight size={14} /></button></header>{detail.jobs.length > 0 ? <div className="career-contact-related-jobs">{detail.jobs.map((job) => <span key={job.id}><CompanyMark company={job.company} small /><b>{job.role}</b><small>{job.company}</small></span>)}</div> : <p className="career-contact-calm-copy">还没有关联职位。只有你明确选择后，这里才会建立关系。</p>}</section>
+          <section><header><div><span>HISTORY</span><h3>联系记录</h3></div>{!archived && <button className="career-text-button" disabled={newWritesBlocked} onClick={onRecord}>记录一次 <Plus size={14} /></button>}</header>{detail.interactions.length > 0 ? <div className="career-contact-timeline">{detail.interactions.map((interaction) => <article key={interaction.id}><i /><div><header><b>{interaction.summary}</b><time>{formatDate(interaction.occurred_at, true)}</time></header><p>{interaction.channel || "未注明渠道"} · {interaction.direction === "outbound" ? "我发出" : interaction.direction === "inbound" ? "对方发来" : "双方交流"}{interaction.job_id ? ` · ${detail.jobs.find((job) => job.id === interaction.job_id)?.role ?? "关联职位"}` : ""}</p>{interaction.notes && <small>{interaction.notes}</small>}</div></article>)}</div> : <p className="career-contact-calm-copy">还没有联系记录。不需要为了填满而补写；下次真实交流后再记。</p>}</section>
           <section><header><div><span>CONTACT</span><h3>联系方式</h3></div></header><div className="career-contact-channels">{contact.email && <a href={`mailto:${contact.email}`}><ContactRound size={16} /><span><b>邮箱</b><small>{contact.email}</small></span><ExternalLink size={14} /></a>}{contact.phone && <a href={`tel:${contact.phone.replace(/[^+\d*#,;]/g, "")}`}><Phone size={16} /><span><b>电话</b><small>{contact.phone}</small></span><ExternalLink size={14} /></a>}{!contact.email && !contact.phone && <p className="career-contact-calm-copy">还没有保存邮箱或电话。</p>}</div>{contact.notes && <p className="career-contact-notes">{contact.notes}</p>}</section>
         </div>
-        <footer className="career-drawer-footer"><button className={archived ? "career-button secondary" : "career-button ghost"} onClick={() => archived ? void changeArchive(false) : setPhase("confirm-archive")}>{archived ? <RotateCcw size={15} /> : <Archive size={15} />}{archived ? "恢复联系人" : "移入归档"}</button></footer>
+        <footer className="career-drawer-footer"><button className={archived ? "career-button secondary" : "career-button ghost"} disabled={newWritesBlocked} onClick={() => archived ? void changeArchive(false) : setPhase("confirm-archive")}>{archived ? <RotateCcw size={15} /> : <Archive size={15} />}{archived ? "恢复联系人" : "移入归档"}</button></footer>
       </>}
     </div>
   </Drawer>;
 }
 
-function JobModal({ data, onClose, onSaved }: { data: CareerData; onClose: () => void; onSaved: (id: string) => Promise<void> }) {
+function JobModal({ data, coreBindings, coreWrites, onDirtyChange, onClose, onSaved, notify }: { data: CareerData; coreBindings: CareerCoreBindings; coreWrites: CareerCoreWriteController; onDirtyChange: (dirty: boolean) => void; onClose: () => void; onSaved: (id: string) => void; notify: (text: string, tone?: Notice["tone"]) => void }) {
   const [saving, setSaving] = useState(false);
-  async function submit(event: FormEvent<HTMLFormElement>) { event.preventDefault(); setSaving(true); const form = new FormData(event.currentTarget); const id = newId("job"); const now = new Date().toISOString(); try { await runCareerBatch([{ sql: `INSERT INTO career_jobs (id,company,role,location,source,source_url,stage_id,priority,salary,work_mode,description,applied_at,deadline,contact_name,note,tags,created_at,updated_at,archived,position) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,0)`, params: [id, form.get("company"), form.get("role"), form.get("location"), form.get("source"), form.get("source_url"), form.get("stage_id"), Number(form.get("priority")), form.get("salary"), form.get("work_mode"), form.get("description"), form.get("stage_id") === "stage_applied" ? now : null, fromDateInput(String(form.get("deadline") || "")), "", form.get("note"), form.get("tags"), now, now] }, { sql: "INSERT INTO career_activity (id,job_id,type,detail,created_at) VALUES (?,?,?,?,?)", params: [newId("activity"), id, "create", `记录了 ${form.get("company")} · ${form.get("role")}`, now] }]); await onSaved(id); } finally { setSaving(false); } }
-  return <Modal title="记录一个新职位" description="先写下关键信息，细节可以随时补充。" onClose={onClose} wide><form className="career-form" onSubmit={submit}><div className="career-form-row"><Field label="公司"><input name="company" required placeholder="例如：Linear" /></Field><Field label="职位"><input name="role" required placeholder="例如：Product Designer" /></Field></div><div className="career-form-row thirds"><Field label="当前阶段"><select name="stage_id" defaultValue="stage_saved">{data.stages.filter((stage) => !stage.is_terminal).map((stage) => <option key={stage.id} value={stage.id}>{stage.name}</option>)}</select></Field><Field label="是否关注" hint="只是方便筛选，不是优先级评分"><select name="priority" defaultValue="1"><option value="1">普通记录</option><option value="2">已关注</option></select></Field><Field label="来源"><select name="source" defaultValue="手动记录"><option>手动记录</option><option>LinkedIn</option><option>BOSS直聘</option><option>官网</option><option>内推</option></select></Field></div><div className="career-form-row"><Field label="地点"><input name="location" placeholder="上海 / 远程" /></Field><Field label="工作方式"><select name="work_mode"><option value="">待确认</option><option>现场办公</option><option>混合办公</option><option>远程</option></select></Field></div><div className="career-form-row"><Field label="薪资"><input name="salary" placeholder="¥30k–45k / 月" /></Field><Field label="截止时间"><input name="deadline" type="datetime-local" /></Field></div><Field label="原职位链接"><input name="source_url" type="url" placeholder="https://" /></Field><Field label="标签" hint="用逗号分隔"><input name="tags" placeholder="AI, 产品设计, 远程" /></Field><Field label="职位描述"><textarea name="description" rows={5} placeholder="粘贴岗位职责和要求…" /></Field><Field label="个人备注"><textarea name="note" rows={3} placeholder="为什么感兴趣？下一步要确认什么？" /></Field><div className="career-form-actions"><button type="button" className="career-button ghost" onClick={onClose}>取消</button><button className="career-button primary" disabled={saving}>{saving ? <LoaderCircle className="spin" size={16} /> : <Plus size={16} />}保存职位</button></div></form></Modal>;
+  const [activeCoreOperationId, setActiveCoreOperationId] = useState<string | null>(null);
+  const [dirty, setDirty] = useState(false);
+  const [closePrompt, setClosePrompt] = useState(false);
+  const savingRef = useRef(false);
+  const dirtyChangeRef = useRef(onDirtyChange);
+  useLayoutEffect(() => { dirtyChangeRef.current = onDirtyChange; }, [onDirtyChange]);
+  useEffect(() => { dirtyChangeRef.current(dirty || saving); }, [dirty, saving]);
+  useEffect(() => () => dirtyChangeRef.current(false), []);
+  function markDirty() {
+    setDirty(true);
+    dirtyChangeRef.current(true);
+  }
+  function clearDirty() {
+    setDirty(false);
+    dirtyChangeRef.current(false);
+  }
+  function requestClose() {
+    if (savingRef.current) { notify("正在安全确认职位保存，请稍候", "info"); return; }
+    if (coreWrites.hasHeldReceipt) { notify("先核对当前职位保存；输入会继续留在这里。", "info"); return; }
+    if (dirty) { setClosePrompt(true); return; }
+    onClose();
+  }
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (savingRef.current) return;
+    const form = new FormData(event.currentTarget);
+    const stage = data.stages.find((item) => item.id === String(form.get("stage_id") ?? ""));
+    const expected = stage ? getBoundCareerStageExpected(coreBindings, stage) : null;
+    const trigger = event.currentTarget.querySelector<HTMLButtonElement>('button[type="submit"]');
+    if (!expected || !trigger || coreWrites.writeLocked) {
+      notify("所选阶段不是当前可写版本；输入仍保留，请先重新读取。", "info");
+      return;
+    }
+    const input: CreateCareerJobCoreInput = {
+      company: String(form.get("company") ?? ""), role: String(form.get("role") ?? ""),
+      location: String(form.get("location") ?? ""), source: String(form.get("source") ?? "手动记录"),
+      sourceUrl: String(form.get("source_url") ?? ""), priority: Number(form.get("priority") ?? 1),
+      salary: String(form.get("salary") ?? ""), workMode: String(form.get("work_mode") ?? ""),
+      description: String(form.get("description") ?? ""), deadline: fromDateInput(String(form.get("deadline") || "")),
+      note: String(form.get("note") ?? ""), tags: String(form.get("tags") ?? ""),
+    };
+    savingRef.current = true; setSaving(true);
+    try {
+      await coreWrites.submitJobCreate(input, expected, trigger, {
+        onPrepared: (receipt) => setActiveCoreOperationId(receipt.operationId),
+        onSettled: ({ outcome, receipt }) => {
+          setActiveCoreOperationId((current) =>
+            current === receipt.operationId ? null : current);
+          if (outcome === "saved" && receipt.kind === "job-create") {
+            clearDirty();
+            onSaved(receipt.after.job.id);
+          } else if (outcome === "changed") {
+            notify("所选阶段已变化；当前输入仍保留，没有创建职位。", "info");
+          }
+        },
+        onAbandonChanged: () => {
+          clearDirty();
+          setActiveCoreOperationId(null);
+          onClose();
+        },
+      });
+    } finally { savingRef.current = false; setSaving(false); }
+  }
+  return <><Modal title="记录一个新职位" description="先写下关键信息，细节可以随时补充。" onClose={requestClose} wide><form className="career-form" onChange={markDirty} onSubmit={submit}><fieldset className="career-core-write-fields" disabled={saving || Boolean(activeCoreOperationId)}><div className="career-form-row"><Field label="公司"><input name="company" required placeholder="例如：Linear" /></Field><Field label="职位"><input name="role" required placeholder="例如：Product Designer" /></Field></div><div className="career-form-row thirds"><Field label="当前阶段"><select name="stage_id" defaultValue="stage_saved">{data.stages.filter((stage) => !stage.is_terminal).map((stage) => <option key={stage.id} value={stage.id}>{stage.name}</option>)}</select></Field><Field label="是否关注" hint="只是方便筛选，不是优先级评分"><select name="priority" defaultValue="1"><option value="1">普通记录</option><option value="2">已关注</option></select></Field><Field label="来源"><select name="source" defaultValue="手动记录"><option>手动记录</option><option>LinkedIn</option><option>BOSS直聘</option><option>官网</option><option>内推</option></select></Field></div><div className="career-form-row"><Field label="地点"><input name="location" placeholder="上海 / 远程" /></Field><Field label="工作方式"><select name="work_mode"><option value="">待确认</option><option>现场办公</option><option>混合办公</option><option>远程</option></select></Field></div><div className="career-form-row"><Field label="薪资"><input name="salary" placeholder="¥30k–45k / 月" /></Field><Field label="截止时间"><input name="deadline" type="datetime-local" /></Field></div><Field label="原职位链接"><input name="source_url" type="url" placeholder="https://" /></Field><Field label="标签" hint="用逗号分隔"><input name="tags" placeholder="AI, 产品设计, 远程" /></Field><Field label="职位描述"><textarea name="description" rows={5} placeholder="粘贴岗位职责和要求…" /></Field><Field label="个人备注"><textarea name="note" rows={3} placeholder="为什么感兴趣？下一步要确认什么？" /></Field></fieldset><CareerCoreEditorRecovery coreWrites={coreWrites} />{(coreWrites.error || coreWrites.status) && <div className="career-inline-error" role="status"><ShieldCheck size={15} />{coreWrites.error || coreWrites.status}</div>}<div className="career-form-actions"><button type="button" className="career-button ghost" disabled={saving} onClick={requestClose}>取消</button><button type="submit" className="career-button primary" disabled={saving || Boolean(activeCoreOperationId) || coreWrites.writeLocked}>{saving || activeCoreOperationId ? <LoaderCircle className="spin" size={16} /> : <Plus size={16} />}{saving || activeCoreOperationId ? "等待核对…" : "保存职位"}</button></div></form></Modal>{closePrompt && <Modal title="保留这份职位输入吗？" description="这些内容还没有写入职迹 SQLite。" onClose={() => setClosePrompt(false)}><div className="career-draft-choice"><p>继续编辑会完整保留当前表单；只有明确放弃才会关闭。</p><div><button type="button" className="career-button primary" data-dialog-initial onClick={() => setClosePrompt(false)}>继续编辑</button><button type="button" className="career-button danger" onClick={() => { clearDirty(); setClosePrompt(false); onClose(); }}>放弃输入</button></div></div></Modal>}</>;
 }
 
-function TaskModal({ data, initialJobId, onClose, onSaved }: { data: CareerData; initialJobId: string | null; onClose: () => void; onSaved: () => Promise<void> }) {
+function TaskModal({ data, initialJobId, newWritesBlocked, newWritesBlockedNow, onExternalMutationChange, onClose, onSaved }: { data: CareerData; initialJobId: string | null; newWritesBlocked: boolean; newWritesBlockedNow: () => boolean; onExternalMutationChange: (active: boolean) => void; onClose: () => void; onSaved: () => Promise<void> }) {
   const [phase, setPhase] = useState<"idle" | "writing" | "refresh-only">("idle");
   const [error, setError] = useState("");
   const savingRef = useRef(false);
@@ -3625,7 +4263,12 @@ function TaskModal({ data, initialJobId, onClose, onSaved }: { data: CareerData;
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (savingRef.current) return;
+    if (newWritesBlockedNow()) {
+      setError("核心资料需要先完成核对；待办没有创建。");
+      return;
+    }
     savingRef.current = true;
+    onExternalMutationChange(true);
     setPhase("writing");
     setError("");
     const form = new FormData(event.currentTarget);
@@ -3645,16 +4288,38 @@ function TaskModal({ data, initialJobId, onClose, onSaved }: { data: CareerData;
       setPhase("idle");
     } finally {
       savingRef.current = false;
+      onExternalMutationChange(false);
     }
   }
   if (phase === "refresh-only") return <Modal title="待办已保存在本机" description="画面还没有重新读取。请只重新读取，不要重复提交。" onClose={() => undefined} dismissible={false} inertToasts><div className="career-task-refresh-only" role="status"><ShieldCheck size={22} /><p>{error || "这条待办已经写入本地 SQLite；重新读取不会再创建一条。"}</p><button className="career-button primary" data-dialog-initial onClick={() => void retryRefresh()}><RotateCcw size={16} />重新读取</button></div></Modal>;
-  return <Modal title="新建待办" description="记录你主动决定的下一步；计划时间可以留空。" onClose={phase === "writing" ? () => undefined : onClose}><form className="career-form" onSubmit={submit}><Field label="要做什么"><input name="title" required placeholder="例如：发送面试感谢邮件" /></Field><Field label="关联职位" hint="可选"><select name="job_id" defaultValue={initialJobId ?? ""}><option value="">个人待办</option>{availableJobs.map((job) => <option key={job.id} value={job.id}>{job.company} · {job.role}</option>)}</select></Field><div className="career-form-row"><Field label="计划时间（可选）" hint="不设时间会放在“以后再说”"><input name="due_at" type="datetime-local" /></Field><Field label="类型"><select name="kind"><option>跟进</option><option>面试准备</option><option>材料</option><option>截止事项</option><option>其他</option></select></Field></div><Field label="优先级"><select name="priority" defaultValue="1"><option value="1">普通</option><option value="2">重点</option><option value="3">时间敏感</option></select></Field>{error && <div className="career-inline-error" role="alert"><X size={15} />{error}</div>}<div className="career-form-actions"><button type="button" className="career-button ghost" disabled={phase === "writing"} onClick={onClose}>取消</button><button className="career-button primary" disabled={phase === "writing"}>{phase === "writing" ? <LoaderCircle className="spin" size={16} /> : <ListTodo size={16} />}{phase === "writing" ? "正在创建…" : "创建待办"}</button></div></form></Modal>;
+  return <Modal title="新建待办" description="记录你主动决定的下一步；计划时间可以留空。" onClose={phase === "writing" ? () => undefined : onClose}><form className="career-form" onSubmit={submit}><Field label="要做什么"><input name="title" required placeholder="例如：发送面试感谢邮件" /></Field><Field label="关联职位" hint="可选"><select name="job_id" defaultValue={initialJobId ?? ""}><option value="">个人待办</option>{availableJobs.map((job) => <option key={job.id} value={job.id}>{job.company} · {job.role}</option>)}</select></Field><div className="career-form-row"><Field label="计划时间（可选）" hint="不设时间会放在“以后再说”"><input name="due_at" type="datetime-local" /></Field><Field label="类型"><select name="kind"><option>跟进</option><option>面试准备</option><option>材料</option><option>截止事项</option><option>其他</option></select></Field></div><Field label="优先级"><select name="priority" defaultValue="1"><option value="1">普通</option><option value="2">重点</option><option value="3">时间敏感</option></select></Field>{error && <div className="career-inline-error" role="alert"><X size={15} />{error}</div>}<div className="career-form-actions"><button type="button" className="career-button ghost" disabled={phase === "writing"} onClick={onClose}>取消</button><button className="career-button primary" disabled={phase === "writing" || newWritesBlocked}>{phase === "writing" ? <LoaderCircle className="spin" size={16} /> : <ListTodo size={16} />}{phase === "writing" ? "正在创建…" : "创建待办"}</button></div></form></Modal>;
 }
 
-function InterviewModal({ data, onClose, onSaved }: { data: CareerData; onClose: () => void; onSaved: () => Promise<void> }) {
+function InterviewModal({ data, coreBindings, coreWrites, onDirtyChange, onClose, onSaved, notify }: { data: CareerData; coreBindings: CareerCoreBindings; coreWrites: CareerCoreWriteController; onDirtyChange: (dirty: boolean) => void; onClose: () => void; onSaved: (id: string) => void; notify: (text: string, tone?: Notice["tone"]) => void }) {
   const [saving, setSaving] = useState(false);
+  const [activeCoreOperationId, setActiveCoreOperationId] = useState<string | null>(null);
+  const [dirty, setDirty] = useState(false);
+  const [closePrompt, setClosePrompt] = useState(false);
   const [error, setError] = useState("");
   const savingRef = useRef(false);
+  const dirtyChangeRef = useRef(onDirtyChange);
+  useLayoutEffect(() => { dirtyChangeRef.current = onDirtyChange; }, [onDirtyChange]);
+  useEffect(() => { dirtyChangeRef.current(dirty || saving); }, [dirty, saving]);
+  useEffect(() => () => dirtyChangeRef.current(false), []);
+  function markDirty() {
+    setDirty(true);
+    dirtyChangeRef.current(true);
+  }
+  function clearDirty() {
+    setDirty(false);
+    dirtyChangeRef.current(false);
+  }
+  function requestClose() {
+    if (savingRef.current) { notify("正在安全确认面试日程，请稍候", "info"); return; }
+    if (coreWrites.hasHeldReceipt) { notify("先核对当前面试保存；输入会继续留在这里。", "info"); return; }
+    if (dirty) { setClosePrompt(true); return; }
+    onClose();
+  }
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (savingRef.current) return;
@@ -3662,10 +4327,41 @@ function InterviewModal({ data, onClose, onSaved }: { data: CareerData; onClose:
     setSaving(true);
     setError("");
     const form = new FormData(event.currentTarget);
-    const now = new Date().toISOString();
+    const job = data.jobs.find((item) => item.id === String(form.get("job_id") ?? ""));
+    const expected = job ? getBoundCareerJobExpected(coreBindings, job) : null;
+    const trigger = event.currentTarget.querySelector<HTMLButtonElement>('button[type="submit"]');
+    const scheduledAt = fromDateInput(String(form.get("scheduled_at") || ""));
     try {
-      await runCareerSql(`INSERT INTO career_interviews (id,job_id,round_name,interview_type,scheduled_at,duration,interviewer,meeting_url,status,summary,raw_notes,questions_json,reflection,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, [newId("interview"), form.get("job_id"), form.get("round_name"), form.get("interview_type"), fromDateInput(String(form.get("scheduled_at") || "")), Number(form.get("duration")), form.get("interviewer"), form.get("meeting_url"), "scheduled", "", "", "[]", "", now, now]);
-      await onSaved();
+      if (!expected || !trigger || !scheduledAt || coreWrites.writeLocked) {
+        setError("关联职位不是当前可写版本；输入仍保留，请先重新读取。");
+        return;
+      }
+      const input: CreateCareerInterviewCoreInput = {
+        roundName: String(form.get("round_name") ?? ""),
+        interviewType: String(form.get("interview_type") ?? ""),
+        scheduledAt,
+        duration: Number(form.get("duration") ?? 45),
+        interviewer: String(form.get("interviewer") ?? ""),
+        meetingUrl: String(form.get("meeting_url") ?? ""),
+      };
+      await coreWrites.submitInterviewCreate(input, expected, trigger, {
+        onPrepared: (receipt) => setActiveCoreOperationId(receipt.operationId),
+        onSettled: ({ outcome, receipt }) => {
+          setActiveCoreOperationId((current) =>
+            current === receipt.operationId ? null : current);
+          if (outcome === "saved" && receipt.kind === "interview-create") {
+            clearDirty();
+            onSaved(receipt.after.interview.id);
+          } else if (outcome === "changed") {
+            setError("关联职位或阶段已变化；当前输入仍保留，没有创建面试。");
+          }
+        },
+        onAbandonChanged: () => {
+          clearDirty();
+          setActiveCoreOperationId(null);
+          onClose();
+        },
+      });
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "面试日程暂时没有保存，请再试一次");
     } finally {
@@ -3674,10 +4370,10 @@ function InterviewModal({ data, onClose, onSaved }: { data: CareerData; onClose:
     }
   }
   const availableJobs = data.jobs.filter((job) => job.archived !== 1 && !data.stages.find((stage) => stage.id === job.stage_id)?.is_terminal);
-  return <Modal title="安排面试轮次" description="时间、面试官和会议入口都放在一起。" onClose={saving ? () => undefined : onClose}><form className="career-form" onSubmit={submit}><Field label="关联职位"><select required name="job_id" defaultValue=""><option value="" disabled>选择职位</option>{availableJobs.map((job) => <option key={job.id} value={job.id}>{job.company} · {job.role}</option>)}</select></Field><div className="career-form-row"><Field label="轮次名称"><input name="round_name" required placeholder="技术二面" /></Field><Field label="形式"><select name="interview_type"><option>视频面试</option><option>电话沟通</option><option>现场面试</option><option>笔试复盘</option></select></Field></div><div className="career-form-row"><Field label="时间"><input name="scheduled_at" type="datetime-local" required /></Field><Field label="时长"><select name="duration" defaultValue="45"><option value="30">30 分钟</option><option value="45">45 分钟</option><option value="60">60 分钟</option><option value="90">90 分钟</option></select></Field></div><Field label="面试官"><input name="interviewer" placeholder="姓名 · 职位" /></Field><Field label="会议链接"><input name="meeting_url" type="url" placeholder="https://" /></Field>{error && <div className="career-inline-error" role="alert"><X size={15} />{error}</div>}<div className="career-form-actions"><button type="button" className="career-button ghost" disabled={saving} onClick={onClose}>取消</button><button className="career-button primary" disabled={saving}>{saving ? <LoaderCircle className="spin" size={16} /> : <CalendarDays size={16} />}{saving ? "正在保存…" : "保存日程"}</button></div></form></Modal>;
+  return <><Modal title="安排面试轮次" description="时间、面试官和会议入口都放在一起。" onClose={requestClose}><form className="career-form" onChange={markDirty} onSubmit={submit}><fieldset className="career-core-write-fields" disabled={saving || Boolean(activeCoreOperationId)}><Field label="关联职位"><select required name="job_id" defaultValue=""><option value="" disabled>选择职位</option>{availableJobs.map((job) => <option key={job.id} value={job.id}>{job.company} · {job.role}</option>)}</select></Field><div className="career-form-row"><Field label="轮次名称"><input name="round_name" required placeholder="技术二面" /></Field><Field label="形式"><select name="interview_type"><option>视频面试</option><option>电话沟通</option><option>现场面试</option><option>笔试复盘</option></select></Field></div><div className="career-form-row"><Field label="时间"><input name="scheduled_at" type="datetime-local" required /></Field><Field label="时长"><select name="duration" defaultValue="45"><option value="30">30 分钟</option><option value="45">45 分钟</option><option value="60">60 分钟</option><option value="90">90 分钟</option></select></Field></div><Field label="面试官"><input name="interviewer" placeholder="姓名 · 职位" /></Field><Field label="会议链接"><input name="meeting_url" type="url" placeholder="https://" /></Field></fieldset><CareerCoreEditorRecovery coreWrites={coreWrites} />{(error || coreWrites.error || coreWrites.status) && <div className="career-inline-error" role="status"><ShieldCheck size={15} />{error || coreWrites.error || coreWrites.status}</div>}<div className="career-form-actions"><button type="button" className="career-button ghost" disabled={saving} onClick={requestClose}>取消</button><button type="submit" className="career-button primary" disabled={saving || Boolean(activeCoreOperationId) || coreWrites.writeLocked}>{saving || activeCoreOperationId ? <LoaderCircle className="spin" size={16} /> : <CalendarDays size={16} />}{saving || activeCoreOperationId ? "等待核对…" : "保存日程"}</button></div></form></Modal>{closePrompt && <Modal title="保留这份面试输入吗？" description="这些内容还没有写入职迹 SQLite。" onClose={() => setClosePrompt(false)}><div className="career-draft-choice"><p>继续编辑会完整保留当前表单；只有明确放弃才会关闭。</p><div><button type="button" className="career-button primary" data-dialog-initial onClick={() => setClosePrompt(false)}>继续编辑</button><button type="button" className="career-button danger" onClick={() => { clearDirty(); setClosePrompt(false); onClose(); }}>放弃输入</button></div></div></Modal>}</>;
 }
 
-function ContactModal({ contactId, data, externalHint, onClose, onRefresh, onSaved, notify }: { contactId: string | null; data: CareerData; externalHint: string; onClose: () => void; onRefresh: () => Promise<void>; onSaved: (contactId: string) => void; notify: (text: string, tone?: Notice["tone"]) => void }) {
+function ContactModal({ contactId, data, externalHint, newWritesBlocked, newWritesBlockedNow, onExternalMutationChange, onClose, onRefresh, onSaved, notify }: { contactId: string | null; data: CareerData; externalHint: string; newWritesBlocked: boolean; newWritesBlockedNow: () => boolean; onExternalMutationChange: (active: boolean) => void; onClose: () => void; onRefresh: () => Promise<void>; onSaved: (contactId: string) => void; notify: (text: string, tone?: Notice["tone"]) => void }) {
   const [detail, setDetail] = useState<CareerContactDetail | null>(null);
   const [loading, setLoading] = useState(Boolean(contactId));
   const [readError, setReadError] = useState("");
@@ -3770,7 +4466,12 @@ function ContactModal({ contactId, data, externalHint, onClose, onRefresh, onSav
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (writeRef.current) return;
+    if (newWritesBlockedNow()) {
+      setError("核心资料需要先完成核对；联系人输入仍保留，没有保存。");
+      return;
+    }
     writeRef.current = true;
+    onExternalMutationChange(true);
     setPhase("writing");
     setError("");
     const form = new FormData(event.currentTarget);
@@ -3826,7 +4527,10 @@ function ContactModal({ contactId, data, externalHint, onClose, onRefresh, onSav
         setPhase("editing");
         setError(careerContactErrorText(caught, "这次没有保存，表单内容仍保留。"));
       }
-    } finally { writeRef.current = false; }
+    } finally {
+      writeRef.current = false;
+      onExternalMutationChange(false);
+    }
   }
   const contact = detail?.contact;
   const linked = new Set(detail?.associations.map((association) => association.job_id) ?? []);
@@ -3836,10 +4540,10 @@ function ContactModal({ contactId, data, externalHint, onClose, onRefresh, onSav
   const canDismiss = phase === "editing" || phase === "blocked" || Boolean(readError);
   // Nested semantic text labels each checkbox; the configured static-depth rule cannot follow it.
   // eslint-disable-next-line jsx-a11y/label-has-associated-control
-  return <Modal title={contactId ? "编辑联系人" : "添加联系人"} description="只保存你确认过的资料与职位关系；联系事实需要单独记录。" onClose={requestClose} dismissible={canDismiss} inertToasts={!canDismiss} wide><div ref={phaseRootRef} className="career-contact-modal-phase" tabIndex={-1}>{loading ? <div className="career-modal-loading"><LoaderCircle className="spin" size={20} />正在打开资料…</div> : contactId && (!detail || readError) ? <div className="career-drawer-read-error" role="status"><ShieldCheck size={22} /><h3>联系人资料暂时没有打开</h3><p>{readError || "没有把它显示成一份可覆盖的空表单。"}</p><div><button type="button" className="career-button primary" data-dialog-initial onClick={retryRead}><RotateCcw size={16} />重新读取</button><button type="button" className="career-button ghost" onClick={onClose}>关闭</button></div></div> : <>{phase === "writing" || phase === "checking" || phase === "refreshing" ? <ContactWriteStatus icon="busy" title={phase === "writing" ? "正在核对并保存" : phase === "checking" ? "正在只读核对保存结果" : "已经停止写入，正在重新读取"} message={phase === "checking" ? "只核对原凭据，不会再次创建联系人。" : phase === "refreshing" ? "这一步只刷新画面，不会再次保存。" : "写入期间会保留表单，暂时不能关闭。"} /> : phase === "uncertain" ? <ContactWriteStatus icon="safe" title="先核对这次保存" message={error} action={<button className="career-button primary" data-contact-safe-focus onClick={() => void inspectUncertain()}><Search size={16} />只读核对</button>} /> : phase === "refresh-only" ? <ContactWriteStatus icon="safe" title="只重新读取联系人" message={error} action={<button className="career-button primary" data-contact-safe-focus onClick={() => void refreshOnly(contactId ?? stableContactId)}><RotateCcw size={16} />重新读取</button>} /> : phase === "blocked" ? <ContactWriteStatus icon="safe" title="没有覆盖已有记录" message={error} action={<button className="career-button primary" data-contact-safe-focus onClick={onClose}>返回联系人</button>} /> : null}{phase === "editing" && discardPrompt && <ContactDiscardPrompt noun="联系人输入" onKeep={() => setDiscardPrompt(false)} onDiscard={() => { setDirty(false); onClose(); }} />}<form hidden={phase !== "editing" || discardPrompt} className="career-form" onChange={() => setDirty(true)} onSubmit={submit}>{externalHint && <div className="career-contact-external-hint" role="status"><ShieldCheck size={16} /><span>{externalHint}</span></div>}<div className="career-form-row"><Field label="姓名"><input name="name" required defaultValue={contact?.name ?? ""} /></Field><Field label="公司" hint="可选"><input name="company" defaultValue={contact?.company ?? ""} /></Field></div><div className="career-form-row"><Field label="身份 / 关系" hint="可选"><input name="role" defaultValue={contact?.role ?? ""} placeholder="Recruiter / 内推人" /></Field><Field label="常用渠道" hint="可选"><select name="channel" defaultValue={contact?.channel ?? ""}><option value="">不设置</option><option>LinkedIn</option><option>BOSS直聘</option><option>邮件</option><option>微信</option><option>电话</option><option>其他</option></select></Field></div><div className="career-form-row"><Field label="邮箱" hint="可选"><input name="email" type="email" defaultValue={contact?.email ?? ""} /></Field><Field label="电话" hint="可选"><input name="phone" defaultValue={contact?.phone ?? ""} /></Field></div><fieldset className="career-contact-job-picker"><legend>关联职位 <small>只建立你明确选择的关系</small></legend>{jobsForPicker.length > 0 ? <div>{jobsForPicker.map((job) => { const stage = data.stages.find((item) => item.id === job.stage_id); const context = job.archived === 1 ? "已归档" : stage?.is_terminal ? "已结束" : "进行中"; return <label key={job.id}><input type="checkbox" name="jobIds" value={job.id} defaultChecked={linked.has(job.id)} /><span><b>{job.role}</b><small>{job.company} · {context}</small></span></label>; })}</div> : <p>还没有可关联的职位。</p>}</fieldset><Field label="备注" hint="可选"><textarea name="notes" rows={4} defaultValue={contact?.notes ?? ""} placeholder="怎么认识、希望记住什么；不用重复写沟通记录。" /></Field>{error && <div className="career-inline-error" role="status"><ShieldCheck size={15} />{error}</div>}<div className="career-form-actions"><button type="button" className="career-button ghost" onClick={requestClose}>取消</button><button className="career-button primary"><Check size={16} />保存联系人</button></div></form></>}</div></Modal>;
+  return <Modal title={contactId ? "编辑联系人" : "添加联系人"} description="只保存你确认过的资料与职位关系；联系事实需要单独记录。" onClose={requestClose} dismissible={canDismiss} inertToasts={!canDismiss} wide><div ref={phaseRootRef} className="career-contact-modal-phase" tabIndex={-1}>{loading ? <div className="career-modal-loading"><LoaderCircle className="spin" size={20} />正在打开资料…</div> : contactId && (!detail || readError) ? <div className="career-drawer-read-error" role="status"><ShieldCheck size={22} /><h3>联系人资料暂时没有打开</h3><p>{readError || "没有把它显示成一份可覆盖的空表单。"}</p><div><button type="button" className="career-button primary" data-dialog-initial onClick={retryRead}><RotateCcw size={16} />重新读取</button><button type="button" className="career-button ghost" onClick={onClose}>关闭</button></div></div> : <>{phase === "writing" || phase === "checking" || phase === "refreshing" ? <ContactWriteStatus icon="busy" title={phase === "writing" ? "正在核对并保存" : phase === "checking" ? "正在只读核对保存结果" : "已经停止写入，正在重新读取"} message={phase === "checking" ? "只核对原凭据，不会再次创建联系人。" : phase === "refreshing" ? "这一步只刷新画面，不会再次保存。" : "写入期间会保留表单，暂时不能关闭。"} /> : phase === "uncertain" ? <ContactWriteStatus icon="safe" title="先核对这次保存" message={error} action={<button className="career-button primary" data-contact-safe-focus onClick={() => void inspectUncertain()}><Search size={16} />只读核对</button>} /> : phase === "refresh-only" ? <ContactWriteStatus icon="safe" title="只重新读取联系人" message={error} action={<button className="career-button primary" data-contact-safe-focus onClick={() => void refreshOnly(contactId ?? stableContactId)}><RotateCcw size={16} />重新读取</button>} /> : phase === "blocked" ? <ContactWriteStatus icon="safe" title="没有覆盖已有记录" message={error} action={<button className="career-button primary" data-contact-safe-focus onClick={onClose}>返回联系人</button>} /> : null}{phase === "editing" && discardPrompt && <ContactDiscardPrompt noun="联系人输入" onKeep={() => setDiscardPrompt(false)} onDiscard={() => { setDirty(false); onClose(); }} />}<form hidden={phase !== "editing" || discardPrompt} className="career-form" onChange={() => setDirty(true)} onSubmit={submit}>{externalHint && <div className="career-contact-external-hint" role="status"><ShieldCheck size={16} /><span>{externalHint}</span></div>}<div className="career-form-row"><Field label="姓名"><input name="name" required defaultValue={contact?.name ?? ""} /></Field><Field label="公司" hint="可选"><input name="company" defaultValue={contact?.company ?? ""} /></Field></div><div className="career-form-row"><Field label="身份 / 关系" hint="可选"><input name="role" defaultValue={contact?.role ?? ""} placeholder="Recruiter / 内推人" /></Field><Field label="常用渠道" hint="可选"><select name="channel" defaultValue={contact?.channel ?? ""}><option value="">不设置</option><option>LinkedIn</option><option>BOSS直聘</option><option>邮件</option><option>微信</option><option>电话</option><option>其他</option></select></Field></div><div className="career-form-row"><Field label="邮箱" hint="可选"><input name="email" type="email" defaultValue={contact?.email ?? ""} /></Field><Field label="电话" hint="可选"><input name="phone" defaultValue={contact?.phone ?? ""} /></Field></div><fieldset className="career-contact-job-picker"><legend>关联职位 <small>只建立你明确选择的关系</small></legend>{jobsForPicker.length > 0 ? <div>{jobsForPicker.map((job) => { const stage = data.stages.find((item) => item.id === job.stage_id); const context = job.archived === 1 ? "已归档" : stage?.is_terminal ? "已结束" : "进行中"; return <label key={job.id}><input type="checkbox" name="jobIds" value={job.id} defaultChecked={linked.has(job.id)} /><span><b>{job.role}</b><small>{job.company} · {context}</small></span></label>; })}</div> : <p>还没有可关联的职位。</p>}</fieldset><Field label="备注" hint="可选"><textarea name="notes" rows={4} defaultValue={contact?.notes ?? ""} placeholder="怎么认识、希望记住什么；不用重复写沟通记录。" /></Field>{error && <div className="career-inline-error" role="status"><ShieldCheck size={15} />{error}</div>}<div className="career-form-actions"><button type="button" className="career-button ghost" onClick={requestClose}>取消</button><button className="career-button primary" disabled={newWritesBlocked}><Check size={16} />保存联系人</button></div></form></>}</div></Modal>;
 }
 
-function ContactInteractionModal({ contactId, data, externalHint, onClose, onRefresh, onSaved, notify }: { contactId: string; data: CareerData; externalHint: string; onClose: () => void; onRefresh: () => Promise<void>; onSaved: () => void; notify: (text: string, tone?: Notice["tone"]) => void }) {
+function ContactInteractionModal({ contactId, data, externalHint, newWritesBlocked, newWritesBlockedNow, onExternalMutationChange, onClose, onRefresh, onSaved, notify }: { contactId: string; data: CareerData; externalHint: string; newWritesBlocked: boolean; newWritesBlockedNow: () => boolean; onExternalMutationChange: (active: boolean) => void; onClose: () => void; onRefresh: () => Promise<void>; onSaved: () => void; notify: (text: string, tone?: Notice["tone"]) => void }) {
   const [detail, setDetail] = useState<CareerContactDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [scheduleNext, setScheduleNext] = useState(false);
@@ -3933,7 +4637,12 @@ function ContactInteractionModal({ contactId, data, externalHint, onClose, onRef
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!detail || writeRef.current) return;
+    if (newWritesBlockedNow()) {
+      setError("核心资料需要先完成核对；联系记录输入仍保留，没有保存。");
+      return;
+    }
     writeRef.current = true;
+    onExternalMutationChange(true);
     setPhase("writing");
     setError("");
     const form = new FormData(event.currentTarget);
@@ -3991,7 +4700,10 @@ function ContactInteractionModal({ contactId, data, externalHint, onClose, onRef
         setPhase("editing");
         setError(careerContactErrorText(caught, "这次没有保存，表单内容仍保留。"));
       }
-    } finally { writeRef.current = false; }
+    } finally {
+      writeRef.current = false;
+      onExternalMutationChange(false);
+    }
   }
   if (loading) return <Modal title="记录一次真实联系" description="只记录已经发生的沟通。" onClose={onClose} wide><div className="career-modal-loading"><LoaderCircle className="spin" size={20} />正在打开联系人…</div></Modal>;
   if (!detail || readError) return <Modal title="记录一次真实联系" description="先确认联系人资料，再记录已经发生的沟通。" onClose={onClose} wide><div className="career-drawer-read-error" role="status"><ShieldCheck size={22} /><h3>联系人资料暂时没有打开</h3><p>{readError || "这里没有把未知资料当成一份空记录。"}</p><div><button type="button" className="career-button primary" data-dialog-initial onClick={retryRead}><RotateCcw size={16} />重新读取</button><button type="button" className="career-button ghost" onClick={onClose}>关闭</button></div></div></Modal>;
@@ -4000,10 +4712,10 @@ function ContactInteractionModal({ contactId, data, externalHint, onClose, onRef
   const canDismiss = phase === "editing" || phase === "blocked";
   // The visible title and explanation are nested so the whole row remains one generous target.
   // eslint-disable-next-line jsx-a11y/label-has-associated-control
-  return <Modal title="记录一次真实联系" description={`记录与 ${contact.name} 已经发生的沟通；不会自动发送消息。`} onClose={requestClose} dismissible={canDismiss} inertToasts={!canDismiss} wide><div ref={phaseRootRef} className="career-contact-modal-phase" tabIndex={-1}>{discardPrompt ? <ContactDiscardPrompt noun="联系记录" onKeep={() => setDiscardPrompt(false)} onDiscard={() => { setDirty(false); onClose(); }} /> : <>{phase === "writing" || phase === "checking" || phase === "refreshing" ? <ContactWriteStatus icon="busy" title={phase === "writing" ? "正在核对并保存" : phase === "checking" ? "正在只读核对保存结果" : "已经停止写入，正在重新读取"} message={phase === "checking" ? "只核对原凭据，不会再次创建联系记录或待办。" : phase === "refreshing" ? "这一步只刷新画面，不会再次保存。" : "写入期间会保留表单，暂时不能关闭。"} /> : phase === "uncertain" ? <ContactWriteStatus icon="safe" title="先核对这次联系" message={error} action={<button className="career-button primary" data-contact-safe-focus onClick={() => void inspectUncertain()}><Search size={16} />只读核对</button>} /> : phase === "refresh-only" ? <ContactWriteStatus icon="safe" title="只重新读取联系人" message={error} action={<button className="career-button primary" data-contact-safe-focus onClick={() => void refreshOnly()}><RotateCcw size={16} />重新读取</button>} /> : phase === "blocked" ? <ContactWriteStatus icon="safe" title="没有覆盖已有记录" message={error} action={<button className="career-button primary" data-contact-safe-focus onClick={onClose}>返回联系历史</button>} /> : null}{phase === "editing" && discardPrompt && <ContactDiscardPrompt noun="联系记录" onKeep={() => setDiscardPrompt(false)} onDiscard={() => { setDirty(false); onClose(); }} />}<form hidden={phase !== "editing" || discardPrompt} className="career-form" onChange={() => setDirty(true)} onSubmit={submit}>{externalHint && <div className="career-contact-external-hint" role="status"><ShieldCheck size={16} /><span>{externalHint}</span></div>}<div className="career-form-row thirds"><Field label="发生时间"><input name="occurred_at" type="datetime-local" required defaultValue={dateInputValue(stableCreatedAt)} /></Field><Field label="方向"><select name="direction" required defaultValue=""><option value="" disabled>请选择</option><option value="outbound">我发出</option><option value="inbound">对方发来</option><option value="mutual">双方交流</option></select></Field><Field label="渠道"><select name="channel" defaultValue=""><option value="">未注明</option><option>LinkedIn</option><option>BOSS直聘</option><option>邮件</option><option>微信</option><option>电话</option><option>当面</option><option>其他</option></select></Field></div><Field label="沟通摘要" hint="必填，写事实而不是评价"><input name="summary" required placeholder="例如：确认了作品集评审时间" /></Field><Field label="关联职位" hint="可选；选择即明确建立关系"><select name="job_id" defaultValue=""><option value="">不关联职位</option>{jobsForPicker.map((job) => <option key={job.id} value={job.id}>{job.company} · {job.role}{job.archived === 1 ? "（已归档）" : ""}</option>)}</select></Field><Field label="补充备注" hint="可选"><textarea name="notes" rows={4} placeholder="关键信息、对方提到的事项…" /></Field><label className="career-contact-follow-toggle"><input type="checkbox" checked={scheduleNext} onChange={(event) => setScheduleNext(event.target.checked)} /><span><b>顺手安排下一步</b><small>只有你选择后才创建待办</small></span></label>{scheduleNext && <div className="career-contact-follow-fields"><Field label="下一步动作"><input name="follow_up_title" required placeholder="例如：发送更新后的案例页" /></Field><Field label="时间"><input name="follow_up_due_at" type="datetime-local" required /></Field></div>}{error && <div className="career-inline-error" role="status"><ShieldCheck size={15} />{error}</div>}<div className="career-form-actions"><button type="button" className="career-button ghost" onClick={requestClose}>取消</button><button className="career-button primary"><MessageSquareText size={16} />保存联系记录</button></div></form></>}</div></Modal>;
+  return <Modal title="记录一次真实联系" description={`记录与 ${contact.name} 已经发生的沟通；不会自动发送消息。`} onClose={requestClose} dismissible={canDismiss} inertToasts={!canDismiss} wide><div ref={phaseRootRef} className="career-contact-modal-phase" tabIndex={-1}>{discardPrompt ? <ContactDiscardPrompt noun="联系记录" onKeep={() => setDiscardPrompt(false)} onDiscard={() => { setDirty(false); onClose(); }} /> : <>{phase === "writing" || phase === "checking" || phase === "refreshing" ? <ContactWriteStatus icon="busy" title={phase === "writing" ? "正在核对并保存" : phase === "checking" ? "正在只读核对保存结果" : "已经停止写入，正在重新读取"} message={phase === "checking" ? "只核对原凭据，不会再次创建联系记录或待办。" : phase === "refreshing" ? "这一步只刷新画面，不会再次保存。" : "写入期间会保留表单，暂时不能关闭。"} /> : phase === "uncertain" ? <ContactWriteStatus icon="safe" title="先核对这次联系" message={error} action={<button className="career-button primary" data-contact-safe-focus onClick={() => void inspectUncertain()}><Search size={16} />只读核对</button>} /> : phase === "refresh-only" ? <ContactWriteStatus icon="safe" title="只重新读取联系人" message={error} action={<button className="career-button primary" data-contact-safe-focus onClick={() => void refreshOnly()}><RotateCcw size={16} />重新读取</button>} /> : phase === "blocked" ? <ContactWriteStatus icon="safe" title="没有覆盖已有记录" message={error} action={<button className="career-button primary" data-contact-safe-focus onClick={onClose}>返回联系历史</button>} /> : null}{phase === "editing" && discardPrompt && <ContactDiscardPrompt noun="联系记录" onKeep={() => setDiscardPrompt(false)} onDiscard={() => { setDirty(false); onClose(); }} />}<form hidden={phase !== "editing" || discardPrompt} className="career-form" onChange={() => setDirty(true)} onSubmit={submit}>{externalHint && <div className="career-contact-external-hint" role="status"><ShieldCheck size={16} /><span>{externalHint}</span></div>}<div className="career-form-row thirds"><Field label="发生时间"><input name="occurred_at" type="datetime-local" required defaultValue={dateInputValue(stableCreatedAt)} /></Field><Field label="方向"><select name="direction" required defaultValue=""><option value="" disabled>请选择</option><option value="outbound">我发出</option><option value="inbound">对方发来</option><option value="mutual">双方交流</option></select></Field><Field label="渠道"><select name="channel" defaultValue=""><option value="">未注明</option><option>LinkedIn</option><option>BOSS直聘</option><option>邮件</option><option>微信</option><option>电话</option><option>当面</option><option>其他</option></select></Field></div><Field label="沟通摘要" hint="必填，写事实而不是评价"><input name="summary" required placeholder="例如：确认了作品集评审时间" /></Field><Field label="关联职位" hint="可选；选择即明确建立关系"><select name="job_id" defaultValue=""><option value="">不关联职位</option>{jobsForPicker.map((job) => <option key={job.id} value={job.id}>{job.company} · {job.role}{job.archived === 1 ? "（已归档）" : ""}</option>)}</select></Field><Field label="补充备注" hint="可选"><textarea name="notes" rows={4} placeholder="关键信息、对方提到的事项…" /></Field><label className="career-contact-follow-toggle"><input type="checkbox" checked={scheduleNext} onChange={(event) => setScheduleNext(event.target.checked)} /><span><b>顺手安排下一步</b><small>只有你选择后才创建待办</small></span></label>{scheduleNext && <div className="career-contact-follow-fields"><Field label="下一步动作"><input name="follow_up_title" required placeholder="例如：发送更新后的案例页" /></Field><Field label="时间"><input name="follow_up_due_at" type="datetime-local" required /></Field></div>}{error && <div className="career-inline-error" role="status"><ShieldCheck size={15} />{error}</div>}<div className="career-form-actions"><button type="button" className="career-button ghost" onClick={requestClose}>取消</button><button className="career-button primary" disabled={newWritesBlocked}><MessageSquareText size={16} />保存联系记录</button></div></form></>}</div></Modal>;
 }
 
-function ContactTaskModal({ contactId, data, externalHint, onClose, onRefresh, onSaved, notify }: { contactId: string; data: CareerData; externalHint: string; onClose: () => void; onRefresh: () => Promise<void>; onSaved: () => void; notify: (text: string, tone?: Notice["tone"]) => void }) {
+function ContactTaskModal({ contactId, data, externalHint, newWritesBlocked, newWritesBlockedNow, onExternalMutationChange, onClose, onRefresh, onSaved, notify }: { contactId: string; data: CareerData; externalHint: string; newWritesBlocked: boolean; newWritesBlockedNow: () => boolean; onExternalMutationChange: (active: boolean) => void; onClose: () => void; onRefresh: () => Promise<void>; onSaved: () => void; notify: (text: string, tone?: Notice["tone"]) => void }) {
   const [detail, setDetail] = useState<CareerContactDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [readError, setReadError] = useState("");
@@ -4095,7 +4807,12 @@ function ContactTaskModal({ contactId, data, externalHint, onClose, onRefresh, o
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!detail || writeRef.current) return;
+    if (newWritesBlockedNow()) {
+      setError("核心资料需要先完成核对；待办输入仍保留，没有创建。");
+      return;
+    }
     writeRef.current = true;
+    onExternalMutationChange(true);
     setPhase("writing");
     setError("");
     const form = new FormData(event.currentTarget);
@@ -4135,13 +4852,16 @@ function ContactTaskModal({ contactId, data, externalHint, onClose, onRefresh, o
         setPhase("editing");
         setError(careerContactErrorText(caught, "这次没有保存，表单内容仍保留。"));
       }
-    } finally { writeRef.current = false; }
+    } finally {
+      writeRef.current = false;
+      onExternalMutationChange(false);
+    }
   }
   if (loading) return <Modal title="安排下一步" description="先确认联系人资料，再安排你主动选择的提醒。" onClose={onClose}><div className="career-modal-loading"><LoaderCircle className="spin" size={20} />正在打开联系人…</div></Modal>;
   if (!detail || readError) return <Modal title="安排下一步" description="先确认联系人资料，再安排你主动选择的提醒。" onClose={onClose}><div className="career-drawer-read-error" role="status"><ShieldCheck size={22} /><h3>联系人资料暂时没有打开</h3><p>{readError || "这里没有把未知资料当成一份空记录。"}</p><div><button type="button" className="career-button primary" data-dialog-initial onClick={retryRead}><RotateCcw size={16} />重新读取</button><button type="button" className="career-button ghost" onClick={onClose}>关闭</button></div></div></Modal>;
   const jobsForPicker = Array.from(new Map([...detail.jobs, ...data.jobs].map((job) => [job.id, job])).values());
   const canDismiss = phase === "editing" || phase === "blocked";
-  return <Modal title="安排下一步" description="这是你主动选择的提醒；计划时间可以留空。" onClose={requestClose} dismissible={canDismiss} inertToasts={!canDismiss} wide><div ref={phaseRootRef} className="career-contact-modal-phase" tabIndex={-1}>{discardPrompt ? <ContactDiscardPrompt noun="下一步" onKeep={() => setDiscardPrompt(false)} onDiscard={() => { setDirty(false); onClose(); }} /> : <>{phase === "writing" || phase === "checking" || phase === "refreshing" ? <ContactWriteStatus icon="busy" title={phase === "writing" ? "正在核对并保存" : phase === "checking" ? "正在只读核对保存结果" : "已经停止写入，正在重新读取"} message={phase === "checking" ? "只核对原凭据，不会再次创建待办。" : phase === "refreshing" ? "这一步只刷新画面，不会再次保存。" : "写入期间会保留表单，暂时不能关闭。"} /> : phase === "uncertain" ? <ContactWriteStatus icon="safe" title="先核对这条待办" message={error} action={<button className="career-button primary" data-contact-safe-focus onClick={() => void inspectUncertain()}><Search size={16} />只读核对</button>} /> : phase === "refresh-only" ? <ContactWriteStatus icon="safe" title="只重新读取联系人" message={error} action={<button className="career-button primary" data-contact-safe-focus onClick={() => void refreshOnly()}><RotateCcw size={16} />重新读取</button>} /> : phase === "blocked" ? <ContactWriteStatus icon="safe" title="没有覆盖已有待办" message={error} action={<button className="career-button primary" data-contact-safe-focus onClick={onClose}>返回联系人</button>} /> : null}{phase === "editing" && discardPrompt && <ContactDiscardPrompt noun="下一步" onKeep={() => setDiscardPrompt(false)} onDiscard={() => { setDirty(false); onClose(); }} />}<form hidden={phase !== "editing" || discardPrompt} className="career-form" onChange={() => setDirty(true)} onSubmit={submit}>{externalHint && <div className="career-contact-external-hint" role="status"><ShieldCheck size={16} /><span>{externalHint}</span></div>}<Field label="要做什么"><input name="title" required placeholder="例如：确认下一轮时间" /></Field><Field label="关联职位" hint="可选；不会按公司自动猜"><select name="job_id" defaultValue=""><option value="">不关联职位</option>{jobsForPicker.map((job) => <option key={job.id} value={job.id}>{job.company} · {job.role}{job.archived === 1 ? "（已归档）" : ""}</option>)}</select></Field><div className="career-form-row"><Field label="计划时间（可选）" hint="不设时间会放在“以后再说”"><input name="due_at" type="datetime-local" /></Field><Field label="类型"><select name="kind" defaultValue="跟进"><option>跟进</option><option>材料</option><option>面试准备</option><option>其他</option></select></Field></div><Field label="优先级"><select name="priority" defaultValue="1"><option value="1">普通</option><option value="2">重点</option><option value="3">时间敏感</option></select></Field>{error && <div className="career-inline-error" role="status"><ShieldCheck size={15} />{error}</div>}<div className="career-form-actions"><button type="button" className="career-button ghost" onClick={requestClose}>取消</button><button className="career-button primary"><CalendarDays size={16} />创建待办</button></div></form></>}</div></Modal>;
+  return <Modal title="安排下一步" description="这是你主动选择的提醒；计划时间可以留空。" onClose={requestClose} dismissible={canDismiss} inertToasts={!canDismiss} wide><div ref={phaseRootRef} className="career-contact-modal-phase" tabIndex={-1}>{discardPrompt ? <ContactDiscardPrompt noun="下一步" onKeep={() => setDiscardPrompt(false)} onDiscard={() => { setDirty(false); onClose(); }} /> : <>{phase === "writing" || phase === "checking" || phase === "refreshing" ? <ContactWriteStatus icon="busy" title={phase === "writing" ? "正在核对并保存" : phase === "checking" ? "正在只读核对保存结果" : "已经停止写入，正在重新读取"} message={phase === "checking" ? "只核对原凭据，不会再次创建待办。" : phase === "refreshing" ? "这一步只刷新画面，不会再次保存。" : "写入期间会保留表单，暂时不能关闭。"} /> : phase === "uncertain" ? <ContactWriteStatus icon="safe" title="先核对这条待办" message={error} action={<button className="career-button primary" data-contact-safe-focus onClick={() => void inspectUncertain()}><Search size={16} />只读核对</button>} /> : phase === "refresh-only" ? <ContactWriteStatus icon="safe" title="只重新读取联系人" message={error} action={<button className="career-button primary" data-contact-safe-focus onClick={() => void refreshOnly()}><RotateCcw size={16} />重新读取</button>} /> : phase === "blocked" ? <ContactWriteStatus icon="safe" title="没有覆盖已有待办" message={error} action={<button className="career-button primary" data-contact-safe-focus onClick={onClose}>返回联系人</button>} /> : null}{phase === "editing" && discardPrompt && <ContactDiscardPrompt noun="下一步" onKeep={() => setDiscardPrompt(false)} onDiscard={() => { setDirty(false); onClose(); }} />}<form hidden={phase !== "editing" || discardPrompt} className="career-form" onChange={() => setDirty(true)} onSubmit={submit}>{externalHint && <div className="career-contact-external-hint" role="status"><ShieldCheck size={16} /><span>{externalHint}</span></div>}<Field label="要做什么"><input name="title" required placeholder="例如：确认下一轮时间" /></Field><Field label="关联职位" hint="可选；不会按公司自动猜"><select name="job_id" defaultValue=""><option value="">不关联职位</option>{jobsForPicker.map((job) => <option key={job.id} value={job.id}>{job.company} · {job.role}{job.archived === 1 ? "（已归档）" : ""}</option>)}</select></Field><div className="career-form-row"><Field label="计划时间（可选）" hint="不设时间会放在“以后再说”"><input name="due_at" type="datetime-local" /></Field><Field label="类型"><select name="kind" defaultValue="跟进"><option>跟进</option><option>材料</option><option>面试准备</option><option>其他</option></select></Field></div><Field label="优先级"><select name="priority" defaultValue="1"><option value="1">普通</option><option value="2">重点</option><option value="3">时间敏感</option></select></Field>{error && <div className="career-inline-error" role="status"><ShieldCheck size={15} />{error}</div>}<div className="career-form-actions"><button type="button" className="career-button ghost" onClick={requestClose}>取消</button><button className="career-button primary" disabled={newWritesBlocked}><CalendarDays size={16} />创建待办</button></div></form></>}</div></Modal>;
 }
 
 type CareerMaterialSavePhase =
@@ -4196,7 +4916,7 @@ function useMaterialPhaseFocus(phase: string, enabled = true) {
   return phaseRootRef;
 }
 
-function MaterialModal({ data, initialRecovery, otherRecoveryPending, onRecoveryUpsert, onRecoveryClear, onClose, onStaleClose, onRefresh, notify }: { data: CareerData; initialRecovery: CareerMaterialSaveRecoveryEntry | null; otherRecoveryPending: boolean; onRecoveryUpsert: (ticket: CareerMaterialSaveRecoveryTicket) => boolean; onRecoveryClear: (ticket: CareerMaterialSaveRecoveryTicket, persisted: boolean) => boolean; onClose: () => void; onStaleClose: () => void; onRefresh: () => Promise<void>; notify: (text: string, tone?: Notice["tone"]) => void }) {
+function MaterialModal({ data, initialRecovery, otherRecoveryPending, newWritesBlocked, newWritesBlockedNow, onExternalMutationChange, onRecoveryUpsert, onRecoveryClear, onClose, onStaleClose, onRefresh, notify }: { data: CareerData; initialRecovery: CareerMaterialSaveRecoveryEntry | null; otherRecoveryPending: boolean; newWritesBlocked: boolean; newWritesBlockedNow: () => boolean; onExternalMutationChange: (active: boolean) => void; onRecoveryUpsert: (ticket: CareerMaterialSaveRecoveryTicket) => boolean; onRecoveryClear: (ticket: CareerMaterialSaveRecoveryTicket, persisted: boolean) => boolean; onClose: () => void; onStaleClose: () => void; onRefresh: () => Promise<void>; notify: (text: string, tone?: Notice["tone"]) => void }) {
   const initialSnapshot = initialRecovery?.ticket.kind === "uncertain-save" ? initialRecovery.ticket.expectedSnapshot : null;
   const [materialId] = useState(() => initialRecovery?.ticket.kind === "uncertain-save" ? initialRecovery.ticket.materialId : newId("material"));
   const [phase, setPhase] = useState<CareerMaterialSavePhase>(() => initialRecovery?.ticket.kind === "uncertain-save" ? "uncertain" : initialRecovery ? "cleanup-review" : "editing");
@@ -4557,11 +5277,16 @@ function MaterialModal({ data, initialRecovery, otherRecoveryPending, onRecovery
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (savingRef.current) return;
+    if (!activeRecoveryRef.current && newWritesBlockedNow()) {
+      setError("先处理当前核心保存或核对提醒；材料输入仍完整保留。");
+      return;
+    }
     if (unboundRecoveryPending) {
       setError("还有一份材料保存等待核对。先完成已有收尾，再添加新的附件。");
       return;
     }
     savingRef.current = true;
+    onExternalMutationChange(true);
     setPhase("saving");
     setError("");
     const form = new FormData(event.currentTarget);
@@ -4683,6 +5408,7 @@ function MaterialModal({ data, initialRecovery, otherRecoveryPending, onRecovery
       }
     } finally {
       savingRef.current = false;
+      onExternalMutationChange(false);
     }
   }
 
@@ -4701,7 +5427,7 @@ function MaterialModal({ data, initialRecovery, otherRecoveryPending, onRecovery
           : "添加求职材料";
   return <><Modal title={modalTitle} description={cleanupPhase || refreshContext === "recovery" ? "只处理上次未完成的本机附件，不会新增或覆盖材料。" : "记录版本与用途；可选文件会保存到当前完整网址与浏览器资料对应的私有存储。"} onClose={requestClose} dismissible={dismissible} inertToasts={phase !== "editing"}>
     <div ref={phaseRootRef} className="career-material-modal-body" data-material-phase-focus tabIndex={-1}>
-    <form className="career-form" hidden={phase !== "editing"} aria-hidden={phase !== "editing"} onChange={() => setDirty(true)} onSubmit={submit}><Field label="材料名称"><input name="name" data-dialog-initial defaultValue={initialSnapshot?.name ?? ""} required placeholder="产品设计主简历" /></Field><div className="career-form-row"><Field label="类型"><select name="kind" defaultValue={initialSnapshot?.kind ?? "简历"}>{initialSnapshot && !materialKinds.includes(initialSnapshot.kind as typeof materialKinds[number]) && <option value={initialSnapshot.kind}>{initialSnapshot.kind}（已恢复）</option>}{materialKinds.map((kind) => <option key={kind}>{kind}</option>)}</select></Field><Field label="版本"><input name="version" defaultValue={initialSnapshot?.version ?? "v1.0"} required /></Field></div><Field label="本地文件" hint="可选；SQLite 只保存文件索引，原件留在浏览器私有存储"><input name="attachment" type="file" accept=".pdf,.doc,.docx,.ppt,.pptx,.txt,.md,application/pdf" />{initialSnapshot?.attachment && <small className="career-field-recovery-note">上次选择过“{initialSnapshot.attachment.originalName}”。浏览器不会自动重新选取文件；若核对确认未保存，请重新选择。</small>}</Field><Field label="关联职位"><select name="linked_job_id" defaultValue={initialSnapshot?.linkedJobId ?? ""}><option value="">主材料 / 不关联</option>{initialLinkedJobUnavailable && <option value={initialSnapshot!.linkedJobId!}>原关联职位（当前列表不可用）</option>}{data.jobs.map((job) => <option key={job.id} value={job.id}>{job.company} · {job.role}</option>)}</select></Field><Field label="状态"><select name="status" defaultValue={initialSnapshot?.status ?? "ready"}><option value="ready">可使用</option><option value="draft">编辑中</option><option value="sent">已发送</option></select></Field><Field label="备注"><textarea name="notes" rows={4} defaultValue={initialSnapshot?.notes ?? ""} placeholder="这版材料做了哪些调整？" /></Field>{unboundRecoveryPending && <div className="career-inline-error" role="status"><ShieldCheck size={15} />另一份材料保存正在等待核对。当前输入会保留；请先关闭并处理已有收尾。</div>}{error && <div className="career-inline-error" role="alert"><X size={15} />{error}</div>}<div className="career-form-actions"><button type="button" className="career-button ghost" onClick={requestClose}>取消</button><button className="career-button primary" disabled={unboundRecoveryPending}><Upload size={16} />保存材料</button></div></form>
+    <form className="career-form" hidden={phase !== "editing"} aria-hidden={phase !== "editing"} onChange={() => setDirty(true)} onSubmit={submit}><Field label="材料名称"><input name="name" data-dialog-initial defaultValue={initialSnapshot?.name ?? ""} required placeholder="产品设计主简历" /></Field><div className="career-form-row"><Field label="类型"><select name="kind" defaultValue={initialSnapshot?.kind ?? "简历"}>{initialSnapshot && !materialKinds.includes(initialSnapshot.kind as typeof materialKinds[number]) && <option value={initialSnapshot.kind}>{initialSnapshot.kind}（已恢复）</option>}{materialKinds.map((kind) => <option key={kind}>{kind}</option>)}</select></Field><Field label="版本"><input name="version" defaultValue={initialSnapshot?.version ?? "v1.0"} required /></Field></div><Field label="本地文件" hint="可选；SQLite 只保存文件索引，原件留在浏览器私有存储"><input name="attachment" type="file" accept=".pdf,.doc,.docx,.ppt,.pptx,.txt,.md,application/pdf" />{initialSnapshot?.attachment && <small className="career-field-recovery-note">上次选择过“{initialSnapshot.attachment.originalName}”。浏览器不会自动重新选取文件；若核对确认未保存，请重新选择。</small>}</Field><Field label="关联职位"><select name="linked_job_id" defaultValue={initialSnapshot?.linkedJobId ?? ""}><option value="">主材料 / 不关联</option>{initialLinkedJobUnavailable && <option value={initialSnapshot!.linkedJobId!}>原关联职位（当前列表不可用）</option>}{data.jobs.map((job) => <option key={job.id} value={job.id}>{job.company} · {job.role}</option>)}</select></Field><Field label="状态"><select name="status" defaultValue={initialSnapshot?.status ?? "ready"}><option value="ready">可使用</option><option value="draft">编辑中</option><option value="sent">已发送</option></select></Field><Field label="备注"><textarea name="notes" rows={4} defaultValue={initialSnapshot?.notes ?? ""} placeholder="这版材料做了哪些调整？" /></Field>{unboundRecoveryPending && <div className="career-inline-error" role="status"><ShieldCheck size={15} />另一份材料保存正在等待核对。当前输入会保留；请先关闭并处理已有收尾。</div>}{error && <div className="career-inline-error" role="alert"><X size={15} />{error}</div>}<div className="career-form-actions"><button type="button" className="career-button ghost" onClick={requestClose}>取消</button><button className="career-button primary" disabled={unboundRecoveryPending || (!activeRecovery && newWritesBlocked)}><Upload size={16} />保存材料</button></div></form>
     {phase === "saving" && <div className="career-material-recovery" role="status"><LoaderCircle className="spin" size={23} /><h3>正在保存到本机</h3><p>先写入附件，再写入材料记录；完成前不会让重复提交。</p></div>}
     {phase === "uncertain" && <div className="career-material-recovery uncertain" role="status" aria-live="polite"><ShieldCheck size={24} /><h3>需要核对保存结果</h3><p>{error}</p><div className="career-material-recovery-actions">{recoveryPersisted && <button className="career-button secondary" onClick={onClose}>稍后继续</button>}<button className="career-button primary" data-dialog-initial onClick={() => void inspectUncertainSave()}><Search size={16} />只读核对</button></div><small>{recoveryPersisted ? "核对线索已留在当前网址的浏览器存储；核对只读取 SQLite 与附件校验值。" : "核对线索只在本次打开期间可用；请先不要刷新或关闭页面。"}</small></div>}
     {phase === "checking" && <div className="career-material-recovery" role="status"><LoaderCircle className="spin" size={23} /><h3>正在只读核对</h3><p>不会再次保存，也不会换一个材料标识。</p></div>}
@@ -4719,7 +5445,7 @@ function MaterialModal({ data, initialRecovery, otherRecoveryPending, onRecovery
   </Modal>{closeConfirm && <Modal title="放弃这份材料草稿吗？" description="表单和所选文件还没有写入职迹。" onClose={resumeMaterialEditing} inertToasts><div className="career-material-close-choice"><p>继续编辑会保留当前输入；明确放弃只关闭表单，不会影响已经存在的材料。</p><div><button className="career-button primary" data-dialog-initial onClick={resumeMaterialEditing}>继续编辑</button><button className="career-button danger" onClick={() => { resumeEditingFocusPendingRef.current = false; finalClosePendingRef.current = true; setCloseConfirm(false); }}>放弃这次输入</button></div></div></Modal>}</>;
 }
 
-function MaterialDeletionModal({ material, onClose, onStaleClose, onRefresh, notify }: { material: Pick<Material, "id" | "name" | "file_key">; onClose: () => void; onStaleClose: () => void; onRefresh: () => Promise<void>; notify: (text: string, tone?: Notice["tone"]) => void }) {
+function MaterialDeletionModal({ material, newWritesBlocked, newWritesBlockedNow, onExternalMutationChange, onClose, onStaleClose, onRefresh, notify }: { material: Pick<Material, "id" | "name" | "file_key">; newWritesBlocked: boolean; newWritesBlockedNow: () => boolean; onExternalMutationChange: (active: boolean) => void; onClose: () => void; onStaleClose: () => void; onRefresh: () => Promise<void>; notify: (text: string, tone?: Notice["tone"]) => void }) {
   const [phase, setPhase] = useState<CareerMaterialDeletionPhase>("loading");
   const [state, setState] = useState<CareerMaterialDeletionState | null>(null);
   const [message, setMessage] = useState("");
@@ -4795,6 +5521,11 @@ function MaterialDeletionModal({ material, onClose, onStaleClose, onRefresh, not
 
   async function performDeletion() {
     if (mutationRef.current) return;
+    const claimsNewMutation = state?.state === "present";
+    if (claimsNewMutation && newWritesBlockedNow()) {
+      setMessage("先处理当前核心保存或核对提醒；没有开始新的材料移除。");
+      return;
+    }
     const receipt: CareerMaterialDeletionReceipt | null = state?.state === "present" || state?.state === "cleanup_pending" ? state.receipt : null;
     if (!receipt) {
       setPhase("changed");
@@ -4802,6 +5533,7 @@ function MaterialDeletionModal({ material, onClose, onStaleClose, onRefresh, not
       return;
     }
     mutationRef.current = true;
+    if (claimsNewMutation) onExternalMutationChange(true);
     setPhase("deleting");
     setMessage("");
     try {
@@ -4854,6 +5586,7 @@ function MaterialDeletionModal({ material, onClose, onStaleClose, onRefresh, not
       }
     } finally {
       mutationRef.current = false;
+      if (claimsNewMutation) onExternalMutationChange(false);
     }
   }
 
@@ -4902,7 +5635,7 @@ function MaterialDeletionModal({ material, onClose, onStaleClose, onRefresh, not
   return <Modal title={phase === "cleanup" ? "继续完成收尾" : `移除「${material.name}」？`} description="这里只整理你选择的这一份材料，不影响职位、投递或其他版本。" onClose={closeSafely} dismissible={canClose} inertToasts>
     <div ref={phaseRootRef} className="career-material-modal-body" data-material-phase-focus tabIndex={-1}>
     {phase === "loading" && <div className="career-material-recovery" role="status"><LoaderCircle className="spin" size={23} /><h3>正在核对材料与原件</h3><p>先确认是否共享同一个本地文件，再显示会发生什么。</p></div>}
-    {phase === "ready" && <div className="career-material-delete-confirm" role={message ? "alert" : undefined}><ShieldCheck size={24} /><h3>先看清这次会处理什么</h3><p>{message || confirmation}</p><div><button className="career-button primary" data-dialog-initial onClick={onClose}>继续保留</button><button className="career-button danger" onClick={() => void performDeletion()}><Trash2 size={16} />确认移除</button></div></div>}
+    {phase === "ready" && <div className="career-material-delete-confirm" role={message ? "alert" : undefined}><ShieldCheck size={24} /><h3>先看清这次会处理什么</h3><p>{message || confirmation}</p><div><button className="career-button primary" data-dialog-initial onClick={onClose}>继续保留</button><button className="career-button danger" disabled={newWritesBlocked} onClick={() => void performDeletion()}><Trash2 size={16} />确认移除</button></div></div>}
     {phase === "deleting" && <div className="career-material-recovery" role="status"><LoaderCircle className="spin" size={23} /><h3>正在安全移除</h3><p>会先留下可重试状态，再核对引用与原件，完成前不会开放重复操作。</p></div>}
     {phase === "cleanup" && <div className="career-material-recovery cleanup" role="status" aria-live="polite"><RotateCcw size={24} /><h3>还有一步没有收尾</h3><p>{message}</p><div className="career-material-recovery-actions"><button className="career-button secondary" data-dialog-initial onClick={allowStaleExit ? onStaleClose : () => void closeAfterRead()}>稍后处理</button><button className="career-button primary" onClick={() => void performDeletion()}><RotateCcw size={16} />继续收尾</button></div><small>材料卡会保留“待收尾”，不会把尚未完成的状态伪装成已删除。</small></div>}
     {phase === "uncertain" && <div className="career-material-recovery uncertain" role="status" aria-live="polite"><ShieldCheck size={24} /><h3>需要核对删除结果</h3><p>{message}</p><div className="career-material-recovery-actions"><button className="career-button secondary" data-dialog-initial onClick={allowStaleExit ? onStaleClose : () => void closeAfterRead()}>稍后再核对</button><button className="career-button primary" onClick={() => void inspectUncertainDeletion()}><Search size={16} />只读核对</button></div></div>}
@@ -5033,7 +5766,7 @@ function CareerImportPreviewEditor({ row, draft, data, sameName, sameNameDecisio
   </article>;
 }
 
-function CareerImportModal({ data, initialCapture, onClose, onRefresh, notify }: { data: CareerData; initialCapture: CareerCapturedSource | null; onClose: () => void; onRefresh: () => Promise<void>; notify: (text: string, tone?: Notice["tone"]) => void }) {
+function CareerImportModal({ data, initialCapture, newWritesBlocked, newWritesBlockedNow, onExternalMutationChange, onClose, onRefresh, notify }: { data: CareerData; initialCapture: CareerCapturedSource | null; newWritesBlocked: boolean; newWritesBlockedNow: () => boolean; onExternalMutationChange: (active: boolean) => void; onClose: () => void; onRefresh: () => Promise<void>; notify: (text: string, tone?: Notice["tone"]) => void }) {
   const [mode, setMode] = useState<CareerImportMode>(initialCapture ? "capture" : "paste");
   const [paste, setPaste] = useState("");
   const [capture, setCapture] = useState<CareerCapturedSource>(initialCapture ?? { url: "", selectedText: "" });
@@ -5124,8 +5857,16 @@ function CareerImportModal({ data, initialCapture, onClose, onRefresh, notify }:
     return requestRef.current.token === token && modeRef.current === targetMode && currentSnapshot(targetMode) === snapshot;
   }
 
+  function newImportOperationOpen() {
+    if (!newWritesBlockedNow()) return true;
+    setError("核心资料需要先完成核对；当前原文与预览仍保留，没有准备或保存新职位。");
+    setPhase(rowsRef.current.length > 0 ? "preview" : "input");
+    return false;
+  }
+
   async function previewWithAi(targetMode: "paste" | "capture") {
     if (absentRowIds) return;
+    if (!newImportOperationOpen()) return;
     const snapshot = currentSnapshot(targetMode);
     const captureValue = valuesRef.current.capture;
     if (targetMode === "paste" ? !snapshot.trim() : !captureValue.url.trim() && !captureValue.selectedText.trim()) return;
@@ -5146,6 +5887,7 @@ function CareerImportModal({ data, initialCapture, onClose, onRefresh, notify }:
     try {
       const fingerprint = await fingerprintCareerImportSource(snapshot);
       if (!requestIsCurrent(token, targetMode, snapshot)) return;
+      if (!newImportOperationOpen()) return;
       setPhase("requesting-ai");
       const trimmedPaste = valuesRef.current.paste.trim();
       const isStandaloneUrl = targetMode === "paste" && /^https?:\/\/\S+$/i.test(trimmedPaste);
@@ -5162,6 +5904,7 @@ function CareerImportModal({ data, initialCapture, onClose, onRefresh, notify }:
       if (!requestIsCurrent(token, targetMode, snapshot)) return;
       if (!response.ok) throw new Error((body as { error?: string } | null)?.error || "这次没有整理成功，原文仍保留在这里。");
       const parsed = parseAiContent(body);
+      if (!newImportOperationOpen()) return;
       if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("服务没有返回可核对的职位字段，原文仍保留在这里。");
       const parsedCandidate = { ...(parsed as Record<string, unknown>) };
       for (const untrustedSourceField of [
@@ -5188,6 +5931,7 @@ function CareerImportModal({ data, initialCapture, onClose, onRefresh, notify }:
 
   async function previewCsv(file: File) {
     if (absentRowIds) return;
+    if (!newImportOperationOpen()) return;
     cancelPendingRequest();
     const token = requestRef.current.token + 1;
     requestRef.current = { token, controller: null };
@@ -5204,6 +5948,7 @@ function CareerImportModal({ data, initialCapture, onClose, onRefresh, notify }:
     try {
       const text = await file.text();
       if (requestRef.current.token !== token) return;
+      if (!newImportOperationOpen()) return;
       valuesRef.current = { ...valuesRef.current, csv: text };
       setCsvText(text);
       const parsed = await parseCareerCsvImportPreview(text);
@@ -5227,6 +5972,7 @@ function CareerImportModal({ data, initialCapture, onClose, onRefresh, notify }:
   }
   async function applyRowChanges(rowId: string) {
     if (revisingRowId) return;
+    if (!newImportOperationOpen()) return;
     const row = rowsRef.current.find((item) => item.id === rowId);
     const draft = drafts[rowId];
     if (!row || !draft) return;
@@ -5258,6 +6004,7 @@ function CareerImportModal({ data, initialCapture, onClose, onRefresh, notify }:
   }
   async function forkDuplicate(rowId: string) {
     if (revisingRowId || absentRowIds) return;
+    if (!newImportOperationOpen()) return;
     const row = rowsRef.current.find((item) => item.id === rowId);
     if (!row) return;
     setRevisingRowId(rowId);
@@ -5297,14 +6044,17 @@ function CareerImportModal({ data, initialCapture, onClose, onRefresh, notify }:
   }
   async function commitPreview() {
     if (commitRef.current || phase !== "preview" || !previewSource) return;
+    if (!newImportOperationOpen()) return;
     const selected = selectCareerImportCommitRows(rowsRef.current, absentRowIds);
     if (selected.length === 0) return;
     commitRef.current = true;
+    onExternalMutationChange(true);
     setPhase("committing");
     setError("");
     try {
       const snapshot = currentSnapshot(previewSource.mode);
       const fingerprint = await fingerprintCareerImportSource(snapshot);
+      if (!newImportOperationOpen()) return;
       if (modeRef.current !== previewSource.mode || snapshot !== previewSource.snapshot || fingerprint !== previewSource.fingerprint) {
         throw new CareerImportError("source_changed", "原文或文件已经变化，请按当前内容重新预览；这次没有保存。");
       }
@@ -5322,7 +6072,10 @@ function CareerImportModal({ data, initialCapture, onClose, onRefresh, notify }:
         setPhase("preview");
         setError(caught instanceof Error ? caught.message : "这次没有保存，预览仍保留在这里。");
       }
-    } finally { commitRef.current = false; }
+    } finally {
+      commitRef.current = false;
+      onExternalMutationChange(false);
+    }
   }
   async function inspectUncertainCommit() {
     if (checkRef.current || uncertainRowsRef.current.length === 0) return;
@@ -5383,7 +6136,7 @@ function CareerImportModal({ data, initialCapture, onClose, onRefresh, notify }:
   const sameNamePending = selectedRows.some((row) => data.jobs.some((job) => sameCareerJobName(job, row.preview.candidate)) && (sameNameDecisions[row.id] ?? "pending") === "pending");
   const sameNameSkipped = selectedRows.some((row) => data.jobs.some((job) => sameCareerJobName(job, row.preview.candidate)) && sameNameDecisions[row.id] === "skip");
   const originalRecoverySelection = absentRowIds === null || selectedRows.every((row) => absentRowIds.has(row.id));
-  const canCommit = phase === "preview" && selectedRows.length > 0 && originalRecoverySelection && !sourceChanged && !hasGlobalBlocking && !hasBlocking && !hasUnappliedDraft && !sameNamePending && !sameNameSkipped;
+  const canCommit = phase === "preview" && selectedRows.length > 0 && originalRecoverySelection && !sourceChanged && !hasGlobalBlocking && !hasBlocking && !hasUnappliedDraft && !sameNamePending && !sameNameSkipped && !newWritesBlocked;
   const dirty = Boolean(paste.trim() || capture.url.trim() || capture.selectedText.trim() || csvText || rows.length > 0);
   const closeLocked = phase === "committing" || phase === "commit-check" || phase === "refreshing" || phase === "refresh-only";
   const recoveryActive = closeLocked || phase === "conflict" || phase === "complete";
@@ -5409,11 +6162,11 @@ function CareerImportModal({ data, initialCapture, onClose, onRefresh, notify }:
   return <><Modal title="从职位原文建立记录" description="所有方式都会先生成可编辑预览；只有你确认保存后，才会写入本机职迹。" onClose={requestClose} wide dismissible={!closeLocked} inertToasts={closeLocked}>
     <div className="career-import-shell">
       {!recoveryActive && <>
-      <div className="career-import-tabs" role="tablist" aria-label="选择原文来源">{careerImportModes.map((item, index) => <button ref={(element) => { tabRefs.current[index] = element; }} type="button" role="tab" id={`career-import-tab-${item.id}`} aria-controls={`career-import-panel-${item.id}`} aria-selected={mode === item.id} tabIndex={mode === item.id ? 0 : -1} disabled={absentRowIds !== null} className={mode === item.id ? "active" : ""} key={item.id} onClick={() => changeMode(item.id)} onKeyDown={(event) => tabKeydown(event, index)}><item.icon size={16} />{item.label}</button>)}</div>
+      <div className="career-import-tabs" role="tablist" aria-label="选择原文来源">{careerImportModes.map((item, index) => <button ref={(element) => { tabRefs.current[index] = element; }} type="button" role="tab" id={`career-import-tab-${item.id}`} aria-controls={`career-import-panel-${item.id}`} aria-selected={mode === item.id} tabIndex={mode === item.id ? 0 : -1} disabled={absentRowIds !== null || newWritesBlocked} className={mode === item.id ? "active" : ""} key={item.id} onClick={() => changeMode(item.id)} onKeyDown={(event) => tabKeydown(event, index)}><item.icon size={16} />{item.label}</button>)}</div>
       <section className="career-import-input-panel" role="tabpanel" id={`career-import-panel-${mode}`} aria-labelledby={`career-import-tab-${mode}`}>
-        {mode === "paste" && <><Field label="职位原文或公开链接"><textarea data-dialog-initial rows={7} value={paste} disabled={absentRowIds !== null} onChange={(event) => changePaste(event.target.value)} placeholder="粘贴职位描述、分享文本，或一个公开职位链接…" /></Field><p className="career-import-privacy"><ShieldCheck size={16} />粘贴：只有你在这里明确输入的内容会经 DeepSeek 整理；不会自动投递。</p><button type="button" className="career-button primary import-button" disabled={absentRowIds !== null || !paste.trim() || phase === "fingerprinting" || phase === "requesting-ai"} onClick={() => void previewWithAi("paste")}><WandSparkles size={16} />按当前内容生成预览</button></>}
-        {mode === "capture" && <><Field label="当前页面 URL"><input type="url" value={capture.url} disabled={absentRowIds !== null} onChange={(event) => changeCapture({ url: event.target.value })} placeholder="https://…" /></Field><Field label="你选中的文字" hint="可以留空"><textarea rows={7} value={capture.selectedText} disabled={absentRowIds !== null} onChange={(event) => changeCapture({ selectedText: event.target.value })} placeholder="采集器只带回你主动选中的文字，不会读取整页正文。" /></Field><p className="career-import-privacy"><ShieldCheck size={16} />采集：只发送 URL 与选中文字，不包含 Cookie、登录态或站内消息；不会自动投递。</p><button type="button" className="career-button primary import-button" disabled={absentRowIds !== null || (!capture.url.trim() && !capture.selectedText.trim()) || phase === "fingerprinting" || phase === "requesting-ai"} onClick={() => void previewWithAi("capture")}><WandSparkles size={16} />按当前采集生成预览</button></>}
-        {mode === "csv" && <div className="career-csv-input"><div><FileArchive size={25} /><span><b>在本机预览 CSV</b><small>支持中英文表头、引号内换行与转义引号。</small></span></div><input className="career-import-file-input" aria-label="选择职位 CSV 文件" type="file" accept=".csv,text/csv" disabled={absentRowIds !== null} onChange={(event) => { const file = event.target.files?.[0]; if (file) void previewCsv(file); event.currentTarget.value = ""; }} />{csvName && <p>当前文件：<b>{csvName}</b></p>}<p className="career-import-privacy"><ShieldCheck size={16} />CSV 只在当前浏览器本机解析，不会发送给 AI。</p></div>}
+        {mode === "paste" && <><Field label="职位原文或公开链接"><textarea data-dialog-initial rows={7} value={paste} disabled={absentRowIds !== null || newWritesBlocked} onChange={(event) => changePaste(event.target.value)} placeholder="粘贴职位描述、分享文本，或一个公开职位链接…" /></Field><p className="career-import-privacy"><ShieldCheck size={16} />粘贴：只有你在这里明确输入的内容会经 DeepSeek 整理；不会自动投递。</p><button type="button" className="career-button primary import-button" disabled={newWritesBlocked || absentRowIds !== null || !paste.trim() || phase === "fingerprinting" || phase === "requesting-ai"} onClick={() => void previewWithAi("paste")}><WandSparkles size={16} />按当前内容生成预览</button></>}
+        {mode === "capture" && <><Field label="当前页面 URL"><input type="url" value={capture.url} disabled={absentRowIds !== null || newWritesBlocked} onChange={(event) => changeCapture({ url: event.target.value })} placeholder="https://…" /></Field><Field label="你选中的文字" hint="可以留空"><textarea rows={7} value={capture.selectedText} disabled={absentRowIds !== null || newWritesBlocked} onChange={(event) => changeCapture({ selectedText: event.target.value })} placeholder="采集器只带回你主动选中的文字，不会读取整页正文。" /></Field><p className="career-import-privacy"><ShieldCheck size={16} />采集：只发送 URL 与选中文字，不包含 Cookie、登录态或站内消息；不会自动投递。</p><button type="button" className="career-button primary import-button" disabled={newWritesBlocked || absentRowIds !== null || (!capture.url.trim() && !capture.selectedText.trim()) || phase === "fingerprinting" || phase === "requesting-ai"} onClick={() => void previewWithAi("capture")}><WandSparkles size={16} />按当前采集生成预览</button></>}
+        {mode === "csv" && <div className="career-csv-input"><div><FileArchive size={25} /><span><b>在本机预览 CSV</b><small>支持中英文表头、引号内换行与转义引号。</small></span></div><input className="career-import-file-input" aria-label="选择职位 CSV 文件" type="file" accept=".csv,text/csv" disabled={absentRowIds !== null || newWritesBlocked} onChange={(event) => { const file = event.target.files?.[0]; if (file) void previewCsv(file); event.currentTarget.value = ""; }} />{csvName && <p>当前文件：<b>{csvName}</b></p>}<p className="career-import-privacy"><ShieldCheck size={16} />CSV 只在当前浏览器本机解析，不会发送给 AI。</p></div>}
       </section>
       {statusText && <div className="career-import-status" role="status" aria-live="polite"><LoaderCircle className="spin" size={17} /><span>{statusText}</span>{(phase === "fingerprinting" || phase === "requesting-ai") && <button type="button" className="career-button ghost" onClick={cancelPendingRequest}>停止整理</button>}</div>}
       {error && <div className="career-inline-error" role="alert"><X size={16} /><span>{error}</span></div>}
@@ -5421,7 +6174,7 @@ function CareerImportModal({ data, initialCapture, onClose, onRefresh, notify }:
       {absentRowIds && phase === "preview" && <div className="career-import-source-changed original-operation" role="status"><ShieldCheck size={17} /><div><b>{committedRowIds.size > 0 ? "已保存与未写入的项目已分开" : "核对确认这次没有写入"}</b><p>{committedRowIds.size > 0 ? "已保存的项目只显示核对结果，不会再次编辑、选择或写入。未写入项目保留原操作标识；这次不能更换原文、文件或新增选择。" : "原预览与操作标识已保留。为避免重复记录，这次不能更换原文、文件或新增选择；仍可修改并再次保存原来的预览。"}</p></div></div>}
       {sourceChanged && rows.length > 0 && <div className="career-import-source-changed" role="status"><FileText size={17} /><div><b>原文已经变化</b><p>旧预览仍完整保留，但不能按新原文保存。请按当前内容重新生成预览。</p></div></div>}
       {globalWarnings.length > 0 && previewSource?.mode === "csv" && <CareerImportWarningGroup warnings={globalWarnings} />}
-      {rows.length > 0 && <div className={`career-import-preview-list ${previewSource?.mode === "csv" ? "csv" : "single"}`}>{rows.map((row) => committedRowIds.has(row.id) ? <article className="career-import-folded-row committed" key={row.id}><div><CheckCircle2 size={17} /><span><b>{row.preview.candidate.company} · {row.preview.candidate.role} 已确认保存在本机</b><small>这条只显示核对结果，不会再次编辑、选择或写入。</small></span></div></article> : row.preview.duplicateOfRowNumber !== undefined ? <article className="career-import-folded-row" key={row.id}><div><FileArchive size={17} /><span><b>第 {row.preview.rowNumber} 行与第 {row.preview.duplicateOfRowNumber} 行内容相同</b><small>默认合并，只保存一条；这不是错误。</small></span></div><button type="button" className="career-button secondary" disabled={revisingRowId !== null || absentRowIds !== null} onClick={() => void forkDuplicate(row.id)}>仍另存</button></article> : <CareerImportPreviewEditor key={row.id} row={row} draft={drafts[row.id] ?? row.preview.candidate} data={data} sameName={data.jobs.find((job) => sameCareerJobName(job, row.preview.candidate))} sameNameDecision={sameNameDecisions[row.id] ?? "pending"} busy={revisingRowId === row.id} csv={previewSource?.mode === "csv"} selectionLocked={Boolean(absentRowIds && !absentRowIds.has(row.id))} onDraft={(field, value) => updateDraft(row.id, field, value)} onApply={() => void applyRowChanges(row.id)} onInclude={(included) => setRowIncluded(row.id, included)} onSameNameDecision={(decision) => setSameNameDecision(row.id, decision)} />)}</div>}
+      {rows.length > 0 && <div className={`career-import-preview-list ${previewSource?.mode === "csv" ? "csv" : "single"}`}>{rows.map((row) => committedRowIds.has(row.id) ? <article className="career-import-folded-row committed" key={row.id}><div><CheckCircle2 size={17} /><span><b>{row.preview.candidate.company} · {row.preview.candidate.role} 已确认保存在本机</b><small>这条只显示核对结果，不会再次编辑、选择或写入。</small></span></div></article> : row.preview.duplicateOfRowNumber !== undefined ? <article className="career-import-folded-row" key={row.id}><div><FileArchive size={17} /><span><b>第 {row.preview.rowNumber} 行与第 {row.preview.duplicateOfRowNumber} 行内容相同</b><small>默认合并，只保存一条；这不是错误。</small></span></div><button type="button" className="career-button secondary" disabled={newWritesBlocked || revisingRowId !== null || absentRowIds !== null} onClick={() => void forkDuplicate(row.id)}>仍另存</button></article> : <CareerImportPreviewEditor key={row.id} row={row} draft={drafts[row.id] ?? row.preview.candidate} data={data} sameName={data.jobs.find((job) => sameCareerJobName(job, row.preview.candidate))} sameNameDecision={sameNameDecisions[row.id] ?? "pending"} busy={newWritesBlocked || revisingRowId === row.id} csv={previewSource?.mode === "csv"} selectionLocked={newWritesBlocked || Boolean(absentRowIds && !absentRowIds.has(row.id))} onDraft={(field, value) => updateDraft(row.id, field, value)} onApply={() => void applyRowChanges(row.id)} onInclude={(included) => setRowIncluded(row.id, included)} onSameNameDecision={(decision) => setSameNameDecision(row.id, decision)} />)}</div>}
       {rows.length > 0 && <footer className="career-import-actions"><div>{hasUnappliedDraft ? "先确认表单里的修改" : sameNamePending ? "请先决定同名记录是否保存" : sameNameSkipped ? "你选择了这次不保存；也可以改回“仍保存这份”" : hasGlobalBlocking || hasBlocking ? "补充必要信息后即可保存" : sourceChanged ? "请按当前原文重新生成预览" : selectedRows.length === 0 ? "可以选择要保存的预览" : "保存只会写入本机 SQLite"}</div><button type="button" className="career-button primary" disabled={!canCommit} onClick={() => void commitPreview()}><Check size={16} />{previewSource?.mode === "csv" ? "保存所选预览" : "保存到职迹"}</button></footer>}
       </>}
       {phase === "committing" && <section className="career-import-recovery" role="status" aria-live="polite"><LoaderCircle className="spin" size={25} /><h3>正在保存到本机</h3><p>这份预览正在以原操作标识写入。为了避免重复记录，完成前不会接受第二次提交。</p></section>}

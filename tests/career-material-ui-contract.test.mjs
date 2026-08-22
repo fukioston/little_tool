@@ -179,7 +179,7 @@ test("phase changes, dirty drafts, focus return, and narrow screens remain opera
 
 test("a stale material list has exactly one safe recovery action", () => {
   assert.match(source, /const \[materialListStale, setMaterialListStale\] = useState\(false\)/);
-  assert.match(source, /if \(!await refresh\(requestedScope\)\) throw new Error/);
+  assert.match(source, /const outcome = await refresh\(requestedScope\)[\s\S]*?if \(outcome !== "applied"\)/);
   assert.match(source, /await requireRefresh\(\)[\s\S]*?setMaterialListStale\(false\)/);
   assert.match(materialsView, /stale && <div className="career-material-stale"/);
   assert.match(materialsView, /data-material-refresh/);
@@ -268,10 +268,12 @@ test("uncertain saves resolve before cleanup and never reopen a conflicting stab
 
 test("recovery banners pause new writes without blocking an existing attachment download", () => {
   assert.match(materialsView, /const actionsLocked = stale \|\| recoveryLocked/);
-  assert.match(materialsView, /data-material-add disabled=\{actionsLocked\}/);
+  assert.match(materialsView, /const newActionsLocked = actionsLocked \|\| newWritesLocked/);
+  assert.match(materialsView, /data-material-add disabled=\{newActionsLocked\}/);
   assert.match(materialsView, /data-material-recover/);
   assert.match(materialsView, /className="career-icon-button" disabled=\{stale\}/);
-  assert.match(materialsView, /className="career-icon-button danger" disabled=\{actionsLocked\}/);
+  assert.match(materialsView, /className="career-icon-button danger" disabled=\{newActionsLocked\}/);
+  assert.match(materialsView, /cleanupPending[\s\S]*?disabled=\{actionsLocked\}/);
   assert.match(materialsView, /有材料保存需要继续核对/);
 });
 
