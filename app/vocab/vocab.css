@@ -497,3 +497,130 @@
   .sc-settings-write-recovery>footer{display:grid;grid-template-columns:minmax(0,1fr)}
   .sc-settings-write-recovery>footer button{width:100%;white-space:normal}
 }
+
+/* Item checkpoints and lifecycle changes use the same quiet, reviewable
+   recovery language while staying distinct from settings receipts. */
+.sc-item-write-banner,.sc-item-truth-notice{
+  width:min(1080px,calc(100% - 48px));
+  margin:14px auto 0;
+  border:1px solid #d4d0c3;
+  border-radius:16px;
+  background:#f4f1e6;
+  padding:14px 16px;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:16px;
+  min-width:0;
+  overflow-wrap:anywhere;
+}
+.sc-item-write-banner>div:first-child,.sc-item-truth-notice>span{min-width:0}
+.sc-item-write-banner b{display:block;font-size:var(--sc-text-footnote)}
+.sc-item-write-banner p{margin:4px 0 0;color:#62645b;font-size:var(--sc-text-caption);line-height:1.55}
+.sc-item-write-actions{display:flex;flex:none;flex-wrap:wrap;justify-content:flex-end;gap:8px}
+.sc-item-write-banner button,.sc-item-truth-notice button{
+  min-height:44px;
+  border:1px solid #c7c3b6;
+  border-radius:23px;
+  background:#fffefa;
+  padding:0 16px;
+  font-size:var(--sc-text-footnote);
+  line-height:1.35;
+}
+.sc-item-write-recovery{
+  width:min(760px,calc(100% - 48px));
+  margin:14px auto 0;
+  border:1px solid #d1cdc0;
+  border-radius:19px;
+  background:#fffefa;
+  box-shadow:0 18px 50px #22251f14;
+  padding:20px;
+  min-width:0;
+  max-width:calc(100vw - 28px);
+  overflow-wrap:anywhere;
+}
+.sc-item-write-recovery>header h2{margin:0;font:500 22px/1.3 Georgia,"Songti SC",serif;outline:none}
+.sc-item-write-recovery>header p{margin:7px 0 0;color:#5f6159;font-size:var(--sc-text-footnote);line-height:1.6}
+.sc-item-write-error,.sc-item-write-status,.sc-item-inline-status{overflow-wrap:anywhere;line-height:1.55}
+.sc-item-write-error{border-left:3px solid #b77966;background:#f7ece7;padding:11px 13px;color:#744a40}
+.sc-item-write-status{border-left:3px solid #a8ad5d;background:#f3f3df;padding:11px 13px;color:#515448}
+.sc-item-receipt{margin-top:15px;border:1px solid #ddd9cc;border-radius:14px;background:#f8f6ef;padding:12px 14px;min-width:0}
+.sc-item-receipt summary{cursor:pointer;min-height:44px;display:flex;align-items:center;font-size:var(--sc-text-footnote);font-weight:650}
+.sc-item-receipt pre{margin:8px 0 0;max-width:100%;white-space:pre-wrap;overflow-wrap:anywhere;font:500 var(--sc-text-footnote)/1.7 -apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC",sans-serif}
+.sc-item-write-recovery>footer{margin-top:17px;display:flex;justify-content:flex-end;flex-wrap:wrap;gap:9px}
+.sc-item-write-action-note{flex:1 0 100%;color:#66685f;font-size:var(--sc-text-caption);line-height:1.5;text-align:right}
+.sc-item-write-recovery>footer button{
+  min-height:44px;
+  border:1px solid #c8c5b9;
+  border-radius:23px;
+  background:#fffefa;
+  padding:0 16px;
+  font-size:var(--sc-text-footnote);
+  line-height:1.35;
+}
+.sc-item-write-recovery>footer button.primary{border-color:#252820;background:#252820;color:#fff}
+.sc-item-truth-notice{font-size:var(--sc-text-footnote);line-height:1.55}
+.sc-podcast-terminal-actions{display:flex;justify-content:flex-end;margin:0 0 14px}
+.sc-podcast-terminal-actions button{
+  min-height:44px;
+  border:1px solid #c7c3b6;
+  border-radius:23px;
+  background:#fffefa;
+  color:#30332b;
+  padding:0 17px;
+  font-size:var(--sc-text-footnote);
+}
+.sc-item-exit-scrim{position:fixed;inset:0;z-index:94;background:#20231d66;backdrop-filter:blur(3px)}
+.sc-item-exit-dialog{
+  position:fixed;
+  z-index:95;
+  left:50%;
+  top:50%;
+  transform:translate(-50%,-50%);
+  width:min(470px,calc(100vw - 32px));
+  max-height:calc(100dvh - 32px);
+  overflow:auto;
+  border:1px solid #d2cfc2;
+  border-radius:20px;
+  background:#fffefa;
+  box-shadow:0 24px 70px #17191438;
+  padding:22px;
+  overflow-wrap:anywhere;
+}
+.sc-item-exit-dialog h2{margin:0;font:500 23px/1.3 Georgia,"Songti SC",serif}
+.sc-item-exit-dialog p{margin:10px 0 0;color:#5f6159;font-size:var(--sc-text-footnote);line-height:1.65}
+.sc-item-exit-dialog footer{margin-top:20px;display:flex;justify-content:flex-end;gap:9px;flex-wrap:wrap}
+.sc-item-exit-dialog button,.sc-item-exit-dialog a{
+  min-height:44px;
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  border:1px solid #c8c5b9;
+  border-radius:23px;
+  background:#fffefa;
+  color:#30332b;
+  padding:0 16px;
+  text-decoration:none;
+  font-size:var(--sc-text-footnote);
+}
+.sc-item-exit-dialog .danger{border-color:#b77966;color:#8b4e40;background:#fff8f5}
+.sc-item-exit-dialog [aria-disabled="true"]{cursor:not-allowed;opacity:.55}
+.sc-item-inline-status{margin:0 0 14px;border-radius:12px;background:#eeece2;color:#60625a;padding:11px 13px;font-size:var(--sc-text-caption)}
+.sc-reader-end .sc-item-inline-status{display:block;margin:12px auto 0;max-width:420px;text-align:left}
+
+@media(max-width:760px){
+  .sc-item-write-banner,.sc-item-truth-notice,.sc-item-write-recovery{width:calc(100% - 28px)}
+  .sc-item-write-banner,.sc-item-truth-notice{align-items:stretch;flex-direction:column}
+  .sc-item-write-actions{display:grid;grid-template-columns:minmax(0,1fr);width:100%}
+  .sc-item-write-banner button,.sc-item-truth-notice button{width:100%;white-space:normal}
+  .sc-podcast-terminal-actions,.sc-podcast-terminal-actions button{width:100%}
+}
+
+@media(max-width:370px){
+  .sc-item-write-recovery{padding:17px 14px}
+  .sc-item-write-recovery>footer{display:grid;grid-template-columns:minmax(0,1fr)}
+  .sc-item-write-recovery>footer button{width:100%;white-space:normal}
+  .sc-item-exit-dialog{width:calc(100vw - 24px);padding:18px 14px}
+  .sc-item-exit-dialog footer{display:grid;grid-template-columns:minmax(0,1fr)}
+  .sc-item-exit-dialog button,.sc-item-exit-dialog a{width:100%;white-space:normal;text-align:center}
+}

@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent } from "react";
 import { errorMessage, explainInChinese, explainSelection } from "@/lib/vocab/api";
 import { exportCompleteVocabBackup } from "@/lib/vocab/backup";
 import {
@@ -18,13 +18,12 @@ import {
   loadVocabSnapshot,
   inspectVocabOccurrenceWrite,
   loadVocabSettingsExpectedState,
+  type VocabItemWriteSnapshot,
   prepareVocabOccurrenceWrite,
   prepareVocabSettingsSave,
   saveLexemeNote,
   saveOccurrence,
   toggleLexemeStar,
-  updateItemProgress,
-  updateItemStatus,
   updateLexemeStatus,
   VocabSettingsMutationError,
   VocabWriteConflictError,
@@ -47,6 +46,20 @@ import {
   useVocabSettingsWriteFlow,
   type VocabSettingsRefreshOutcome,
 } from "./VocabSettingsWriteFlow";
+import {
+  VocabItemWriteBanner,
+  VocabItemWriteRecovery,
+  useVocabItemWriteFlow,
+  type VocabItemExpectedMap,
+  type VocabItemRefreshOutcome,
+} from "./VocabItemWriteFlow";
+import {
+  firstVocabItemRecoveryFocusTarget,
+  vocabItemExitDecision,
+  vocabItemHistoryBackDecision,
+} from "./item-write-state";
+
+const VOCAB_ITEM_HISTORY_GUARD = "__privateAiSuiteVocabItemGuard";
 
 const navigation: Array<{ id: VocabView; label: string; glyph: string }> = [
   { id: "today", label: "今日", glyph: "今" },
@@ -65,6 +78,7 @@ type VocabSnapshotReadStatus = "loading" | "ready" | "stale";
 type VocabFactsReadBundle = Readonly<{
   snapshot: VocabSnapshot;
   expected: VocabSettingsWriteSnapshot;
+  itemExpectedById: VocabItemExpectedMap;
 }>;
 type VocabSettingsDraft = Readonly<{
   settings: VocabSettings;
@@ -126,9 +140,20 @@ async function loadVocabFactsWithSettingsExpected(): Promise<VocabFactsReadBundl
     const expectedAfter = await loadVocabSettingsExpectedState();
     if (sameVocabSettingsExpectedState(expectedBefore, expectedAfter) &&
         sameVocabSettings(facts.settings, expectedAfter.settings)) {
+      const itemExpectedById = new Map<string, VocabItemWriteSnapshot>();
+      const items = facts.items.map((source) => {
+        const item = { ...source };
+        itemExpectedById.set(item.id, {
+          generationId: expectedAfter.generationId,
+          generationSequence: expectedAfter.generationSequence,
+          item,
+        });
+        return item;
+      });
       return {
-        snapshot: { ...facts, settings: expectedAfter.settings },
+        snapshot: { ...facts, items, settings: expectedAfter.settings },
         expected: expectedAfter,
+        itemExpectedById,
       };
     }
   }
@@ -231,10 +256,15 @@ export default function VocabApp() {
   const [snapshot, setSnapshot] = useState<VocabSnapshot>(empty);
   const [settingsExpected, setSettingsExpected] = useState<VocabSettingsWriteSnapshot | null>(null);
   const [snapshotReadStatus, setSnapshotReadStatus] = useState<VocabSnapshotReadStatus>("loading");
+  const [snapshotReadError, setSnapshotReadError] = useState("");
   const [settingsDraft, setSettingsDraft] = useState<VocabSettingsDraft | null>(null);
   const [settingsExternalPending, setSettingsExternalPending] = useState(false);
   const [settingsWriteNotice, setSettingsWriteNotice] = useState("");
   const [settingsRecoveryOpen, setSettingsRecoveryOpen] = useState(false);
+  const [itemRecoveryOpen, setItemRecoveryOpen] = useState(false);
+  const [itemExternalPending, setItemExternalPending] = useState(false);
+  const [itemExitConfirmOpen, setItemExitConfirmOpen] = useState(false);
+  const [itemExitDestination, setItemExitDestination] = useState<"suite" | "history">("suite");
   const [ready, setReady] = useState(false);
   const [fatal, setFatal] = useState("");
   const [view, setView] = useState<VocabView>("today");
@@ -267,9 +297,12 @@ export default function VocabApp() {
   const snapshotReadRequestRef = useRef(0);
   const snapshotRef = useRef(snapshot);
   const settingsExpectedRef = useRef<VocabSettingsWriteSnapshot | null>(null);
+  const itemExpectedByIdRef = useRef<VocabItemExpectedMap>(new Map());
+  const itemWriteGuardRef = useRef<(next: VocabItemExpectedMap) => boolean>(() => false);
   const settingsDraftRef = useRef<VocabSettingsDraft | null>(null);
   const flushedSettingsDraftRevisionRef = useRef<number | null>(null);
   const pendingSettingsBundleRef = useRef<Readonly<{ requestId: number; bundle: VocabFactsReadBundle }> | null>(null);
+  const pendingItemBundleRef = useRef<Readonly<{ requestId: number; bundle: VocabFactsReadBundle }> | null>(null);
   const settingsPrepareBindingRef = useRef<Readonly<{
     trigger: HTMLElement;
     revision: number | null;
@@ -282,6 +315,77 @@ export default function VocabApp() {
     expected: VocabSettingsWriteSnapshot;
   }> | null>(null);
   const settingsFocusFrame = useRef<number | null>(null);
+  const itemRecoveryOpenRef = useRef(false);
+  const itemRecoveryOpenerRef = useRef<HTMLElement | null>(null);
+  const itemRecoveryFocusFrame = useRef<number | null>(null);
+  const snapshotReadFocusFrame = useRef<number | null>(null);
+  const itemExitOpenerRef = useRef<HTMLElement | null>(null);
+  const itemExitFocusFrame = useRef<number | null>(null);
+  const itemHistoryGuardRef = useRef<string | null>(null);
+  const itemHistoryRestoringRef = useRef(false);
+  const itemHistoryConfirmAfterRestoreRef = useRef(false);
+  const rememberItemRecoveryOpener = useCallback((trigger: HTMLButtonElement) => {
+    itemRecoveryOpenerRef.current = trigger;
+    itemRecoveryOpenRef.current = true;
+    setItemRecoveryOpen(true);
+  }, []);
+  const restoreItemRecoveryFocus = useCallback(() => {
+    if (itemRecoveryFocusFrame.current !== null) {
+      window.cancelAnimationFrame(itemRecoveryFocusFrame.current);
+    }
+    itemRecoveryFocusFrame.current = window.requestAnimationFrame(() => {
+      itemRecoveryFocusFrame.current = window.requestAnimationFrame(() => {
+        itemRecoveryFocusFrame.current = null;
+        const target = firstVocabItemRecoveryFocusTarget([
+          itemRecoveryOpenerRef.current,
+          document.querySelector<HTMLElement>(".sc-item-write-banner button:not(:disabled)"),
+          document.querySelector<HTMLElement>(
+            ".sc-main h1",
+          ),
+          document.querySelector<HTMLElement>(".sc-menu:not(:disabled)"),
+        ], (candidate) => {
+          if (
+            !candidate.isConnected || candidate.hidden ||
+            candidate.matches(":disabled") || candidate.getClientRects().length === 0
+          ) return false;
+          const style = window.getComputedStyle(candidate);
+          return style.display !== "none" && style.visibility !== "hidden";
+        });
+        itemRecoveryOpenerRef.current = null;
+        if (!target) return;
+        if (target.matches("h1")) target.tabIndex = -1;
+        target.focus({ preventScroll: true });
+      });
+    });
+  }, []);
+  const restoreItemExitFocus = useCallback(() => {
+    if (itemExitFocusFrame.current !== null) {
+      window.cancelAnimationFrame(itemExitFocusFrame.current);
+    }
+    itemExitFocusFrame.current = window.requestAnimationFrame(() => {
+      itemExitFocusFrame.current = window.requestAnimationFrame(() => {
+        itemExitFocusFrame.current = null;
+        const target = firstVocabItemRecoveryFocusTarget([
+          itemExitOpenerRef.current,
+          document.querySelector<HTMLElement>(
+            ".sc-library .sc-page-title h1, .sc-reader h1, .sc-podcast-head h1, .sc-main h1",
+          ),
+          document.querySelector<HTMLElement>(".sc-menu:not(:disabled)"),
+        ], (candidate) => {
+          if (
+            !candidate.isConnected || candidate === document.body || candidate.hidden ||
+            candidate.matches(":disabled") || candidate.getClientRects().length === 0
+          ) return false;
+          const style = window.getComputedStyle(candidate);
+          return style.display !== "none" && style.visibility !== "hidden";
+        });
+        itemExitOpenerRef.current = null;
+        if (!target) return;
+        if (target.matches("h1")) target.tabIndex = -1;
+        target.focus({ preventScroll: true });
+      });
+    });
+  }, []);
   const sidebarOpener = useRef<HTMLButtonElement>(null);
   const sidebarFocusFrame = useRef<number | null>(null);
   const focusSidebarOpenerAfterClose = useCallback(() => {
@@ -311,20 +415,42 @@ export default function VocabApp() {
     closeMobileSidebar,
     "button[data-sidebar-close]",
   );
+  const closeItemExitConfirm = useCallback(() => {
+    setItemExitConfirmOpen(false);
+    restoreItemExitFocus();
+  }, [restoreItemExitFocus]);
+  const itemExitDialog = useOverlayDialog<HTMLElement>(
+    itemExitConfirmOpen,
+    closeItemExitConfirm,
+    "[data-item-exit-stay]",
+  );
 
   useEffect(() => () => {
     if (sidebarFocusFrame.current !== null) {
       window.cancelAnimationFrame(sidebarFocusFrame.current);
+    }
+    if (itemRecoveryFocusFrame.current !== null) {
+      window.cancelAnimationFrame(itemRecoveryFocusFrame.current);
+    }
+    if (snapshotReadFocusFrame.current !== null) {
+      window.cancelAnimationFrame(snapshotReadFocusFrame.current);
+    }
+    if (itemExitFocusFrame.current !== null) {
+      window.cancelAnimationFrame(itemExitFocusFrame.current);
     }
   }, []);
 
   const applyVocabFactsBundle = useCallback((bundle: VocabFactsReadBundle) => {
     snapshotRef.current = bundle.snapshot;
     settingsExpectedRef.current = bundle.expected;
+    itemExpectedByIdRef.current = bundle.itemExpectedById;
     setSnapshot(bundle.snapshot);
     setSettingsExpected(bundle.expected);
     setSnapshotReadStatus("ready");
+    setSnapshotReadError("");
     setReady(true);
+    pendingItemBundleRef.current = null;
+    setItemExternalPending(false);
   }, []);
 
   const readVocabFacts = useCallback(async (): Promise<Readonly<{
@@ -337,6 +463,11 @@ export default function VocabApp() {
       if (requestId !== snapshotReadRequestRef.current) {
         return { outcome: "superseded", snapshot: snapshotRef.current };
       }
+      if (itemWriteGuardRef.current(bundle.itemExpectedById)) {
+        pendingItemBundleRef.current = { requestId, bundle };
+        setItemExternalPending(true);
+        return { outcome: "deferred", snapshot: snapshotRef.current };
+      }
       const draft = settingsDraftRef.current;
       if (draft) {
         const settingsChanged = !sameVocabSettingsExpectedState(draft.expected, bundle.expected);
@@ -347,10 +478,14 @@ export default function VocabApp() {
         }
         const nextSnapshot = { ...bundle.snapshot, settings: draft.expected.settings };
         snapshotRef.current = nextSnapshot;
+        itemExpectedByIdRef.current = bundle.itemExpectedById;
         setSnapshot(nextSnapshot);
         setSnapshotReadStatus("ready");
+        setSnapshotReadError("");
         setReady(true);
         pendingSettingsBundleRef.current = null;
+        pendingItemBundleRef.current = null;
+        setItemExternalPending(false);
         setSettingsExternalPending(false);
         return { outcome: "applied", snapshot: nextSnapshot };
       }
@@ -359,10 +494,38 @@ export default function VocabApp() {
       applyVocabFactsBundle(bundle);
       return { outcome: "applied", snapshot: bundle.snapshot };
     } catch (reason) {
-      if (requestId === snapshotReadRequestRef.current) setSnapshotReadStatus("stale");
+      if (requestId === snapshotReadRequestRef.current) {
+        setSnapshotReadStatus("stale");
+        setSnapshotReadError(errorMessage(reason));
+      }
       throw reason;
     }
   }, [applyVocabFactsBundle]);
+
+  const retryVocabFactsRead = useCallback((trigger: HTMLButtonElement) => {
+    setSnapshotReadError("");
+    void readVocabFacts().catch(() => undefined).finally(() => {
+      if (snapshotReadFocusFrame.current !== null) {
+        window.cancelAnimationFrame(snapshotReadFocusFrame.current);
+      }
+      snapshotReadFocusFrame.current = window.requestAnimationFrame(() => {
+        snapshotReadFocusFrame.current = window.requestAnimationFrame(() => {
+          snapshotReadFocusFrame.current = null;
+          const target = firstVocabItemRecoveryFocusTarget([
+            trigger,
+            document.querySelector<HTMLElement>(".sc-item-truth-notice button:not(:disabled)"),
+            document.querySelector<HTMLElement>(".sc-main h1"),
+            document.querySelector<HTMLElement>(".sc-menu:not(:disabled)"),
+          ], (candidate) => candidate.isConnected && !candidate.hidden &&
+            !candidate.matches(":disabled") && candidate.getClientRects().length > 0 &&
+            window.getComputedStyle(candidate).visibility !== "hidden");
+          if (!target) return;
+          if (target.matches("h1")) target.tabIndex = -1;
+          target.focus({ preventScroll: true });
+        });
+      });
+    });
+  }, [readVocabFacts]);
 
   const readAndApplySnapshot = useCallback(async () => {
     const result = await readVocabFacts();
@@ -377,6 +540,14 @@ export default function VocabApp() {
   const refreshSettingsFacts = useCallback(async (): Promise<VocabSettingsRefreshOutcome> => {
     return (await readVocabFacts()).outcome;
   }, [readVocabFacts]);
+
+  const refreshItemFacts = useCallback(async (): Promise<VocabItemRefreshOutcome> => {
+    return (await readVocabFacts()).outcome;
+  }, [readVocabFacts]);
+
+  const getItemExpected = useCallback((itemId: string) => {
+    return itemExpectedByIdRef.current.get(itemId) ?? null;
+  }, []);
 
   const clearSettingsDraft = useCallback(() => {
     settingsDraftRef.current = null;
@@ -438,6 +609,32 @@ export default function VocabApp() {
     onDurableCommitted: consumeCommittedSettingsDraft,
     onDurableSettled: settleSettingsWrite,
   });
+  const settingsDatabaseWriteLocked = settingsWrites.writeLocked ||
+    settingsWrites.operationInProgress();
+  const itemWrites = useVocabItemWriteFlow({
+    refresh: refreshItemFacts,
+    getExpected: getItemExpected,
+    externalWriteLocked: settingsDatabaseWriteLocked ||
+      snapshotReadStatus !== "ready",
+    onToast: setToast,
+    onAttention: (background) => {
+      if (!background) {
+        if (!itemRecoveryOpenRef.current) {
+          const active = document.activeElement instanceof HTMLElement &&
+              document.activeElement !== document.body &&
+              !document.activeElement.closest(".sc-item-write-recovery")
+            ? document.activeElement
+            : null;
+          itemRecoveryOpenerRef.current = active;
+        }
+        itemRecoveryOpenRef.current = true;
+        setItemRecoveryOpen(true);
+      }
+    },
+  });
+  useEffect(() => {
+    itemWriteGuardRef.current = itemWrites.shouldDeferBundle;
+  }, [itemWrites.shouldDeferBundle]);
   const effectiveLocalLock = vocabSettingsOutboundBlocked(
     snapshot.settings.local_lock,
     settingsWrites.journal.loaded,
@@ -537,6 +734,11 @@ export default function VocabApp() {
     setSettingsExternalPending(false);
     setSettingsWriteNotice("");
     if (pending && pending.requestId === snapshotReadRequestRef.current) {
+      if (itemWriteGuardRef.current(pending.bundle.itemExpectedById)) {
+        pendingItemBundleRef.current = pending;
+        setItemExternalPending(true);
+        return;
+      }
       applyVocabFactsBundle(pending.bundle);
       return;
     }
@@ -1023,13 +1225,141 @@ export default function VocabApp() {
     return savePickedWord(note);
   }, [inspectPendingWord, refreshCommittedWord, requestAbandonConflictedWord, savePickedWord, wordSavePhase]);
 
-  const recordReaderProgress = useCallback(async (item: LibraryItem, progress: number) => {
-    await updateItemProgress(item.id, Math.max(0, Math.min(.99, progress)));
-  }, []);
+  const queueItemCheckpoint = itemWrites.queueCheckpoint;
+  const recordItemProgressCandidate = useCallback((item: LibraryItem, progress: number) => {
+    return queueItemCheckpoint(item, progress);
+  }, [queueItemCheckpoint]);
 
-  const recordPodcastProgress = useCallback(async (item: LibraryItem, progress: number) => {
-    await updateItemProgress(item.id, Math.max(0, Math.min(1, progress)), progress > .98);
-  }, []);
+  const discardItemCheckpointsAndRefresh = itemWrites.discardCheckpointsAndRefresh;
+  const discardAllItemCheckpoints = itemWrites.discardCheckpoints;
+  const allowDiscardedItemNavigation = itemWrites.allowDiscardedNavigation;
+  const itemOperationInProgress = itemWrites.operationInProgress;
+  const itemWriteBusy = itemWrites.busy;
+  const itemHasDirtyCheckpoint = itemWrites.hasDirtyCheckpoint;
+  const itemHasVolatileReceipt = itemWrites.hasVolatileHeldReceipt;
+  const discardItemPositionsAndReadLatest = useCallback(async (
+    trigger: HTMLButtonElement,
+  ) => {
+    await discardItemCheckpointsAndRefresh(true, trigger);
+  }, [discardItemCheckpointsAndRefresh]);
+
+  const requestSuiteExit = useCallback((event: ReactMouseEvent<HTMLAnchorElement>) => {
+    const decision = vocabItemExitDecision(
+      itemWriteBusy || itemOperationInProgress() || itemHasVolatileReceipt,
+      itemHasDirtyCheckpoint,
+    );
+    if (decision === "leave") {
+      if (itemHistoryGuardRef.current !== null) {
+        event.preventDefault();
+        itemHistoryGuardRef.current = null;
+        window.location.replace("/");
+      }
+      return;
+    }
+    event.preventDefault();
+    if (decision === "block") {
+      setToast("正在安全确认条目；结果明确前先留在本页。");
+      return;
+    }
+    itemExitOpenerRef.current = event.currentTarget;
+    setItemExitDestination("suite");
+    setItemExitConfirmOpen(true);
+  }, [itemHasDirtyCheckpoint, itemHasVolatileReceipt, itemOperationInProgress, itemWriteBusy]);
+
+  useEffect(() => {
+    const hasRisk = itemWriteBusy || itemOperationInProgress() ||
+      itemHasDirtyCheckpoint || itemHasVolatileReceipt;
+    if (hasRisk && itemHistoryGuardRef.current === null) {
+      const token = typeof crypto.randomUUID === "function"
+        ? crypto.randomUUID()
+        : `vocab-item-${Date.now()}`;
+      const current = window.history.state;
+      const state = current && typeof current === "object"
+        ? { ...current, [VOCAB_ITEM_HISTORY_GUARD]: token }
+        : { [VOCAB_ITEM_HISTORY_GUARD]: token };
+      window.history.pushState(state, "", window.location.href);
+      itemHistoryGuardRef.current = token;
+    }
+    const token = itemHistoryGuardRef.current;
+    if (!token) return;
+    // popstate cannot cancel an arbitrary multi-entry history.go jump. This
+    // sentinel protects normal one-step Back/Forward; beforeunload protects a
+    // document exit while volatile work is still present.
+    const onPopState = () => {
+      if (itemHistoryGuardRef.current !== token) return;
+      if (itemHistoryRestoringRef.current) {
+        itemHistoryRestoringRef.current = false;
+        if (itemHistoryConfirmAfterRestoreRef.current) {
+          itemHistoryConfirmAfterRestoreRef.current = false;
+          const active = document.activeElement;
+          itemExitOpenerRef.current = active instanceof HTMLElement &&
+              active !== document.body && !active.closest(".sc-item-exit-dialog")
+            ? active
+            : null;
+          setItemExitDestination("history");
+          setItemExitConfirmOpen(true);
+        }
+        return;
+      }
+      const current = window.history.state;
+      if (
+        current && typeof current === "object" &&
+        current[VOCAB_ITEM_HISTORY_GUARD] === token
+      ) return;
+      const decision = vocabItemHistoryBackDecision(
+        itemWriteBusy || itemOperationInProgress() || itemHasVolatileReceipt,
+        itemHasDirtyCheckpoint,
+      );
+      if (decision === "continue") {
+        itemHistoryGuardRef.current = null;
+        window.queueMicrotask(() => window.history.back());
+        return;
+      }
+      itemHistoryRestoringRef.current = true;
+      itemHistoryConfirmAfterRestoreRef.current = decision === "restore-confirm";
+      window.history.forward();
+      if (decision === "restore-block") {
+        setToast("正在安全确认条目；结果明确前已阻止离开本页。");
+      }
+    };
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, [itemHasDirtyCheckpoint, itemHasVolatileReceipt, itemOperationInProgress, itemWriteBusy]);
+
+  const abandonItemPositionAndLeaveSuite = useCallback(() => {
+    if (itemWriteBusy || itemOperationInProgress() || itemHasVolatileReceipt) return;
+    const guarded = itemHistoryGuardRef.current !== null;
+    discardAllItemCheckpoints();
+    allowDiscardedItemNavigation();
+    itemHistoryGuardRef.current = null;
+    setItemExitConfirmOpen(false);
+    if (guarded) window.location.replace("/");
+    else window.location.assign("/");
+  }, [allowDiscardedItemNavigation, discardAllItemCheckpoints, itemHasVolatileReceipt, itemOperationInProgress, itemWriteBusy]);
+
+  const abandonItemPositionAndContinueHistory = useCallback(() => {
+    if (itemWriteBusy || itemOperationInProgress() || itemHasVolatileReceipt) return;
+    discardAllItemCheckpoints();
+    setItemExitConfirmOpen(false);
+    const guarded = itemHistoryGuardRef.current !== null;
+    itemHistoryGuardRef.current = null;
+    window.history.go(guarded ? -2 : -1);
+  }, [discardAllItemCheckpoints, itemHasVolatileReceipt, itemOperationInProgress, itemWriteBusy]);
+
+  useEffect(() => {
+    if (!itemRecoveryOpen || itemWrites.flow.phase !== "idle") return;
+    if (
+      itemWrites.journal.storageUnavailable || itemWrites.journal.lockUnavailable ||
+      itemWrites.journal.entries.length > 0 || itemWrites.journal.unreadable.length > 0 ||
+      itemWrites.hasHeldReceipt
+    ) return;
+    const frame = window.requestAnimationFrame(() => {
+      itemRecoveryOpenRef.current = false;
+      setItemRecoveryOpen(false);
+      restoreItemRecoveryFocus();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [itemRecoveryOpen, itemWrites.flow.phase, itemWrites.hasHeldReceipt, itemWrites.journal, restoreItemRecoveryFocus]);
 
   const exportBackup = useCallback(async () => {
     const backup = await exportCompleteVocabBackup();
@@ -1077,6 +1407,16 @@ export default function VocabApp() {
   const settingsPairBound = settingsExpected !== null && snapshot.settings === settingsExpected.settings &&
     (!settingsDraft || settingsDraft.expected === settingsExpected);
   const settingsControlsLocked = snapshotReadStatus !== "ready" || !settingsPairBound || settingsWrites.writeLocked;
+  const itemWritePermanentReadOnly = snapshotReadStatus !== "ready" ||
+    !itemWrites.journal.loaded || itemWrites.journal.storageUnavailable ||
+    itemWrites.journal.lockUnavailable || itemWrites.journal.unreadable.length > 0 ||
+    itemWrites.hasConflictedCheckpoint;
+  const itemDatabaseMutationLocked = itemWrites.busy || itemWrites.operationInProgress() ||
+    itemWrites.hasDirtyCheckpoint || itemWrites.hasConflictedCheckpoint ||
+    itemWrites.hasHeldReceipt ||
+    !itemWrites.journal.loaded || itemWrites.journal.storageUnavailable ||
+    itemWrites.journal.lockUnavailable || itemWrites.journal.entries.length > 0 ||
+    itemWrites.journal.unreadable.length > 0;
   const settingsControlStatus = settingsWrites.busy
     ? "正在安全确认设置；结果明确前不会开始另一笔写入。"
     : snapshotReadStatus !== "ready"
@@ -1096,7 +1436,7 @@ export default function VocabApp() {
   return <main className="shici" style={{ "--reader-scale": displayedSettings.font_scale, "--reader-leading": displayedSettings.line_height } as CSSProperties}>
     <aside ref={sidebarDialog} id="sc-navigation" className={`sc-sidebar ${sideOpen ? "open" : ""}`} role={mobile && sideOpen ? "dialog" : undefined} aria-modal={mobile && sideOpen ? true : undefined} aria-label="拾词导航" aria-hidden={sidebarHidden || undefined} inert={sidebarHidden || undefined} tabIndex={sidebarHidden ? -1 : mobile && sideOpen ? -1 : undefined}>
       <button data-sidebar-close className="sc-sidebar-close" tabIndex={sidebarHidden ? -1 : undefined} onClick={closeMobileSidebar} aria-label="关闭导航">×</button>
-      <Link href="/" className="sc-brand" aria-label="返回私人工作台" tabIndex={sidebarHidden ? -1 : undefined}><Logo /></Link>
+      <Link href="/" className="sc-brand" aria-label="返回私人工作台" tabIndex={sidebarHidden ? -1 : undefined} onClick={requestSuiteExit}><Logo /></Link>
       <nav>{navigation.map((item) => <button key={item.id} tabIndex={sidebarHidden ? -1 : undefined} aria-current={view === item.id ? "page" : undefined} className={view === item.id ? "active" : ""} onClick={() => go(item.id)}><i>{item.glyph}</i><span>{item.label}</span></button>)}</nav>
       <div className="sc-side-foot"><button tabIndex={sidebarHidden ? -1 : undefined} className={view === "settings" ? "active" : ""} onClick={() => go("settings")}><i>设</i><span>设置</span></button><div><i className={storageStatus?.persisted === true ? "persisted" : ""} /><span>当前浏览器<small>{storageStatus?.persisted === true ? "已获持久化保护" : !persistenceSupported ? "未提供持久化保护接口" : storageStatus?.persisted === false ? "请定期导出备份" : "保护状态暂时未知"}</small></span></div></div>
     </aside>
@@ -1104,16 +1444,27 @@ export default function VocabApp() {
       <header className="sc-topbar"><button ref={sidebarOpener} className="sc-menu" onClick={() => setSideOpen((value) => !value)} aria-expanded={sideOpen} aria-controls="sc-navigation" aria-label={sideOpen ? "关闭导航" : "打开导航"}>拾</button><div className="sc-crumb"><span>拾词</span><b>/</b><strong>{pageLabel}</strong></div><div className="sc-top-actions"><button className="sc-search-jump" aria-label="搜索资料、词和语境" onClick={() => setSearchOpen(true)}>⌕ <span>搜索</span><kbd>⌘ K</kbd></button><button className="sc-import" aria-label="导入内容" onClick={() => setImportOpen(true)}>＋ <span>导入内容</span></button></div></header>
       <VocabSettingsWriteBanner controller={settingsWrites} />
       {settingsRecoveryOpen && <VocabSettingsWriteRecovery controller={settingsWrites} />}
+      <VocabItemWriteBanner controller={itemWrites} onOpen={rememberItemRecoveryOpener} />
+      {itemRecoveryOpen && <VocabItemWriteRecovery controller={itemWrites} />}
+      {snapshotReadStatus === "stale" && !itemExternalPending &&
+        !settingsExternalPending && !globalSettingsNotice &&
+        <section className="sc-item-truth-notice sc-snapshot-read-notice" role="alert">
+          <span>{snapshotReadError
+            ? `${snapshotReadError} 当前仍显示上次成功读取的完整资料；所有条目写入保持暂停。`
+            : "当前仍显示上次成功读取的完整资料；所有条目写入保持暂停。"}</span>
+          <button type="button" disabled={itemWrites.busy || settingsWrites.busy} onClick={(event) => retryVocabFactsRead(event.currentTarget)}>只重新读取</button>
+        </section>}
+      {itemExternalPending && <section className="sc-item-truth-notice" role="status"><span>另一页的条目已经变化；当前阅读位置仍按原完整条目保留，没有拼接或覆盖。</span><button type="button" disabled={itemWrites.busy} onClick={(event) => void discardItemPositionsAndReadLatest(event.currentTarget)}>放弃本页位置并读取最新</button></section>}
       {globalSettingsNotice && <section className="sc-settings-truth-notice" role="status"><span>{globalSettingsNotice}</span><button type="button" disabled={settingsWrites.busy} onClick={rereadSettingsTruth}>{settingsDraft ? "放弃草稿并读取最新设置" : "只重新读取"}</button></section>}
       <div className="sc-view">
         {view === "today" && <TodayView snapshot={snapshot} due={dueCards.length} onOpen={openItem} onGo={go} onImport={() => setImportOpen(true)} onWord={setWordId} />}
-        {view === "library" && <LibraryView items={snapshot.items} onOpen={openItem} onImport={() => setImportOpen(true)} onArchive={async (item) => { await updateItemStatus(item.id, item.status === "archived" ? "unread" : "archived"); await refresh(); }} />}
-        {view === "reader" && <ReaderView item={activeItem?.kind === "article" ? activeItem : snapshot.items.find((item) => item.kind === "article") ?? null} blocks={snapshot.blocks} occurrences={snapshot.occurrences} bookmarks={snapshot.bookmarks} onSelect={selectText} onBack={() => go("library")} onProgress={recordReaderProgress} onFinish={async (item) => { await updateItemProgress(item.id, 1, true); await refresh(); setToast("已标记为读完，随时可以改回阅读中"); }} onBookmark={async (item, block) => { await createBookmark(item.id, block?.id ?? "top", block?.text.slice(0, 30) ?? item.title); await refresh(); setToast("已收藏当前位置"); }} />}
-        {view === "podcast" && <PodcastView key={(activeItem?.kind === "podcast" ? activeItem : snapshot.items.find((item) => item.kind === "podcast"))?.id ?? "empty-podcast"} item={activeItem?.kind === "podcast" ? activeItem : snapshot.items.find((item) => item.kind === "podcast") ?? null} segments={snapshot.segments} occurrences={snapshot.occurrences} autoFollow={snapshot.settings.auto_follow} autoFollowWriteLocked={settingsControlsLocked} autoFollowWriteBusy={settingsWrites.busy} autoFollowStatus={settingsControlStatus} localLock={effectiveLocalLock} onAutoFollow={(value, trigger) => requestSettingsChange({ auto_follow: value }, trigger)} onSelect={selectText} onProgress={recordPodcastProgress} onBookmark={async (item, ms, label) => { await createBookmark(item.id, `t:${ms}`, label); await refresh(); setToast("已收藏此刻"); }} />}
+        {view === "library" && <LibraryView items={snapshot.items} itemWriteLocked={snapshotReadStatus !== "ready" || itemWrites.writeLocked} itemWriteBusy={itemWrites.busy} itemWriteStatus={itemWrites.error || itemWrites.status} onOpen={openItem} onImport={() => setImportOpen(true)} onArchive={(item, trigger) => void itemWrites.startLifecycle(item.status === "archived" ? "restore" : "archive", item, trigger)} />}
+        {view === "reader" && <ReaderView item={activeItem?.kind === "article" ? activeItem : snapshot.items.find((item) => item.kind === "article") ?? null} blocks={snapshot.blocks} occurrences={snapshot.occurrences} bookmarks={snapshot.bookmarks} itemWriteLocked={snapshotReadStatus !== "ready" || itemWrites.writeLocked} itemWriteBusy={itemWrites.busy} itemWriteStatus={itemWrites.error || itemWrites.status} onSelect={selectText} onBack={() => go("library")} onProgress={recordItemProgressCandidate} onFinish={(item, trigger) => void itemWrites.startLifecycle("complete", item, trigger)} onBookmark={async (item, block) => { await createBookmark(item.id, block?.id ?? "top", block?.text.slice(0, 30) ?? item.title); await refresh(); setToast("已收藏当前位置"); }} />}
+        {view === "podcast" && <PodcastView key={(activeItem?.kind === "podcast" ? activeItem : snapshot.items.find((item) => item.kind === "podcast"))?.id ?? "empty-podcast"} item={activeItem?.kind === "podcast" ? activeItem : snapshot.items.find((item) => item.kind === "podcast") ?? null} segments={snapshot.segments} occurrences={snapshot.occurrences} autoFollow={snapshot.settings.auto_follow} autoFollowWriteLocked={settingsControlsLocked} autoFollowWriteBusy={settingsWrites.busy} autoFollowStatus={settingsControlStatus} itemWriteLocked={snapshotReadStatus !== "ready" || itemWrites.writeLocked} itemWritePermanentReadOnly={itemWritePermanentReadOnly} itemWriteBusy={itemWrites.busy} itemWriteStatus={itemWrites.error || itemWrites.status} localLock={effectiveLocalLock} onAutoFollow={(value, trigger) => requestSettingsChange({ auto_follow: value }, trigger)} onSelect={selectText} onProgress={recordItemProgressCandidate} onFinish={(item, trigger) => void itemWrites.startLifecycle("complete", item, trigger)} onBookmark={async (item, ms, label) => { await createBookmark(item.id, `t:${ms}`, label); await refresh(); setToast("已收藏此刻"); }} />}
         {view === "words" && <WordsView lexemes={snapshot.lexemes} occurrences={snapshot.occurrences} onOpen={setWordId} onStar={async (word) => { await toggleLexemeStar(word.id, !word.starred); await refresh(); }} />}
         {view === "review" && <ReviewView cards={snapshot.reviewCards} onRefresh={refresh} onGo={go} />}
         {view === "stats" && <StatsView snapshot={snapshot} />}
-        {view === "settings" && <SettingsView settings={displayedSettings} settingsDraftDirty={Boolean(settingsDraft)} settingsWriteLocked={settingsControlsLocked} settingsWriteBusy={settingsWrites.busy} settingsWriteStatus={settingsControlStatus} storage={storageStatus} persistenceSupported={persistenceSupported} onDraftChange={updateSettingsDraft} onDraftCommit={submitSettingsDraft} onToggle={(patch, trigger) => requestSettingsChange(patch, trigger)} onDiscardDraft={discardSettingsDraftAndRead} onExport={exportBackup} onRestoreRefresh={refreshAfterBackupActivation} onPersist={async () => { const granted = await requestPersistentLocalStorage(); const checked = await refreshStorageStatus(); return checked.persisted ?? granted; }} onTestAi={async () => { if (settingsOutboundBlocked()) throw new Error("本地锁已开启或正在安全确认；没有发出检查请求"); const response = await fetch("/api/health", { headers: { Accept: "application/json" } }); const health = await response.json() as { ai?: { configured?: boolean } }; if (!response.ok) throw new Error("无法检查 AI 服务状态"); if (!health.ai?.configured) throw new Error("DeepSeek API Key 尚未配置"); }} />}
+        {view === "settings" && <SettingsView settings={displayedSettings} settingsDraftDirty={Boolean(settingsDraft)} settingsWriteLocked={settingsControlsLocked} settingsWriteBusy={settingsWrites.busy} databaseMutationLocked={itemDatabaseMutationLocked} settingsWriteStatus={settingsControlStatus} storage={storageStatus} persistenceSupported={persistenceSupported} onDraftChange={updateSettingsDraft} onDraftCommit={submitSettingsDraft} onToggle={(patch, trigger) => requestSettingsChange(patch, trigger)} onDiscardDraft={discardSettingsDraftAndRead} onExport={exportBackup} onRestoreRefresh={refreshAfterBackupActivation} onPersist={async () => { const granted = await requestPersistentLocalStorage(); const checked = await refreshStorageStatus(); return checked.persisted ?? granted; }} onTestAi={async () => { if (settingsOutboundBlocked()) throw new Error("本地锁已开启或正在安全确认；没有发出检查请求"); const response = await fetch("/api/health", { headers: { Accept: "application/json" } }); const health = await response.json() as { ai?: { configured?: boolean } }; if (!response.ok) throw new Error("无法检查 AI 服务状态"); if (!health.ai?.configured) throw new Error("DeepSeek API Key 尚未配置"); }} />}
       </div>
     </section>
     <nav className="sc-mobile-tabs" aria-label="拾词页面">{navigation.slice(0, 4).map((item) => <button key={item.id} aria-current={view === item.id ? "page" : undefined} className={view === item.id ? "active" : ""} onClick={() => go(item.id)}><i>{item.glyph}</i><span>{item.label}</span></button>)}</nav>
@@ -1121,6 +1472,17 @@ export default function VocabApp() {
     {wordId && <WordDetail key={wordId} word={snapshot.lexemes.find((word) => word.id === wordId) ?? null} occurrences={snapshot.occurrences.filter((item) => item.lexeme_id === wordId)} onClose={() => setWordId(null)} onNote={async (id, note) => { await saveLexemeNote(id, note); await refresh(); setToast("笔记已保存"); }} onStatus={async (id, status) => { await updateLexemeStatus(id, status); await refresh(); }} />}
     {importOpen && <ImportWizard localLock={effectiveLocalLock} onClose={() => setImportOpen(false)} onImported={async (id) => { const data = await readAndApplySnapshot(); setImportOpen(false); const item = data.items.find((entry) => entry.id === id); if (item) openItem(item); setToast("内容已存入本地资料库"); }} />}
     {searchOpen && <SearchPalette snapshot={snapshot} onClose={() => setSearchOpen(false)} onOpenItem={openItem} onOpenWord={(id) => { setWordId(id); }} />}
+    {itemExitConfirmOpen && <>
+      <div className="sc-item-exit-scrim" aria-hidden="true" />
+      <section ref={itemExitDialog} className="sc-item-exit-dialog" role="dialog" aria-modal="true" aria-labelledby="sc-item-exit-title" tabIndex={-1}>
+        <h2 id="sc-item-exit-title">还有未保存的阅读位置</h2>
+        <p>默认留在本页继续安全保存。若现在离开，只会放弃本页尚未写入的位置；已保存资料和安全收据不会删除。</p>
+        <footer>
+          <button data-item-exit-stay type="button" onClick={closeItemExitConfirm}>继续留在本页</button>
+          {itemExitDestination === "suite" ? <button className="danger" type="button" disabled={itemWrites.busy || itemWrites.hasVolatileHeldReceipt} onClick={abandonItemPositionAndLeaveSuite}>放弃本页位置并离开</button> : <button className="danger" type="button" disabled={itemWrites.busy || itemWrites.hasVolatileHeldReceipt} onClick={abandonItemPositionAndContinueHistory}>放弃本页位置并返回</button>}
+        </footer>
+      </section>
+    </>}
     {!selection && !toast && (occurrenceRecovery || (wordSavePhase === "refresh_failed" && committedOccurrence)) && (wordAbandonConfirm ? <div className="sc-toast sc-toast-confirm" role="group" aria-label="是否只移除这条恢复提醒"><span>词库内容会原样保留</span><div><button data-word-reminder-keep onClick={cancelWordAbandon}>继续保留提醒</button><button className="danger" onClick={() => void abandonConflictedWord()}>只移除提醒</button></div></div> : <button data-word-recovery-primary className="sc-toast" disabled={wordSaveBusy} aria-label={wordSavePhase === "refresh_failed" ? "上次收词已保存，只刷新词库" : wordSavePhase === "conflict" ? "移除这条冲突提醒" : "只读核对上次收词结果"} onClick={() => void wordPrimaryAction()}><span>{wordSaveBusy ? "正在确认…" : wordSavePhase === "refresh_failed" ? "上次收词已保存" : wordSavePhase === "conflict" ? "发现冲突，不会改库" : "上次收词待核对"}</span>{wordSavePhase === "refresh_failed" ? "只刷新词库" : wordSavePhase === "conflict" ? "移除提醒" : "只读核对"}</button>)}
     {toast && <div className="sc-toast" role="status"><span>✓</span>{toast}</div>}
     {mobile && sideOpen && <button className="sc-nav-scrim" onClick={closeMobileSidebar} aria-label="关闭导航" />}

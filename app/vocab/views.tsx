@@ -21,6 +21,15 @@ import {
 } from "@/lib/vocab/store";
 import { scheduleReviewV2 } from "@/lib/vocab/srs";
 import type { ContentBlock, Lexeme, LibraryItem, Occurrence, ReviewCard, ReviewRating, SelectionTarget, TranscriptSegment, VocabSettings, VocabSnapshot, VocabView } from "@/lib/vocab/types";
+import {
+  shouldReportVocabReaderProgress,
+  sameVocabLibraryItemFacts,
+  vocabPodcastCompleteActionEnabled,
+  vocabPodcastPositionCanReport,
+  vocabPodcastPositionReportChanged,
+  vocabPodcastSeekShouldReport,
+  vocabPodcastSnapshotPositionMode,
+} from "./item-write-state";
 import { AnnotatedText, EmptyState, Metric, Toggle } from "./ui";
 import { VocabBackupFlow } from "./VocabBackupFlow";
 import {
@@ -98,7 +107,8 @@ function isInteractiveTarget(target: EventTarget | null) {
 export function TodayView({ snapshot, due, onOpen, onGo, onImport, onWord }: { snapshot: VocabSnapshot; due: number; onOpen: (item: LibraryItem) => void; onGo: (view: VocabView) => void; onImport: () => void; onWord: (id: string) => void }) {
   const hour = new Date().getHours();
   const greeting = hour < 11 ? "早上好" : hour < 18 ? "下午好" : "晚上好";
-  const resume = snapshot.items.find((item) => item.status === "in_progress") ?? snapshot.items[0];
+  const resume = snapshot.items.find((item) => item.status === "in_progress") ??
+    snapshot.items.find((item) => item.status === "unread");
   const today = localDayKey();
   const activity = snapshot.activity.find((entry) => entry.day === today);
   const minutes = Math.round(((activity?.read_seconds ?? 0) + (activity?.listen_seconds ?? 0)) / 60);
@@ -112,19 +122,19 @@ export function TodayView({ snapshot, due, onOpen, onGo, onImport, onWord }: { s
   </div>;
 }
 
-export function LibraryView({ items, onOpen, onImport, onArchive }: { items: LibraryItem[]; onOpen: (item: LibraryItem) => void; onImport: () => void; onArchive: (item: LibraryItem) => void }) {
+export function LibraryView({ items, itemWriteLocked, itemWriteBusy, itemWriteStatus, onOpen, onImport, onArchive }: { items: LibraryItem[]; itemWriteLocked: boolean; itemWriteBusy: boolean; itemWriteStatus: string; onOpen: (item: LibraryItem) => void; onImport: () => void; onArchive: (item: LibraryItem, trigger: HTMLButtonElement) => void }) {
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<"all" | "article" | "podcast" | "archived">("all");
   const visible = items.filter((item) => (filter === "all" ? item.status !== "archived" : filter === "archived" ? item.status === "archived" : item.kind === filter && item.status !== "archived") && `${item.title}${item.source}${item.author}`.toLowerCase().includes(query.toLowerCase()));
   return <div className="sc-page sc-library"><header className="sc-page-title"><div><span className="sc-eyebrow">YOUR LOCAL LIBRARY</span><h1>资料库</h1><p>{items.filter((item) => item.status !== "archived").length} 项英文内容，保存在当前完整网址与浏览器资料中。</p></div><button className="sc-primary" onClick={onImport}>＋ 导入内容</button></header><div className="sc-toolbar"><label className="sc-search">⌕<input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索标题、作者或来源"/></label><div className="sc-segmented">{([['all','全部'],['article','文章'],['podcast','播客'],['archived','归档']] as const).map(([id,label]) => <button aria-pressed={filter===id} key={id} className={filter === id ? "active" : ""} onClick={() => setFilter(id)}>{label}</button>)}</div></div>
-    {visible.length ? <div className="sc-library-grid">{visible.map((item,index) => <article className="sc-library-card" key={item.id}><button className="sc-card-main" onClick={() => onOpen(item)}><div className={`sc-cover cover-${index % 4 + 1}`}><span>{item.kind === "article" ? "ARTICLE" : "PODCAST"}</span><strong>{item.title.slice(0,1)}</strong><i>{Math.round(item.progress * 100)}%</i></div><div className="sc-card-copy"><span>{item.source}</span><h2>{item.title}</h2><p>{item.description}</p><footer><small>{item.author || formatShortDate(item.published_at)}</small><b>{item.kind === "article" ? "阅读" : formatKnownVocabDuration(item.duration_ms)} · {Math.round(item.progress * 100)}%</b></footer></div></button><button className="sc-card-menu" onClick={() => onArchive(item)} aria-label={item.status === "archived" ? "恢复到资料库" : "移入归档"}>{item.status === "archived" ? "恢复" : "归档"}</button></article>)}</div> : <EmptyState title="没有找到内容" copy="换一个搜索词，或带回新的英文文章与播客。" action={<button onClick={onImport}>导入内容</button>} />}</div>;
+    {itemWriteStatus && <p id="sc-library-item-write-status" className="sc-item-inline-status" role="status">{itemWriteStatus}</p>}
+    {visible.length ? <div className="sc-library-grid">{visible.map((item,index) => <article className="sc-library-card" key={item.id}><button className="sc-card-main" onClick={() => onOpen(item)}><div className={`sc-cover cover-${index % 4 + 1}`}><span>{item.kind === "article" ? "ARTICLE" : "PODCAST"}</span><strong>{item.title.slice(0,1)}</strong><i>{Math.round(item.progress * 100)}%</i></div><div className="sc-card-copy"><span>{item.source}</span><h2>{item.title}</h2><p>{item.description}</p><footer><small>{item.author || formatShortDate(item.published_at)}</small><b>{item.kind === "article" ? "阅读" : formatKnownVocabDuration(item.duration_ms)} · {Math.round(item.progress * 100)}%</b></footer></div></button><button className="sc-card-menu" disabled={itemWriteLocked || itemWriteBusy} aria-busy={itemWriteBusy || undefined} aria-describedby={itemWriteStatus ? "sc-library-item-write-status" : undefined} onClick={(event) => onArchive(item, event.currentTarget)} aria-label={item.status === "archived" ? "恢复到资料库" : "移入归档"}>{item.status === "archived" ? "恢复" : "归档"}</button></article>)}</div> : <EmptyState title="没有找到内容" copy="换一个搜索词，或带回新的英文文章与播客。" action={<button onClick={onImport}>导入内容</button>} />}</div>;
 }
 
-export function ReaderView({ item, blocks, occurrences, bookmarks, onSelect, onBack, onProgress, onFinish, onBookmark }: { item: LibraryItem | null; blocks: ContentBlock[]; occurrences: Occurrence[]; bookmarks: VocabSnapshot["bookmarks"]; onSelect: (target: SelectionTarget) => void; onBack: () => void; onProgress: (item: LibraryItem, progress: number) => Promise<unknown>; onFinish: (item: LibraryItem) => void; onBookmark: (item: LibraryItem, block?: ContentBlock) => void }) {
+export function ReaderView({ item, blocks, occurrences, bookmarks, itemWriteLocked, itemWriteBusy, itemWriteStatus, onSelect, onBack, onProgress, onFinish, onBookmark }: { item: LibraryItem | null; blocks: ContentBlock[]; occurrences: Occurrence[]; bookmarks: VocabSnapshot["bookmarks"]; itemWriteLocked: boolean; itemWriteBusy: boolean; itemWriteStatus: string; onSelect: (target: SelectionTarget) => void; onBack: () => void; onProgress: (item: LibraryItem, progress: number) => unknown; onFinish: (item: LibraryItem, trigger: HTMLButtonElement) => void; onBookmark: (item: LibraryItem, block?: ContentBlock) => void }) {
   const prose = useRef<HTMLDivElement>(null);
   const lastActivity = useRef(0);
   const lastSavedProgress = useRef(item?.progress ?? 0);
-  const progressTimer = useRef<number | null>(null);
   const restoredItem = useRef<string | null>(null);
   const trackedItemId = item?.id ?? null;
   const articleBlocks = useMemo(() => blocks.filter((block) => block.item_id === trackedItemId), [blocks, trackedItemId]);
@@ -144,7 +154,7 @@ export function ReaderView({ item, blocks, occurrences, bookmarks, onSelect, onB
     const markActivity = () => { lastActivity.current = Date.now(); };
     const interval = window.setInterval(() => {
       if (document.visibilityState === "visible" && Date.now() - lastActivity.current < 30_000) {
-        void recordStudySeconds(trackedItemId, "read", 15);
+        void recordStudySeconds(trackedItemId, "read", 15).catch(() => undefined);
       }
     }, 15_000);
     window.addEventListener("scroll", markActivity, { passive: true });
@@ -161,14 +171,20 @@ export function ReaderView({ item, blocks, occurrences, bookmarks, onSelect, onB
   useEffect(() => {
     const container = prose.current;
     if (!container || !item || !articleBlocks.length) return;
-    if (restoredItem.current !== item.id) {
-      restoredItem.current = item.id;
-      const restoredIndex = Math.min(articleBlocks.length - 1, Math.max(0, Math.round(item.progress * (articleBlocks.length - 1))));
-      if (item.progress > .02 && item.progress < .98) {
-        window.setTimeout(() => document.getElementById(articleBlocks[restoredIndex].id)?.scrollIntoView({ block: "center" }), 0);
-      }
-    }
-    const updatePosition = () => {
+    const needsRestore = restoredItem.current !== item.id;
+    const restoredIndex = Math.min(
+      articleBlocks.length - 1,
+      Math.max(0, Math.round(item.progress * (articleBlocks.length - 1))),
+    );
+    restoredItem.current = item.id;
+    lastSavedProgress.current = item.progress;
+    setDisplayProgress(item.progress);
+    setCurrentBlockId(articleBlocks[restoredIndex]?.id ?? null);
+    let persistenceEnabled = false;
+    let setupTimer: number | null = null;
+    let firstFrame: number | null = null;
+    let secondFrame: number | null = null;
+    const updatePosition = (fromEnabledScrollListener: boolean) => {
       const nodes = Array.from(container.querySelectorAll<HTMLElement>("[data-block-id]"));
       let index = 0;
       nodes.forEach((node, candidate) => { if (node.getBoundingClientRect().top <= Math.max(180, window.innerHeight * .35)) index = candidate; });
@@ -177,17 +193,40 @@ export function ReaderView({ item, blocks, occurrences, bookmarks, onSelect, onB
       setCurrentBlockId(block.id);
       const progress = articleBlocks.length === 1 ? .5 : index / (articleBlocks.length - 1);
       setDisplayProgress(progress);
-      if (Math.abs(progress - lastSavedProgress.current) < .02) return;
+      if (!shouldReportVocabReaderProgress(
+        fromEnabledScrollListener,
+        progress,
+        lastSavedProgress.current,
+      )) return;
       lastSavedProgress.current = progress;
-      if (progressTimer.current !== null) window.clearTimeout(progressTimer.current);
-      progressTimer.current = window.setTimeout(() => { void onProgress(item, progress); }, 650);
+      void onProgress(item, progress);
     };
-    updatePosition();
-    window.addEventListener("scroll", updatePosition, { passive: true });
+    const onScroll = () => updatePosition(persistenceEnabled);
+    const enablePersistenceAfterLayout = () => {
+      firstFrame = window.requestAnimationFrame(() => {
+        firstFrame = null;
+        secondFrame = window.requestAnimationFrame(() => {
+          secondFrame = null;
+          updatePosition(false);
+          persistenceEnabled = true;
+          window.addEventListener("scroll", onScroll, { passive: true });
+        });
+      });
+    };
+    if (needsRestore && item.progress > .02 && item.progress < .98) {
+      setupTimer = window.setTimeout(() => {
+        setupTimer = null;
+        document.getElementById(articleBlocks[restoredIndex].id)?.scrollIntoView({ block: "center" });
+        enablePersistenceAfterLayout();
+      }, 0);
+    } else {
+      enablePersistenceAfterLayout();
+    }
     return () => {
-      window.removeEventListener("scroll", updatePosition);
-      if (progressTimer.current !== null) window.clearTimeout(progressTimer.current);
-      void onProgress(item, lastSavedProgress.current);
+      if (setupTimer !== null) window.clearTimeout(setupTimer);
+      if (firstFrame !== null) window.cancelAnimationFrame(firstFrame);
+      if (secondFrame !== null) window.cancelAnimationFrame(secondFrame);
+      window.removeEventListener("scroll", onScroll);
     };
   }, [articleBlocks, item, onProgress]);
 
@@ -236,16 +275,25 @@ export function ReaderView({ item, blocks, occurrences, bookmarks, onSelect, onB
       if (block.kind === "heading") return <h2 id={block.id} data-block-id={block.id} key={block.id} {...keyboardProps(block)}>{body}</h2>;
       if (block.kind === "quote") return <blockquote id={block.id} data-block-id={block.id} key={block.id} {...keyboardProps(block)}>{body}</blockquote>;
       return <p id={block.id} data-block-id={block.id} key={block.id} {...keyboardProps(block)}>{body}</p>;
-    })}</div><footer className="sc-reader-end"><span>拾</span><p>You reached the end.</p><button onClick={() => onFinish(item)}>标记为读完</button></footer></article><aside className="sc-reader-meta"><div><span>已拾词</span><strong>{occurrences.filter((entry) => entry.item_id === item.id).length}</strong></div><div><span>书签</span><strong>{bookmarks.filter((entry) => entry.item_id === item.id).length}</strong></div><p>点击一个词、拖选短语，或聚焦段落后用方向键和 Enter。AI 只会收到附近语境。</p></aside></div>;
+    })}</div><footer className="sc-reader-end"><span>拾</span><p>You reached the end.</p><button disabled={itemWriteLocked || itemWriteBusy || item.status === "complete" || item.status === "archived"} aria-busy={itemWriteBusy || undefined} aria-describedby={itemWriteStatus ? "sc-reader-item-write-status" : undefined} onClick={(event) => onFinish(item, event.currentTarget)}>{item.status === "complete" ? "已经读完" : itemWriteBusy ? "正在安全确认…" : "标记为读完"}</button>{itemWriteStatus && <small id="sc-reader-item-write-status" className="sc-item-inline-status" role="status">{itemWriteStatus}</small>}</footer></article><aside className="sc-reader-meta"><div><span>已拾词</span><strong>{occurrences.filter((entry) => entry.item_id === item.id).length}</strong></div><div><span>书签</span><strong>{bookmarks.filter((entry) => entry.item_id === item.id).length}</strong></div><p>点击一个词、拖选短语，或聚焦段落后用方向键和 Enter。AI 只会收到附近语境。</p></aside></div>;
 }
 
-export function PodcastView({ item, segments, occurrences, autoFollow, autoFollowWriteLocked, autoFollowWriteBusy, autoFollowStatus, localLock, onAutoFollow, onSelect, onProgress, onBookmark }: { item: LibraryItem | null; segments: TranscriptSegment[]; occurrences: Occurrence[]; autoFollow: boolean; autoFollowWriteLocked: boolean; autoFollowWriteBusy: boolean; autoFollowStatus: string; localLock: boolean; onAutoFollow: (value: boolean, trigger: HTMLButtonElement) => void; onSelect: (target: SelectionTarget) => void; onProgress: (item: LibraryItem, progress: number) => Promise<unknown>; onBookmark: (item: LibraryItem, ms: number, label: string) => void }) {
+export function PodcastView({ item, segments, occurrences, autoFollow, autoFollowWriteLocked, autoFollowWriteBusy, autoFollowStatus, itemWriteLocked, itemWritePermanentReadOnly, itemWriteBusy, itemWriteStatus, localLock, onAutoFollow, onSelect, onProgress, onFinish, onBookmark }: { item: LibraryItem | null; segments: TranscriptSegment[]; occurrences: Occurrence[]; autoFollow: boolean; autoFollowWriteLocked: boolean; autoFollowWriteBusy: boolean; autoFollowStatus: string; itemWriteLocked: boolean; itemWritePermanentReadOnly: boolean; itemWriteBusy: boolean; itemWriteStatus: string; localLock: boolean; onAutoFollow: (value: boolean, trigger: HTMLButtonElement) => void; onSelect: (target: SelectionTarget) => void; onProgress: (item: LibraryItem, progress: number) => unknown; onFinish: (item: LibraryItem, trigger: HTMLButtonElement | null) => void; onBookmark: (item: LibraryItem, ms: number, label: string) => void }) {
   const audio = useRef<HTMLAudioElement>(null);
   const activeRow = useRef<HTMLButtonElement>(null);
   const listenStartedAt = useRef<number | null>(null);
-  const lastProgressWrite = useRef(0);
+  const lastProgressReportAt = useRef(0);
   const currentMsRef = useRef(Math.round((item?.progress ?? 0) * (item?.duration_ms ?? 0)));
   const durationRef = useRef(item?.duration_ms ?? 0);
+  const terminalIntent = useRef(false);
+  const positionActivityRef = useRef(false);
+  const sliderActivityRef = useRef(false);
+  const lastReportedPositionRef = useRef<Readonly<{
+    item: LibraryItem;
+    progress: number;
+  }> | null>(null);
+  const displayedItemRef = useRef(item);
+  const onProgressRef = useRef(onProgress);
   const [localSrc, setLocalSrc] = useState<string | null>(null);
   const [currentMs, setCurrentMs] = useState(() => Math.round((item?.progress ?? 0) * (item?.duration_ms ?? 0)));
   const [durationMs, setDurationMs] = useState(item?.duration_ms ?? 0);
@@ -253,6 +301,7 @@ export function PodcastView({ item, segments, occurrences, autoFollow, autoFollo
   const [playing, setPlaying] = useState(false);
   const [followPaused, setFollowPaused] = useState(false);
   const [mediaError, setMediaError] = useState("");
+  const [terminalRetry, setTerminalRetry] = useState(false);
   const [keyboardWord, setKeyboardWord] = useState<{ segmentId: string; index: number } | null>(null);
   const episodeSegments = useMemo(() => segments.filter((entry) => entry.item_id === item?.id), [item?.id, segments]);
   const alignedTranscript = episodeSegments.some((entry) => entry.end_ms > entry.start_ms);
@@ -269,17 +318,90 @@ export function PodcastView({ item, segments, occurrences, autoFollow, autoFollo
   const follow = autoFollow && !followPaused;
   const canResumeLocally = autoFollow && followPaused;
   const followStatusId = "sc-podcast-follow-status";
+  const trackedItemId = item?.id ?? null;
+
+  useEffect(() => {
+    positionActivityRef.current = false;
+    sliderActivityRef.current = false;
+  }, [src, trackedItemId]);
+
+  useEffect(() => {
+    const previousItem = displayedItemRef.current;
+    const positionMode = vocabPodcastSnapshotPositionMode(
+      !sameVocabLibraryItemFacts(previousItem, item),
+      audio.current?.paused ?? !playing,
+    );
+    displayedItemRef.current = item;
+    onProgressRef.current = onProgress;
+    if (positionMode !== "sync-baseline" || !item) return;
+    positionActivityRef.current = false;
+    sliderActivityRef.current = false;
+    if (item.status !== "complete" && item.status !== "archived") {
+      terminalIntent.current = false;
+    }
+    const mediaDuration = audio.current && Number.isFinite(audio.current.duration)
+      ? audio.current.duration * 1000
+      : 0;
+    const nextDuration = mediaDuration || item.duration_ms || durationRef.current;
+    const restored = Math.min(
+      nextDuration,
+      Math.max(0, item.progress * nextDuration),
+    );
+    durationRef.current = nextDuration;
+    currentMsRef.current = restored;
+    lastProgressReportAt.current = performance.now();
+    if (audio.current) audio.current.currentTime = restored / 1000;
+    const frame = window.requestAnimationFrame(() => {
+      setDurationMs(nextDuration);
+      setCurrentMs(restored);
+      setTerminalRetry(false);
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [item, onProgress, playing]);
 
   const commitListen = useCallback(() => {
-    if (listenStartedAt.current === null || !item) return;
+    if (listenStartedAt.current === null || !trackedItemId) return;
     const seconds = Math.max(0, Math.round((performance.now() - listenStartedAt.current) / 1000));
     listenStartedAt.current = null;
-    if (seconds > 0) void recordStudySeconds(item.id, "listen", seconds);
-  }, [item]);
+    if (seconds > 0) void recordStudySeconds(trackedItemId, "listen", seconds).catch(() => undefined);
+  }, [trackedItemId]);
 
   const startListen = useCallback(() => {
+    positionActivityRef.current = true;
     if (document.visibilityState === "visible" && listenStartedAt.current === null) listenStartedAt.current = performance.now();
   }, []);
+
+  const reportCurrentPosition = useCallback(() => {
+    const currentItem = displayedItemRef.current;
+    if (!currentItem || !vocabPodcastPositionCanReport(
+      positionActivityRef.current,
+      terminalIntent.current,
+      Boolean(audio.current?.ended),
+      currentItem.status,
+    )) return;
+    const progress = Math.min(.99, currentMsRef.current /
+      Math.max(1, durationRef.current || currentItem.duration_ms || 1));
+    const last = lastReportedPositionRef.current;
+    if (!vocabPodcastPositionReportChanged(last, currentItem, progress)) return;
+    lastReportedPositionRef.current = { item: currentItem, progress };
+    void onProgressRef.current(currentItem, progress);
+  }, []);
+
+  const seek = useCallback((
+    ms: number,
+    source: "explicit-user" | "slider-input" = "explicit-user",
+  ) => {
+    currentMsRef.current = ms;
+    positionActivityRef.current = true;
+    if (source === "slider-input") sliderActivityRef.current = true;
+    setCurrentMs(ms);
+    if (audio.current) audio.current.currentTime = ms / 1000;
+    if (vocabPodcastSeekShouldReport(source)) {
+      lastProgressReportAt.current = performance.now();
+      reportCurrentPosition();
+      if (source === "slider-input") sliderActivityRef.current = false;
+    }
+  }, [reportCurrentPosition]);
 
   useEffect(() => {
     if (!item?.audio_url?.startsWith("local:")) return;
@@ -299,13 +421,15 @@ export function PodcastView({ item, segments, occurrences, autoFollow, autoFollo
   }, [activeIndex, alignedTranscript, follow, playing]);
   useEffect(() => {
     const visibility = () => {
-      if (document.visibilityState === "hidden") commitListen();
+      if (document.visibilityState === "hidden") {
+        commitListen();
+        reportCurrentPosition();
+      }
       else if (!audio.current?.paused) startListen();
-      if (document.visibilityState === "hidden" && item) void onProgress(item, currentMsRef.current / Math.max(1, durationRef.current || fallbackDuration));
     };
     document.addEventListener("visibilitychange", visibility);
     return () => { document.removeEventListener("visibilitychange", visibility); commitListen(); };
-  }, [commitListen, fallbackDuration, item, onProgress, startListen]);
+  }, [commitListen, reportCurrentPosition, startListen]);
   useEffect(() => {
     const shortcut = (event: KeyboardEvent) => {
       if (isInteractiveTarget(event.target)) return;
@@ -314,9 +438,8 @@ export function PodcastView({ item, segments, occurrences, autoFollow, autoFollo
       if (event.key.toLowerCase() === "k") seek(episodeSegments[Math.min(episodeSegments.length-1,activeIndex+1)]?.start_ms ?? currentMs);
     };
     window.addEventListener("keydown", shortcut); return () => window.removeEventListener("keydown", shortcut);
-  }, [activeIndex, currentMs, episodeSegments, src]);
+  }, [activeIndex, currentMs, episodeSegments, seek, src]);
   if (!item) return <EmptyState title="还没有播客" copy="从 RSS、音频或英文字幕开始一段听读。"/>;
-  function seek(ms: number) { currentMsRef.current = ms; setCurrentMs(ms); if (audio.current) audio.current.currentTime = ms/1000; }
   const selectRange = (segment: TranscriptSegment, index: number, range: { text: string; start: number; end: number }) => {
     const context = sentenceContext(segment.text,range.start,range.end);
     onSelect({ surface:range.text,sentence:context.sentence,before:context.before || adjacentSentence(episodeSegments[index-1]?.text ?? "", "preceding"),after:context.after || adjacentSentence(episodeSegments[index+1]?.text ?? "", "following"),itemId:item.id,segmentId:segment.id,startUtf16:range.start,endUtf16:range.end,contextStartUtf16:context.startUtf16,contextEndUtf16:context.endUtf16,startMs:alignedTranscript?segment.start_ms:undefined });
@@ -338,13 +461,20 @@ export function PodcastView({ item, segments, occurrences, autoFollow, autoFollo
   const updateTime = (event: SyntheticEvent<HTMLAudioElement>) => {
     const next = event.currentTarget.currentTime * 1000;
     currentMsRef.current = next;
+    if (!event.currentTarget.paused) positionActivityRef.current = true;
     setCurrentMs(next);
-    if (next - lastProgressWrite.current >= 10_000) {
-      lastProgressWrite.current = next;
-      void onProgress(item, next / Math.max(1, duration));
+    const now = performance.now();
+    if (now - lastProgressReportAt.current >= 10_000) {
+      lastProgressReportAt.current = now;
+      reportCurrentPosition();
     }
   };
-  return <div className="sc-podcast-page">{src && <audio ref={audio} src={src} preload="metadata" onLoadedMetadata={(event) => { const nextDuration=Number.isFinite(event.currentTarget.duration)?event.currentTarget.duration*1000:fallbackDuration;durationRef.current=nextDuration;setDurationMs(nextDuration);const restored=Math.min(nextDuration,Math.max(0,item.progress*nextDuration));currentMsRef.current=restored;event.currentTarget.currentTime=restored/1000;setCurrentMs(restored); }} onTimeUpdate={updateTime} onPlay={() => { setPlaying(true); startListen(); }} onPause={() => { setPlaying(false); commitListen(); void onProgress(item,currentMsRef.current/Math.max(1,durationRef.current||fallbackDuration)); }} onEnded={() => { setPlaying(false); commitListen(); void onProgress(item,1); }} onError={() => setMediaError("音频无法播放，来源可能已失效或格式不受支持。")}/>}<header className="sc-podcast-head"><div><span className="sc-eyebrow">LISTEN IN CONTEXT</span><h1>{item.title}</h1><p>{item.description}</p><div><b>{item.source}</b><span>{item.author}</span><span>{formatKnownVocabDuration(knownDuration)}</span></div></div><div className="sc-podcast-art"><i/><i/><i/><strong>声</strong></div></header><section className="sc-player" aria-label="音频播放器"><button className="sc-play" aria-label={playing?"暂停":"播放"} disabled={!src} onClick={() => { if (audio.current?.paused) void audio.current.play(); else audio.current?.pause(); }}>{playing ? "Ⅱ" : "▶"}</button><span>{formatDuration(currentMs)}</span><input type="range" aria-label="播放进度" aria-valuetext={`${formatDuration(currentMs)} / ${formatDuration(duration)}`} min={0} max={Math.max(1,duration)} value={Math.min(currentMs,duration)} onChange={(event) => seek(Number(event.target.value))}/><span>{formatDuration(duration)}</span><button className="sc-speed" aria-label={`播放速度 ${speed} 倍，点击切换`} onClick={() => { const next = speed >= 2 ? .75 : speed + .25; setSpeed(next); if (audio.current) audio.current.playbackRate = next; }}>{speed}×</button><button aria-label="收藏当前播放位置" onClick={() => onBookmark(item,currentMs,active?.text.slice(0,24) ?? item.title)}>◇</button></section>{mediaError && <div className="sc-inline-error" role="alert">{mediaError}</div>}{remoteBlocked ? <div className="sc-notice">本地锁阻止了远程音频请求。你仍可阅读字幕；关闭本地锁后才会连接音频来源。</div> : !src && <div className="sc-notice">当前单集没有可播放音频。英文字幕仍可阅读和选词。</div>}{!alignedTranscript && episodeSegments.length > 0 && <div className="sc-notice">这份纯文本字幕没有时间轴，因此不会伪装成同步字幕；你仍可逐段阅读和选词。</div>}<section className="sc-transcript-shell"><aside><span>本期字幕</span><strong>{episodeSegments.length}</strong><p>{alignedTranscript?"段":"段 · 未对齐"}</p><button type="button" className={follow ? "active" : ""} aria-pressed={follow} aria-busy={autoFollowWriteBusy || undefined} aria-describedby={autoFollowStatus ? followStatusId : undefined} disabled={!alignedTranscript || (autoFollowWriteLocked && !canResumeLocally)} onClick={(event) => { if (canResumeLocally) setFollowPaused(false); else { if (!autoFollow) setFollowPaused(false); onAutoFollow(!autoFollow, event.currentTarget); } }}>◎ {autoFollowWriteBusy ? "正在确认偏好…" : follow ? "正在跟随" : autoFollow ? "继续这次跟随" : "开启自动跟随"}</button>{autoFollowStatus && <small id={followStatusId} className="sc-podcast-follow-status" role="status">{autoFollowStatus}</small>}</aside><div className="sc-transcript" onWheel={() => { if (autoFollow) setFollowPaused(true); }}>{episodeSegments.length ? episodeSegments.map((segment,index) => { const words=wordRanges(segment.text);const activeRange=keyboardWord?.segmentId===segment.id?words[keyboardWord.index]:null;return <button ref={alignedTranscript&&index === activeIndex ? activeRow : undefined} key={segment.id} className={alignedTranscript&&index === activeIndex ? "active" : ""} aria-current={alignedTranscript&&index===activeIndex?"true":undefined} title="左右方向键选择单词，Enter 或 E 查看解释；Space 跳到此处" onFocus={()=>{if(words.length&&keyboardWord?.segmentId!==segment.id)setKeyboardWord({segmentId:segment.id,index:0});}} onKeyDown={(event)=>transcriptKey(segment,index,event)} onClick={() => { if (alignedTranscript) seek(segment.start_ms); }} onMouseUp={(event) => pick(segment,index,event)}><time>{alignedTranscript?formatDuration(segment.start_ms):"—"}</time><p><AnnotatedText text={segment.text} ranges={occurrences.filter((entry) => entry.segment_id === segment.id)} activeRange={activeRange}/></p>{segment.speaker && <small>{segment.speaker}</small>}</button>;}) : <EmptyState title="没有字幕" copy="导入 VTT、SRT、LRC 或纯文本后，字幕会显示在这里。"/>}</div></section></div>;
+  const completeActionEnabled = vocabPodcastCompleteActionEnabled(
+    item.status,
+    itemWriteLocked,
+    itemWriteBusy,
+  );
+  return <div className="sc-podcast-page">{src && <audio ref={audio} src={src} preload="metadata" onLoadedMetadata={(event) => { const nextDuration=Number.isFinite(event.currentTarget.duration)?event.currentTarget.duration*1000:fallbackDuration;durationRef.current=nextDuration;setDurationMs(nextDuration);const restored=Math.min(nextDuration,Math.max(0,item.progress*nextDuration));currentMsRef.current=restored;event.currentTarget.currentTime=restored/1000;setCurrentMs(restored); }} onTimeUpdate={updateTime} onPlay={() => { terminalIntent.current=false;setTerminalRetry(false);setPlaying(true);startListen(); }} onPause={() => { setPlaying(false);commitListen();reportCurrentPosition(); }} onEnded={() => { terminalIntent.current=true;setTerminalRetry(true);setPlaying(false);commitListen();if(item.status!=="complete"&&item.status!=="archived")onFinish(item, null); }} onError={() => setMediaError("音频无法播放，来源可能已失效或格式不受支持。")}/>}<header className="sc-podcast-head"><div><span className="sc-eyebrow">LISTEN IN CONTEXT</span><h1>{item.title}</h1><p>{item.description}</p><div><b>{item.source}</b><span>{item.author}</span><span>{formatKnownVocabDuration(knownDuration)}</span></div></div><div className="sc-podcast-art"><i/><i/><i/><strong>声</strong></div></header><section className="sc-player" aria-label="音频播放器"><button className="sc-play" aria-label={playing?"暂停":"播放"} disabled={!src} onClick={() => { if (audio.current?.paused) void audio.current.play(); else audio.current?.pause(); }}>{playing ? "Ⅱ" : "▶"}</button><span>{formatDuration(currentMs)}</span><input type="range" aria-label="播放进度" aria-valuetext={`${formatDuration(currentMs)} / ${formatDuration(duration)}`} min={0} max={Math.max(1,duration)} value={Math.min(currentMs,duration)} onChange={(event) => seek(Number(event.target.value), "slider-input")} onPointerUp={reportCurrentPosition} onBlur={reportCurrentPosition}/><span>{formatDuration(duration)}</span><button className="sc-speed" aria-label={`播放速度 ${speed} 倍，点击切换`} onClick={() => { const next = speed >= 2 ? .75 : speed + .25; setSpeed(next); if (audio.current) audio.current.playbackRate = next; }}>{speed}×</button><button aria-label="收藏当前播放位置" onClick={() => onBookmark(item,currentMs,active?.text.slice(0,24) ?? item.title)}>◇</button></section>{item.status !== "complete" && item.status !== "archived" && <div className="sc-podcast-terminal-actions"><button type="button" disabled={!completeActionEnabled} aria-busy={itemWriteBusy || undefined} aria-describedby={itemWriteStatus ? "sc-podcast-item-write-status" : undefined} onClick={(event) => { setTerminalRetry(false);onFinish(item, event.currentTarget); }}>{itemWriteBusy ? "正在安全确认…" : terminalRetry ? "重新标记已听完" : "标记已听完"}</button></div>}{itemWriteStatus && <div id="sc-podcast-item-write-status" className="sc-item-inline-status" role="status">{itemWriteStatus}</div>}{itemWriteLocked && !itemWriteStatus && <div className="sc-item-inline-status" role="status">{itemWritePermanentReadOnly ? "当前只读开放；播放和字幕可用，位置只留在本页且不会用不安全的凭据写入。" : "当前位置先暂存在本页；安全操作结束后会再尝试保存。"}</div>}{mediaError && <div className="sc-inline-error" role="alert">{mediaError}</div>}{remoteBlocked ? <div className="sc-notice">本地锁阻止了远程音频请求。你仍可阅读字幕；关闭本地锁后才会连接音频来源。</div> : !src && <div className="sc-notice">当前单集没有可播放音频。英文字幕仍可阅读和选词。</div>}{!alignedTranscript && episodeSegments.length > 0 && <div className="sc-notice">这份纯文本字幕没有时间轴，因此不会伪装成同步字幕；你仍可逐段阅读和选词。</div>}<section className="sc-transcript-shell"><aside><span>本期字幕</span><strong>{episodeSegments.length}</strong><p>{alignedTranscript?"段":"段 · 未对齐"}</p><button type="button" className={follow ? "active" : ""} aria-pressed={follow} aria-busy={autoFollowWriteBusy || undefined} aria-describedby={autoFollowStatus ? followStatusId : undefined} disabled={!alignedTranscript || (autoFollowWriteLocked && !canResumeLocally)} onClick={(event) => { if (canResumeLocally) setFollowPaused(false); else { if (!autoFollow) setFollowPaused(false); onAutoFollow(!autoFollow, event.currentTarget); } }}>◎ {autoFollowWriteBusy ? "正在确认偏好…" : follow ? "正在跟随" : autoFollow ? "继续这次跟随" : "开启自动跟随"}</button>{autoFollowStatus && <small id={followStatusId} className="sc-podcast-follow-status" role="status">{autoFollowStatus}</small>}</aside><div className="sc-transcript" onWheel={() => { if (autoFollow) setFollowPaused(true); }}>{episodeSegments.length ? episodeSegments.map((segment,index) => { const words=wordRanges(segment.text);const activeRange=keyboardWord?.segmentId===segment.id?words[keyboardWord.index]:null;return <button ref={alignedTranscript&&index === activeIndex ? activeRow : undefined} key={segment.id} className={alignedTranscript&&index === activeIndex ? "active" : ""} aria-current={alignedTranscript&&index===activeIndex?"true":undefined} title="左右方向键选择单词，Enter 或 E 查看解释；Space 跳到此处" onFocus={()=>{if(words.length&&keyboardWord?.segmentId!==segment.id)setKeyboardWord({segmentId:segment.id,index:0});}} onKeyDown={(event)=>transcriptKey(segment,index,event)} onClick={() => { if (alignedTranscript) seek(segment.start_ms); }} onMouseUp={(event) => pick(segment,index,event)}><time>{alignedTranscript?formatDuration(segment.start_ms):"—"}</time><p><AnnotatedText text={segment.text} ranges={occurrences.filter((entry) => entry.segment_id === segment.id)} activeRange={activeRange}/></p>{segment.speaker && <small>{segment.speaker}</small>}</button>;}) : <EmptyState title="没有字幕" copy="导入 VTT、SRT、LRC 或纯文本后，字幕会显示在这里。"/>}</div></section></div>;
 }
 
 export function WordsView({ lexemes, occurrences, onOpen, onStar }: { lexemes: Lexeme[]; occurrences: Occurrence[]; onOpen: (id: string) => void; onStar: (word: Lexeme) => void }) {
@@ -1185,6 +1315,7 @@ type SettingsViewProps = {
   settingsDraftDirty: boolean;
   settingsWriteLocked: boolean;
   settingsWriteBusy: boolean;
+  databaseMutationLocked: boolean;
   settingsWriteStatus: string;
   storage: LocalStorageEstimate | null;
   persistenceSupported: boolean;
@@ -1198,7 +1329,7 @@ type SettingsViewProps = {
   onTestAi: () => Promise<void>;
 };
 
-export function SettingsView({ settings, settingsDraftDirty, settingsWriteLocked, settingsWriteBusy, settingsWriteStatus, storage, persistenceSupported, onDraftChange, onDraftCommit, onToggle, onDiscardDraft, onExport, onRestoreRefresh, onPersist, onTestAi }: SettingsViewProps) {
+export function SettingsView({ settings, settingsDraftDirty, settingsWriteLocked, settingsWriteBusy, databaseMutationLocked, settingsWriteStatus, storage, persistenceSupported, onDraftChange, onDraftCommit, onToggle, onDiscardDraft, onExport, onRestoreRefresh, onPersist, onTestAi }: SettingsViewProps) {
   const [message,setMessage]=useState("");
   const [busy,setBusy]=useState(false);
   const run=async(action:()=>Promise<string|void>,success:string)=>{setBusy(true);setMessage("");try{const result=await action();setMessage(result||success);}catch(error){setMessage(error instanceof Error?error.message:"操作失败");}finally{setBusy(false);}};
@@ -1219,7 +1350,7 @@ export function SettingsView({ settings, settingsDraftDirty, settingsWriteLocked
       </section>
       <section id="ai"><header><h2>AI 与隐私</h2><p>选词后会先显示准确字段说明；只有再点“解释这个词”才会发送。</p></header><Toggle label="默认显示简体中文说明" copy="英文释义始终优先" value={settings.chinese_explanation} disabled={settingsWriteLocked} describedBy={settingsWriteStatus ? settingsStatusId : undefined} onChange={(value, trigger)=>onToggle({chinese_explanation:value}, trigger)}/><Toggle label="本地锁" copy="阻止 URL、RSS、AI、转写与远程音频请求" value={settings.local_lock} disabled={settingsWriteLocked} describedBy={settingsWriteStatus ? settingsStatusId : undefined} onChange={(value, trigger)=>onToggle({local_lock:value}, trigger)}/><div className="sc-endpoint"><span><i className={settings.local_lock?"locked":""}/><b>DeepSeek · OpenAI compatible</b><small>{settings.local_lock?"本地锁已开启":"由服务端安全配置"}</small></span><button disabled={busy||settingsWriteLocked||settingsWriteBusy||settings.local_lock} onClick={()=>void run(onTestAi,"检测到服务端 AI 配置；这次检查没有发送文章或词语内容。")}>检查配置</button></div></section>
       <section id="review-settings"><header><h2>复习节奏</h2><p>这里只控制每天首次加入复习的新词，不会隐藏旧卡。</p></header><div className="sc-setting-row"><label htmlFor="sc-daily-limit">每日新词<small>0 只暂停新词；已到期、学习中和重新学习的词不受影响</small></label><input {...rangeProps} id="sc-daily-limit" type="range" min="0" max="30" value={settings.daily_new_limit} aria-valuetext={settings.daily_new_limit === 0 ? "暂停加入新词" : `每天最多 ${settings.daily_new_limit} 个新词`} onChange={(event)=>onDraftChange({daily_new_limit:Number(event.target.value)})}/><b>{settings.daily_new_limit === 0 ? "暂停" : `${settings.daily_new_limit} 个`}</b></div></section>
-      <section id="data"><header><h2>数据与备份</h2><p>完整备份包含 SQLite 数据与实际保存在拾词里的本地音频。</p></header><div className={`sc-storage-fact ${storage?.persisted===true?"persisted":""}`}><span><i /><b>{storage?.persisted===true?"浏览器已授予持久化保护":!persistenceSupported?"当前浏览器未提供持久化保护接口":storage===null?"正在读取存储状态":storage.persisted===false?"仍可能被浏览器清理":"保护状态暂时未知"}</b><small>{storage?`当前占用 ${formatStorageBytes(storage.usage)} · 可用约 ${formatStorageBytes(storage.available)}`:"正在读取当前浏览器的容量信息"}</small></span>{persistenceSupported&&storage?.persisted!==true&&<button disabled={busy || settingsWriteLocked || settingsWriteBusy} onClick={()=>void run(async()=>{const result=await onPersist();return result===true?"已获得浏览器持久化保护。":result===false?"浏览器暂未授予持久化保护，请保持定期备份。":"保护请求已完成，但浏览器暂时无法复查状态。";},"")}>请求保护</button>}</div><VocabBackupFlow controlsDisabled={busy || settingsWriteLocked || settingsWriteBusy} onExport={onExport} onRefreshActivated={onRestoreRefresh} onNotice={setMessage}/>{(settingsWriteLocked || settingsWriteBusy) && <p className="sc-settings-backup-lock" role="status">先核对完页面上方的设置收据，再开始备份或切换资料库。</p>}<p className="sc-data-note">备份是未加密的私人文件，不含 AI 密钥。请把它保存在受信任的位置；旧版拾词数据库不包含本地音频原件。</p></section>
+      <section id="data"><header><h2>数据与备份</h2><p>完整备份包含 SQLite 数据与实际保存在拾词里的本地音频。</p></header><div className={`sc-storage-fact ${storage?.persisted===true?"persisted":""}`}><span><i /><b>{storage?.persisted===true?"浏览器已授予持久化保护":!persistenceSupported?"当前浏览器未提供持久化保护接口":storage===null?"正在读取存储状态":storage.persisted===false?"仍可能被浏览器清理":"保护状态暂时未知"}</b><small>{storage?`当前占用 ${formatStorageBytes(storage.usage)} · 可用约 ${formatStorageBytes(storage.available)}`:"正在读取当前浏览器的容量信息"}</small></span>{persistenceSupported&&storage?.persisted!==true&&<button disabled={busy || settingsWriteLocked || settingsWriteBusy || databaseMutationLocked} onClick={()=>void run(async()=>{const result=await onPersist();return result===true?"已获得浏览器持久化保护。":result===false?"浏览器暂未授予持久化保护，请保持定期备份。":"保护请求已完成，但浏览器暂时无法复查状态。";},"")}>请求保护</button>}</div><VocabBackupFlow controlsDisabled={busy || settingsWriteLocked || settingsWriteBusy || databaseMutationLocked} onExport={onExport} onRefreshActivated={onRestoreRefresh} onNotice={setMessage}/>{(settingsWriteLocked || settingsWriteBusy || databaseMutationLocked) && <p className="sc-settings-backup-lock" role="status">先核对完页面上方的设置或条目收据，并处理未保存的阅读位置，再开始备份或切换资料库。</p>}<p className="sc-data-note">备份是未加密的私人文件，不含 AI 密钥。请把它保存在受信任的位置；旧版拾词数据库不包含本地音频原件。</p></section>
       {settingsWriteStatus&&<div id={settingsStatusId} className="sc-settings-safe-status" role="status"><span>{settingsWriteStatus}</span>{settingsDraftDirty&&<button type="button" disabled={settingsWriteBusy} onClick={onDiscardDraft}>放弃这次预览并读取最新设置</button>}</div>}
       {message&&<div className="sc-settings-message" role="status">{message}</div>}
     </div></div>

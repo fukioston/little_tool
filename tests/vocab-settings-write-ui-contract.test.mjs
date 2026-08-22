@@ -204,7 +204,7 @@ test("E1-S-E2 retries only whole bundles and retains the exact second envelope",
   const expectedReads = [stableA, replacement, stableB, stableB];
   const trace = [];
   readHelpers.setLoaders(
-    async () => { trace.push("S"); return { marker: trace.length, settings: { ...settings } }; },
+    async () => { trace.push("S"); return { marker: trace.length, items: [], settings: { ...settings } }; },
     async () => { trace.push("E"); return expectedReads.shift(); },
   );
   const bundle = await readHelpers.loadVocabFactsWithSettingsExpected();
@@ -214,7 +214,7 @@ test("E1-S-E2 retries only whole bundles and retains the exact second envelope",
 
   let reads = 0;
   readHelpers.setLoaders(
-    async () => ({ settings: { ...settings } }),
+    async () => ({ items: [], settings: { ...settings } }),
     async () => ({ ...stableA, generationId: `moving-${reads++}` }),
   );
   await assert.rejects(() => readHelpers.loadVocabFactsWithSettingsExpected(), /持续变化/);
@@ -314,6 +314,9 @@ test("only volatile work or an unsaved slider draft blocks unload and backup act
   assert.match(unload, /if \(!busy\) return/);
   assert.doesNotMatch(unload, /journal\.entries|journal\.unreadable/);
   assert.match(appSource, /if \(!settingsDraft\) return;[\s\S]*?beforeunload/);
-  assert.match(viewsSource, /VocabBackupFlow controlsDisabled=\{busy \|\| settingsWriteLocked \|\| settingsWriteBusy\}/);
+  assert.match(
+    viewsSource,
+    /VocabBackupFlow controlsDisabled=\{busy \|\| settingsWriteLocked \|\| settingsWriteBusy \|\| databaseMutationLocked\}/,
+  );
   assert.match(uiSource, /disabled=\{disabled\}/);
 });
