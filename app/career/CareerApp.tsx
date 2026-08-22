@@ -85,16 +85,20 @@ import {
   sanitizeCareerAiRequestPayload,
 } from "@/lib/career/ai-payload";
 import {
-  commitPreparedCareerLifecycleChange,
   loadCareerLifecycleScope,
-  prepareCareerLifecycleChange,
-  type CareerLifecycleChoice,
-  type CareerLifecycleImpactItem,
-  type CareerLifecycleIntent,
   type CareerLifecycleScope,
   type CareerLifecycleSnapshot,
-  type CareerPreparedLifecycleChange,
 } from "@/lib/career/lifecycle";
+import {
+  type CareerLifecycleWriteChoice,
+  type CareerLifecycleWriteImpactItem,
+  type CareerLifecycleWriteIntent,
+  type CareerLifecycleWritePreview,
+} from "@/lib/career/lifecycle-writes";
+import type {
+  CareerTaskCreateExpectedContext,
+  CareerTaskWriteExpectedState,
+} from "@/lib/career/task-writes";
 import {
   CareerTaskError,
   careerTaskActions,
@@ -145,11 +149,15 @@ import type {
 } from "@/lib/career/types";
 import { useCareerCoreWriteFlow } from "./CareerCoreWriteFlow";
 import {
+  useCareerLifecycleTaskWriteFlow,
+  type CareerLifecycleTaskSubmitResult,
+} from "./CareerLifecycleTaskWriteFlow";
+import {
   careerCoreBundleApplyDecision,
   careerCoreGenerationChangeBarrier,
   careerCoreHistoryBackDecision,
   careerCoreHistoryGuardResolution,
-  createCareerCoreExternalMutationGate,
+  createCareerDatabaseMutationRegistry,
   careerInterviewDraftRestoreMode,
   createCareerCoreReadBundle,
   getBoundCareerInterviewExpected,
@@ -160,6 +168,8 @@ import {
   type CareerCoreReadBundle,
   type CareerInterviewEditorSnapshot,
   type CareerInterviewLocalDraft,
+  type CareerDatabaseMutationOwner,
+  type CareerDatabaseMutationToken,
 } from "./core-write-state";
 
 const navItems: Array<{ id: CareerView; label: string; compact: string; icon: typeof LayoutDashboard }> = [
@@ -178,6 +188,10 @@ const emptyData: CareerData = { stages: [], jobs: [], tasks: [], interviews: [],
 const emptyLifecycleSnapshot: CareerLifecycleSnapshot = { jobs: [], tasks: [], interviews: [] };
 type CareerJobScope = Exclude<CareerLifecycleScope, "all">;
 type CareerCoreWriteController = ReturnType<typeof useCareerCoreWriteFlow>;
+type CareerLifecycleChoice = CareerLifecycleWriteChoice;
+type CareerLifecycleImpactItem = CareerLifecycleWriteImpactItem;
+type CareerLifecycleIntent = CareerLifecycleWriteIntent;
+type CareerPreparedLifecycleChange = CareerLifecycleWritePreview;
 
 const CAREER_MATERIAL_SAVE_RECOVERY_PREFIX = "career.material-save-recovery.v1:";
 const CAREER_MATERIAL_SAVE_RECOVERY_MAX_BYTES = 256 * 1024;
@@ -577,8 +591,7 @@ function careerAiClientIssueText(action: unknown, error: unknown) {
 }
 
 type CareerLifecycleDialogState =
-  | { phase: "decision"; prepared: CareerPreparedLifecycleChange; choice: CareerLifecycleChoice | null; changed: boolean; error: string; rememberUndo: boolean }
-  | { phase: "refresh-recovery"; prepared: CareerPreparedLifecycleChange; error: string; rememberUndo: boolean };
+  { phase: "decision"; prepared: CareerPreparedLifecycleChange; choice: CareerLifecycleChoice | null; changed: boolean; error: string; rememberUndo: boolean };
 
 type CareerTaskSheetRequest = Readonly<{
   taskId: string;
@@ -1006,8 +1019,9 @@ export default function CareerApp() {
   const materialStaleFocusPendingRef = useRef(false);
   const materialRefreshRef = useRef(false);
   const contactUndoWriteRef = useRef(false);
-  const externalMutationGateRef = useRef(createCareerCoreExternalMutationGate());
-  const [externalMutationClaimCount, setExternalMutationClaimCount] = useState(0);
+  const databaseMutationRegistryRef = useRef(createCareerDatabaseMutationRegistry());
+  const externalMutationTokensRef = useRef(new Map<string, CareerDatabaseMutationToken>());
+  const [, setExternalMutationClaimCount] = useState(0);
   const contactRemovalFocusRef = useRef<HTMLElement | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
   const [historyExitPrompt, setHistoryExitPrompt] = useState(false);
@@ -1245,10 +1259,26 @@ export default function CareerApp() {
       setCoreSnapshotStale(true);
     }, () => window.location.reload())), []);
 
+  const notify = useCallback((text: string, tone: Notice["tone"] = "success") => {
+    const item = { id: crypto.randomUUID(), tone, text };
+    setNotices((current) => [...current, item]);
+    window.setTimeout(() => setNotices((current) => current.filter((notice) => notice.id !== item.id)), 3600);
+  }, []);
+
   useEffect(() => subscribeToCareerDataChanges((reason) => {
-    if (/^career-(?:stage-renamed|job-(?:created|updated)|interview-(?:created|updated))$/.test(reason)) {
+    const coreReason = /^career-(?:stage-renamed|job-(?:created|updated)|interview-(?:created|updated))$/.test(reason);
+    const lifecycleTaskReason = /^career-(?:job-(?:stage-transitioned|archived|restored)|task-(?:created|completed))$/.test(reason);
+    if (coreReason || lifecycleTaskReason) {
       coreSnapshotStaleRef.current = true;
       setCoreSnapshotStale(true);
+    }
+    if (lifecycleTaskReason) {
+      if (coreDirtyEditorsRef.current.size > 0 || lifecycleDialog || modal === "task" || taskSheet) {
+        notify("职位或待办刚在另一页变化；当前输入仍保留，写入已暂停。", "info");
+      } else {
+        void refresh().catch(() => notify("另一页更新了职位或待办，但这里暂时没有读到稳定版本。", "error"));
+      }
+      return;
     }
     if (!reason.startsWith("career-contact")) return;
     if (contactEditorId !== undefined || contactAction) {
@@ -1260,7 +1290,7 @@ export default function CareerApp() {
         setContactDataHint("另一个页面更新了联系人，但这里暂时没有重新读到。现有画面没有被当成最新版本。");
       });
     }
-  }), [contactAction, contactEditorId, contactUndo, refreshContacts, selectedContactId, view]);
+  }), [contactAction, contactEditorId, contactUndo, lifecycleDialog, modal, notify, refresh, refreshContacts, selectedContactId, taskSheet, view]);
 
   useEffect(() => {
     function refreshVisibleContactsOnFocus() {
@@ -1366,12 +1396,6 @@ export default function CareerApp() {
     url.searchParams.delete("text");
     window.history.replaceState(window.history.state, "", `${url.pathname}${url.search}${url.hash}`);
   }, [capturedDraft]);
-
-  const notify = useCallback((text: string, tone: Notice["tone"] = "success") => {
-    const item = { id: crypto.randomUUID(), tone, text };
-    setNotices((current) => [...current, item]);
-    window.setTimeout(() => setNotices((current) => current.filter((notice) => notice.id !== item.id)), 3600);
-  }, []);
 
   async function refreshMaterials() {
     if (materialRefreshRef.current) return;
@@ -1490,16 +1514,59 @@ export default function CareerApp() {
   }, []);
 
   const setBackupMutationGate = useCallback((active: boolean) => {
+    const key = "backup";
+    const current = externalMutationTokensRef.current.get(key);
+    if (active && !current) {
+      const token = databaseMutationRegistryRef.current.tryClaim("backup");
+      if (!token) return false;
+      externalMutationTokensRef.current.set(key, token);
+    } else if (!active && current) {
+      externalMutationTokensRef.current.delete(key);
+      databaseMutationRegistryRef.current.release(current);
+    }
     backupMutationActiveRef.current = active;
     setBackupMutationActive(active);
+    setExternalMutationClaimCount(databaseMutationRegistryRef.current.count());
+    return true;
   }, []);
 
-  const setExternalMutationClaim = useCallback((key: string, active: boolean) => {
-    setExternalMutationClaimCount(externalMutationGateRef.current.set(key, active));
+  const claimDatabaseMutation = useCallback((owner: CareerDatabaseMutationOwner) => {
+    const token = databaseMutationRegistryRef.current.tryClaim(owner);
+    setExternalMutationClaimCount(databaseMutationRegistryRef.current.count());
+    return token;
   }, []);
+  const releaseDatabaseMutation = useCallback((token: CareerDatabaseMutationToken) => {
+    databaseMutationRegistryRef.current.release(token);
+    setExternalMutationClaimCount(databaseMutationRegistryRef.current.count());
+  }, []);
+  const databaseMutationActiveExcept = useCallback((owner: CareerDatabaseMutationOwner) =>
+    databaseMutationRegistryRef.current.isActiveExcept(owner), []);
+  const externalOwner = useCallback((key: string): CareerDatabaseMutationOwner => {
+    if (key.startsWith("contact")) return "contact";
+    if (key.startsWith("material")) return "material";
+    if (key === "career-import") return "import";
+    if (key.startsWith("task")) return "task";
+    return "backup";
+  }, []);
+  const setExternalMutationClaim = useCallback((key: string, active: boolean) => {
+    const current = externalMutationTokensRef.current.get(key);
+    if (active) {
+      if (current) return true;
+      const token = databaseMutationRegistryRef.current.tryClaim(externalOwner(key));
+      if (!token) return false;
+      externalMutationTokensRef.current.set(key, token);
+      setExternalMutationClaimCount(databaseMutationRegistryRef.current.count());
+      return true;
+    }
+    if (!current) return true;
+    externalMutationTokensRef.current.delete(key);
+    databaseMutationRegistryRef.current.release(current);
+    setExternalMutationClaimCount(databaseMutationRegistryRef.current.count());
+    return true;
+  }, [externalOwner]);
 
   const coreExternalWriteLocked = backupMutationActive || lifecycleLocked ||
-    externalMutationClaimCount > 0 || scopeLoading || materialRefreshBusy || materialRemoval !== null ||
+    scopeLoading || materialRefreshBusy || materialRemoval !== null ||
     modal === "task" || modal === "material" || modal === "import" ||
     taskSheet !== null || contactEditorId !== undefined ||
     contactAction !== null || selectedContactId !== null ||
@@ -1507,7 +1574,7 @@ export default function CareerApp() {
   const coreExternalWriteInProgress = useCallback(() =>
     backupMutationActiveRef.current || lifecycleWriteRef.current ||
     taskCompletionRef.current.size > 0 || contactUndoWriteRef.current ||
-    externalMutationGateRef.current.isActive(),
+    databaseMutationRegistryRef.current.isActiveExcept("core"),
   []);
   const refreshCoreAfterReceipt = useCallback(async (
     receipt: CareerCoreWriteReceipt,
@@ -1528,15 +1595,52 @@ export default function CareerApp() {
     dirtyEditorCount: coreDirtyEditorCount,
     onToast: (message) => notify(message),
     onAttention: () => undefined,
+    claimDatabaseMutation: () => claimDatabaseMutation("core"),
+    releaseDatabaseMutation,
+    databaseMutationActiveExcept: () => databaseMutationActiveExcept("core"),
   });
-  const coreDatabaseMutationLockedNow = useCallback(() =>
-    coreSnapshotStaleRef.current || coreWrites.databaseMutationLocked ||
+  const lifecycleTaskWrites = useCareerLifecycleTaskWriteFlow({
+    refresh: () => refresh(jobScopeRef.current),
+    snapshotStale: coreSnapshotStale,
+    snapshotStaleNow: () => coreSnapshotStaleRef.current,
+    externalBlockedNow: () => backupMutationActiveRef.current ||
+      databaseMutationRegistryRef.current.isActiveExcept("lifecycle") &&
+      databaseMutationRegistryRef.current.isActiveExcept("task") ||
       coreWrites.isWriteInProgress(),
-  [coreWrites]);
+    claimDatabaseMutation: (owner) => claimDatabaseMutation(owner),
+    releaseDatabaseMutation,
+    databaseMutationActiveExcept: (owner) => databaseMutationActiveExcept(owner),
+    dirtyEditorCount: coreDirtyEditorCount,
+    onToast: (message) => notify(message),
+    onAttention: () => undefined,
+  });
+  const coreDatabaseMutationLockedNow = useCallback((owner?: CareerDatabaseMutationOwner) =>
+    coreSnapshotStaleRef.current || coreWrites.databaseMutationLocked ||
+      lifecycleTaskWrites.databaseMutationLocked || coreWrites.isWriteInProgress() ||
+      lifecycleTaskWrites.isWriteInProgress() ||
+      (owner
+        ? databaseMutationRegistryRef.current.isActiveExcept(owner)
+        : databaseMutationRegistryRef.current.isActive()),
+  [coreWrites, lifecycleTaskWrites]);
+  const hasCareerVolatileWork = coreWrites.hasVolatileWork ||
+    lifecycleTaskWrites.hasVolatileWork;
+
+  useEffect(() => {
+    function recheckCareerTruthOnFocus() {
+      if (!coreSnapshotStaleRef.current || coreDirtyEditorsRef.current.size > 0 ||
+        coreWrites.isWriteInProgress() || lifecycleTaskWrites.isWriteInProgress()) return;
+      void refresh().catch(() => {
+        coreSnapshotStaleRef.current = true;
+        setCoreSnapshotStale(true);
+      });
+    }
+    window.addEventListener("focus", recheckCareerTruthOnFocus);
+    return () => window.removeEventListener("focus", recheckCareerTruthOnFocus);
+  }, [coreWrites, lifecycleTaskWrites, refresh]);
 
   useEffect(() => {
     function protectSpaExit(event: MouseEvent) {
-      if (coreDirtyEditorsRef.current.size === 0 && !coreWrites.hasVolatileWork) return;
+      if (coreDirtyEditorsRef.current.size === 0 && !hasCareerVolatileWork) return;
       const target = event.target instanceof Element ? event.target.closest<HTMLAnchorElement>("a[href]") : null;
       if (!target || target.target === "_blank" || target.hasAttribute("download")) return;
       const destination = new URL(target.href, window.location.href);
@@ -1547,10 +1651,10 @@ export default function CareerApp() {
     }
     document.addEventListener("click", protectSpaExit, true);
     return () => document.removeEventListener("click", protectSpaExit, true);
-  }, [coreWrites.hasVolatileWork, notify]);
+  }, [hasCareerVolatileWork, notify]);
 
   useEffect(() => {
-    const hasRisk = coreDirtyEditorCount > 0 || coreWrites.hasVolatileWork;
+    const hasRisk = coreDirtyEditorCount > 0 || hasCareerVolatileWork;
     if (hasRisk && historyGuardRef.current === null) {
       const token = typeof crypto.randomUUID === "function"
         ? crypto.randomUUID()
@@ -1596,7 +1700,7 @@ export default function CareerApp() {
       if (current && typeof current === "object" &&
         current.careerCoreHistoryGuard === token) return;
       const decision = careerCoreHistoryBackDecision(
-        coreWrites.hasVolatileWork,
+        hasCareerVolatileWork,
         coreDirtyEditorsRef.current.size,
       );
       if (decision === "continue") {
@@ -1613,7 +1717,7 @@ export default function CareerApp() {
     }
     window.addEventListener("popstate", onPopState);
     return () => window.removeEventListener("popstate", onPopState);
-  }, [coreDirtyEditorCount, coreWrites.hasVolatileWork, notify]);
+  }, [coreDirtyEditorCount, hasCareerVolatileWork, notify]);
 
   const stayAfterHistoryExit = useCallback(() => {
     setHistoryExitPrompt(false);
@@ -1626,14 +1730,14 @@ export default function CareerApp() {
   }, []);
 
   const abandonDirtyEditorsAndContinueHistory = useCallback(() => {
-    if (coreWrites.hasVolatileWork) return;
+    if (hasCareerVolatileWork) return;
     coreDirtyEditorsRef.current.clear();
     setCoreDirtyEditorCount(0);
     setHistoryExitPrompt(false);
     const guarded = historyGuardRef.current !== null;
     historyGuardRef.current = null;
     window.history.go(guarded ? -2 : -1);
-  }, [coreWrites.hasVolatileWork]);
+  }, [hasCareerVolatileWork]);
 
   function lifecycleDefaultChoice(prepared: CareerPreparedLifecycleChange) {
     return prepared.requiresChoice ? null : prepared.allowedChoices[0] ?? null;
@@ -1670,39 +1774,39 @@ export default function CareerApp() {
     choice: CareerLifecycleChoice,
     rememberUndo = true,
   ) {
-    if (coreDatabaseMutationLockedNow()) {
-      notify("先处理当前职迹保存或核对提醒，再变更职位状态。", "info");
+    if (coreDatabaseMutationLockedNow("lifecycle")) {
+      const blockedMessage = "另一笔数据库操作正在进行；这次没有准备或提交，可以保留当前确认内容后重试。";
+      setLifecycleDialog((current) => current?.phase === "decision"
+        ? { ...current, error: blockedMessage }
+        : current);
+      notify(blockedMessage, "info");
       return false;
     }
     setLifecycleBusy(true);
     setLifecyclePendingJobId(prepared.job.id);
     try {
-      const result = await commitPreparedCareerLifecycleChange(prepared, choice);
-      if (result.status === "changed") {
+      const trigger = lifecycleTriggerRef.current ?? document.body;
+      const result = await lifecycleTaskWrites.submitLifecycle(prepared, choice, trigger);
+      if (result.outcome === "preview-changed") {
         setLifecycleDialog({
           phase: "decision",
-          prepared: result.prepared,
-          choice: lifecycleDefaultChoice(result.prepared),
+          prepared: result.preview,
+          choice: lifecycleDefaultChoice(result.preview),
           changed: true,
           error: "",
           rememberUndo,
         });
         return false;
       }
-
-      lifecycleRefreshOnlyRef.current = true;
-      try {
-        await requireRefresh();
-      } catch {
-        setLifecycleDialog({
-          phase: "refresh-recovery",
-          prepared,
-          error: "更改已保存在本机，页面暂未重新读取，请不要重复提交。",
-          rememberUndo,
-        });
+      if (result.outcome !== "saved") {
+        setLifecycleDialog((current) => current?.phase === "decision"
+          ? {
+              ...current,
+              error: "另一笔数据库操作正在进行，或这份预览需要重新核对；没有准备或提交，可以稍后重试。",
+            }
+          : current);
         return false;
       }
-      lifecycleRefreshOnlyRef.current = false;
       setLifecycleDialog(null);
       updateLifecycleUndo(prepared, rememberUndo);
       focusAfterLifecycle();
@@ -1743,8 +1847,32 @@ export default function CareerApp() {
     lifecycleTriggerRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     setLifecyclePendingJobId(intent.jobId);
     try {
-      const prepared = await prepareCareerLifecycleChange(intent);
-      if (coreDatabaseMutationLockedNow()) {
+      const boundJob = coreBindings
+        ? getBoundCareerJobExpected(coreBindings, currentJob)
+        : null;
+      const currentStage = data.stages.find((stage) => stage.id === currentJob.stage_id);
+      const nextStage = intent.kind === "stage"
+        ? data.stages.find((stage) => stage.id === intent.nextStageId) ?? null
+        : null;
+      if (!boundJob || !currentStage || boundJob.stage !== currentStage ||
+        (intent.kind === "stage" && !nextStage)) {
+        notify("职位或阶段显示绑定已经变化；请重新打开后再试。", "info");
+        return false;
+      }
+      const displayed = {
+        generationId: boundJob.generationId,
+        generationSequence: boundJob.generationSequence,
+        job: boundJob.job,
+        currentStage,
+        nextStage,
+      } satisfies import("@/lib/career/lifecycle-writes").CareerLifecycleDisplayedExpected;
+      const prepared = await lifecycleTaskWrites.previewLifecycle(
+        intent,
+        displayed,
+        lifecycleTriggerRef.current ?? document.body,
+      );
+      if (!prepared || coreDatabaseMutationLockedNow("lifecycle")) {
+        if (prepared) lifecycleTaskWrites.cancelLifecyclePreview();
         notify("准备期间核心资料已需要核对；职位状态没有改变。", "info");
         return false;
       }
@@ -1753,6 +1881,7 @@ export default function CareerApp() {
         prepared.job.currentStage.id !== options.expectedUndo.to ||
         prepared.job.nextStage?.id !== options.expectedUndo.from
       )) {
+        lifecycleTaskWrites.cancelLifecyclePreview();
         setUndo(null);
         notify("职位状态已经变化，这次撤销已失效。", "info");
         return false;
@@ -1776,31 +1905,10 @@ export default function CareerApp() {
   }
 
   async function confirmLifecycleChange() {
-    if (!lifecycleDialog || lifecycleDialog.phase !== "decision" || !lifecycleDialog.choice || lifecycleWriteRef.current || lifecycleRefreshOnlyRef.current || coreDatabaseMutationLockedNow()) return;
+    if (!lifecycleDialog || lifecycleDialog.phase !== "decision" || !lifecycleDialog.choice || lifecycleWriteRef.current || lifecycleRefreshOnlyRef.current || coreDatabaseMutationLockedNow("lifecycle")) return;
     lifecycleWriteRef.current = true;
     try { await finishPreparedLifecycle(lifecycleDialog.prepared, lifecycleDialog.choice, lifecycleDialog.rememberUndo); }
     finally { lifecycleWriteRef.current = false; }
-  }
-
-  async function retryLifecycleRefresh() {
-    if (!lifecycleDialog || lifecycleDialog.phase !== "refresh-recovery" || lifecycleWriteRef.current) return;
-    lifecycleWriteRef.current = true;
-    setLifecycleBusy(true);
-    try {
-      await requireRefresh();
-      lifecycleRefreshOnlyRef.current = false;
-      updateLifecycleUndo(lifecycleDialog.prepared, lifecycleDialog.rememberUndo);
-      setLifecycleDialog(null);
-      focusAfterLifecycle();
-    } catch {
-      setLifecycleDialog((current) => current?.phase === "refresh-recovery" ? {
-        ...current,
-        error: "更改仍已保存在本机，页面还没有重新读取。请只重试刷新，不要重复提交。",
-      } : current);
-    } finally {
-      lifecycleWriteRef.current = false;
-      setLifecycleBusy(false);
-    }
   }
 
   async function handleUndo() {
@@ -1825,33 +1933,35 @@ export default function CareerApp() {
   }
 
   async function completeTask(task: Task) {
-    if (coreDatabaseMutationLockedNow()) {
+    if (coreDatabaseMutationLockedNow("task")) {
       notify("先处理当前核心保存或核对提醒，再更改待办。", "info");
       return;
     }
     if (task.status !== "todo") { openTask(task.id); return; }
-    const expectedUpdatedAt = task.updated_at;
-    if (!expectedUpdatedAt) { openTask(task.id, "stale"); return; }
     await runCareerTaskUiOnce(taskCompletionRef.current, task.id, async () => {
-      let committed = false;
       try {
-        if (coreDatabaseMutationLockedNow()) return;
-        await careerTaskActions.complete(task.id, {
-          expectedUpdatedAt,
-          operationId: `task_complete_${crypto.randomUUID()}`,
-        });
-        committed = true;
-        await refreshTasks();
-        notify(`已完成「${task.title}」`, "info");
-      } catch (error) {
-        if (committed) {
-          openTask(task.id, "refresh-only");
-          return;
-        }
-        if (error instanceof CareerTaskError && error.code === "changed") {
+        if (coreDatabaseMutationLockedNow("task")) return;
+        const displayed = allLifecycle.tasks.find((item) => item.id === task.id);
+        if (displayed !== task) {
           openTask(task.id, "stale");
           return;
         }
+        if (!coreBindings) {
+          openTask(task.id, "stale");
+          return;
+        }
+        const expected: CareerTaskWriteExpectedState = {
+          generationId: coreBindings.generationId,
+          generationSequence: coreBindings.generationSequence,
+          task: displayed,
+        };
+        const trigger = document.activeElement instanceof HTMLElement
+          ? document.activeElement
+          : document.body;
+        const result = await lifecycleTaskWrites.submitTaskComplete(expected, trigger);
+        if (result.outcome === "saved") notify(`已完成「${task.title}」`, "info");
+        else if (result.outcome === "changed") openTask(task.id, "stale");
+      } catch (error) {
         notify(error instanceof Error ? error.message : "这次更改没有保存，原记录仍保持不变。", "error");
       }
     });
@@ -1940,8 +2050,17 @@ export default function CareerApp() {
       } finally { contactUndoWriteRef.current = false; }
       return;
     }
+    const mutationToken = claimDatabaseMutation("contact");
+    if (!mutationToken) {
+      contactUndoWriteRef.current = false;
+      notify("另一笔数据库操作已经开始；联系人恢复没有提交。", "info");
+      return;
+    }
     setContactUndo({ ...ticket, phase: "writing", message: "正在恢复联系人…" });
     try {
+      if (coreDatabaseMutationLockedNow("contact")) {
+        throw new Error("另一笔数据库操作已经开始；联系人恢复没有提交。");
+      }
       const result = await restoreCareerContactSafely(ticket.id, ticket.expected);
       if (result.outcome === "saved" || result.outcome === "already_saved") {
         setContactUndo({ ...ticket, phase: "refresh-only", message: "恢复写入已结束，正在只读刷新…" });
@@ -1970,7 +2089,10 @@ export default function CareerApp() {
       } else {
         setContactUndo({ ...ticket, phase: "ready", message: error instanceof Error ? error.message : "这次没有恢复，归档状态保持不变。" });
       }
-    } finally { contactUndoWriteRef.current = false; }
+    } finally {
+      contactUndoWriteRef.current = false;
+      releaseDatabaseMutation(mutationToken);
+    }
   }
 
   function navigate(next: CareerView) {
@@ -2038,6 +2160,38 @@ export default function CareerApp() {
             {(coreWrites.journal.storageUnavailable || coreWrites.journal.lockUnavailable) && <button className="career-button secondary" onClick={coreWrites.retryStorage}><RotateCcw size={16} />重新检查浏览器能力</button>}
           </footer>
         </div>}
+        {(lifecycleTaskWrites.flow.phase !== "idle" || lifecycleTaskWrites.error ||
+          lifecycleTaskWrites.hasRecoveryAttention) && <div
+          ref={lifecycleTaskWrites.attentionRef}
+          className="career-lifecycle-task-recovery"
+          tabIndex={-1}
+          role={lifecycleTaskWrites.error ? "alert" : "status"}
+          aria-live="polite"
+        >
+          <div><b>职位 / 待办安全核对</b><p>{lifecycleTaskWrites.error ||
+            ("message" in lifecycleTaskWrites.flow
+              ? lifecycleTaskWrites.flow.message
+              : lifecycleTaskWrites.journal.entries.length > 0 || lifecycleTaskWrites.hasHeldReceipt
+                ? "有一张职位或待办收据仍需核对；数据库写入保持暂停。"
+                : lifecycleTaskWrites.journal.peerEntries.length > 0
+                  ? "另一类职迹写入仍有收据需要核对；数据库写入保持暂停。"
+                  : lifecycleTaskWrites.journal.unreadable.length > 0
+                    ? "有一条核对提醒无法验证；没有据此写入。"
+                    : lifecycleTaskWrites.journal.storageUnavailable
+                      ? "浏览器暂时无法完整读取核对线索；数据库写入保持暂停。"
+                      : lifecycleTaskWrites.journal.lockUnavailable
+                        ? "当前浏览器缺少安全的跨页面锁；数据库写入保持暂停。"
+                        : lifecycleTaskWrites.status) || "正在安全确认本地写入。"}</p></div>
+          <footer>
+            {lifecycleTaskWrites.journal.storageUnavailable && <button className="career-button primary" onClick={lifecycleTaskWrites.retryStorage}>重试读取提醒</button>}
+            {lifecycleTaskWrites.journal.unreadable.length > 0 && <button className="career-button ghost" onClick={() => void lifecycleTaskWrites.removeFirstUnreadable()}>只清除无法验证的提醒</button>}
+            {lifecycleTaskWrites.flow.phase === "check" && <button className="career-button primary" onClick={() => void lifecycleTaskWrites.inspectActive()}>只读核对</button>}
+            {lifecycleTaskWrites.flow.phase === "expected" && <><button className="career-button ghost" onClick={() => void lifecycleTaskWrites.discardTerminal()}>放弃未写入收据</button><button className="career-button primary" onClick={() => void lifecycleTaskWrites.continueExpected()}>继续同一次写入</button></>}
+            {(lifecycleTaskWrites.flow.phase === "refresh-only" || lifecycleTaskWrites.flow.phase === "changed") && <button className="career-button primary" onClick={() => void lifecycleTaskWrites.retryRefresh()}>只重新读取</button>}
+            {lifecycleTaskWrites.flow.phase === "invalid" && <button className="career-button ghost" onClick={() => void lifecycleTaskWrites.discardTerminal()}>只清除无效提醒</button>}
+            {lifecycleTaskWrites.flow.phase === "idle" && lifecycleTaskWrites.journal.entries.length > 0 && <button className="career-button primary" onClick={lifecycleTaskWrites.retryStorage}>打开核对提醒</button>}
+          </footer>
+        </div>}
         {legacyReviewNeeded && <div className="career-legacy-review-note" role="status"><ShieldCheck size={19} /><div><b>旧版资料需要你看一眼</b><p>旧版可能含示例内容，未自动删除以保护你的编辑。我们不会替你判断哪些记录属于你，也不会自行清理。</p></div></div>}
         {view === "today" && <TodayView data={allData} now={careerClock} onNavigate={navigate} onSelectJob={setSelectedJobId} onSelectInterview={setSelectedInterviewId} onOpenTask={openTask} onCompleteTask={completeTask} onAddJob={openJobCreation} onAi={runAi} />}
         {view === "board" && <BoardView data={boardData} jobs={boardJobs} now={careerClock} query={query} sourceFilter={sourceFilter} priorityOnly={priorityOnly} onSourceFilter={setSourceFilter} onPriorityOnly={setPriorityOnly} onClear={() => { setQuery(""); setSourceFilter("all"); setPriorityOnly(false); }} onSelectJob={setSelectedJobId} onAddJob={openJobCreation} onMove={async (jobId, stageId) => { await requestLifecycleChange({ kind: "stage", jobId, nextStageId: stageId }); }} lifecycleLocked={lifecycleLocked || coreWrites.databaseMutationLocked} sensors={sensors} activeJob={activeJob} onDragStart={(event) => { if (!lifecycleWriteRef.current && !lifecycleRefreshOnlyRef.current && !coreDatabaseMutationLockedNow()) setActiveDragId(String(event.active.id)); }} onDragEnd={async (event) => { setActiveDragId(null); if (!event.over || lifecycleWriteRef.current || lifecycleRefreshOnlyRef.current || coreDatabaseMutationLockedNow()) return; const stageId = String(event.over.id).replace(/^stage:/, ""); if (data.stages.some((stage) => stage.id === stageId)) await requestLifecycleChange({ kind: "stage", jobId: String(event.active.id), nextStageId: stageId }); }} />}
@@ -2063,7 +2217,7 @@ export default function CareerApp() {
           notify={notify}
         />}
         {view === "analytics" && <AnalyticsView data={allData} now={careerClock} />}
-        {view === "settings" && <SettingsView data={data} coreBindings={coreBindings} coreWrites={coreWrites} onDirtyChange={(dirty) => setCoreEditorDirty("stage:rename", dirty)} newDatabaseWritesLocked={coreWrites.databaseMutationLocked} newDatabaseWritesLockedNow={coreDatabaseMutationLockedNow} onExternalMutationChange={setBackupMutationGate} onRefresh={requireRefresh} onExport={async () => {
+        {view === "settings" && <SettingsView data={data} coreBindings={coreBindings} coreWrites={coreWrites} onDirtyChange={(dirty) => setCoreEditorDirty("stage:rename", dirty)} newDatabaseWritesLocked={coreWrites.databaseMutationLocked || lifecycleTaskWrites.databaseMutationLocked} newDatabaseWritesLockedNow={() => coreDatabaseMutationLockedNow("backup")} onExternalMutationChange={setBackupMutationGate} onRefresh={requireRefresh} onExport={async () => {
           try {
             const exported = await exportCompleteCareerBackup();
             const url = URL.createObjectURL(exported.blob);
@@ -2084,23 +2238,27 @@ export default function CareerApp() {
     {lifecycleDialog && <CareerLifecycleModal
       state={lifecycleDialog}
       busy={lifecycleBusy}
-      newWritesBlocked={coreWrites.databaseMutationLocked}
+      newWritesBlocked={coreWrites.databaseMutationLocked || lifecycleTaskWrites.databaseMutationLocked}
       onChoice={(choice) => setLifecycleDialog((current) => current?.phase === "decision" ? { ...current, choice, error: "" } : current)}
       onClose={() => {
         if (!lifecycleBusy && lifecycleDialog.phase === "decision") {
+          const focusRecovery = lifecycleTaskWrites.hasRecoveryAttention;
           setLifecycleDialog(null);
-          focusAfterLifecycle();
+          lifecycleTaskWrites.cancelLifecyclePreview();
+          if (focusRecovery) {
+            window.requestAnimationFrame(() =>
+              lifecycleTaskWrites.attentionRef.current?.focus({ preventScroll: true }));
+          } else focusAfterLifecycle();
         }
       }}
       onConfirm={() => { void confirmLifecycleChange(); }}
-      onRetryRefresh={() => { void retryLifecycleRefresh(); }}
     />}
     {selectedContactId && <ContactDrawer
       contactId={selectedContactId}
       revision={contactRevision}
       now={careerClock}
       newWritesBlocked={coreWrites.databaseMutationLocked}
-      newWritesBlockedNow={coreDatabaseMutationLockedNow}
+      newWritesBlockedNow={() => coreDatabaseMutationLockedNow("contact")}
       onExternalMutationChange={(active) => setExternalMutationClaim("contact-archive", active)}
       onClose={() => setSelectedContactId(null)}
       onEdit={() => { if (!coreDatabaseMutationLockedNow()) setContactEditorId(selectedContactId); }}
@@ -2124,14 +2282,32 @@ export default function CareerApp() {
       notify={notify}
     />}
     {modal === "job" && <JobModal data={data} coreBindings={coreBindings} coreWrites={coreWrites} onDirtyChange={(dirty) => setCoreEditorDirty("job:create", dirty)} onClose={() => setModal(null)} onSaved={(id) => { setModal(null); setSelectedJobId(id); }} notify={notify} />}
-    {modal === "task" && <TaskModal data={data} initialJobId={selectedJobId} newWritesBlocked={coreWrites.databaseMutationLocked} newWritesBlockedNow={coreDatabaseMutationLockedNow} onExternalMutationChange={(active) => setExternalMutationClaim("task-create", active)} onClose={() => { setModal(null); setSelectedJobId(null); }} onSaved={async () => { await refreshTasks(); setModal(null); setSelectedJobId(null); notify("待办已创建"); }} />}
+    {modal === "task" && <TaskModal data={data} initialJobId={selectedJobId} newWritesBlocked={coreWrites.databaseMutationLocked || lifecycleTaskWrites.databaseMutationLocked} onClose={() => { setModal(null); setSelectedJobId(null); }} onSubmit={async (input, job, trigger) => {
+      const stage = job ? data.stages.find((item) => item.id === job.stage_id) ?? null : null;
+      const bound = job ? getBoundCareerJobExpected(coreBindings, job) : null;
+      if (job && (!bound || bound.stage !== stage)) return { outcome: "blocked", entityId: null };
+      const expected: CareerTaskCreateExpectedContext = job && bound && stage
+        ? {
+            generationId: bound.generationId,
+            generationSequence: bound.generationSequence,
+            job: bound.job,
+            stage,
+          }
+        : {
+            generationId: coreBindings.generationId,
+            generationSequence: coreBindings.generationSequence,
+            job: null,
+            stage: null,
+          };
+      return lifecycleTaskWrites.submitTaskCreate(input, expected, trigger);
+    }} />}
     {modal === "interview" && <InterviewModal data={data} coreBindings={coreBindings} coreWrites={coreWrites} onDirtyChange={(dirty) => setCoreEditorDirty("interview:create", dirty)} onClose={() => setModal(null)} onSaved={(id) => { setModal(null); setSelectedInterviewId(id); }} notify={notify} />}
     {modal === "material" && <MaterialModal
       data={data}
       initialRecovery={materialSaveRecoveryEntries[0] ?? null}
       otherRecoveryPending={materialSaveRecoveryEntries.length > (materialSaveRecoveryEntries[0] ? 1 : 0) || materialRecoveryUnreadableKeys.length > 0}
       newWritesBlocked={coreWrites.databaseMutationLocked}
-      newWritesBlockedNow={coreDatabaseMutationLockedNow}
+      newWritesBlockedNow={() => coreDatabaseMutationLockedNow("material")}
       onExternalMutationChange={(active) => setExternalMutationClaim("material-save", active)}
       onRecoveryUpsert={persistMaterialSaveRecovery}
       onRecoveryClear={clearMaterialSaveRecovery}
@@ -2140,15 +2316,15 @@ export default function CareerApp() {
       onRefresh={refreshMaterials}
       notify={notify}
     />}
-    {materialRemoval && <MaterialDeletionModal material={materialRemoval} newWritesBlocked={coreWrites.databaseMutationLocked} newWritesBlockedNow={coreDatabaseMutationLockedNow} onExternalMutationChange={(active) => setExternalMutationClaim("material-delete", active)} onClose={closeMaterialRemoval} onStaleClose={closeRemovalWithStaleList} onRefresh={refreshMaterials} notify={notify} />}
-    {modal === "import" && <CareerImportModal data={allData} initialCapture={importInitial} newWritesBlocked={coreWrites.databaseMutationLocked} newWritesBlockedNow={coreDatabaseMutationLockedNow} onExternalMutationChange={(active) => setExternalMutationClaim("career-import", active)} onClose={closeCareerImport} onRefresh={requireRefresh} notify={notify} />}
+    {materialRemoval && <MaterialDeletionModal material={materialRemoval} newWritesBlocked={coreWrites.databaseMutationLocked} newWritesBlockedNow={() => coreDatabaseMutationLockedNow("material")} onExternalMutationChange={(active) => setExternalMutationClaim("material-delete", active)} onClose={closeMaterialRemoval} onStaleClose={closeRemovalWithStaleList} onRefresh={refreshMaterials} notify={notify} />}
+    {modal === "import" && <CareerImportModal data={allData} initialCapture={importInitial} newWritesBlocked={coreWrites.databaseMutationLocked} newWritesBlockedNow={() => coreDatabaseMutationLockedNow("import")} onExternalMutationChange={(active) => setExternalMutationClaim("career-import", active)} onClose={closeCareerImport} onRefresh={requireRefresh} notify={notify} />}
     {searchOpen && <CommandPalette data={data} onClose={() => setSearchOpen(false)} onNavigate={navigate} onSelectJob={(id) => { setSearchOpen(false); setSelectedJobId(id); }} onAdd={() => { setSearchOpen(false); openJobCreation(); }} />}
     {contactEditorId !== undefined && <ContactModal
       contactId={contactEditorId}
       data={data}
       externalHint={contactDataHint}
       newWritesBlocked={coreWrites.databaseMutationLocked}
-      newWritesBlockedNow={coreDatabaseMutationLockedNow}
+      newWritesBlockedNow={() => coreDatabaseMutationLockedNow("contact")}
       onExternalMutationChange={(active) => setExternalMutationClaim("contact-save", active)}
       onClose={() => setContactEditorId(undefined)}
       onRefresh={refreshContacts}
@@ -2164,7 +2340,7 @@ export default function CareerApp() {
       data={data}
       externalHint={contactDataHint}
       newWritesBlocked={coreWrites.databaseMutationLocked}
-      newWritesBlockedNow={coreDatabaseMutationLockedNow}
+      newWritesBlockedNow={() => coreDatabaseMutationLockedNow("contact")}
       onExternalMutationChange={(active) => setExternalMutationClaim("contact-interaction", active)}
       onClose={() => setContactAction(null)}
       onRefresh={refreshContacts}
@@ -2179,7 +2355,7 @@ export default function CareerApp() {
       data={data}
       externalHint={contactDataHint}
       newWritesBlocked={coreWrites.databaseMutationLocked}
-      newWritesBlockedNow={coreDatabaseMutationLockedNow}
+      newWritesBlockedNow={() => coreDatabaseMutationLockedNow("contact")}
       onExternalMutationChange={(active) => setExternalMutationClaim("contact-task", active)}
       onClose={() => setContactAction(null)}
       onRefresh={refreshTasks}
@@ -2193,9 +2369,19 @@ export default function CareerApp() {
       key={taskSheet.nonce}
       request={taskSheet}
       now={careerClock}
-      externalWriteLocked={coreWrites.databaseMutationLocked}
-      externalWriteLockedNow={coreDatabaseMutationLockedNow}
+      externalWriteLocked={coreWrites.databaseMutationLocked || lifecycleTaskWrites.databaseMutationLocked}
+      externalWriteLockedNow={() => coreDatabaseMutationLockedNow("task")}
       onExternalMutationChange={(active) => setExternalMutationClaim("task-detail", active)}
+      onComplete={async (task, trigger) => {
+        const expected: CareerTaskWriteExpectedState = {
+          generationId: coreBindings.generationId,
+          generationSequence: coreBindings.generationSequence,
+          task,
+        };
+        const result = await lifecycleTaskWrites.submitTaskComplete(expected, trigger);
+        if (result.outcome === "saved") setTaskSheet(null);
+        return result;
+      }}
       onClose={() => setTaskSheet(null)}
       onRefresh={refreshTasks}
       notify={notify}
@@ -2216,7 +2402,7 @@ export default function CareerApp() {
       } : undefined}
       applyLabel={aiState.applyLabel}
     />}
-    {historyExitPrompt && <Modal title="放弃未保存的职迹输入？" description="浏览器返回不会替你保存当前表单。" onClose={() => undefined} dismissible={false} inertToasts><div className="career-draft-choice career-history-exit"><p>继续编辑是安全的默认选择。只有明确放弃，才会离开并让下一次打开重新读取资料。</p><div><button type="button" className="career-button primary" data-dialog-initial onClick={stayAfterHistoryExit}>继续编辑</button><button type="button" className="career-button danger" disabled={coreWrites.hasVolatileWork} onClick={abandonDirtyEditorsAndContinueHistory}>放弃输入并返回</button></div></div></Modal>}
+    {historyExitPrompt && <Modal title="放弃未保存的职迹输入？" description="浏览器返回不会替你保存当前表单。" onClose={() => undefined} dismissible={false} inertToasts><div className="career-draft-choice career-history-exit"><p>继续编辑是安全的默认选择。只有明确放弃，才会离开并让下一次打开重新读取资料。</p><div><button type="button" className="career-button primary" data-dialog-initial onClick={stayAfterHistoryExit}>继续编辑</button><button type="button" className="career-button danger" disabled={hasCareerVolatileWork} onClick={abandonDirtyEditorsAndContinueHistory}>放弃输入并返回</button></div></div></Modal>}
     <div className="career-toast-stack" aria-live="polite">{contactUndo && <button className="career-toast undo career-contact-undo" disabled={contactUndo.phase === "writing"} onClick={() => void handleContactUndo()} aria-label={contactUndo.phase === "refresh-only" ? `核对恢复「${contactUndo.name}」` : `撤销归档「${contactUndo.name}」`}>{contactUndo.phase === "writing" ? <LoaderCircle className="spin" size={16} /> : <RotateCcw size={16} />}<span>{contactUndo.message}</span> <b>{contactUndo.phase === "refresh-only" ? "只读核对" : contactUndo.phase === "writing" ? "请稍候" : "撤销"}</b></button>}{undo && <button className="career-toast undo" onClick={handleUndo}><RotateCcw size={16} />阶段已更新 <b>撤销</b></button>}{notices.map((notice) => <div className={`career-toast ${notice.tone}`} key={notice.id}>{notice.tone === "success" ? <Check size={16} /> : notice.tone === "error" ? <X size={16} /> : <Bell size={16} />}{notice.text}</div>)}</div>
   </main>;
 }
@@ -2581,7 +2767,7 @@ function SettingsView({ data, coreBindings, coreWrites, onDirtyChange, newDataba
   onDirtyChange: (dirty: boolean) => void;
   newDatabaseWritesLocked: boolean;
   newDatabaseWritesLockedNow: () => boolean;
-  onExternalMutationChange: (active: boolean) => void;
+  onExternalMutationChange: (active: boolean) => boolean;
   onRefresh: () => Promise<void>;
   onExport: () => Promise<void>;
   notify: (text: string, tone?: Notice["tone"]) => void;
@@ -2648,11 +2834,6 @@ function SettingsView({ data, coreBindings, coreWrites, onDirtyChange, newDataba
     backupFlow.phase === "activating" || backupFlow.phase === "discarding" || backupFlow.phase === "cleaning";
   const backupWriteLocked = !backupRecoveryLoaded || backupFlowBusy || Boolean(activeBackupRecovery) ||
     backupRecoveryUnreadableKeys.length > 0 || backupStorageNeedsAttention;
-
-  useLayoutEffect(() => {
-    onExternalMutationChange(backupFlowBusy || exportBusy);
-    return () => onExternalMutationChange(false);
-  }, [backupFlowBusy, exportBusy, onExternalMutationChange]);
 
   const persistBackupRecovery = useCallback((ticket: CareerBackupRecoveryTicket) => {
     const storageKey = careerBackupRecoveryStorageKey(ticket);
@@ -2823,7 +3004,10 @@ function SettingsView({ data, coreBindings, coreWrites, onDirtyChange, newDataba
       notify("先处理当前核心保存或核对提醒，再开始新的备份导出。", "info");
       return;
     }
-    onExternalMutationChange(true);
+    if (!onExternalMutationChange(true)) {
+      notify("另一笔数据库操作已经开始；没有导出备份快照。", "info");
+      return;
+    }
     setExportBusy(true);
     try { await onExport(); }
     finally { setExportBusy(false); onExternalMutationChange(false); }
@@ -2867,7 +3051,6 @@ function SettingsView({ data, coreBindings, coreWrites, onDirtyChange, newDataba
     if (entry.ticket.kind !== "candidate") return;
     const { receipt, mode } = entry.ticket;
     backupOperationRef.current = true;
-    onExternalMutationChange(true);
     setBackupFlow({ phase: "checking", title: "正在核对当前版本", text: "只读取版本状态，不会再次启用或删除候选。" });
     try {
       const inspection = await inspectCareerRestoreActivation(receipt);
@@ -2900,14 +3083,13 @@ function SettingsView({ data, coreBindings, coreWrites, onDirtyChange, newDataba
       }
     } finally {
       backupOperationRef.current = false;
-      onExternalMutationChange(false);
     }
   }
 
   async function recoverPreparation(entry: CareerBackupRecoveryEntry) {
     if (entry.ticket.kind !== "prepare") return;
+    if (!onExternalMutationChange(true)) return;
     backupOperationRef.current = true;
-    onExternalMutationChange(true);
     setBackupFlow({ phase: "checking", title: "正在继续核对", text: "沿用上次留下的核对信息，不会重新读取或写入备份文件。" });
     try {
       const recovered = await recoverCareerBackupPrepare(entry.ticket.receipt);
@@ -2974,9 +3156,9 @@ function SettingsView({ data, coreBindings, coreWrites, onDirtyChange, newDataba
 
   async function prepareSelectedBackup(file: File) {
     if (backupWriteLocked || backupOperationRef.current || newDatabaseWritesLockedNow()) return;
+    if (!onExternalMutationChange(true)) return;
     allowInitialBackupResumeRef.current = false;
     backupOperationRef.current = true;
-    onExternalMutationChange(true);
     const controller = new AbortController();
     backupPrepareControllerRef.current = controller;
     setBackupPrepareStopping(false);
@@ -3043,8 +3225,8 @@ function SettingsView({ data, coreBindings, coreWrites, onDirtyChange, newDataba
       setBackupFlow({ phase: "activation-check", receipt, message: "当前网址的浏览器存储暂时不能保存继续信息，因此没有启用。恢复存储后，只会先核对当前版本。" });
       return;
     }
+    if (!onExternalMutationChange(true)) return;
     backupOperationRef.current = true;
-    onExternalMutationChange(true);
     setBackupFlow({ phase: "activating", receipt });
     try {
       await activatePreparedCareerRestore(receipt);
@@ -3072,8 +3254,8 @@ function SettingsView({ data, coreBindings, coreWrites, onDirtyChange, newDataba
       setBackupFlow({ phase: "discard-only", receipt, message: "当前网址的浏览器存储暂时不能保存收尾信息，因此没有开始收尾。" });
       return;
     }
+    if (!onExternalMutationChange(true)) return;
     backupOperationRef.current = true;
-    onExternalMutationChange(true);
     setBackupFlow({ phase: "discarding", receipt });
     try {
       const discarded = await discardPreparedCareerRestore(receipt);
@@ -3104,8 +3286,8 @@ function SettingsView({ data, coreBindings, coreWrites, onDirtyChange, newDataba
 
   async function cleanPreparedAttachments(receipt: CareerPrepareCleanupReceipt) {
     if (backupOperationRef.current) return;
+    if (!onExternalMutationChange(true)) return;
     backupOperationRef.current = true;
-    onExternalMutationChange(true);
     setBackupFlow({ phase: "cleaning", receipt });
     try {
       await retryCareerPrepareCleanup(receipt);
@@ -3253,12 +3435,13 @@ type CareerTaskSheetPhase = "idle" | "loading" | "ready" | "writing" | "refreshi
 type CareerTaskSheetMode = "summary" | "schedule" | "restore" | "cancel-confirm";
 type CareerTaskDueChoice = "later" | "new" | "original" | null;
 
-function TaskDetailSheet({ request, now, externalWriteLocked, externalWriteLockedNow, onExternalMutationChange, onClose, onRefresh, notify }: {
+function TaskDetailSheet({ request, now, externalWriteLocked, externalWriteLockedNow, onExternalMutationChange, onComplete, onClose, onRefresh, notify }: {
   request: CareerTaskSheetRequest;
   now: number;
   externalWriteLocked: boolean;
   externalWriteLockedNow: () => boolean;
-  onExternalMutationChange: (active: boolean) => void;
+  onExternalMutationChange: (active: boolean) => boolean;
+  onComplete: (task: Task, trigger: HTMLElement) => Promise<CareerLifecycleTaskSubmitResult>;
   onClose: () => void;
   onRefresh: () => Promise<void>;
   notify: (text: string, tone?: Notice["tone"]) => void;
@@ -3336,8 +3519,11 @@ function TaskDetailSheet({ request, now, externalWriteLocked, externalWriteLocke
       setMessage("先处理当前核心保存或核对提醒；没有开始更改待办。");
       return;
     }
+    if (!onExternalMutationChange(true)) {
+      setMessage("另一笔数据库操作已经开始；没有更改待办。");
+      return;
+    }
     writeRef.current = true;
-    onExternalMutationChange(true);
     setPhase("writing");
     setMessage("");
     try {
@@ -3450,7 +3636,7 @@ function TaskDetailSheet({ request, now, externalWriteLocked, externalWriteLocke
         {lifecyclePaused && <div className="career-task-context"><Archive size={16} /><span><b>随职位暂停</b><small>{task.cancellation_reason === "job_archived" ? "这条安排随职位归档而暂停，记录仍完整保留。" : "这条安排随职位结束而暂停，记录仍完整保留。"}</small></span></div>}
         {mode === "summary" && phase !== "stale" && <div className="career-task-actions">
           {!taskVersion && <p className="career-task-blocked">这条记录缺少可确认的版本，请先查看最新状态。</p>}
-          {task.status === "todo" && taskVersion && <><button className="career-button primary" disabled={busy || externalWriteLocked} onClick={() => void finishMutation(() => careerTaskActions.complete(task.id, { expectedUpdatedAt: taskVersion, operationId: `task_complete_${crypto.randomUUID()}` }), "待办已完成")}><Check size={16} />标记为已完成</button><button className="career-button secondary" disabled={busy || externalWriteLocked} onClick={() => { setDueChoice(null); setNewDueAt(""); setMode("schedule"); }}><CalendarDays size={16} />调整安排</button>{task.due_at && <button className="career-button ghost" disabled={busy || externalWriteLocked} onClick={() => void finishMutation(() => careerTaskActions.reschedule(task.id, { expectedUpdatedAt: taskVersion, dueAt: null, operationId: `task_later_${crypto.randomUUID()}` }), "已放到“以后再说”")}>以后再说</button>}<button className="career-button ghost" disabled={busy || externalWriteLocked} onClick={() => setMode("cancel-confirm")}>放下这条待办</button></>}
+          {task.status === "todo" && taskVersion && <><button className="career-button primary" disabled={busy || externalWriteLocked} onClick={(event) => void onComplete(task, event.currentTarget)}><Check size={16} />标记为已完成</button><button className="career-button secondary" disabled={busy || externalWriteLocked} onClick={() => { setDueChoice(null); setNewDueAt(""); setMode("schedule"); }}><CalendarDays size={16} />调整安排</button>{task.due_at && <button className="career-button ghost" disabled={busy || externalWriteLocked} onClick={() => void finishMutation(() => careerTaskActions.reschedule(task.id, { expectedUpdatedAt: taskVersion, dueAt: null, operationId: `task_later_${crypto.randomUUID()}` }), "已放到“以后再说”")}>以后再说</button>}<button className="career-button ghost" disabled={busy || externalWriteLocked} onClick={() => setMode("cancel-confirm")}>放下这条待办</button></>}
           {(task.status === "done" || task.status === "canceled") && taskVersion && !restoreBlockedCopy && (task.status === "done" || detail?.canRestoreWithNewDueAt) && <button className="career-button primary" disabled={busy || externalWriteLocked} onClick={() => { setDueChoice(null); setNewDueAt(""); setMode("restore"); }}><RotateCcw size={16} />重新放回待办</button>}
           {restoreBlockedCopy && <p className="career-task-blocked">{restoreBlockedCopy}</p>}
         </div>}
@@ -3476,14 +3662,13 @@ function lifecycleImpactCopy(item: CareerLifecycleImpactItem) {
   return item.effect === "restore" ? "会按你的选择恢复" : "会按你的选择处理";
 }
 
-function CareerLifecycleModal({ state, busy, newWritesBlocked, onChoice, onClose, onConfirm, onRetryRefresh }: {
+function CareerLifecycleModal({ state, busy, newWritesBlocked, onChoice, onClose, onConfirm }: {
   state: CareerLifecycleDialogState;
   busy: boolean;
   newWritesBlocked: boolean;
   onChoice: (choice: CareerLifecycleChoice) => void;
   onClose: () => void;
   onConfirm: () => void;
-  onRetryRefresh: () => void;
 }) {
   const prepared = state.prepared;
   const target = prepared.intent.kind === "archive"
@@ -3510,13 +3695,6 @@ function CareerLifecycleModal({ state, busy, newWritesBlocked, onChoice, onClose
       : prepared.job.nextStage?.isTerminal
         ? "记录结果"
         : "确认阶段";
-
-  if (state.phase === "refresh-recovery") {
-    return <Modal title="更改已保存" description={`${prepared.job.company} · ${prepared.job.role}`} onClose={() => undefined} dismissible={false} inertToasts>
-      <div className="career-lifecycle-body recovery"><div className="career-lifecycle-recovery" role="alert"><ShieldCheck size={21} /><div><b>不要再次提交</b><p>{state.error}</p></div></div><p className="career-lifecycle-calm-note">这里只会重新读取页面，不会再次写入刚才的更改。</p></div>
-      <footer className="career-lifecycle-actions"><button data-dialog-initial className="career-button primary" disabled={busy} onClick={onRetryRefresh}>{busy ? <LoaderCircle className="spin" size={16} /> : <RotateCcw size={16} />}{busy ? "正在重新读取…" : "重试刷新"}</button></footer>
-    </Modal>;
-  }
 
   return <Modal title={title} description={description} onClose={onClose} wide inertToasts>
     <div className="career-lifecycle-body">
@@ -4047,7 +4225,7 @@ function ContactDrawer({ contactId, revision, now, externalHint, newWritesBlocke
   externalHint: string;
   newWritesBlocked: boolean;
   newWritesBlockedNow: () => boolean;
-  onExternalMutationChange: (active: boolean) => void;
+  onExternalMutationChange: (active: boolean) => boolean;
   onClose: () => void;
   onEdit: () => void;
   onRecord: () => void;
@@ -4120,8 +4298,11 @@ function ContactDrawer({ contactId, revision, now, externalHint, newWritesBlocke
       setMessage("核心资料需要先完成核对；联系人状态没有改变。");
       return;
     }
+    if (!onExternalMutationChange(true)) {
+      setMessage("另一笔数据库操作已经开始；联系人状态没有改变。");
+      return;
+    }
     writeRef.current = true;
-    onExternalMutationChange(true);
     targetArchivedRef.current = targetArchived;
     setPhase("writing");
     setMessage("");
@@ -4243,55 +4424,44 @@ function JobModal({ data, coreBindings, coreWrites, onDirtyChange, onClose, onSa
   return <><Modal title="记录一个新职位" description="先写下关键信息，细节可以随时补充。" onClose={requestClose} wide><form className="career-form" onChange={markDirty} onSubmit={submit}><fieldset className="career-core-write-fields" disabled={saving || Boolean(activeCoreOperationId)}><div className="career-form-row"><Field label="公司"><input name="company" required placeholder="例如：Linear" /></Field><Field label="职位"><input name="role" required placeholder="例如：Product Designer" /></Field></div><div className="career-form-row thirds"><Field label="当前阶段"><select name="stage_id" defaultValue="stage_saved">{data.stages.filter((stage) => !stage.is_terminal).map((stage) => <option key={stage.id} value={stage.id}>{stage.name}</option>)}</select></Field><Field label="是否关注" hint="只是方便筛选，不是优先级评分"><select name="priority" defaultValue="1"><option value="1">普通记录</option><option value="2">已关注</option></select></Field><Field label="来源"><select name="source" defaultValue="手动记录"><option>手动记录</option><option>LinkedIn</option><option>BOSS直聘</option><option>官网</option><option>内推</option></select></Field></div><div className="career-form-row"><Field label="地点"><input name="location" placeholder="上海 / 远程" /></Field><Field label="工作方式"><select name="work_mode"><option value="">待确认</option><option>现场办公</option><option>混合办公</option><option>远程</option></select></Field></div><div className="career-form-row"><Field label="薪资"><input name="salary" placeholder="¥30k–45k / 月" /></Field><Field label="截止时间"><input name="deadline" type="datetime-local" /></Field></div><Field label="原职位链接"><input name="source_url" type="url" placeholder="https://" /></Field><Field label="标签" hint="用逗号分隔"><input name="tags" placeholder="AI, 产品设计, 远程" /></Field><Field label="职位描述"><textarea name="description" rows={5} placeholder="粘贴岗位职责和要求…" /></Field><Field label="个人备注"><textarea name="note" rows={3} placeholder="为什么感兴趣？下一步要确认什么？" /></Field></fieldset><CareerCoreEditorRecovery coreWrites={coreWrites} />{(coreWrites.error || coreWrites.status) && <div className="career-inline-error" role="status"><ShieldCheck size={15} />{coreWrites.error || coreWrites.status}</div>}<div className="career-form-actions"><button type="button" className="career-button ghost" disabled={saving} onClick={requestClose}>取消</button><button type="submit" className="career-button primary" disabled={saving || Boolean(activeCoreOperationId) || coreWrites.writeLocked}>{saving || activeCoreOperationId ? <LoaderCircle className="spin" size={16} /> : <Plus size={16} />}{saving || activeCoreOperationId ? "等待核对…" : "保存职位"}</button></div></form></Modal>{closePrompt && <Modal title="保留这份职位输入吗？" description="这些内容还没有写入职迹 SQLite。" onClose={() => setClosePrompt(false)}><div className="career-draft-choice"><p>继续编辑会完整保留当前表单；只有明确放弃才会关闭。</p><div><button type="button" className="career-button primary" data-dialog-initial onClick={() => setClosePrompt(false)}>继续编辑</button><button type="button" className="career-button danger" onClick={() => { clearDirty(); setClosePrompt(false); onClose(); }}>放弃输入</button></div></div></Modal>}</>;
 }
 
-function TaskModal({ data, initialJobId, newWritesBlocked, newWritesBlockedNow, onExternalMutationChange, onClose, onSaved }: { data: CareerData; initialJobId: string | null; newWritesBlocked: boolean; newWritesBlockedNow: () => boolean; onExternalMutationChange: (active: boolean) => void; onClose: () => void; onSaved: () => Promise<void> }) {
-  const [phase, setPhase] = useState<"idle" | "writing" | "refresh-only">("idle");
+function TaskModal({ data, initialJobId, newWritesBlocked, onClose, onSubmit }: { data: CareerData; initialJobId: string | null; newWritesBlocked: boolean; onClose: () => void; onSubmit: (input: import("@/lib/career/task-writes").CreateCareerTaskWriteInput, job: Job | null, trigger: HTMLElement) => Promise<CareerLifecycleTaskSubmitResult>; }) {
+  const [phase, setPhase] = useState<"idle" | "writing">("idle");
   const [error, setError] = useState("");
   const savingRef = useRef(false);
-  const stableIdRef = useRef(newId("task"));
   const activeStageIds = new Set(data.stages.filter((stage) => stage.is_terminal !== 1).map((stage) => stage.id));
   const availableJobs = data.jobs.filter((job) => job.archived !== 1 && activeStageIds.has(job.stage_id));
-  async function finishRefresh() {
-    try { await onSaved(); }
-    catch { setPhase("refresh-only"); setError("待办已保存在本机，但画面还没有重新读取。请只重新读取，不要重复提交。"); }
-  }
-  async function retryRefresh() {
-    if (phase !== "refresh-only") return;
-    setError("");
-    try { await onSaved(); }
-    catch { setError("待办仍已保存在本机。这里只会重新读取，不会再次创建。"); }
-  }
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (savingRef.current) return;
-    if (newWritesBlockedNow()) {
+    if (newWritesBlocked) {
       setError("核心资料需要先完成核对；待办没有创建。");
       return;
     }
     savingRef.current = true;
-    onExternalMutationChange(true);
     setPhase("writing");
     setError("");
     const form = new FormData(event.currentTarget);
+    const jobId = String(form.get("job_id") ?? "") || null;
+    const job = jobId ? availableJobs.find((item) => item.id === jobId) ?? null : null;
+    const trigger = event.currentTarget.querySelector<HTMLButtonElement>('button[type="submit"]');
     try {
-      await careerTaskActions.create({
-        id: stableIdRef.current,
+      if (jobId && !job || !trigger) throw new Error("关联职位已经变化；待办没有创建。");
+      const result = await onSubmit({
         title: String(form.get("title") ?? ""),
-        jobId: String(form.get("job_id") ?? "") || null,
+        jobId,
         dueAt: fromDateInput(String(form.get("due_at") || "")),
         kind: String(form.get("kind") ?? "跟进"),
         priority: Number(form.get("priority") ?? 1),
-      });
-      setPhase("refresh-only");
-      await finishRefresh();
+      }, job, trigger);
+      if (result.outcome === "saved") onClose();
+      else if (result.outcome === "changed") setError("关联职位已经变化；旧输入没有覆盖当前资料。");
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "待办暂时没有保存，请再试一次");
-      setPhase("idle");
     } finally {
       savingRef.current = false;
-      onExternalMutationChange(false);
+      setPhase("idle");
     }
   }
-  if (phase === "refresh-only") return <Modal title="待办已保存在本机" description="画面还没有重新读取。请只重新读取，不要重复提交。" onClose={() => undefined} dismissible={false} inertToasts><div className="career-task-refresh-only" role="status"><ShieldCheck size={22} /><p>{error || "这条待办已经写入本地 SQLite；重新读取不会再创建一条。"}</p><button className="career-button primary" data-dialog-initial onClick={() => void retryRefresh()}><RotateCcw size={16} />重新读取</button></div></Modal>;
   return <Modal title="新建待办" description="记录你主动决定的下一步；计划时间可以留空。" onClose={phase === "writing" ? () => undefined : onClose}><form className="career-form" onSubmit={submit}><Field label="要做什么"><input name="title" required placeholder="例如：发送面试感谢邮件" /></Field><Field label="关联职位" hint="可选"><select name="job_id" defaultValue={initialJobId ?? ""}><option value="">个人待办</option>{availableJobs.map((job) => <option key={job.id} value={job.id}>{job.company} · {job.role}</option>)}</select></Field><div className="career-form-row"><Field label="计划时间（可选）" hint="不设时间会放在“以后再说”"><input name="due_at" type="datetime-local" /></Field><Field label="类型"><select name="kind"><option>跟进</option><option>面试准备</option><option>材料</option><option>截止事项</option><option>其他</option></select></Field></div><Field label="优先级"><select name="priority" defaultValue="1"><option value="1">普通</option><option value="2">重点</option><option value="3">时间敏感</option></select></Field>{error && <div className="career-inline-error" role="alert"><X size={15} />{error}</div>}<div className="career-form-actions"><button type="button" className="career-button ghost" disabled={phase === "writing"} onClick={onClose}>取消</button><button className="career-button primary" disabled={phase === "writing" || newWritesBlocked}>{phase === "writing" ? <LoaderCircle className="spin" size={16} /> : <ListTodo size={16} />}{phase === "writing" ? "正在创建…" : "创建待办"}</button></div></form></Modal>;
 }
 
@@ -4373,7 +4543,7 @@ function InterviewModal({ data, coreBindings, coreWrites, onDirtyChange, onClose
   return <><Modal title="安排面试轮次" description="时间、面试官和会议入口都放在一起。" onClose={requestClose}><form className="career-form" onChange={markDirty} onSubmit={submit}><fieldset className="career-core-write-fields" disabled={saving || Boolean(activeCoreOperationId)}><Field label="关联职位"><select required name="job_id" defaultValue=""><option value="" disabled>选择职位</option>{availableJobs.map((job) => <option key={job.id} value={job.id}>{job.company} · {job.role}</option>)}</select></Field><div className="career-form-row"><Field label="轮次名称"><input name="round_name" required placeholder="技术二面" /></Field><Field label="形式"><select name="interview_type"><option>视频面试</option><option>电话沟通</option><option>现场面试</option><option>笔试复盘</option></select></Field></div><div className="career-form-row"><Field label="时间"><input name="scheduled_at" type="datetime-local" required /></Field><Field label="时长"><select name="duration" defaultValue="45"><option value="30">30 分钟</option><option value="45">45 分钟</option><option value="60">60 分钟</option><option value="90">90 分钟</option></select></Field></div><Field label="面试官"><input name="interviewer" placeholder="姓名 · 职位" /></Field><Field label="会议链接"><input name="meeting_url" type="url" placeholder="https://" /></Field></fieldset><CareerCoreEditorRecovery coreWrites={coreWrites} />{(error || coreWrites.error || coreWrites.status) && <div className="career-inline-error" role="status"><ShieldCheck size={15} />{error || coreWrites.error || coreWrites.status}</div>}<div className="career-form-actions"><button type="button" className="career-button ghost" disabled={saving} onClick={requestClose}>取消</button><button type="submit" className="career-button primary" disabled={saving || Boolean(activeCoreOperationId) || coreWrites.writeLocked}>{saving || activeCoreOperationId ? <LoaderCircle className="spin" size={16} /> : <CalendarDays size={16} />}{saving || activeCoreOperationId ? "等待核对…" : "保存日程"}</button></div></form></Modal>{closePrompt && <Modal title="保留这份面试输入吗？" description="这些内容还没有写入职迹 SQLite。" onClose={() => setClosePrompt(false)}><div className="career-draft-choice"><p>继续编辑会完整保留当前表单；只有明确放弃才会关闭。</p><div><button type="button" className="career-button primary" data-dialog-initial onClick={() => setClosePrompt(false)}>继续编辑</button><button type="button" className="career-button danger" onClick={() => { clearDirty(); setClosePrompt(false); onClose(); }}>放弃输入</button></div></div></Modal>}</>;
 }
 
-function ContactModal({ contactId, data, externalHint, newWritesBlocked, newWritesBlockedNow, onExternalMutationChange, onClose, onRefresh, onSaved, notify }: { contactId: string | null; data: CareerData; externalHint: string; newWritesBlocked: boolean; newWritesBlockedNow: () => boolean; onExternalMutationChange: (active: boolean) => void; onClose: () => void; onRefresh: () => Promise<void>; onSaved: (contactId: string) => void; notify: (text: string, tone?: Notice["tone"]) => void }) {
+function ContactModal({ contactId, data, externalHint, newWritesBlocked, newWritesBlockedNow, onExternalMutationChange, onClose, onRefresh, onSaved, notify }: { contactId: string | null; data: CareerData; externalHint: string; newWritesBlocked: boolean; newWritesBlockedNow: () => boolean; onExternalMutationChange: (active: boolean) => boolean; onClose: () => void; onRefresh: () => Promise<void>; onSaved: (contactId: string) => void; notify: (text: string, tone?: Notice["tone"]) => void }) {
   const [detail, setDetail] = useState<CareerContactDetail | null>(null);
   const [loading, setLoading] = useState(Boolean(contactId));
   const [readError, setReadError] = useState("");
@@ -4470,8 +4640,11 @@ function ContactModal({ contactId, data, externalHint, newWritesBlocked, newWrit
       setError("核心资料需要先完成核对；联系人输入仍保留，没有保存。");
       return;
     }
+    if (!onExternalMutationChange(true)) {
+      setError("另一笔数据库操作已经开始；联系人输入仍保留。");
+      return;
+    }
     writeRef.current = true;
-    onExternalMutationChange(true);
     setPhase("writing");
     setError("");
     const form = new FormData(event.currentTarget);
@@ -4543,7 +4716,7 @@ function ContactModal({ contactId, data, externalHint, newWritesBlocked, newWrit
   return <Modal title={contactId ? "编辑联系人" : "添加联系人"} description="只保存你确认过的资料与职位关系；联系事实需要单独记录。" onClose={requestClose} dismissible={canDismiss} inertToasts={!canDismiss} wide><div ref={phaseRootRef} className="career-contact-modal-phase" tabIndex={-1}>{loading ? <div className="career-modal-loading"><LoaderCircle className="spin" size={20} />正在打开资料…</div> : contactId && (!detail || readError) ? <div className="career-drawer-read-error" role="status"><ShieldCheck size={22} /><h3>联系人资料暂时没有打开</h3><p>{readError || "没有把它显示成一份可覆盖的空表单。"}</p><div><button type="button" className="career-button primary" data-dialog-initial onClick={retryRead}><RotateCcw size={16} />重新读取</button><button type="button" className="career-button ghost" onClick={onClose}>关闭</button></div></div> : <>{phase === "writing" || phase === "checking" || phase === "refreshing" ? <ContactWriteStatus icon="busy" title={phase === "writing" ? "正在核对并保存" : phase === "checking" ? "正在只读核对保存结果" : "已经停止写入，正在重新读取"} message={phase === "checking" ? "只核对原凭据，不会再次创建联系人。" : phase === "refreshing" ? "这一步只刷新画面，不会再次保存。" : "写入期间会保留表单，暂时不能关闭。"} /> : phase === "uncertain" ? <ContactWriteStatus icon="safe" title="先核对这次保存" message={error} action={<button className="career-button primary" data-contact-safe-focus onClick={() => void inspectUncertain()}><Search size={16} />只读核对</button>} /> : phase === "refresh-only" ? <ContactWriteStatus icon="safe" title="只重新读取联系人" message={error} action={<button className="career-button primary" data-contact-safe-focus onClick={() => void refreshOnly(contactId ?? stableContactId)}><RotateCcw size={16} />重新读取</button>} /> : phase === "blocked" ? <ContactWriteStatus icon="safe" title="没有覆盖已有记录" message={error} action={<button className="career-button primary" data-contact-safe-focus onClick={onClose}>返回联系人</button>} /> : null}{phase === "editing" && discardPrompt && <ContactDiscardPrompt noun="联系人输入" onKeep={() => setDiscardPrompt(false)} onDiscard={() => { setDirty(false); onClose(); }} />}<form hidden={phase !== "editing" || discardPrompt} className="career-form" onChange={() => setDirty(true)} onSubmit={submit}>{externalHint && <div className="career-contact-external-hint" role="status"><ShieldCheck size={16} /><span>{externalHint}</span></div>}<div className="career-form-row"><Field label="姓名"><input name="name" required defaultValue={contact?.name ?? ""} /></Field><Field label="公司" hint="可选"><input name="company" defaultValue={contact?.company ?? ""} /></Field></div><div className="career-form-row"><Field label="身份 / 关系" hint="可选"><input name="role" defaultValue={contact?.role ?? ""} placeholder="Recruiter / 内推人" /></Field><Field label="常用渠道" hint="可选"><select name="channel" defaultValue={contact?.channel ?? ""}><option value="">不设置</option><option>LinkedIn</option><option>BOSS直聘</option><option>邮件</option><option>微信</option><option>电话</option><option>其他</option></select></Field></div><div className="career-form-row"><Field label="邮箱" hint="可选"><input name="email" type="email" defaultValue={contact?.email ?? ""} /></Field><Field label="电话" hint="可选"><input name="phone" defaultValue={contact?.phone ?? ""} /></Field></div><fieldset className="career-contact-job-picker"><legend>关联职位 <small>只建立你明确选择的关系</small></legend>{jobsForPicker.length > 0 ? <div>{jobsForPicker.map((job) => { const stage = data.stages.find((item) => item.id === job.stage_id); const context = job.archived === 1 ? "已归档" : stage?.is_terminal ? "已结束" : "进行中"; return <label key={job.id}><input type="checkbox" name="jobIds" value={job.id} defaultChecked={linked.has(job.id)} /><span><b>{job.role}</b><small>{job.company} · {context}</small></span></label>; })}</div> : <p>还没有可关联的职位。</p>}</fieldset><Field label="备注" hint="可选"><textarea name="notes" rows={4} defaultValue={contact?.notes ?? ""} placeholder="怎么认识、希望记住什么；不用重复写沟通记录。" /></Field>{error && <div className="career-inline-error" role="status"><ShieldCheck size={15} />{error}</div>}<div className="career-form-actions"><button type="button" className="career-button ghost" onClick={requestClose}>取消</button><button className="career-button primary" disabled={newWritesBlocked}><Check size={16} />保存联系人</button></div></form></>}</div></Modal>;
 }
 
-function ContactInteractionModal({ contactId, data, externalHint, newWritesBlocked, newWritesBlockedNow, onExternalMutationChange, onClose, onRefresh, onSaved, notify }: { contactId: string; data: CareerData; externalHint: string; newWritesBlocked: boolean; newWritesBlockedNow: () => boolean; onExternalMutationChange: (active: boolean) => void; onClose: () => void; onRefresh: () => Promise<void>; onSaved: () => void; notify: (text: string, tone?: Notice["tone"]) => void }) {
+function ContactInteractionModal({ contactId, data, externalHint, newWritesBlocked, newWritesBlockedNow, onExternalMutationChange, onClose, onRefresh, onSaved, notify }: { contactId: string; data: CareerData; externalHint: string; newWritesBlocked: boolean; newWritesBlockedNow: () => boolean; onExternalMutationChange: (active: boolean) => boolean; onClose: () => void; onRefresh: () => Promise<void>; onSaved: () => void; notify: (text: string, tone?: Notice["tone"]) => void }) {
   const [detail, setDetail] = useState<CareerContactDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [scheduleNext, setScheduleNext] = useState(false);
@@ -4641,8 +4814,11 @@ function ContactInteractionModal({ contactId, data, externalHint, newWritesBlock
       setError("核心资料需要先完成核对；联系记录输入仍保留，没有保存。");
       return;
     }
+    if (!onExternalMutationChange(true)) {
+      setError("另一笔数据库操作已经开始；联系记录输入仍保留。");
+      return;
+    }
     writeRef.current = true;
-    onExternalMutationChange(true);
     setPhase("writing");
     setError("");
     const form = new FormData(event.currentTarget);
@@ -4715,7 +4891,7 @@ function ContactInteractionModal({ contactId, data, externalHint, newWritesBlock
   return <Modal title="记录一次真实联系" description={`记录与 ${contact.name} 已经发生的沟通；不会自动发送消息。`} onClose={requestClose} dismissible={canDismiss} inertToasts={!canDismiss} wide><div ref={phaseRootRef} className="career-contact-modal-phase" tabIndex={-1}>{discardPrompt ? <ContactDiscardPrompt noun="联系记录" onKeep={() => setDiscardPrompt(false)} onDiscard={() => { setDirty(false); onClose(); }} /> : <>{phase === "writing" || phase === "checking" || phase === "refreshing" ? <ContactWriteStatus icon="busy" title={phase === "writing" ? "正在核对并保存" : phase === "checking" ? "正在只读核对保存结果" : "已经停止写入，正在重新读取"} message={phase === "checking" ? "只核对原凭据，不会再次创建联系记录或待办。" : phase === "refreshing" ? "这一步只刷新画面，不会再次保存。" : "写入期间会保留表单，暂时不能关闭。"} /> : phase === "uncertain" ? <ContactWriteStatus icon="safe" title="先核对这次联系" message={error} action={<button className="career-button primary" data-contact-safe-focus onClick={() => void inspectUncertain()}><Search size={16} />只读核对</button>} /> : phase === "refresh-only" ? <ContactWriteStatus icon="safe" title="只重新读取联系人" message={error} action={<button className="career-button primary" data-contact-safe-focus onClick={() => void refreshOnly()}><RotateCcw size={16} />重新读取</button>} /> : phase === "blocked" ? <ContactWriteStatus icon="safe" title="没有覆盖已有记录" message={error} action={<button className="career-button primary" data-contact-safe-focus onClick={onClose}>返回联系历史</button>} /> : null}{phase === "editing" && discardPrompt && <ContactDiscardPrompt noun="联系记录" onKeep={() => setDiscardPrompt(false)} onDiscard={() => { setDirty(false); onClose(); }} />}<form hidden={phase !== "editing" || discardPrompt} className="career-form" onChange={() => setDirty(true)} onSubmit={submit}>{externalHint && <div className="career-contact-external-hint" role="status"><ShieldCheck size={16} /><span>{externalHint}</span></div>}<div className="career-form-row thirds"><Field label="发生时间"><input name="occurred_at" type="datetime-local" required defaultValue={dateInputValue(stableCreatedAt)} /></Field><Field label="方向"><select name="direction" required defaultValue=""><option value="" disabled>请选择</option><option value="outbound">我发出</option><option value="inbound">对方发来</option><option value="mutual">双方交流</option></select></Field><Field label="渠道"><select name="channel" defaultValue=""><option value="">未注明</option><option>LinkedIn</option><option>BOSS直聘</option><option>邮件</option><option>微信</option><option>电话</option><option>当面</option><option>其他</option></select></Field></div><Field label="沟通摘要" hint="必填，写事实而不是评价"><input name="summary" required placeholder="例如：确认了作品集评审时间" /></Field><Field label="关联职位" hint="可选；选择即明确建立关系"><select name="job_id" defaultValue=""><option value="">不关联职位</option>{jobsForPicker.map((job) => <option key={job.id} value={job.id}>{job.company} · {job.role}{job.archived === 1 ? "（已归档）" : ""}</option>)}</select></Field><Field label="补充备注" hint="可选"><textarea name="notes" rows={4} placeholder="关键信息、对方提到的事项…" /></Field><label className="career-contact-follow-toggle"><input type="checkbox" checked={scheduleNext} onChange={(event) => setScheduleNext(event.target.checked)} /><span><b>顺手安排下一步</b><small>只有你选择后才创建待办</small></span></label>{scheduleNext && <div className="career-contact-follow-fields"><Field label="下一步动作"><input name="follow_up_title" required placeholder="例如：发送更新后的案例页" /></Field><Field label="时间"><input name="follow_up_due_at" type="datetime-local" required /></Field></div>}{error && <div className="career-inline-error" role="status"><ShieldCheck size={15} />{error}</div>}<div className="career-form-actions"><button type="button" className="career-button ghost" onClick={requestClose}>取消</button><button className="career-button primary" disabled={newWritesBlocked}><MessageSquareText size={16} />保存联系记录</button></div></form></>}</div></Modal>;
 }
 
-function ContactTaskModal({ contactId, data, externalHint, newWritesBlocked, newWritesBlockedNow, onExternalMutationChange, onClose, onRefresh, onSaved, notify }: { contactId: string; data: CareerData; externalHint: string; newWritesBlocked: boolean; newWritesBlockedNow: () => boolean; onExternalMutationChange: (active: boolean) => void; onClose: () => void; onRefresh: () => Promise<void>; onSaved: () => void; notify: (text: string, tone?: Notice["tone"]) => void }) {
+function ContactTaskModal({ contactId, data, externalHint, newWritesBlocked, newWritesBlockedNow, onExternalMutationChange, onClose, onRefresh, onSaved, notify }: { contactId: string; data: CareerData; externalHint: string; newWritesBlocked: boolean; newWritesBlockedNow: () => boolean; onExternalMutationChange: (active: boolean) => boolean; onClose: () => void; onRefresh: () => Promise<void>; onSaved: () => void; notify: (text: string, tone?: Notice["tone"]) => void }) {
   const [detail, setDetail] = useState<CareerContactDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [readError, setReadError] = useState("");
@@ -4811,8 +4987,11 @@ function ContactTaskModal({ contactId, data, externalHint, newWritesBlocked, new
       setError("核心资料需要先完成核对；待办输入仍保留，没有创建。");
       return;
     }
+    if (!onExternalMutationChange(true)) {
+      setError("另一笔数据库操作已经开始；待办输入仍保留。");
+      return;
+    }
     writeRef.current = true;
-    onExternalMutationChange(true);
     setPhase("writing");
     setError("");
     const form = new FormData(event.currentTarget);
@@ -4916,7 +5095,7 @@ function useMaterialPhaseFocus(phase: string, enabled = true) {
   return phaseRootRef;
 }
 
-function MaterialModal({ data, initialRecovery, otherRecoveryPending, newWritesBlocked, newWritesBlockedNow, onExternalMutationChange, onRecoveryUpsert, onRecoveryClear, onClose, onStaleClose, onRefresh, notify }: { data: CareerData; initialRecovery: CareerMaterialSaveRecoveryEntry | null; otherRecoveryPending: boolean; newWritesBlocked: boolean; newWritesBlockedNow: () => boolean; onExternalMutationChange: (active: boolean) => void; onRecoveryUpsert: (ticket: CareerMaterialSaveRecoveryTicket) => boolean; onRecoveryClear: (ticket: CareerMaterialSaveRecoveryTicket, persisted: boolean) => boolean; onClose: () => void; onStaleClose: () => void; onRefresh: () => Promise<void>; notify: (text: string, tone?: Notice["tone"]) => void }) {
+function MaterialModal({ data, initialRecovery, otherRecoveryPending, newWritesBlocked, newWritesBlockedNow, onExternalMutationChange, onRecoveryUpsert, onRecoveryClear, onClose, onStaleClose, onRefresh, notify }: { data: CareerData; initialRecovery: CareerMaterialSaveRecoveryEntry | null; otherRecoveryPending: boolean; newWritesBlocked: boolean; newWritesBlockedNow: () => boolean; onExternalMutationChange: (active: boolean) => boolean; onRecoveryUpsert: (ticket: CareerMaterialSaveRecoveryTicket) => boolean; onRecoveryClear: (ticket: CareerMaterialSaveRecoveryTicket, persisted: boolean) => boolean; onClose: () => void; onStaleClose: () => void; onRefresh: () => Promise<void>; notify: (text: string, tone?: Notice["tone"]) => void }) {
   const initialSnapshot = initialRecovery?.ticket.kind === "uncertain-save" ? initialRecovery.ticket.expectedSnapshot : null;
   const [materialId] = useState(() => initialRecovery?.ticket.kind === "uncertain-save" ? initialRecovery.ticket.materialId : newId("material"));
   const [phase, setPhase] = useState<CareerMaterialSavePhase>(() => initialRecovery?.ticket.kind === "uncertain-save" ? "uncertain" : initialRecovery ? "cleanup-review" : "editing");
@@ -5089,6 +5268,10 @@ function MaterialModal({ data, initialRecovery, otherRecoveryPending, newWritesB
 
   async function retryAttachmentCleanup() {
     if (savingRef.current || !cleanupReceipt) return;
+    if (!onExternalMutationChange(true)) {
+      setError("另一笔数据库操作已经开始；附件收尾没有执行。");
+      return;
+    }
     savingRef.current = true;
     setPhase("cleanup-running");
     setError("");
@@ -5128,6 +5311,7 @@ function MaterialModal({ data, initialRecovery, otherRecoveryPending, newWritesB
       setError(caught instanceof Error ? caught.message : "附件收尾暂时没有完成；恢复线索仍保留。");
     } finally {
       savingRef.current = false;
+      onExternalMutationChange(false);
     }
   }
 
@@ -5285,8 +5469,11 @@ function MaterialModal({ data, initialRecovery, otherRecoveryPending, newWritesB
       setError("还有一份材料保存等待核对。先完成已有收尾，再添加新的附件。");
       return;
     }
+    if (!onExternalMutationChange(true)) {
+      setError("另一笔数据库操作已经开始；材料输入仍保留。");
+      return;
+    }
     savingRef.current = true;
-    onExternalMutationChange(true);
     setPhase("saving");
     setError("");
     const form = new FormData(event.currentTarget);
@@ -5445,7 +5632,7 @@ function MaterialModal({ data, initialRecovery, otherRecoveryPending, newWritesB
   </Modal>{closeConfirm && <Modal title="放弃这份材料草稿吗？" description="表单和所选文件还没有写入职迹。" onClose={resumeMaterialEditing} inertToasts><div className="career-material-close-choice"><p>继续编辑会保留当前输入；明确放弃只关闭表单，不会影响已经存在的材料。</p><div><button className="career-button primary" data-dialog-initial onClick={resumeMaterialEditing}>继续编辑</button><button className="career-button danger" onClick={() => { resumeEditingFocusPendingRef.current = false; finalClosePendingRef.current = true; setCloseConfirm(false); }}>放弃这次输入</button></div></div></Modal>}</>;
 }
 
-function MaterialDeletionModal({ material, newWritesBlocked, newWritesBlockedNow, onExternalMutationChange, onClose, onStaleClose, onRefresh, notify }: { material: Pick<Material, "id" | "name" | "file_key">; newWritesBlocked: boolean; newWritesBlockedNow: () => boolean; onExternalMutationChange: (active: boolean) => void; onClose: () => void; onStaleClose: () => void; onRefresh: () => Promise<void>; notify: (text: string, tone?: Notice["tone"]) => void }) {
+function MaterialDeletionModal({ material, newWritesBlocked, newWritesBlockedNow, onExternalMutationChange, onClose, onStaleClose, onRefresh, notify }: { material: Pick<Material, "id" | "name" | "file_key">; newWritesBlocked: boolean; newWritesBlockedNow: () => boolean; onExternalMutationChange: (active: boolean) => boolean; onClose: () => void; onStaleClose: () => void; onRefresh: () => Promise<void>; notify: (text: string, tone?: Notice["tone"]) => void }) {
   const [phase, setPhase] = useState<CareerMaterialDeletionPhase>("loading");
   const [state, setState] = useState<CareerMaterialDeletionState | null>(null);
   const [message, setMessage] = useState("");
@@ -5521,9 +5708,8 @@ function MaterialDeletionModal({ material, newWritesBlocked, newWritesBlockedNow
 
   async function performDeletion() {
     if (mutationRef.current) return;
-    const claimsNewMutation = state?.state === "present";
-    if (claimsNewMutation && newWritesBlockedNow()) {
-      setMessage("先处理当前核心保存或核对提醒；没有开始新的材料移除。");
+    if (newWritesBlockedNow()) {
+      setMessage("先处理当前数据库操作；没有开始材料移除或附件收尾。");
       return;
     }
     const receipt: CareerMaterialDeletionReceipt | null = state?.state === "present" || state?.state === "cleanup_pending" ? state.receipt : null;
@@ -5532,8 +5718,11 @@ function MaterialDeletionModal({ material, newWritesBlocked, newWritesBlockedNow
       setMessage("这份材料的确认信息已经变化。没有开始移除，请重新读取后再决定。");
       return;
     }
+    if (!onExternalMutationChange(true)) {
+      setMessage("另一笔数据库操作已经开始；没有移除材料或附件。");
+      return;
+    }
     mutationRef.current = true;
-    if (claimsNewMutation) onExternalMutationChange(true);
     setPhase("deleting");
     setMessage("");
     try {
@@ -5586,7 +5775,7 @@ function MaterialDeletionModal({ material, newWritesBlocked, newWritesBlockedNow
       }
     } finally {
       mutationRef.current = false;
-      if (claimsNewMutation) onExternalMutationChange(false);
+      onExternalMutationChange(false);
     }
   }
 
@@ -5766,7 +5955,7 @@ function CareerImportPreviewEditor({ row, draft, data, sameName, sameNameDecisio
   </article>;
 }
 
-function CareerImportModal({ data, initialCapture, newWritesBlocked, newWritesBlockedNow, onExternalMutationChange, onClose, onRefresh, notify }: { data: CareerData; initialCapture: CareerCapturedSource | null; newWritesBlocked: boolean; newWritesBlockedNow: () => boolean; onExternalMutationChange: (active: boolean) => void; onClose: () => void; onRefresh: () => Promise<void>; notify: (text: string, tone?: Notice["tone"]) => void }) {
+function CareerImportModal({ data, initialCapture, newWritesBlocked, newWritesBlockedNow, onExternalMutationChange, onClose, onRefresh, notify }: { data: CareerData; initialCapture: CareerCapturedSource | null; newWritesBlocked: boolean; newWritesBlockedNow: () => boolean; onExternalMutationChange: (active: boolean) => boolean; onClose: () => void; onRefresh: () => Promise<void>; notify: (text: string, tone?: Notice["tone"]) => void }) {
   const [mode, setMode] = useState<CareerImportMode>(initialCapture ? "capture" : "paste");
   const [paste, setPaste] = useState("");
   const [capture, setCapture] = useState<CareerCapturedSource>(initialCapture ?? { url: "", selectedText: "" });
@@ -6047,8 +6236,11 @@ function CareerImportModal({ data, initialCapture, newWritesBlocked, newWritesBl
     if (!newImportOperationOpen()) return;
     const selected = selectCareerImportCommitRows(rowsRef.current, absentRowIds);
     if (selected.length === 0) return;
+    if (!onExternalMutationChange(true)) {
+      setError("另一笔数据库操作已经开始；没有保存导入职位。");
+      return;
+    }
     commitRef.current = true;
-    onExternalMutationChange(true);
     setPhase("committing");
     setError("");
     try {

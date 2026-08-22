@@ -114,7 +114,8 @@ test("committed refresh recovery cannot repeat a task write", () => {
   assert.doesNotMatch(retry, /careerTaskActions\.(complete|reschedule|cancel|restore|reopenCompleted|create)/);
   assert.match(source, /更改已保存在本机/);
   assert.match(source, /请只重新读取，不要重复提交/);
-  assert.match(source, /stableIdRef = useRef\(newId\("task"\)\)/);
+  assert.match(source, /lifecycleTaskWrites\.submitTaskCreate\(input, expected, trigger\)/);
+  assert.match(source, /lifecycleTaskWrites\.submitTaskComplete\(expected, trigger\)/);
 });
 
 test("restore and cancel ask for a safe explicit decision", () => {

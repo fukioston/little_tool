@@ -161,8 +161,8 @@ test("every job stage and archive entrance goes through one lifecycle request", 
   assert.doesNotMatch(source, /UPDATE career_jobs SET stage_id/);
   assert.doesNotMatch(source, /UPDATE career_jobs SET archived/);
   assert.doesNotMatch(source, /function moveJob|function removeJob/);
-  assert.match(source, /prepareCareerLifecycleChange\(intent\)/);
-  assert.match(source, /commitPreparedCareerLifecycleChange\(prepared, choice\)/);
+  assert.match(source, /lifecycleTaskWrites\.previewLifecycle\(/);
+  assert.match(source, /lifecycleTaskWrites\.submitLifecycle\(prepared, choice, trigger\)/);
   assert.match(source, /onLifecycle\(\{ kind: "stage"/);
   assert.match(source, /onLifecycle\(\{ kind: "archive"/);
   assert.match(source, /onLifecycle\(\{ kind: "restore"/);
@@ -184,27 +184,21 @@ test("a consequential lifecycle choice is never preselected", () => {
   assert.match(source, /\? "确认归档"/);
   assert.match(source, /\? "确认取回"/);
   assert.match(source, /\? "记录结果"/);
-  assert.match(source, /setLifecycleDialog\(null\);\s*focusAfterLifecycle\(\);/);
+  assert.match(source, /setLifecycleDialog\(null\);\s*lifecycleTaskWrites\.cancelLifecyclePreview\(\);\s*if \(focusRecovery\)[\s\S]*?attentionRef\.current\?\.focus[\s\S]*?else focusAfterLifecycle\(\);/);
 });
 
 test("changed previews and committed refresh recovery cannot repeat a write", () => {
   const finishStart = source.indexOf("async function finishPreparedLifecycle");
   const requestStart = source.indexOf("async function requestLifecycleChange", finishStart);
   const finishSource = source.slice(finishStart, requestStart);
-  assert.match(finishSource, /if \(result\.status === "changed"\)/);
-  assert.match(finishSource, /prepared: result\.prepared/);
+  assert.match(finishSource, /if \(result\.outcome === "preview-changed"\)/);
+  assert.match(finishSource, /prepared: result\.preview/);
   assert.match(finishSource, /changed: true/);
   assert.match(source, /安排刚有变化，请再看一眼/);
-  assert.match(finishSource, /lifecycleRefreshOnlyRef\.current = true/);
-  assert.match(finishSource, /phase: "refresh-recovery"/);
-  assert.match(finishSource, /更改已保存在本机/);
-  const retryStart = source.indexOf("async function retryLifecycleRefresh");
-  const undoStart = source.indexOf("async function handleUndo", retryStart);
-  const retrySource = source.slice(retryStart, undoStart);
-  assert.match(retrySource, /await requireRefresh\(\)/);
-  assert.doesNotMatch(retrySource, /commitPreparedCareerLifecycleChange|prepareCareerLifecycleChange/);
-  assert.match(source, /请不要重复提交/);
-  assert.match(source, /dismissible=\{false\} inertToasts/);
+  assert.match(source, /lifecycleTaskWrites\.flow\.phase === "refresh-only"/);
+  assert.match(source, /lifecycleTaskWrites\.retryRefresh\(\)/);
+  assert.doesNotMatch(source, /commitPreparedCareerLifecycleChange|prepareCareerLifecycleChange/);
+  assert.match(source, /只重新读取/);
 });
 
 test("dragging is pointer-only while the stage select remains the keyboard path", () => {

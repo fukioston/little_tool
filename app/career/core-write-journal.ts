@@ -4,9 +4,12 @@ import {
 } from "@/lib/career/core-writes";
 
 export const CAREER_CORE_WRITE_PREFIX = "career.core-write.v1:";
+export const CAREER_LIFECYCLE_TASK_WRITE_PREFIX =
+  "career.lifecycle-task-write.v1:";
 export const CAREER_CORE_WRITE_JOURNAL_LOCK =
   "private-ai-suite:career:core-write-journal";
 export const CAREER_CORE_WRITE_MAX_CHARS = 1024 * 1024;
+export const CAREER_LIFECYCLE_TASK_WRITE_MAX_BYTES = 8 * 1024 * 1024;
 
 export type CareerCoreWriteTicket = Readonly<{
   version: 1;
@@ -26,8 +29,14 @@ export type UnreadableCareerCoreWrite = Readonly<{
   raw: string;
 }>;
 
+export type CareerCoreWritePeerEntry = Readonly<{
+  storageKey: string;
+  raw: string;
+}>;
+
 export type CareerCoreWriteJournal = Readonly<{
   entries: readonly CareerCoreWriteEntry[];
+  peerEntries: readonly CareerCoreWritePeerEntry[];
   unreadable: readonly UnreadableCareerCoreWrite[];
   storageUnavailable: boolean;
   lockUnavailable: boolean;
@@ -142,6 +151,7 @@ export function readCareerCoreWriteJournal(
   locks: CareerCoreWriteJournalLockManager | null = browserLocks(),
 ): CareerCoreWriteJournal {
   const entries: CareerCoreWriteEntry[] = [];
+  const peerEntries: CareerCoreWritePeerEntry[] = [];
   const unreadable: UnreadableCareerCoreWrite[] = [];
   try {
     const length = storage.length;
@@ -152,10 +162,20 @@ export function readCareerCoreWriteJournal(
         throw new Error("unstable storage enumeration");
       }
       seen.add(storageKey);
-      if (!storageKey.startsWith(CAREER_CORE_WRITE_PREFIX)) continue;
+      const core = storageKey.startsWith(CAREER_CORE_WRITE_PREFIX);
+      const peer = storageKey.startsWith(CAREER_LIFECYCLE_TASK_WRITE_PREFIX);
+      if (!core && !peer) continue;
       let raw = "";
       try {
         raw = storage.getItem(storageKey) ?? "";
+        if (peer) {
+          if (!raw || new TextEncoder().encode(raw).byteLength >
+              CAREER_LIFECYCLE_TASK_WRITE_MAX_BYTES) {
+            throw new Error("invalid peer ticket size");
+          }
+          peerEntries.push({ storageKey, raw });
+          continue;
+        }
         if (!raw || raw.length > CAREER_CORE_WRITE_MAX_CHARS) {
           throw new Error("invalid ticket size");
         }
@@ -175,6 +195,7 @@ export function readCareerCoreWriteJournal(
   } catch {
     return {
       entries: [],
+      peerEntries: [],
       unreadable: [],
       storageUnavailable: true,
       lockUnavailable: !locks,
@@ -185,8 +206,10 @@ export function readCareerCoreWriteJournal(
     left.storageKey.localeCompare(right.storageKey));
   unreadable.sort((left, right) =>
     left.storageKey.localeCompare(right.storageKey));
+  peerEntries.sort((left, right) => left.storageKey.localeCompare(right.storageKey));
   return {
     entries,
+    peerEntries,
     unreadable,
     storageUnavailable: false,
     lockUnavailable: !locks,
@@ -254,7 +277,7 @@ export async function persistCareerCoreWrite(
     if (journal.unreadable.length > 0) {
       throw new Error("先处理无法验证的职迹提醒；没有开始新的写入。");
     }
-    if (journal.entries.length > 0) {
+    if (journal.entries.length > 0 || journal.peerEntries.length > 0) {
       throw new Error("先处理上一条职迹核对线索；没有开始新的写入。");
     }
     return persistToStorage(storage, ticket);
@@ -356,7 +379,7 @@ export async function runWithCurrentCareerCoreWrite<Result>(
     if (!entryNow || entryNow.raw !== entry.raw || rawNow.raw !== entry.raw) {
       return { outcome: "stale" } as const;
     }
-    if (journal.entries.length !== 1) {
+    if (journal.entries.length !== 1 || journal.peerEntries.length > 0) {
       return { outcome: "blocked", reason: "peer" } as const;
     }
     const leased = leaseFor(storage, entryNow);
@@ -381,7 +404,8 @@ export async function runWithMissingCareerCoreWrite<Result>(
     if (journal.unreadable.length > 0) return { outcome: "blocked", reason: "unreadable" } as const;
     const rawNow = currentRaw(storage, heldEntry.storageKey);
     if (!rawNow.available) return { outcome: "blocked", reason: "storage" } as const;
-    if (journal.entries.length > 0 || rawNow.raw !== null) {
+    if (journal.entries.length > 0 || journal.peerEntries.length > 0 ||
+      rawNow.raw !== null) {
       return { outcome: "stale" } as const;
     }
     const checkpoint = persistToStorage(storage, {

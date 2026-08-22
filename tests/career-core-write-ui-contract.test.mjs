@@ -832,27 +832,23 @@ test("generation broadcast marks stale before a canceled reload can reach any mu
 });
 
 test("external mutation claims close the reverse core gate in the same tick", () => {
-  const gate = state.createCareerCoreExternalMutationGate();
-  const coreMayStart = () => !gate.isActive();
-  assert.equal(coreMayStart(), true);
-  assert.equal(gate.set("contact", true), 1);
-  assert.equal(coreMayStart(), false);
-  assert.equal(gate.set("task", true), 2);
-  assert.equal(gate.set("contact", false), 1);
-  assert.equal(coreMayStart(), false);
-  assert.equal(gate.set("task", false), 0);
-  assert.equal(coreMayStart(), true);
+  const gate = state.createCareerDatabaseMutationRegistry();
+  const contact = gate.tryClaim("contact");
+  assert.ok(contact);
+  assert.equal(gate.isActiveExcept("core"), true);
+  assert.equal(gate.tryClaim("task"), null);
+  assert.equal(gate.release(contact), true);
+  assert.equal(gate.isActive(), false);
 
   const getter = appSource.slice(
     appSource.indexOf("const coreExternalWriteInProgress"),
     appSource.indexOf("const refreshCoreAfterReceipt"),
   );
-  assert.match(getter, /externalMutationGateRef\.current\.isActive\(\)/);
+  assert.match(getter, /databaseMutationRegistryRef\.current\.isActiveExcept\("core"\)/);
   assert.doesNotMatch(getter, /modal ===|contactEditorId|selectedContactId|taskSheet/);
   for (const functionName of [
     "TaskDetailSheet",
     "ContactDrawer",
-    "TaskModal",
     "ContactModal",
     "ContactInteractionModal",
     "ContactTaskModal",
@@ -1081,11 +1077,11 @@ test("prepare is durable before commit and the lease repeats the same-tick gate"
     flowSource.indexOf("const startPrepared = useCallback"),
     flowSource.indexOf("const submitStageRename"),
   );
-  assert.ok(start.indexOf("if (externalBlockedNow())") <
+  assert.ok(start.indexOf("if (externalBlockedNow()") <
     start.indexOf("const receipt = await prepare()"));
   assert.match(
     start,
-    /const receipt = await prepare\(\);[\s\S]*?if \(externalBlockedNow\(\)\)/,
+    /const receipt = await prepare\(\);[\s\S]*?if \(externalBlockedNow\(\)/,
   );
   assert.ok(start.indexOf("holdEntry(held)") <
     start.indexOf("await persistCareerCoreWrite"));
@@ -1095,7 +1091,7 @@ test("prepare is durable before commit and the lease repeats the same-tick gate"
     start.indexOf("commitEntry(durable)"));
   assert.match(
     start,
-    /await persistCareerCoreWrite\(held\.ticket\);[\s\S]*?if \(externalBlockedNow\(\)\)/,
+    /await persistCareerCoreWrite\(held\.ticket\);[\s\S]*?if \(externalBlockedNow\(\)/,
   );
 
   const commit = flowSource.slice(
@@ -1103,7 +1099,7 @@ test("prepare is durable before commit and the lease repeats the same-tick gate"
     flowSource.indexOf("const startPrepared = useCallback"),
   );
   assert.match(commit, /runWithCurrentCareerCoreWrite/);
-  assert.ok(commit.indexOf("if (externalBlockedNow())") <
+  assert.ok(commit.indexOf("if (externalBlockedNow()") <
     commit.indexOf("await commitCareerCoreWrite(receipt)"));
   assert.ok(commit.indexOf("lease.committed()") < commit.indexOf('return "saved"'));
   assert.ok(commit.indexOf("lease.changed()") < commit.indexOf('return "changed"'));
@@ -1137,14 +1133,11 @@ test("uncertainty is inspect-only; terminal refresh precedes raw-CAS removal", (
 });
 
 test("lifecycle collisions close both ways while recovery-only paths stay reachable", () => {
-  const lifecycle = appSource.slice(
-    appSource.indexOf("async function requestLifecycleChange"),
-    appSource.indexOf("async function retryLifecycleRefresh"),
-  );
+  const lifecycle = appSource.slice(appSource.indexOf("async function requestLifecycleChange"));
   assert.ok(lifecycle.indexOf("lifecycleWriteRef.current = true") <
-    lifecycle.indexOf("await prepareCareerLifecycleChange(intent)"));
+    lifecycle.indexOf("await lifecycleTaskWrites.previewLifecycle("));
   assert.match(lifecycle, /finishPreparedLifecycle/);
-  assert.match(appSource, /coreSnapshotStaleRef\.current \|\| coreWrites\.databaseMutationLocked \|\|[\s\S]*?coreWrites\.isWriteInProgress\(\)/);
+  assert.match(appSource, /databaseMutationRegistryRef\.current\.isActiveExcept\(owner\)/);
 
   const prepareBackup = appSource.slice(
     appSource.indexOf("async function prepareSelectedBackup"),
@@ -1160,14 +1153,14 @@ test("lifecycle collisions close both ways while recovery-only paths stay reacha
     appSource.indexOf("async function discardCandidate"),
     appSource.indexOf("async function retryPrepareCleanup"),
   );
-  assert.doesNotMatch(discardBackup, /newDatabaseWritesLockedNow\(\)/);
+  assert.match(discardBackup, /onExternalMutationChange\(true\)/);
 
   const materialDelete = appSource.slice(
     appSource.indexOf("async function performDeletion"),
     appSource.indexOf("async function inspectUncertainDeletion"),
   );
-  assert.match(materialDelete, /const claimsNewMutation = state\?\.state === "present";[\s\S]*?if \(claimsNewMutation && newWritesBlockedNow\(\)\)/);
-  assert.doesNotMatch(materialDelete, /state\?\.state === "cleanup_pending" && newWritesBlockedNow/);
+  assert.match(materialDelete, /if \(newWritesBlockedNow\(\)\)/);
+  assert.match(materialDelete, /if \(!onExternalMutationChange\(true\)\)/);
 });
 
 test("dirty and volatile exit protection plus 319px recovery controls remain operable", () => {

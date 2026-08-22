@@ -29,6 +29,7 @@ import {
 } from "@/lib/career/core-writes";
 import {
   CAREER_CORE_WRITE_PREFIX,
+  CAREER_LIFECYCLE_TASK_WRITE_PREFIX,
   careerCoreHeldReceiptBarrier,
   claimCareerCoreWrite,
   createCareerCoreWriteEntry,
@@ -53,6 +54,7 @@ import {
   runCareerCoreClaimedUiAction,
   type CareerCoreEditorSettlement,
   type CareerCoreEditorSettlementLifecycle,
+  type CareerDatabaseMutationToken,
 } from "./core-write-state";
 
 export type CareerCoreRefreshOutcome = "applied" | "superseded" | "deferred";
@@ -90,6 +92,7 @@ export type CareerCoreFlowState =
 const EMPTY_JOURNAL: JournalView = {
   loaded: false,
   entries: [],
+  peerEntries: [],
   unreadable: [],
   storageUnavailable: false,
   lockUnavailable: false,
@@ -155,6 +158,9 @@ export function useCareerCoreWriteFlow({
   dirtyEditorCount,
   onToast,
   onAttention,
+  claimDatabaseMutation,
+  releaseDatabaseMutation,
+  databaseMutationActiveExcept,
 }: {
   refresh: (
     receipt: CareerCoreWriteReceipt,
@@ -168,6 +174,9 @@ export function useCareerCoreWriteFlow({
   dirtyEditorCount: number;
   onToast: (message: string) => void;
   onAttention: () => void;
+  claimDatabaseMutation: () => CareerDatabaseMutationToken | null;
+  releaseDatabaseMutation: (token: CareerDatabaseMutationToken) => void;
+  databaseMutationActiveExcept: () => boolean;
 }) {
   const [journal, setJournal] = useState<JournalView>(EMPTY_JOURNAL);
   const [flow, setFlow] = useState<CareerCoreFlowState>({ phase: "idle" });
@@ -198,7 +207,7 @@ export function useCareerCoreWriteFlow({
     storageUnavailable: journal.storageUnavailable,
     lockUnavailable: journal.lockUnavailable,
     unreadableCount: journal.unreadable.length,
-    entryCount: journal.entries.length,
+    entryCount: journal.entries.length + journal.peerEntries.length,
     hasHeldReceipt: heldBarrier.blocksWrites,
     operationInProgress: busy,
     snapshotStale,
@@ -211,7 +220,7 @@ export function useCareerCoreWriteFlow({
     storageUnavailable: journal.storageUnavailable,
     lockUnavailable: journal.lockUnavailable,
     unreadableCount: journal.unreadable.length,
-    entryCount: journal.entries.length,
+    entryCount: journal.entries.length + journal.peerEntries.length,
     snapshotStale,
   });
   const hasVolatileWork = busy || heldBarrier.volatile;
@@ -254,6 +263,7 @@ export function useCareerCoreWriteFlow({
     } catch {
       next = {
         entries: [],
+        peerEntries: [],
         unreadable: [],
         storageUnavailable: true,
         lockUnavailable: typeof navigator === "undefined" || !navigator.locks,
@@ -317,7 +327,8 @@ export function useCareerCoreWriteFlow({
     function onStorage(event: StorageEvent) {
       if (
         event.storageArea === window.localStorage &&
-        (event.key === null || event.key.startsWith(CAREER_CORE_WRITE_PREFIX))
+        (event.key === null || event.key.startsWith(CAREER_CORE_WRITE_PREFIX) ||
+          event.key.startsWith(CAREER_LIFECYCLE_TASK_WRITE_PREFIX))
       ) passiveScan();
     }
     const onFocus = () => passiveScan();
@@ -637,11 +648,19 @@ export function useCareerCoreWriteFlow({
     trigger: HTMLElement,
     lifecycle?: CareerCoreSubmitLifecycle,
   ): Promise<CareerCoreSubmitResult> => {
+    const databaseToken = claimDatabaseMutation();
+    if (!databaseToken) {
+      setError("另一笔数据库操作已经开始；没有准备核心写入。");
+      return { outcome: "blocked", entityId: null };
+    }
     const token = claim("prepare", kind);
-    if (!token) return { outcome: "blocked", entityId: null };
+    if (!token) {
+      releaseDatabaseMutation(databaseToken);
+      return { outcome: "blocked", entityId: null };
+    }
     let held: CareerCoreWriteEntry | null = null;
     try {
-      if (externalBlockedNow()) {
+      if (externalBlockedNow() || databaseMutationActiveExcept()) {
         throw new CareerCoreExternalWritePausedError(
           "另一笔数据库操作正在进行，或画面不是最新版本；没有准备写入。",
         );
@@ -652,7 +671,7 @@ export function useCareerCoreWriteFlow({
         storageUnavailable: current.storageUnavailable,
         lockUnavailable: current.lockUnavailable,
         unreadableCount: current.unreadable.length,
-        entryCount: current.entries.length,
+        entryCount: current.entries.length + current.peerEntries.length,
         hasHeldReceipt: heldEntriesRef.current.size > 0,
         operationInProgress: false,
         snapshotStale: snapshotStaleNowRef.current(),
@@ -665,7 +684,7 @@ export function useCareerCoreWriteFlow({
       if (receipt.kind !== kind) {
         throw new Error("准备返回的收据不属于当前动作；没有保存或提交。");
       }
-      if (externalBlockedNow()) {
+      if (externalBlockedNow() || databaseMutationActiveExcept()) {
         throw new CareerCoreExternalWritePausedError(
           "准备期间另一笔数据库操作开始；输入仍保留，没有保存或提交收据。",
         );
@@ -677,7 +696,7 @@ export function useCareerCoreWriteFlow({
       const durable = await persistCareerCoreWrite(held.ticket);
       holdEntry(durable);
       reloadJournal();
-      if (externalBlockedNow()) {
+      if (externalBlockedNow() || databaseMutationActiveExcept()) {
         present({
           phase: "check",
           entry: durable,
@@ -702,8 +721,9 @@ export function useCareerCoreWriteFlow({
       return { outcome: "blocked", entityId: null };
     } finally {
       release(token);
+      releaseDatabaseMutation(databaseToken);
     }
-  }, [claim, commitEntry, externalBlockedNow, holdEntry, present, release, reloadJournal, rememberSettlement]);
+  }, [claim, claimDatabaseMutation, commitEntry, databaseMutationActiveExcept, externalBlockedNow, holdEntry, present, release, releaseDatabaseMutation, reloadJournal, rememberSettlement]);
 
   const submitStageRename = useCallback((
     name: string,
@@ -781,11 +801,19 @@ export function useCareerCoreWriteFlow({
 
   const continueExpected = useCallback(async () => {
     if (flow.phase !== "expected" || operationRef.current || externalBlockedNow()) return;
+    const databaseToken = claimDatabaseMutation();
+    if (!databaseToken) return;
     const token = claim("commit", flow.entry.ticket.receipt.kind);
-    if (!token) return;
+    if (!token) {
+      releaseDatabaseMutation(databaseToken);
+      return;
+    }
     try { await commitEntry(flow.entry); }
-    finally { release(token); }
-  }, [claim, commitEntry, externalBlockedNow, flow, release]);
+    finally {
+      release(token);
+      releaseDatabaseMutation(databaseToken);
+    }
+  }, [claim, claimDatabaseMutation, commitEntry, externalBlockedNow, flow, release, releaseDatabaseMutation]);
 
   const discardTerminal = useCallback(async () => {
     if (!(flow.phase === "expected" || flow.phase === "invalid") || operationRef.current) return;

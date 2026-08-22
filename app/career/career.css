@@ -2297,3 +2297,49 @@
   width: 100%;
   min-width: 0;
 }
+
+.career-lifecycle-task-recovery {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  margin-bottom: 14px;
+  padding: 14px 16px;
+  border: 1px solid #b9d2c6;
+  border-radius: 14px;
+  background: #f1f7f4;
+  color: #405e51;
+  overflow: hidden;
+}
+.career-lifecycle-task-recovery:focus-visible {
+  outline: 3px solid #8db09f45;
+  outline-offset: 2px;
+}
+.career-lifecycle-task-recovery > div { min-width: 0; }
+.career-lifecycle-task-recovery b { color: var(--career-ink); font-size: 13px; }
+.career-lifecycle-task-recovery p {
+  margin: 4px 0 0;
+  font-size: 12px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+.career-lifecycle-task-recovery > footer {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.career-lifecycle-task-recovery .career-button { min-height: 44px; }
+
+@media (max-width: 520px) {
+  .career-lifecycle-task-recovery {
+    grid-template-columns: minmax(0, 1fr);
+    padding: 13px;
+  }
+  .career-lifecycle-task-recovery > footer,
+  .career-lifecycle-task-recovery > footer .career-button {
+    width: 100%;
+    min-width: 0;
+    white-space: normal;
+  }
+}

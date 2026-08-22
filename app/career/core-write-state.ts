@@ -415,6 +415,69 @@ export function careerCoreHistoryGuardResolution(
   return hasRisk ? "keep" : "consume";
 }
 
+export const CAREER_DATABASE_MUTATION_OWNERS = [
+  "core", "lifecycle", "task", "backup", "contact", "import", "material",
+] as const;
+
+export type CareerDatabaseMutationOwner =
+  (typeof CAREER_DATABASE_MUTATION_OWNERS)[number];
+export type CareerDatabaseMutationToken = Readonly<{
+  owner: CareerDatabaseMutationOwner;
+  nonce: symbol;
+}>;
+
+/**
+ * Same-tick, owner-aware database mutation registry. A token is minted only
+ * while the registry is empty; releasing a stale or foreign token is a no-op.
+ * `isActiveExcept` lets the current owner recheck after an awaited prepare or
+ * lock acquisition without deadlocking itself.
+ */
+export function createCareerDatabaseMutationRegistry() {
+  const claims = new Map<CareerDatabaseMutationOwner, CareerDatabaseMutationToken>();
+  return {
+    tryClaim(owner: CareerDatabaseMutationOwner): CareerDatabaseMutationToken | null {
+      if (claims.size > 0) return null;
+      const token = Object.freeze({ owner, nonce: Symbol(`career-${owner}-mutation`) });
+      claims.set(owner, token);
+      return token;
+    },
+    release(token: CareerDatabaseMutationToken): boolean {
+      if (claims.get(token.owner) !== token) return false;
+      claims.delete(token.owner);
+      return true;
+    },
+    isActiveExcept(owner: CareerDatabaseMutationOwner): boolean {
+      for (const claimedOwner of claims.keys()) {
+        if (claimedOwner !== owner) return true;
+      }
+      return false;
+    },
+    isOwned(token: CareerDatabaseMutationToken): boolean {
+      return claims.get(token.owner) === token;
+    },
+    count(): number {
+      return claims.size;
+    },
+    isActive(): boolean {
+      return claims.size > 0;
+    },
+  } as const;
+}
+
+export function careerLifecycleTaskRecoveryAttention(input: Readonly<{
+  heldReceiptCount: number;
+  journalEntryCount: number;
+  peerEntryCount: number;
+  unreadableCount: number;
+  storageUnavailable: boolean;
+  lockUnavailable: boolean;
+}>): boolean {
+  return input.heldReceiptCount > 0 || input.journalEntryCount > 0 ||
+    input.peerEntryCount > 0 || input.unreadableCount > 0 ||
+    input.storageUnavailable || input.lockUnavailable;
+}
+
+/** @deprecated Use the token registry; kept as a compatibility facade for tests. */
 export function createCareerCoreExternalMutationGate() {
   const claims = new Set<string>();
   return {
@@ -423,9 +486,7 @@ export function createCareerCoreExternalMutationGate() {
       else claims.delete(key);
       return claims.size;
     },
-    isActive(): boolean {
-      return claims.size > 0;
-    },
+    isActive(): boolean { return claims.size > 0; },
   } as const;
 }
 
