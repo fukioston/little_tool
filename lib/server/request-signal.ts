@@ -44,16 +44,42 @@ export function isAbortLike(error: unknown): boolean {
   );
 }
 
-export async function readAbortableFormData(request: Request): Promise<FormData> {
+export class RequestBodyTooLargeError extends Error {
+  readonly name = "RequestBodyTooLargeError";
+
+  constructor(public readonly maxBytes: number) {
+    super(`request body exceeds ${maxBytes} bytes`);
+  }
+}
+
+export async function readBoundedAbortableFormData(
+  request: Request,
+  maxBytes: number,
+): Promise<FormData> {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) {
+    throw new TypeError("maxBytes must be a non-negative safe integer");
+  }
   if (request.signal.aborted) {
     throw request.signal.reason ?? new DOMException("request cancelled", "AbortError");
   }
   if (!request.body) return request.formData();
 
   const contentType = request.headers.get("content-type");
+  const declaredText = request.headers.get("content-length")?.trim() ?? "";
+  const declared = /^\d+$/.test(declaredText) ? Number(declaredText) : 0;
+  if (Number.isSafeInteger(declared) && declared > maxBytes) {
+    const reader = request.body.getReader();
+    try {
+      await reader.cancel(new RequestBodyTooLargeError(maxBytes)).catch(() => undefined);
+    } finally {
+      reader.releaseLock();
+    }
+    throw new RequestBodyTooLargeError(maxBytes);
+  }
   const reader = request.body.getReader();
   let streamController: ReadableStreamDefaultController<Uint8Array> | null = null;
   let stopped = false;
+  let total = 0;
   const abortFromCaller = () => {
     if (stopped) return;
     stopped = true;
@@ -77,6 +103,14 @@ export async function readAbortableFormData(request: Request): Promise<FormData>
           controller.close();
           return;
         }
+        if (value.byteLength > maxBytes - total) {
+          stopped = true;
+          const error = new RequestBodyTooLargeError(maxBytes);
+          controller.error(error);
+          await reader.cancel(error).catch(() => undefined);
+          return;
+        }
+        total += value.byteLength;
         controller.enqueue(value);
       } catch (error) {
         if (stopped) return;
@@ -103,4 +137,8 @@ export async function readAbortableFormData(request: Request): Promise<FormData>
     }
     reader.releaseLock();
   }
+}
+
+export function readAbortableFormData(request: Request): Promise<FormData> {
+  return readBoundedAbortableFormData(request, Number.MAX_SAFE_INTEGER);
 }

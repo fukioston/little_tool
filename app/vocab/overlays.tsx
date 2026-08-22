@@ -3,7 +3,16 @@
 import { useCallback, useEffect, useRef, useState, type ChangeEvent, type DragEvent } from "react";
 import { errorMessage, postJson } from "@/lib/vocab/api";
 import { VOCAB_AI_DISCLOSURE_BY_ACTION } from "@/lib/vocab/ai-payload";
-import { normalizeArticleApi, normalizePodcastApi, parseArticleText, parseTranscript, readFileText } from "@/lib/vocab/content";
+import {
+  normalizeArticleApi,
+  normalizePodcastApi,
+  normalizeTranscriptionSegments,
+  parseArticleText,
+  parseTranscript,
+  podcastEpisodeHasImportableMedia,
+  readFileText,
+  vocabLocalImportFileProblem,
+} from "@/lib/vocab/content";
 import {
   inspectVocabImportWrite,
   isVocabImportWriteReceipt,
@@ -274,6 +283,13 @@ class VocabLocalLockImportError extends Error {
   }
 }
 
+class VocabImportCancelledError extends Error {
+  constructor(message = "已取消转写；没有写入文章、字幕或音频。") {
+    super(message);
+    this.name = "VocabImportCancelledError";
+  }
+}
+
 function assertVocabExternalImportAllowed(
   localLock: boolean,
   signal: AbortSignal,
@@ -290,6 +306,64 @@ function throwIfVocabImportAborted(signal: AbortSignal) {
 function isVocabLocalLockImportError(reason: unknown): reason is VocabLocalLockImportError {
   return reason instanceof VocabLocalLockImportError;
 }
+
+function isVocabImportCancelledError(reason: unknown): reason is VocabImportCancelledError {
+  return reason instanceof VocabImportCancelledError;
+}
+
+function vocabImportErrorMessage(reason: unknown): string {
+  const code = reason && typeof reason === "object"
+    ? String((reason as { code?: unknown }).code ?? "")
+    : "";
+  if (code === "CROSS_ORIGIN_ISOLATION_REQUIRED") {
+    return "当前页面缺少安全打开 SQLite 所需的跨源隔离（COOP/COEP）。请从受支持的正式地址打开后再导入；没有写入任何内容。";
+  }
+  if (code === "OPFS_UNAVAILABLE") {
+    return "当前浏览器或隐私模式不支持保存本地音频所需的 OPFS。请改用最新版 Chrome、Edge 或 Safari 的普通窗口；没有写入任何内容。";
+  }
+  if (code === "BROWSER_STORAGE_UNAVAILABLE" || code === "BROWSER_REQUIRED") {
+    return "当前环境无法使用浏览器本地存储。请在受支持浏览器的普通窗口中重试；没有写入任何内容。";
+  }
+  return errorMessage(reason);
+}
+
+function localAudioStorageProblem(): string | null {
+  if (typeof navigator === "undefined" || !navigator.storage) {
+    return "当前环境无法使用浏览器本地存储，不能保存这份音频。";
+  }
+  if (typeof navigator.storage.getDirectory !== "function") {
+    return "当前浏览器或隐私模式不支持 OPFS，不能保存这份本地音频。";
+  }
+  return null;
+}
+
+function remoteTranscriptPayload(value: unknown): Readonly<{
+  text: string;
+  url: string;
+  transcriptType: string;
+}> {
+  const root = value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+  const data = root.data && typeof root.data === "object" && !Array.isArray(root.data)
+    ? root.data as Record<string, unknown>
+    : root;
+  if (typeof data.text !== "string" || !data.text.trim()) {
+    throw new Error("远程字幕为空。出版社没有返回可导入的字幕内容。");
+  }
+  return {
+    text: data.text,
+    url: typeof data.url === "string" ? data.url : "transcript.txt",
+    transcriptType: typeof data.transcriptType === "string"
+      ? data.transcriptType
+      : typeof data.contentType === "string" ? data.contentType : "",
+  };
+}
+
+type PendingAudioOnlyImport = Readonly<{
+  episode: ParsedPodcast;
+  reason: string;
+}>;
 
 export function ImportWizard({ localLock, onClose, onImported }: { localLock: boolean; onClose: () => void; onImported: (id: string) => void | Promise<void> }) {
   const [kind, setKind] = useState<"article" | "rss" | "audio">("article");
@@ -310,6 +384,8 @@ export function ImportWizard({ localLock, onClose, onImported }: { localLock: bo
   const [committedId, setCommittedId] = useState<string | null>(null);
   const [confirmAbandon, setConfirmAbandon] = useState(false);
   const [transcriptionConfigured, setTranscriptionConfigured] = useState<boolean | null>(null);
+  const [pendingAudioOnly, setPendingAudioOnly] = useState<PendingAudioOnlyImport | null>(null);
+  const [cancelRequested, setCancelRequested] = useState(false);
   const operation = useRef<AbortController | null>(null);
   const healthOperation = useRef<AbortController | null>(null);
   const busyRef = useRef(false);
@@ -392,12 +468,23 @@ export function ImportWizard({ localLock, onClose, onImported }: { localLock: bo
     if (busyRef.current) return false;
     busyRef.current = true;
     setBusy(true);
+    setCancelRequested(false);
     return true;
   };
   const finish = (controller?: AbortController) => {
     if (controller && operation.current === controller) operation.current = null;
     busyRef.current = false;
-    if (!closed.current) setBusy(false);
+    if (!closed.current) {
+      setBusy(false);
+      setCancelRequested(false);
+    }
+  };
+
+  const cancelCurrentOperation = () => {
+    const active = operation.current;
+    if (!active || active.signal.aborted) return;
+    setCancelRequested(true);
+    active.abort(new VocabImportCancelledError());
   };
   const checkpoint = (next: ImportRecovery) => {
     writeImportRecovery(next);
@@ -444,7 +531,7 @@ export function ImportWizard({ localLock, onClose, onImported }: { localLock: bo
     ) {
       if (!clearCheckpoint()) {
         setPhase("idle");
-        setError(errorMessage(caught));
+        setError(vocabImportErrorMessage(caught));
       }
       return;
     }
@@ -462,7 +549,7 @@ export function ImportWizard({ localLock, onClose, onImported }: { localLock: bo
       return;
     }
     setPhase("idle");
-    setError(errorMessage(caught));
+    setError(vocabImportErrorMessage(caught));
   };
 
   const submit = async () => {
@@ -490,14 +577,20 @@ export function ImportWizard({ localLock, onClose, onImported }: { localLock: bo
           article = parseArticleText(paste, title || "Pasted article");
         } else {
           if (!articleFile) throw new Error("请选择 txt、md 或 html 文件");
+          const fileProblem = vocabLocalImportFileProblem(articleFile, "article");
+          if (fileProblem) throw new Error(fileProblem);
+          const articleText = await readFileText(articleFile);
+          throwIfVocabImportAborted(controller.signal);
+          if (!articleText) throw new Error("文章文件没有可导入的文字内容。");
           article = parseArticleText(
-            await readFileText(articleFile),
+            articleText,
             title || articleFile.name.replace(/\.[^.]+$/, ""),
           );
         }
         if (title.trim()) article.title = title.trim();
         throwIfVocabImportAborted(controller.signal);
         const receipt = await prepareVocabArticleWrite(article, articleMode);
+        throwIfVocabImportAborted(controller.signal);
         checkpoint({ version: 1, type: "database", receipt });
         checkpointed = true;
         setPhase("committing");
@@ -517,9 +610,23 @@ export function ImportWizard({ localLock, onClose, onImported }: { localLock: bo
         setStage(0);
       } else {
         if (!audioFile && !transcriptFile) throw new Error("请添加音频或字幕文件");
-        let segments: ParsedPodcast["segments"] = transcriptFile
-          ? parseTranscript(await readFileText(transcriptFile), transcriptFile.name)
-          : [];
+        if (audioFile) {
+          const audioProblem = vocabLocalImportFileProblem(audioFile, "audio", {
+            forTranscription: transcribe,
+          });
+          if (audioProblem) throw new Error(audioProblem);
+          const storageProblem = localAudioStorageProblem();
+          if (storageProblem) throw new Error(storageProblem);
+        }
+        let segments: ParsedPodcast["segments"] = [];
+        if (transcriptFile) {
+          const transcriptProblem = vocabLocalImportFileProblem(transcriptFile, "transcript");
+          if (transcriptProblem) throw new Error(transcriptProblem);
+          const transcriptText = await readFileText(transcriptFile);
+          throwIfVocabImportAborted(controller.signal);
+          segments = parseTranscript(transcriptText, transcriptFile.name, transcriptFile.type);
+          if (!segments.length) throw new Error("字幕文件没有可导入的文字内容。");
+        }
         let durationMs = segments.at(-1)?.end_ms ?? 0;
         if (transcribe && audioFile && segments.length === 0) {
           assertVocabExternalImportAllowed(localLock, controller.signal, "本地锁已开启，没有发送音频转写。");
@@ -541,19 +648,15 @@ export function ImportWizard({ localLock, onClose, onImported }: { localLock: bo
             throw new Error(String((payload as Record<string, unknown>).error ?? "转写失败"));
           }
           const data = ((payload as Record<string, unknown>).data ?? payload) as Record<string, unknown>;
-          if (Array.isArray(data.segments)) {
-            segments = data.segments.flatMap((entry, index) => {
-              if (!entry || typeof entry !== "object") return [];
-              const row = entry as Record<string, unknown>;
-              return [{
-                start_ms: Number(row.start_ms ?? Number(row.start ?? index * 5) * 1_000),
-                end_ms: Number(row.end_ms ?? Number(row.end ?? (index + 1) * 5) * 1_000),
-                text: String(row.text ?? ""),
-                speaker: typeof row.speaker === "string" ? row.speaker : null,
-              }];
-            });
+          segments = normalizeTranscriptionSegments(data.segments);
+          const reportedDuration = Number(data.duration_ms);
+          durationMs = Number.isFinite(reportedDuration) && reportedDuration >= 0
+            ? Math.round(reportedDuration)
+            : segments.at(-1)?.end_ms ?? 0;
+          throwIfVocabImportAborted(controller.signal);
+          if (!segments.length) {
+            throw new Error("转写服务没有返回可导入的字幕；没有写入仅音频条目。");
           }
-          durationMs = Number(data.duration_ms ?? segments.at(-1)?.end_ms ?? 0);
         }
         throwIfVocabImportAborted(controller.signal);
         const podcast: ParsedPodcast = {
@@ -576,6 +679,7 @@ export function ImportWizard({ localLock, onClose, onImported }: { localLock: bo
             "file",
             audioFile,
           );
+          throwIfVocabImportAborted(controller.signal);
           const result = await saveVocabPodcastWithAudio(
             podcast,
             "file",
@@ -591,6 +695,7 @@ export function ImportWizard({ localLock, onClose, onImported }: { localLock: bo
           await finishCommitted(result.itemId);
         } else {
           const receipt = await prepareVocabPodcastWrite(podcast, "file");
+          throwIfVocabImportAborted(controller.signal);
           checkpoint({ version: 1, type: "database", receipt });
           checkpointed = true;
           await finishCommitted(await savePodcast(podcast, "file", receipt));
@@ -600,7 +705,14 @@ export function ImportWizard({ localLock, onClose, onImported }: { localLock: bo
       const localLockError = isVocabLocalLockImportError(caught)
         ? caught
         : isVocabLocalLockImportError(controller.signal.reason) ? controller.signal.reason : null;
-      if (localLockError && !checkpointed) {
+      const cancelled = isVocabImportCancelledError(caught)
+        ? caught
+        : isVocabImportCancelledError(controller.signal.reason) ? controller.signal.reason : null;
+      if (cancelled && !checkpointed) {
+        setPhase("idle");
+        setStage(0);
+        setError(cancelled.message);
+      } else if (localLockError && !checkpointed) {
         setPhase("idle");
         setError(localLockError.message);
       } else if (!controller.signal.aborted || checkpointed) {
@@ -611,7 +723,7 @@ export function ImportWizard({ localLock, onClose, onImported }: { localLock: bo
     }
   };
 
-  const importEpisode = async (episode: ParsedPodcast) => {
+  const importEpisode = async (episode: ParsedPodcast, audioOnlyConfirmed = false) => {
     if (!begin()) return;
     const controller = new AbortController();
     operation.current = controller;
@@ -620,31 +732,56 @@ export function ImportWizard({ localLock, onClose, onImported }: { localLock: bo
     setError("");
     let checkpointed = false;
     try {
-      let ready = episode;
-      if (!episode.segments.length && episode.transcriptUrl) {
+      if (!podcastEpisodeHasImportableMedia(episode)) {
+        throw new Error("这一集既没有音频，也没有受支持的字幕，不能导入。");
+      }
+      if (audioOnlyConfirmed && !episode.audioUrl) {
+        throw new Error("这一集没有音频，不能跳过失败的字幕。");
+      }
+      let ready: ParsedPodcast = audioOnlyConfirmed
+        ? { ...episode, transcriptUrl: undefined, transcriptType: undefined, segments: [] }
+        : episode;
+      if (!audioOnlyConfirmed && !episode.segments.length && episode.transcriptUrl) {
         try {
           assertVocabExternalImportAllowed(localLock, controller.signal, "本地锁已开启，没有读取这一集的远程字幕。");
           setStage(1);
-          const transcript = normalizeArticleApi(await postJson(
-            "/api/import/article",
-            { url: episode.transcriptUrl },
+          const transcript = remoteTranscriptPayload(await postJson(
+            "/api/import/rss",
+            {
+              kind: "transcript",
+              url: episode.transcriptUrl,
+              transcriptType: episode.transcriptType,
+            },
             controller.signal,
           ));
           assertVocabExternalImportAllowed(localLock, controller.signal, "本地锁已开启；远程字幕读取已经停止，没有继续处理。");
+          const segments = parseTranscript(
+            transcript.text,
+            transcript.url,
+            transcript.transcriptType || episode.transcriptType,
+          );
+          if (!segments.length) throw new Error("远程字幕没有可导入的文字内容。");
           ready = {
             ...episode,
-            segments: parseTranscript(
-              transcript.blocks.map((block) => block.text).join("\n\n"),
-              episode.transcriptUrl,
-            ),
+            segments,
           };
         } catch (caught) {
           if (controller.signal.aborted || isVocabLocalLockImportError(caught)) throw caught;
-          // The episode remains importable when its publisher blocks transcripts.
+          const reason = vocabImportErrorMessage(caught);
+          setPhase("idle");
+          setStage(0);
+          if (episode.audioUrl) {
+            setPendingAudioOnly({ episode, reason });
+            setError(`远程字幕读取失败：${reason} 请明确选择是否仍导入仅音频。`);
+            return;
+          }
+          throw new Error(`远程字幕读取失败：${reason} 这一集也没有音频，因此不能导入。`);
         }
       }
       throwIfVocabImportAborted(controller.signal);
+      setPendingAudioOnly(null);
       const receipt = await prepareVocabPodcastWrite(ready, "rss");
+      throwIfVocabImportAborted(controller.signal);
       checkpoint({ version: 1, type: "database", receipt });
       checkpointed = true;
       setPhase("committing");
@@ -654,7 +791,14 @@ export function ImportWizard({ localLock, onClose, onImported }: { localLock: bo
       const localLockError = isVocabLocalLockImportError(caught)
         ? caught
         : isVocabLocalLockImportError(controller.signal.reason) ? controller.signal.reason : null;
-      if (localLockError && !checkpointed) {
+      const cancelled = isVocabImportCancelledError(caught)
+        ? caught
+        : isVocabImportCancelledError(controller.signal.reason) ? controller.signal.reason : null;
+      if (cancelled && !checkpointed) {
+        setPhase("idle");
+        setStage(0);
+        setError(cancelled.message);
+      } else if (localLockError && !checkpointed) {
         setPhase("idle");
         setError(localLockError.message);
       } else if (!controller.signal.aborted || checkpointed) {
@@ -795,7 +939,7 @@ export function ImportWizard({ localLock, onClose, onImported }: { localLock: bo
     }
   };
 
-  const controlsLocked = busy || Boolean(recovery) || Boolean(committedId);
+  const controlsLocked = busy || Boolean(recovery) || Boolean(committedId) || Boolean(pendingAudioOnly);
   const recoveryAction = phase === "uncertain" || phase === "conflict" || phase === "recovery_absent" || phase === "refresh_failed";
   const primaryLabel = busy
     ? phase === "refreshing" ? "只刷新中…" : "正在确认…"
@@ -813,13 +957,129 @@ export function ImportWizard({ localLock, onClose, onImported }: { localLock: bo
       : phase === "refresh_failed"
         ? refreshOnly
         : submit;
+  const transcriptionSizeProblem = audioFile
+    ? vocabLocalImportFileProblem(audioFile, "audio", { forTranscription: true })
+    : null;
+  const canCancelTranscription = busy && kind === "audio" &&
+    phase === "preparing" && stage === 1 && transcribe;
 
-  return <><button className="sc-modal-scrim" disabled={busy} onClick={close} aria-label="关闭导入"/><section ref={dialog} className="sc-import-modal" role="dialog" aria-modal="true" aria-labelledby="sc-import-title" tabIndex={-1}><header><Logo/><div><span>添加到资料库</span><h2 id="sc-import-title">从哪里开始？</h2></div><button data-dialog-close disabled={busy} onClick={close} aria-label="关闭导入内容">×</button></header><div className="sc-import-types">{([['article','英文文章'],['rss','RSS 播客'],['audio','音频 / 字幕']] as const).map(([id,label])=><button key={id} disabled={controlsLocked} aria-pressed={kind===id} className={kind===id?"active":""} onClick={()=>{setKind(id);setError("");setEpisodes([]);}}>{label}</button>)}</div><div className="sc-import-body">
-    {kind==="article"&&<><div className="sc-import-subtabs">{([['url','网页地址'],['paste','粘贴文本'],['file','本地文件']] as const).map(([id,label])=><button key={id} disabled={controlsLocked} aria-pressed={articleMode===id} className={articleMode===id?"active":""} onClick={()=>setArticleMode(id)}>{label}</button>)}</div>{articleMode==="url"&&<label className="sc-field"><span>文章地址</span><input disabled={controlsLocked} value={url} onChange={(event)=>setUrl(event.target.value)} placeholder="https://…"/><small>网页会经安全提取，只保留可读正文。</small></label>}{articleMode==="paste"&&<label className="sc-field"><span>英文文章内容</span><textarea disabled={controlsLocked} value={paste} onChange={(event)=>setPaste(event.target.value)} placeholder="Paste an English article here…"/></label>}{articleMode==="file"&&<FileDrop disabled={controlsLocked} file={articleFile} accept=".txt,.md,.html,text/plain,text/markdown,text/html" label="TXT、Markdown 或 HTML" onFile={setArticleFile}/>}<label className="sc-field compact"><span>标题（可选）</span><input disabled={controlsLocked} value={title} onChange={(event)=>setTitle(event.target.value)} placeholder="自动识别，也可以手动覆盖"/></label></>}
-    {kind==="rss"&&!episodes.length&&<><label className="sc-field"><span>RSS 地址</span><input disabled={controlsLocked} value={url} onChange={(event)=>setUrl(event.target.value)} placeholder="https://example.com/feed.xml"/><small>先读取节目目录，再由你选择要保存的单集。</small></label><div className="sc-privacy-hint"><i>隐</i><p>只有 RSS 地址会发送到导入服务；单集不会自动下载。</p></div></>}
-    {kind==="rss"&&episodes.length>0&&<div className="sc-episode-picker"><header><span>选择一集</span><small>显示全部 {episodes.length} 个结果</small></header>{episodes.map((episode,index)=><button key={`${episode.title}-${index}`} disabled={controlsLocked} onClick={()=>void importEpisode(episode)}><i>{String(index+1).padStart(2,"0")}</i><span><b>{episode.title}</b><small>{episode.source} · {episode.durationMs?`${Math.round(episode.durationMs/60000)} 分钟`:"时长未知"}</small></span><strong>导入 →</strong></button>)}</div>}
-    {kind==="audio"&&<><FileDrop disabled={controlsLocked} file={audioFile} accept="audio/*,.mp3,.m4a,.wav,.ogg" label="音频文件" onFile={setAudioFile}/><FileDrop disabled={controlsLocked} file={transcriptFile} accept=".vtt,.srt,.lrc,.txt,text/vtt,text/plain" label="VTT、SRT、LRC 或纯文本字幕" onFile={(file)=>{setTranscriptFile(file);if(file)setTranscribe(false);}}/><label className="sc-field compact"><span>节目标题</span><input disabled={controlsLocked} value={title} onChange={(event)=>setTitle(event.target.value)} placeholder="Untitled podcast"/></label><label className="sc-check"><input aria-label="没有字幕时请求外部转写" type="checkbox" checked={transcribe} disabled={controlsLocked||Boolean(transcriptFile)||localLock||transcriptionConfigured!==true} onChange={(event)=>setTranscribe(event.target.checked)}/><span><b>没有字幕时，请求外部转写</b><small>{transcriptFile?"已选择字幕，不会上传音频转写。":localLock?"本地锁已开启，不会上传音频。":transcriptionConfigured===null?"正在检查是否配置了转写服务…":transcriptionConfigured?"只有音频会发送到已配置的转写端点。":"当前未配置转写服务；可以直接导入字幕文件。"}</small></span></label></>}
-    {error&&<div className="sc-import-error" role={confirmAbandon?"status":"alert"}>{error}</div>}{busy&&<div className="sc-import-progress" role="status" aria-live="polite"><i><em style={{width:stage===1?"58%":stage===2?"82%":stage===3?"94%":"22%"}}/></i><span>{phase==="refreshing"?"内容已保存，正在刷新页面…":stage===1?(kind==="audio"?"正在转写英文音频…":"正在读取远程内容…"):stage===2?"正在核对并写入本地资料库…":"正在准备…"}</span></div>}</div>{(!episodes.length||recoveryAction)&&(confirmAbandon?<footer className="sc-reminder-confirm"><button ref={keepReminderButton} onClick={close}>继续保留提醒</button><button className="danger" onClick={()=>void abandonConflict()}>只移除提醒</button></footer>:<footer><button disabled={busy} onClick={close}>关闭</button><button className="sc-primary" disabled={busy} onClick={()=>void primaryAction()}>{primaryLabel}</button></footer>)}</section></>;
+  const chooseArticleFile = (file: File | null) => {
+    setError("");
+    if (file) {
+      const problem = vocabLocalImportFileProblem(file, "article");
+      if (problem) {
+        setArticleFile(null);
+        setError(problem);
+        return;
+      }
+    }
+    setArticleFile(file);
+  };
+
+  const chooseTranscriptFile = (file: File | null) => {
+    setError("");
+    if (file) {
+      const problem = vocabLocalImportFileProblem(file, "transcript");
+      if (problem) {
+        setTranscriptFile(null);
+        setError(problem);
+        return;
+      }
+      setTranscribe(false);
+    }
+    setTranscriptFile(file);
+  };
+
+  const chooseAudioFile = (file: File | null) => {
+    setError("");
+    if (file) {
+      const problem = vocabLocalImportFileProblem(file, "audio") ?? localAudioStorageProblem();
+      if (problem) {
+        setAudioFile(null);
+        setTranscribe(false);
+        setError(problem);
+        return;
+      }
+      const transcriptionProblem = vocabLocalImportFileProblem(file, "audio", {
+        forTranscription: true,
+      });
+      if (transcribe && transcriptionProblem) {
+        setTranscribe(false);
+        setError(`${transcriptionProblem} 已关闭外部转写；仍可仅在本地导入音频。`);
+      }
+    } else {
+      setTranscribe(false);
+    }
+    setAudioFile(file);
+  };
+
+  const chooseTranscription = (checked: boolean) => {
+    setError("");
+    if (checked) {
+      if (!audioFile) {
+        setError("请先选择要转写的音频文件。");
+        return;
+      }
+      const problem = vocabLocalImportFileProblem(audioFile, "audio", {
+        forTranscription: true,
+      });
+      if (problem) {
+        setError(problem);
+        return;
+      }
+    }
+    setTranscribe(checked);
+  };
+
+  return <>
+    <button className="sc-modal-scrim" disabled={busy} onClick={close} aria-label="关闭导入" />
+    <section ref={dialog} className="sc-import-modal" role="dialog" aria-modal="true" aria-labelledby="sc-import-title" tabIndex={-1}>
+      <header><Logo /><div><span>添加到资料库</span><h2 id="sc-import-title">从哪里开始？</h2></div><button data-dialog-close disabled={busy} onClick={close} aria-label="关闭导入内容">×</button></header>
+      <div className="sc-import-types">{([['article', '英文文章'], ['rss', 'RSS 播客'], ['audio', '音频 / 字幕']] as const).map(([id, label]) => <button key={id} disabled={controlsLocked} aria-pressed={kind === id} className={kind === id ? "active" : ""} onClick={() => { setKind(id); setError(""); setEpisodes([]); setPendingAudioOnly(null); }}>{label}</button>)}</div>
+      <div className="sc-import-body">
+        {kind === "article" && <>
+          <div className="sc-import-subtabs">{([['url', '网页地址'], ['paste', '粘贴文本'], ['file', '本地文件']] as const).map(([id, label]) => <button key={id} disabled={controlsLocked} aria-pressed={articleMode === id} className={articleMode === id ? "active" : ""} onClick={() => setArticleMode(id)}>{label}</button>)}</div>
+          {articleMode === "url" && <label className="sc-field"><span>文章地址</span><input disabled={controlsLocked} value={url} onChange={(event) => setUrl(event.target.value)} placeholder="https://…" /><small>网页会经安全提取，只保留可读正文。</small></label>}
+          {articleMode === "paste" && <label className="sc-field"><span>英文文章内容</span><textarea disabled={controlsLocked} value={paste} onChange={(event) => setPaste(event.target.value)} placeholder="Paste an English article here…" /></label>}
+          {articleMode === "file" && <FileDrop disabled={controlsLocked} file={articleFile} accept=".txt,.md,.html,text/plain,text/markdown,text/html" label="TXT、Markdown 或 HTML" onFile={chooseArticleFile} />}
+          <label className="sc-field compact"><span>标题（可选）</span><input disabled={controlsLocked} value={title} onChange={(event) => setTitle(event.target.value)} placeholder="自动识别，也可以手动覆盖" /></label>
+        </>}
+        {kind === "rss" && !episodes.length && <>
+          <label className="sc-field"><span>RSS 地址</span><input disabled={controlsLocked} value={url} onChange={(event) => setUrl(event.target.value)} placeholder="https://example.com/feed.xml" /><small>先读取节目目录，再由你选择要保存的单集。</small></label>
+          <div className="sc-privacy-hint"><i>隐</i><p>只有 RSS 地址会发送到导入服务；单集不会自动下载。</p></div>
+        </>}
+        {kind === "rss" && episodes.length > 0 && <div className="sc-episode-picker">
+          <header><span>选择一集</span><small>显示全部 {episodes.length} 个结果</small></header>
+          {episodes.map((episode, index) => {
+            const importable = podcastEpisodeHasImportableMedia(episode);
+            const media = episode.audioUrl && episode.transcriptUrl
+              ? "音频与字幕"
+              : episode.audioUrl ? "仅音频" : episode.transcriptUrl ? "仅字幕" : "没有可导入媒体";
+            return <button key={`${episode.title}-${index}`} disabled={controlsLocked || !importable} aria-disabled={!importable} onClick={() => void importEpisode(episode)}>
+              <i>{String(index + 1).padStart(2, "0")}</i><span><b>{episode.title}</b><small>{episode.source} · {episode.durationMs ? `${Math.round(episode.durationMs / 60000)} 分钟` : "时长未知"} · {media}</small></span><strong>{importable ? "导入 →" : "不可导入"}</strong>
+            </button>;
+          })}
+        </div>}
+        {pendingAudioOnly && <div className="sc-import-error" role="alert">
+          <p>字幕失败原因：{pendingAudioOnly.reason}</p>
+          <p>尚未写入这一集。只有你明确确认后，才会保存不含字幕的音频条目。</p>
+          <div className="sc-reminder-confirm"><button onClick={() => { setPendingAudioOnly(null); setError("已停止这次单集导入；没有写入任何内容。"); }}>不导入</button><button className="danger" onClick={() => void importEpisode(pendingAudioOnly.episode, true)}>仍导入仅音频</button></div>
+        </div>}
+        {kind === "audio" && <>
+          <FileDrop disabled={controlsLocked} file={audioFile} accept="audio/*,.mp3,.m4a,.wav,.ogg" label="音频文件" onFile={chooseAudioFile} />
+          <FileDrop disabled={controlsLocked} file={transcriptFile} accept=".vtt,.srt,.lrc,.txt,.json,.html,text/vtt,text/html,text/plain,application/json" label="VTT、SRT、LRC、JSON、HTML 或纯文本字幕" onFile={chooseTranscriptFile} />
+          <label className="sc-field compact"><span>节目标题</span><input disabled={controlsLocked} value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Untitled podcast" /></label>
+          <label className="sc-check"><input aria-label="没有字幕时请求外部转写" type="checkbox" checked={transcribe} disabled={controlsLocked || !audioFile || Boolean(transcriptFile) || Boolean(transcriptionSizeProblem) || localLock || transcriptionConfigured !== true} onChange={(event) => chooseTranscription(event.target.checked)} /><span><b>没有字幕时，请求外部转写</b><small>{transcriptFile ? "已选择字幕；字幕只在本地读取，不会上传音频。" : localLock ? "本地锁已开启，不会上传音频。" : transcriptionSizeProblem ? `${transcriptionSizeProblem} 音频仍可只保存在本机。` : transcriptionConfigured === null ? "正在检查是否配置了转写服务…" : transcriptionConfigured ? "勾选后会把完整音频上传到已配置的外部转写端点；不勾选不会上传。" : "当前未配置转写服务；音频和字幕文件不会上传。"}</small></span></label>
+        </>}
+        {error && !pendingAudioOnly && <div className="sc-import-error" role={confirmAbandon ? "status" : "alert"}>{error}</div>}
+        {busy && <div className="sc-import-progress" role="status" aria-live="polite"><i><em style={{ width: stage === 1 ? "58%" : stage === 2 ? "82%" : stage === 3 ? "94%" : "22%" }} /></i><span>{cancelRequested ? "正在取消转写；不会写入…" : phase === "refreshing" ? "内容已保存，正在刷新页面…" : stage === 1 ? (kind === "audio" ? "正在转写英文音频…" : "正在读取远程内容…") : stage === 2 ? "正在核对并写入本地资料库…" : "正在准备…"}</span></div>}
+      </div>
+      {(!episodes.length || recoveryAction) && (confirmAbandon?<footer className="sc-reminder-confirm"><button ref={keepReminderButton} onClick={close}>继续保留提醒</button><button className="danger" onClick={() => void abandonConflict()}>只移除提醒</button></footer>
+        : canCancelTranscription
+          ? <footer><button className="danger" disabled={cancelRequested} onClick={cancelCurrentOperation}>{cancelRequested ? "正在取消…" : "取消转写"}</button></footer>
+          : <footer><button disabled={busy} onClick={close}>关闭</button><button className="sc-primary" disabled={busy} onClick={() => void primaryAction()}>{primaryLabel}</button></footer>)}
+    </section>
+  </>;
 }
 
 function FileDrop({file,accept,label,disabled=false,onFile}:{file:File|null;accept:string;label:string;disabled?:boolean;onFile:(file:File|null)=>void}){

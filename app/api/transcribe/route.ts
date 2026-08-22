@@ -1,5 +1,15 @@
 import { errorResponse, HttpError, jsonResponse, verifySameOrigin } from "@/lib/server/http";
-import { composeRequestSignal, isAbortLike, readAbortableFormData } from "@/lib/server/request-signal";
+import {
+  composeRequestSignal,
+  isAbortLike,
+  readBoundedAbortableFormData,
+  RequestBodyTooLargeError,
+} from "@/lib/server/request-signal";
+import { VOCAB_TRANSCRIPTION_AUDIO_MAX_BYTES } from "@/lib/vocab/content";
+
+const TRANSCRIPTION_MULTIPART_OVERHEAD_MAX_BYTES = 1024 * 1024;
+const TRANSCRIPTION_MULTIPART_MAX_BYTES =
+  VOCAB_TRANSCRIPTION_AUDIO_MAX_BYTES + TRANSCRIPTION_MULTIPART_OVERHEAD_MAX_BYTES;
 
 export async function POST(request: Request) {
   const originError = verifySameOrigin(request);
@@ -14,15 +24,18 @@ export async function POST(request: Request) {
     if (!/^https:\/\//i.test(baseUrl) && !/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(baseUrl)) {
       throw new HttpError(500, "转录服务地址配置无效。", "TRANSCRIPTION_CONFIG_INVALID");
     }
-    const length = Number(request.headers.get("content-length") || 0);
-    if (length > 100 * 1024 * 1024) throw new HttpError(413, "音频文件不能超过 100 MB。", "AUDIO_TOO_LARGE");
     if (request.signal.aborted) {
       throw new HttpError(499, "转录已停止。", "REQUEST_CANCELLED");
     }
-    const incoming = await readAbortableFormData(request);
+    const incoming = await readBoundedAbortableFormData(
+      request,
+      TRANSCRIPTION_MULTIPART_MAX_BYTES,
+    );
     const file = incoming.get("file");
     if (!(file instanceof File) || file.size === 0) throw new HttpError(400, "请选择有效的音频文件。", "AUDIO_REQUIRED");
-    if (file.size > 100 * 1024 * 1024) throw new HttpError(413, "音频文件不能超过 100 MB。", "AUDIO_TOO_LARGE");
+    if (file.size > VOCAB_TRANSCRIPTION_AUDIO_MAX_BYTES) {
+      throw new HttpError(413, "音频文件不能超过 100 MiB。", "AUDIO_TOO_LARGE");
+    }
     const upstream = new FormData();
     upstream.set("file", file, file.name.replace(/[\\/\0]/g, "_").slice(0, 120));
     upstream.set("model", model);
@@ -67,19 +80,26 @@ export async function POST(request: Request) {
       const segments = arraySegments(raw.segments || raw.words || []);
       return jsonResponse({ ok: true, data: { schema_version: "1.0", language: raw.language || null, duration_ms: Math.round(Number(raw.duration || 0) * 1000), text: raw.text || segments.map((segment) => segment.text).join(" "), segments, provider: { label: "Configured transcription endpoint", model } } });
     } catch (error) {
-      if (error instanceof HttpError) throw error;
       if (upstreamSignal.cause() === "caller") {
         throw new HttpError(499, "转录已停止。", "REQUEST_CANCELLED");
       }
       if (upstreamSignal.cause() === "timeout") {
         throw new HttpError(504, "转录超时，请尝试较短的音频。", "TRANSCRIPTION_TIMEOUT");
       }
+      if (error instanceof HttpError) throw error;
       if (isAbortLike(error)) throw new HttpError(502, "转录服务没有返回可读取结果。", "TRANSCRIPTION_CONNECTION_FAILED");
       throw new HttpError(502, "转录服务没有返回可读取结果。", "TRANSCRIPTION_CONNECTION_FAILED");
     } finally { upstreamSignal.dispose(); }
   } catch (error) {
-    if (request.signal.aborted && !(error instanceof HttpError)) {
+    if (request.signal.aborted) {
       return errorResponse(new HttpError(499, "转录已停止。", "REQUEST_CANCELLED"));
+    }
+    if (error instanceof RequestBodyTooLargeError) {
+      return errorResponse(new HttpError(
+        413,
+        "上传请求超过 101 MiB；音频本身不能超过 100 MiB。",
+        "AUDIO_ENVELOPE_TOO_LARGE",
+      ));
     }
     return errorResponse(error);
   }

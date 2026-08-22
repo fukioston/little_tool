@@ -486,7 +486,11 @@ test("ImportWizard gates every external request synchronously and aborts when th
     assert.ok(submit.lastIndexOf("assertVocabExternalImportAllowed", requestAt) >= 0);
   }
   const episode = overlaysSource.slice(overlaysSource.indexOf("const importEpisode = async"), overlaysSource.indexOf("const inspectRecovery = async"));
-  assert.ok(episode.indexOf("assertVocabExternalImportAllowed") < episode.indexOf('postJson(\n            "/api/import/article"'));
+  const transcriptRequest = episode.indexOf('postJson(\n            "/api/import/rss"');
+  assert.ok(transcriptRequest > 0);
+  assert.ok(episode.indexOf("assertVocabExternalImportAllowed") < transcriptRequest);
+  assert.match(episode, /kind: "transcript"/);
+  assert.doesNotMatch(episode, /postJson\([\s\S]*?"\/api\/import\/article"/);
   assert.match(episode, /controller\.signal\.aborted \|\| isVocabLocalLockImportError\(caught\)/);
   assert.equal((overlaysSource.match(/fetch\("\/api\/health"/g) ?? []).length, 1);
   assert.equal((overlaysSource.match(/没有继续发送内容/g) ?? []).length >= 1, true);

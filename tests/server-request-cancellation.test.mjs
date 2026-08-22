@@ -44,10 +44,69 @@ async function loadServerModule(relativePath, transform = (value) => value) {
     }
   `, "tests/stubs/http.mjs");
   const signalUrl = dataModule(await transpile("lib/server/request-signal.ts"), "lib/server/request-signal.ts");
+  const pinnedUrl = dataModule(`
+    export function pinnedHttpTransportAvailable() { return true; }
+    export async function pinnedHttpFetch(target, init) {
+      return globalThis.fetch(target.url, init);
+    }
+  `, "tests/stubs/pinned-http.mjs");
   const output = transform(await transpile(relativePath))
     .replaceAll('"./http"', JSON.stringify(httpUrl))
+    .replaceAll('"./pinned-http"', JSON.stringify(pinnedUrl))
     .replaceAll('"./request-signal"', JSON.stringify(signalUrl));
   return import(dataModule(output, relativePath));
+}
+
+async function loadTranscribeRoute() {
+  const httpUrl = dataModule(`
+    export class HttpError extends Error {
+      constructor(status, message, code) {
+        super(message);
+        this.status = status;
+        this.code = code;
+      }
+    }
+    export function verifySameOrigin() { return null; }
+    export function jsonResponse(value, status = 200) {
+      return Response.json(value, { status });
+    }
+    export function errorResponse(error) {
+      return Response.json({ ok: false, error: error.message, code: error.code }, {
+        status: error instanceof HttpError ? error.status : 500,
+      });
+    }
+  `, "tests/stubs/transcribe-http.mjs");
+  const signalUrl = dataModule(`
+    export class RequestBodyTooLargeError extends Error {}
+    export async function readBoundedAbortableFormData(_request, maxBytes) {
+      globalThis.__serverTranscribeEnvelopeLimit = maxBytes;
+      if (globalThis.__serverTranscribeEnvelopeOverflow) {
+        throw new RequestBodyTooLargeError("oversized envelope");
+      }
+      return globalThis.__serverTranscribeIncoming;
+    }
+    export function composeRequestSignal(signal) {
+      return { signal, cause: () => signal.aborted ? "caller" : null, dispose() {} };
+    }
+    export function isAbortLike(error) {
+      return error instanceof DOMException && error.name === "AbortError";
+    }
+  `, "tests/stubs/transcribe-signal.mjs");
+  const contentUrl = dataModule(`
+    export const VOCAB_TRANSCRIPTION_AUDIO_MAX_BYTES = 100 * 1024 * 1024;
+  `, "tests/stubs/transcribe-content.mjs");
+  const output = (await transpile("app/api/transcribe/route.ts"))
+    .replaceAll('"@/lib/server/http"', JSON.stringify(httpUrl))
+    .replaceAll('"@/lib/server/request-signal"', JSON.stringify(signalUrl))
+    .replaceAll('"@/lib/vocab/content"', JSON.stringify(contentUrl));
+  return import(dataModule(output, "app/api/transcribe/route.ts"));
+}
+
+function safeFetchRuntime() {
+  return {
+    fetchPinned: (target, init) => globalThis.fetch(target.url, init),
+    resolveDns: async () => ({ addresses: ["93.184.216.34"] }),
+  };
 }
 
 test("caller cancellation immediately reaches the composed upstream signal", async () => {
@@ -117,6 +176,121 @@ test("multipart parsing settles promptly and releases its body when the caller c
   assert.equal(bodyCancelled, 1);
 });
 
+test("bounded multipart parsing counts streamed bytes, ignores a low Content-Length, and cancels on overflow", async () => {
+  const { readBoundedAbortableFormData, RequestBodyTooLargeError } = await loadRequestSignalModule();
+  const bytes = new TextEncoder().encode(
+    "--edge\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.mp3\"\r\n" +
+    "Content-Type: audio/mpeg\r\n\r\nabc\r\n--edge--\r\n",
+  );
+  const makeRequest = (declaredLength, keepOpen = false) => {
+    let cancelled = 0;
+    let sent = false;
+    const headers = new Headers({ "content-type": "multipart/form-data; boundary=edge" });
+    if (declaredLength !== undefined) headers.set("content-length", String(declaredLength));
+    const request = {
+      signal: new AbortController().signal,
+      headers,
+      body: new ReadableStream({
+        pull(controller) {
+          if (sent) {
+            if (!keepOpen) controller.close();
+            return;
+          }
+          sent = true;
+          controller.enqueue(bytes);
+        },
+        cancel() { cancelled += 1; },
+      }),
+    };
+    return { request, cancelled: () => cancelled };
+  };
+
+  const exact = makeRequest(bytes.byteLength);
+  const form = await readBoundedAbortableFormData(exact.request, bytes.byteLength);
+  assert.equal(form.get("file").size, 3);
+  assert.equal(exact.cancelled(), 0);
+
+  const lying = makeRequest(1, true);
+  await assert.rejects(
+    readBoundedAbortableFormData(lying.request, bytes.byteLength - 1),
+    (error) => error instanceof RequestBodyTooLargeError,
+  );
+  assert.equal(lying.cancelled(), 1);
+
+  const declaredTooLarge = makeRequest(bytes.byteLength + 1, true);
+  await assert.rejects(
+    readBoundedAbortableFormData(declaredTooLarge.request, bytes.byteLength),
+    (error) => error instanceof RequestBodyTooLargeError,
+  );
+  assert.equal(declaredTooLarge.cancelled(), 1);
+});
+
+test("transcription accepts an exact 100 MiB parsed file, rejects one byte more, and bounds multipart overhead", async () => {
+  const route = await loadTranscribeRoute();
+  const originalFetch = globalThis.fetch;
+  const originalIncoming = globalThis.__serverTranscribeIncoming;
+  const originalOverflow = globalThis.__serverTranscribeEnvelopeOverflow;
+  const originalLimit = globalThis.__serverTranscribeEnvelopeLimit;
+  const originalKey = process.env.TRANSCRIPTION_API_KEY;
+  const originalBase = process.env.TRANSCRIPTION_BASE_URL;
+  let upstreamCalls = 0;
+  class SizedFile extends File {
+    constructor(size) {
+      super(["x"], "edge.mp3", { type: "audio/mpeg" });
+      this.declaredSize = size;
+    }
+    get size() { return this.declaredSize; }
+  }
+  const incoming = (file) => ({
+    get(name) {
+      if (name === "file") return file;
+      if (name === "language") return null;
+      return null;
+    },
+  });
+  process.env.TRANSCRIPTION_API_KEY = "test-key";
+  process.env.TRANSCRIPTION_BASE_URL = "https://transcribe.example";
+  globalThis.fetch = async () => {
+    upstreamCalls += 1;
+    return Response.json({ text: "ok", segments: [{ start: 0, end: 1, text: "ok" }] });
+  };
+  const callRoute = () => route.POST(new Request("http://localhost/api/transcribe", {
+    method: "POST",
+  }));
+  try {
+    globalThis.__serverTranscribeEnvelopeOverflow = false;
+    globalThis.__serverTranscribeIncoming = incoming(new SizedFile(100 * 1024 * 1024));
+    const exact = await callRoute();
+    assert.equal(exact.status, 200);
+    assert.equal(globalThis.__serverTranscribeEnvelopeLimit, 101 * 1024 * 1024);
+    assert.equal(upstreamCalls, 1);
+
+    globalThis.__serverTranscribeIncoming = incoming(new SizedFile(100 * 1024 * 1024 + 1));
+    const fileTooLarge = await callRoute();
+    assert.equal(fileTooLarge.status, 413);
+    assert.equal((await fileTooLarge.json()).code, "AUDIO_TOO_LARGE");
+    assert.equal(upstreamCalls, 1);
+
+    globalThis.__serverTranscribeEnvelopeOverflow = true;
+    const envelopeTooLarge = await callRoute();
+    assert.equal(envelopeTooLarge.status, 413);
+    assert.equal((await envelopeTooLarge.json()).code, "AUDIO_ENVELOPE_TOO_LARGE");
+    assert.equal(upstreamCalls, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalIncoming === undefined) delete globalThis.__serverTranscribeIncoming;
+    else globalThis.__serverTranscribeIncoming = originalIncoming;
+    if (originalOverflow === undefined) delete globalThis.__serverTranscribeEnvelopeOverflow;
+    else globalThis.__serverTranscribeEnvelopeOverflow = originalOverflow;
+    if (originalLimit === undefined) delete globalThis.__serverTranscribeEnvelopeLimit;
+    else globalThis.__serverTranscribeEnvelopeLimit = originalLimit;
+    if (originalKey === undefined) delete process.env.TRANSCRIPTION_API_KEY;
+    else process.env.TRANSCRIPTION_API_KEY = originalKey;
+    if (originalBase === undefined) delete process.env.TRANSCRIPTION_BASE_URL;
+    else process.env.TRANSCRIPTION_BASE_URL = originalBase;
+  }
+});
+
 test("DeepSeek and remote fetch preserve a timeout that wins before a later caller abort", async () => {
   const [deepSeek, safeFetch] = await Promise.all([
     loadServerModule(
@@ -139,7 +313,7 @@ test("DeepSeek and remote fetch preserve a timeout that wins before a later call
   try {
     for (const operation of [
       (signal) => deepSeek.runDeepSeekJson({ system: "s", user: "u", promptVersion: "test" }, signal),
-      (signal) => safeFetch.safeFetchText("https://example.com/slow", { signal }),
+      (signal) => safeFetch.safeFetchText("https://example.com/slow", { signal, runtime: safeFetchRuntime() }),
     ]) {
       const caller = new AbortController();
       const pending = operation(caller.signal);
@@ -172,7 +346,7 @@ test("a late upstream response cannot turn a cancelled request back into success
   try {
     for (const operation of [
       (signal) => deepSeek.runDeepSeekJson({ system: "s", user: "u", promptVersion: "test" }, signal),
-      (signal) => safeFetch.safeFetchText("https://example.com/late", { signal }),
+      (signal) => safeFetch.safeFetchText("https://example.com/late", { signal, runtime: safeFetchRuntime() }),
     ]) {
       const caller = new AbortController();
       const pending = operation(caller.signal);
@@ -239,7 +413,7 @@ test("an already closed caller never starts DeepSeek or remote fetch", async () 
       (error) => error.code === "REQUEST_CANCELLED",
     );
     await assert.rejects(
-      safeFetch.safeFetchText("https://example.com/article", { signal: caller.signal }),
+      safeFetch.safeFetchText("https://example.com/article", { signal: caller.signal, runtime: safeFetchRuntime() }),
       (error) => error.code === "REQUEST_CANCELLED",
     );
     assert.equal(calls, 0);
@@ -262,7 +436,7 @@ test("closing a remote text request aborts fetch and is not mislabeled as a time
     });
   };
   try {
-    const pending = safeFetch.safeFetchText("https://example.com/article", { signal: caller.signal });
+    const pending = safeFetch.safeFetchText("https://example.com/article", { signal: caller.signal, runtime: safeFetchRuntime() });
     await new Promise((resolve) => setTimeout(resolve, 0));
     caller.abort(new DOMException("dialog closed", "AbortError"));
     await assert.rejects(pending, (error) => error.code === "REQUEST_CANCELLED" && error.status === 499);
@@ -286,7 +460,7 @@ test("closing while a remote response body is streaming remains a cancellation",
     cancel() { bodyCancelled += 1; },
   }), { status: 200, headers: { "content-type": "text/plain" } });
   try {
-    const pending = safeFetch.safeFetchText("https://example.com/slow-body", { signal: caller.signal });
+    const pending = safeFetch.safeFetchText("https://example.com/slow-body", { signal: caller.signal, runtime: safeFetchRuntime() });
     await new Promise((resolve) => setTimeout(resolve, 0));
     caller.abort(new DOMException("dialog closed", "AbortError"));
     await assert.rejects(
@@ -320,7 +494,7 @@ test("redirect and rejected upstream bodies are explicitly released", async () =
     return new Response("finished", { status: 200, headers: { "content-type": "text/plain" } });
   };
   try {
-    const result = await safeFetch.safeFetchText("https://example.com/start");
+    const result = await safeFetch.safeFetchText("https://example.com/start", { runtime: safeFetchRuntime() });
     assert.equal(result.text, "finished");
     assert.equal(redirectsCancelled, 1);
 
@@ -350,7 +524,7 @@ test("a broken remote response body becomes a stable 502 and releases its reader
   }), { status: 200, headers: { "content-type": "text/plain" } });
   try {
     await assert.rejects(
-      safeFetch.safeFetchText("https://example.com/broken"),
+      safeFetch.safeFetchText("https://example.com/broken", { runtime: safeFetchRuntime() }),
       (error) => error.code === "REMOTE_BODY_FAILED" && error.status === 502,
     );
     assert.ok(cancelled <= 1, "a stream that already errored may reject cancellation, but must not loop");
@@ -389,7 +563,8 @@ test("AI, remote text, transcription, and media routes forward the incoming requ
   assert.match(media, /signal:\s*controller\.signal/);
   assert.match(media, /await upstream\.body\?\.cancel\(\)/);
   assert.ok(
-    transcribe.indexOf("if (request.signal.aborted)") < transcribe.indexOf("await readAbortableFormData(request)"),
+    transcribe.indexOf("if (request.signal.aborted)") < transcribe.indexOf("await readBoundedAbortableFormData("),
     "an already cancelled transcription must not parse a large multipart body",
   );
+  assert.match(transcribe, /TRANSCRIPTION_MULTIPART_MAX_BYTES/);
 });
