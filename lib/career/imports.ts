@@ -813,8 +813,8 @@ function commitFacts(preview: Pick<
     jobId: preview.jobId,
     activityId: preview.activityId,
     createdAt: preview.createdAt,
-    job: expectedJob(preview),
-    activity: expectedActivity(preview),
+    job: careerImportExpectedJob(preview),
+    activity: careerImportExpectedActivity(preview),
   };
 }
 
@@ -891,7 +891,7 @@ export async function reviseCareerJobImportPreview(
     key,
     patch[key as keyof CareerImportPreviewPatch],
   ]))) as CareerImportPreviewPatch;
-  await assertPreviewIntegrity(stablePreview, false);
+  await assertCareerImportPreviewIntegrity(stablePreview, false);
   const normalized = normalizeCandidate(
     { ...stablePreview.candidate, ...stablePatch },
     "",
@@ -939,7 +939,7 @@ export async function forkCareerJobImportPreview(
 ): Promise<CareerJobImportPreview> {
   const stablePreview = snapshotPreview(preview);
   const createdAt = timestampOrNow(options.now);
-  await assertPreviewIntegrity(stablePreview);
+  await assertCareerImportPreviewIntegrity(stablePreview);
   return assemblePreview({
     sourceFingerprint: stablePreview.sourceFingerprint,
     createdAt,
@@ -1278,7 +1278,7 @@ export async function parseCareerCsvImportPreview(
   };
 }
 
-function expectedJob(preview: Pick<CareerJobImportPreview, "jobId" | "createdAt" | "candidate">): ExistingJobRow {
+export function careerImportExpectedJob(preview: Pick<CareerJobImportPreview, "jobId" | "createdAt" | "candidate">): ExistingJobRow {
   return {
     id: preview.jobId,
     company: preview.candidate.company,
@@ -1307,7 +1307,7 @@ function expectedJob(preview: Pick<CareerJobImportPreview, "jobId" | "createdAt"
   };
 }
 
-function expectedActivity(preview: Pick<CareerJobImportPreview, "activityId" | "jobId" | "createdAt" | "candidate">): ExistingActivityRow {
+export function careerImportExpectedActivity(preview: Pick<CareerJobImportPreview, "activityId" | "jobId" | "createdAt" | "candidate">): ExistingActivityRow {
   return {
     id: preview.activityId,
     job_id: preview.jobId,
@@ -1443,7 +1443,7 @@ function validatePreviewMetadata(preview: CareerJobImportPreview): void {
   }
 }
 
-async function assertPreviewIntegrity(
+export async function assertCareerImportPreviewIntegrity(
   preview: CareerJobImportPreview,
   requireCommittable = true,
 ): Promise<void> {
@@ -1527,11 +1527,11 @@ function preflightExisting(
   }
   const jobMatches = exactObjectMatch(
     job as unknown as Record<string, unknown>,
-    expectedJob(preview) as unknown as Record<string, unknown>,
+    careerImportExpectedJob(preview) as unknown as Record<string, unknown>,
   );
   const activityMatches = exactObjectMatch(
     activity as unknown as Record<string, unknown>,
-    expectedActivity(preview) as unknown as Record<string, unknown>,
+    careerImportExpectedActivity(preview) as unknown as Record<string, unknown>,
   );
   if (!jobMatches || !activityMatches) {
     throw importError(
@@ -1543,8 +1543,8 @@ function preflightExisting(
 }
 
 function insertStatements(preview: CareerJobImportPreview): readonly SqlStatement[] {
-  const job = expectedJob(preview);
-  const activity = expectedActivity(preview);
+  const job = careerImportExpectedJob(preview);
+  const activity = careerImportExpectedActivity(preview);
   return [
     {
       sql: `INSERT INTO career_jobs(
@@ -1754,7 +1754,7 @@ export async function commitCareerJobImports(
       if (!item || typeof item !== "object" || typeof item.currentSourceFingerprint !== "string") {
         throw importError("invalid_preview", "导入预览无效，请重新预览");
       }
-      await assertPreviewIntegrity(item.preview);
+      await assertCareerImportPreviewIntegrity(item.preview);
       if (item.currentSourceFingerprint !== item.preview.sourceFingerprint) {
         throw importError(
           "source_changed",
@@ -1869,7 +1869,7 @@ export async function inspectCareerImportCommit(
 ): Promise<CareerImportCommitInspection> {
   const preview = snapshotPreview(previewInput);
   try {
-    await assertPreviewIntegrity(preview);
+    await assertCareerImportPreviewIntegrity(preview);
   } catch (error) {
     if (error instanceof CareerImportError) throw error;
     throw importError("invalid_preview", "暂时无法核对这份导入预览，请稍后再试");

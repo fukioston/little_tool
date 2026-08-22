@@ -19,14 +19,26 @@ const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 
 export type CareerWritePurpose =
   | "career-lifecycle-write"
-  | "career-task-write";
+  | "career-task-write"
+  | "career-contact-write"
+  | "career-import-write"
+  | "career-material-write";
 
 export type CareerWriteKind =
   | "stage-transition"
   | "job-archive"
   | "job-restore"
   | "task-create"
-  | "task-complete";
+  | "task-complete"
+  | "contact-create"
+  | "contact-update"
+  | "contact-archive"
+  | "contact-restore"
+  | "contact-interaction-create"
+  | "contact-task-create"
+  | "job-import-batch"
+  | "material-save"
+  | "material-delete";
 
 export type CareerWriteGenerationExpectation = Readonly<{
   generationId: string;
@@ -271,10 +283,17 @@ export function generatedCareerWriteOperationId(
   runtime: CareerWriteStorageRuntime,
   purpose: CareerWritePurpose,
 ): string {
-  const family = purpose === "career-lifecycle-write" ? "lifecycle" : "task";
-  const operationId = `career-${family}-operation-${runtime.randomUUID()}`;
+  const family: Record<CareerWritePurpose, string> = {
+    "career-lifecycle-write": "lifecycle",
+    "career-task-write": "task",
+    "career-contact-write": "contact",
+    "career-import-write": "import",
+    "career-material-write": "material",
+  };
+  const prefix = family[purpose];
+  const operationId = `career-${prefix}-operation-${runtime.randomUUID()}`;
   const pattern = new RegExp(
-    `^career-${family}-operation-${UUID_V4_PATTERN.source.slice(1, -1)}$`,
+    `^career-${prefix}-operation-${UUID_V4_PATTERN.source.slice(1, -1)}$`,
     "i",
   );
   if (!pattern.test(operationId)) {
@@ -288,11 +307,31 @@ export function isCareerWriteOperationId(
   purpose: CareerWritePurpose,
 ): value is string {
   if (typeof value !== "string") return false;
-  const family = purpose === "career-lifecycle-write" ? "lifecycle" : "task";
+  const family: Record<CareerWritePurpose, string> = {
+    "career-lifecycle-write": "lifecycle",
+    "career-task-write": "task",
+    "career-contact-write": "contact",
+    "career-import-write": "import",
+    "career-material-write": "material",
+  };
   return new RegExp(
-    `^career-${family}-operation-${UUID_V4_PATTERN.source.slice(1, -1)}$`,
+    `^career-${family[purpose]}-operation-${UUID_V4_PATTERN.source.slice(1, -1)}$`,
     "i",
   ).test(value);
+}
+
+/** SQLite's default BINARY collation compares the UTF-8 bytes, not locale text. */
+export function compareSqliteBinaryText(left: string, right: string): number {
+  const encoder = new TextEncoder();
+  const leftBytes = encoder.encode(left);
+  const rightBytes = encoder.encode(right);
+  const length = Math.min(leftBytes.length, rightBytes.length);
+  for (let index = 0; index < length; index += 1) {
+    if (leftBytes[index] !== rightBytes[index]) {
+      return leftBytes[index] - rightBytes[index];
+    }
+  }
+  return leftBytes.length - rightBytes.length;
 }
 
 export function generatedCareerTaskId(runtime: CareerWriteStorageRuntime): string {

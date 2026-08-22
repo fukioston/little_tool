@@ -12,6 +12,8 @@ const KEY_B = "71000000-0000-4000-8000-000000000002";
 const KEY_C = "71000000-0000-4000-8000-000000000003";
 const KEY_D = "71000000-0000-4000-8000-000000000004";
 const KEY_E = "71000000-0000-4000-8000-000000000005";
+let writeFault = null;
+let removeFault = null;
 
 function domError(name) {
   return new DOMException(name, name);
@@ -43,6 +45,10 @@ class MemoryFileHandle {
         chunks.push(bytesFor(value));
       },
       close: async () => {
+        if (writeFault?.name === this.name && writeFault.mode === "before") {
+          writeFault = null;
+          throw new Error("write before close");
+        }
         const size = chunks.reduce((total, chunk) => total + chunk.byteLength, 0);
         const combined = new Uint8Array(size);
         let offset = 0;
@@ -51,6 +57,10 @@ class MemoryFileHandle {
           offset += chunk.byteLength;
         }
         this.bytes = combined;
+        if (writeFault?.name === this.name && writeFault.mode === "after") {
+          writeFault = null;
+          throw new Error("write response lost");
+        }
       },
       abort: async () => undefined,
     };
@@ -86,7 +96,15 @@ class MemoryDirectoryHandle {
   }
 
   async removeEntry(name) {
+    if (removeFault?.name === name && removeFault.mode === "before") {
+      removeFault = null;
+      throw new Error("remove before");
+    }
     if (!this.entriesByName.delete(name)) throw domError("NotFoundError");
+    if (removeFault?.name === name && removeFault.mode === "after") {
+      removeFault = null;
+      throw new Error("remove response lost");
+    }
   }
 
   async *entries() {
@@ -100,6 +118,13 @@ async function writeMemoryFile(directory, name, value) {
   await writable.write(typeof value === "string" ? value : JSON.stringify(value));
   await writable.close();
   return handle;
+}
+
+function treeShape(directory) {
+  return [...directory.entriesByName.entries()].map(([name, entry]) => [
+    name,
+    entry.kind === "directory" ? treeShape(entry) : entry.bytes.byteLength,
+  ]);
 }
 
 const opfsRoot = new MemoryDirectoryHandle("root");
@@ -270,4 +295,205 @@ test("an ownership mismatch never deletes another operation's bytes or metadata"
     await (await files.getLocalFile("career", key)).file.text(),
     "owned elsewhere",
   );
+});
+
+test("owned fragment inspection classifies recovery states without any mutation", async () => {
+  const missingKey = "71000000-0000-4000-8000-000000000010";
+  const claimKey = "71000000-0000-4000-8000-000000000011";
+  const bytesKey = "71000000-0000-4000-8000-000000000012";
+  const completeKey = "71000000-0000-4000-8000-000000000013";
+  const metadataKey = "71000000-0000-4000-8000-000000000014";
+  const foreignKey = "71000000-0000-4000-8000-000000000015";
+  const { objects, metadata } = await careerDirectories();
+  await writeMemoryFile(metadata, `${claimKey}.json`, {
+    version: 1, namespace: "career", key: claimKey, stagingOwner: OWNER_A,
+  });
+  await writeMemoryFile(objects, `${bytesKey}.bin`, "unverifiable bytes");
+  await files.saveLocalFileAtKey("career", completeKey, new Blob(["complete"]), {}, OWNER_A);
+  await files.saveLocalFileAtKey("career", metadataKey, new Blob(["metadata only"]), {}, OWNER_A);
+  await objects.removeEntry(`${metadataKey}.bin`);
+  await files.saveLocalFileAtKey("career", foreignKey, new Blob(["foreign"]), {}, OWNER_B);
+  const before = treeShape(opfsRoot);
+
+  assert.deepEqual(await files.inspectOwnedLocalFileFragments("career", missingKey, OWNER_A), { state: "missing" });
+  assert.deepEqual(await files.inspectOwnedLocalFileFragments("career", claimKey, OWNER_A), {
+    state: "owned", objectPresent: false, metadataKind: "claim",
+  });
+  assert.deepEqual(await files.inspectOwnedLocalFileFragments("career", bytesKey, OWNER_A), {
+    state: "foreign_or_unverifiable", objectPresent: true, metadataPresent: false,
+  });
+  assert.deepEqual(await files.inspectOwnedLocalFileFragments("career", completeKey, OWNER_A), {
+    state: "owned", objectPresent: true, metadataKind: "complete",
+  });
+  assert.deepEqual(await files.inspectOwnedLocalFileFragments("career", metadataKey, OWNER_A), {
+    state: "owned", objectPresent: false, metadataKind: "complete",
+  });
+  assert.deepEqual(await files.inspectOwnedLocalFileFragments("career", foreignKey, OWNER_A), {
+    state: "foreign_or_unverifiable", objectPresent: true, metadataPresent: true,
+  });
+  assert.deepEqual(treeShape(opfsRoot), before);
+});
+
+test("ordinary deletion claims recover metadata-only and bytes-only fragments before release", async () => {
+  for (const partial of ["metadata-only", "bytes-only"]) {
+    const stored = await files.saveLocalFile("career", new Blob([`ordinary ${partial}`]), {
+      originalName: `${partial}.txt`, mimeType: "text/plain",
+    });
+    const { objects, metadata } = await careerDirectories();
+    if (partial === "metadata-only") await objects.removeEntry(`${stored.key}.bin`);
+    else await metadata.removeEntry(`${stored.key}.json`);
+    await files.claimLocalFileDeletion("career", stored.key, stored, OWNER_A);
+    assert.deepEqual(await files.inspectClaimedLocalFileDeletion(
+      "career", stored.key, stored, OWNER_A), {
+      state: "owned",
+      phase: "claimed",
+      objectPresent: partial === "bytes-only",
+      metadataPresent: partial === "metadata-only",
+    });
+    await files.sweepClaimedLocalFileDeletion("career", stored.key, stored, OWNER_A);
+    assert.deepEqual(await files.inspectClaimedLocalFileDeletion(
+      "career", stored.key, stored, OWNER_A), {
+      state: "owned", phase: "swept", objectPresent: false, metadataPresent: false,
+    });
+    assert.equal(await files.releaseClaimedLocalFileDeletion(
+      "career", stored.key, stored, OWNER_A), true);
+    assert.equal((await files.inspectClaimedLocalFileDeletion(
+      "career", stored.key, stored, OWNER_A)).state, "missing_claim");
+  }
+});
+
+test("deletion claim write response loss settles exact and pre-write failure deletes nothing", async () => {
+  const recovered = await files.saveLocalFile("career", new Blob(["claim response loss"]), {
+    originalName: "claim.txt",
+  });
+  writeFault = { name: `${recovered.key}.deletion.json`, mode: "after" };
+  await files.claimLocalFileDeletion("career", recovered.key, recovered, OWNER_A);
+  assert.equal((await files.inspectClaimedLocalFileDeletion(
+    "career", recovered.key, recovered, OWNER_A)).state, "owned");
+  const listedWhileClaimed = await files.listLocalFiles("career");
+  assert.equal(listedWhileClaimed.filter(({ key }) => key === recovered.key).length, 1);
+  assert.equal(JSON.stringify(listedWhileClaimed).includes("deletionOwner"), false);
+  assert.equal(JSON.stringify(listedWhileClaimed).includes("deletion-claim"), false);
+
+  const failed = await files.saveLocalFile("career", new Blob(["claim failed"]), {
+    originalName: "failed.txt",
+  });
+  writeFault = { name: `${failed.key}.deletion.json`, mode: "before" };
+  await assert.rejects(files.claimLocalFileDeletion("career", failed.key, failed, OWNER_A),
+    /write before close/);
+  assert.equal(await (await files.getLocalFile("career", failed.key)).file.text(), "claim failed");
+});
+
+test("a swept deletion claim blocks same-key foreign resurrection until exact release", async () => {
+  const stored = await files.saveLocalFile("career", new Blob(["old ordinary file"]), {
+    originalName: "old.txt",
+  });
+  await files.claimLocalFileDeletion("career", stored.key, stored, OWNER_A);
+  await files.sweepClaimedLocalFileDeletion("career", stored.key, stored, OWNER_A);
+  const { objects } = await careerDirectories();
+  await writeMemoryFile(objects, `${stored.key}.bin`, "foreign resurrection");
+  assert.equal((await files.inspectClaimedLocalFileDeletion(
+    "career", stored.key, stored, OWNER_A)).state, "foreign_or_unverifiable");
+  await assert.rejects(files.sweepClaimedLocalFileDeletion(
+    "career", stored.key, stored, OWNER_A), /cannot sweep|foreign/i);
+  await assert.rejects(files.releaseClaimedLocalFileDeletion(
+    "career", stored.key, stored, OWNER_A), /not ready/);
+  await assert.rejects(files.abandonClaimedLocalFileDeletion(
+    "career", stored.key, stored, OWNER_A), /untouched/);
+  assert.equal(await (await objects.getFileHandle(`${stored.key}.bin`)).getFile().then((file) => file.text()),
+    "foreign resurrection");
+  await assert.rejects(files.saveLocalFileAtKey(
+    "career", stored.key, new Blob(["replacement"]), {}, OWNER_B),
+  (error) => error?.code === "FILE_KEY_COLLISION");
+});
+
+test("owned deletion preserves metadata on object failure and settles object response loss", async () => {
+  const before = await files.saveLocalFileAtKey(
+    "career", "71000000-0000-4000-8000-000000000020", new Blob(["before failure"]), {}, OWNER_A,
+  );
+  removeFault = { name: `${before.key}.bin`, mode: "before" };
+  await assert.rejects(files.deleteOwnedLocalFile("career", before.key, OWNER_A), /remove before/);
+  assert.equal(await (await files.getLocalFile("career", before.key)).file.text(), "before failure");
+
+  const after = await files.saveLocalFileAtKey(
+    "career", "71000000-0000-4000-8000-000000000021", new Blob(["after failure"]), {}, OWNER_A,
+  );
+  removeFault = { name: `${after.key}.bin`, mode: "after" };
+  assert.equal(await files.deleteOwnedLocalFile("career", after.key, OWNER_A), true);
+  assert.deepEqual(await files.inspectOwnedLocalFileFragments("career", after.key, OWNER_A), { state: "missing" });
+});
+
+test("same-owner extra, array, wrong-version metadata and malformed claims never authorize deletion", async () => {
+  const { objects, metadata } = await careerDirectories();
+  for (const [suffix, mutate] of [
+    ["022", (record) => ({ ...record, extra: true })],
+    ["023", (record) => [record]],
+    ["024", (record) => ({ ...record, version: 2 })],
+  ]) {
+    const key = `71000000-0000-4000-8000-000000000${suffix}`;
+    const stored = await files.saveLocalFileAtKey(
+      "career", key, new Blob([`schema ${suffix}`]), {}, OWNER_A,
+    );
+    await writeMemoryFile(metadata, `${key}.json`, mutate(stored));
+    const before = treeShape(opfsRoot);
+    assert.equal((await files.inspectOwnedLocalFileFragments("career", key, OWNER_A)).state,
+      "foreign_or_unverifiable");
+    await assert.rejects(files.deleteOwnedLocalFile("career", key, OWNER_A),
+      (error) => error?.code === "FILE_OWNERSHIP_MISMATCH");
+    assert.deepEqual(treeShape(opfsRoot), before);
+    assert.equal(await (await objects.getFileHandle(`${key}.bin`)).getFile().then((file) => file.text()),
+      `schema ${suffix}`);
+  }
+
+  const ordinary = await files.saveLocalFile("career", new Blob(["claim schema"]), {
+    originalName: "claim-schema.txt",
+  });
+  await files.claimLocalFileDeletion("career", ordinary.key, ordinary, OWNER_A);
+  const claimHandle = await metadata.getFileHandle(`${ordinary.key}.deletion.json`);
+  const rawClaim = JSON.parse(await (await claimHandle.getFile()).text());
+  await writeMemoryFile(metadata, `${ordinary.key}.deletion.json`, { ...rawClaim, extra: true });
+  const beforeClaimChecks = treeShape(opfsRoot);
+  assert.equal((await files.inspectClaimedLocalFileDeletion(
+    "career", ordinary.key, ordinary, OWNER_A)).state, "foreign_or_unverifiable");
+  await assert.rejects(files.sweepClaimedLocalFileDeletion(
+    "career", ordinary.key, ordinary, OWNER_A), /cannot sweep/i);
+  await assert.rejects(files.releaseClaimedLocalFileDeletion(
+    "career", ordinary.key, ordinary, OWNER_A), /not ready/i);
+  assert.deepEqual(treeShape(opfsRoot), beforeClaimChecks);
+});
+
+test("missing-both deletion reservation is swept atomically and settles claim response loss", async () => {
+  const beforeKey = "71000000-0000-4000-8000-000000000025";
+  writeFault = { name: `${beforeKey}.deletion.json`, mode: "before" };
+  await assert.rejects(files.claimLocalFileDeletion("career", beforeKey, null, OWNER_A),
+    /write before close/);
+  assert.equal((await files.inspectClaimedLocalFileDeletion(
+    "career", beforeKey, null, OWNER_A)).state, "missing_claim");
+  assert.equal((await files.inspectLocalFileDeletionCandidate(
+    "career", beforeKey, null)).state, "missing");
+
+  const afterKey = "71000000-0000-4000-8000-000000000026";
+  writeFault = { name: `${afterKey}.deletion.json`, mode: "after" };
+  await files.claimLocalFileDeletion("career", afterKey, null, OWNER_A);
+  assert.deepEqual(await files.inspectClaimedLocalFileDeletion(
+    "career", afterKey, null, OWNER_A), {
+    state: "owned", phase: "swept", objectPresent: false, metadataPresent: false,
+  });
+  await assert.rejects(files.saveLocalFileAtKey(
+    "career", afterKey, new Blob(["resurrection"]), {}, OWNER_B),
+  (error) => error?.code === "FILE_KEY_COLLISION");
+  assert.equal(await files.releaseClaimedLocalFileDeletion(
+    "career", afterKey, null, OWNER_A), true);
+  assert.equal((await files.inspectClaimedLocalFileDeletion(
+    "career", afterKey, null, OWNER_A)).state, "missing_claim");
+
+  const disappeared = await files.saveLocalFile("career", new Blob(["disappeared"]), {
+    originalName: "disappeared.txt",
+  });
+  const { objects, metadata } = await careerDirectories();
+  await objects.removeEntry(`${disappeared.key}.bin`);
+  await metadata.removeEntry(`${disappeared.key}.json`);
+  await files.claimLocalFileDeletion("career", disappeared.key, disappeared, OWNER_A);
+  assert.equal((await files.inspectClaimedLocalFileDeletion(
+    "career", disappeared.key, disappeared, OWNER_A)).phase, "swept");
 });

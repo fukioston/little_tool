@@ -48,6 +48,59 @@ export type LocalStorageEstimate = Readonly<{
   usageDetails: Readonly<Record<string, number>>;
 }>;
 
+/**
+ * Read-only fragment facts for crash recovery. No key or file bytes are
+ * returned, and inspection never creates an OPFS directory.
+ */
+export type OwnedLocalFileFragmentInspection =
+  | Readonly<{ state: "missing" }>
+  | Readonly<{
+      state: "owned";
+      objectPresent: boolean;
+      metadataKind: "claim" | "complete";
+    }>
+  | Readonly<{
+      state: "foreign_or_unverifiable";
+      objectPresent: boolean;
+      metadataPresent: boolean;
+    }>;
+
+export type ClaimedLocalFileDeletionInspection =
+  | Readonly<{ state: "missing_claim" }>
+  | Readonly<{
+      state: "owned";
+      phase: "claimed" | "object_deleted" | "swept";
+      objectPresent: boolean;
+      metadataPresent: boolean;
+    }>
+  | Readonly<{
+      state: "foreign_or_unverifiable";
+      objectPresent: boolean;
+      metadataPresent: boolean;
+    }>;
+
+/**
+ * Read-only facts used before reserving an ordinary-file deletion. Thrown I/O
+ * errors are deliberately not collapsed into any of these verified states.
+ */
+export type LocalFileDeletionCandidateInspection =
+  | Readonly<{ state: "missing" }>
+  | Readonly<{
+      state: "exact";
+      objectPresent: boolean;
+      metadataPresent: boolean;
+    }>
+  | Readonly<{
+      state: "verified_changed";
+      objectPresent: boolean;
+      metadataPresent: boolean;
+    }>
+  | Readonly<{
+      state: "foreign_or_unverifiable";
+      objectPresent: boolean;
+      metadataPresent: boolean;
+    }>;
+
 export class LocalFileError extends Error {
   constructor(
     message: string,
@@ -204,11 +257,12 @@ async function assertKeyAvailableWithoutCreatingDirectories(
     directoryIfPresent(namespaceDirectory, "objects"),
     directoryIfPresent(namespaceDirectory, "metadata"),
   ]);
-  const [objectExists, metadataExists] = await Promise.all([
+  const [objectExists, metadataExists, deletionClaimExists] = await Promise.all([
     objects ? fileEntryExists(objects, objectFilename(key)) : false,
     metadata ? fileEntryExists(metadata, metadataFilename(key)) : false,
+    metadata ? fileEntryExists(metadata, deletionClaimFilename(key)) : false,
   ]);
-  if (objectExists || metadataExists) {
+  if (objectExists || metadataExists || deletionClaimExists) {
     throw new LocalFileError(
       "The local file key is already in use.",
       "FILE_KEY_COLLISION",
@@ -221,11 +275,12 @@ async function assertKeyAvailableInDirectories(
   metadata: FileSystemDirectoryHandle,
   key: string,
 ): Promise<void> {
-  const [objectExists, metadataExists] = await Promise.all([
+  const [objectExists, metadataExists, deletionClaimExists] = await Promise.all([
     fileEntryExists(objects, objectFilename(key)),
     fileEntryExists(metadata, metadataFilename(key)),
+    fileEntryExists(metadata, deletionClaimFilename(key)),
   ]);
-  if (objectExists || metadataExists) {
+  if (objectExists || metadataExists || deletionClaimExists) {
     throw new LocalFileError(
       "The local file key is already in use.",
       "FILE_KEY_COLLISION",
@@ -253,6 +308,16 @@ type LocalFileWriteClaim = Readonly<{
   stagingOwner: string;
 }>;
 
+type LocalFileDeletionClaim = Readonly<{
+  version: 1;
+  kind: "local-file-deletion-claim";
+  namespace: LocalFileNamespace;
+  key: string;
+  deletionOwner: string;
+  phase: "claimed" | "object_deleted" | "swept";
+  expectedMetadata: LocalFileMetadata | null;
+}>;
+
 function assertStagingOwner(stagingOwner: string): void {
   if (!/^[0-9a-f]{64}$/.test(stagingOwner)) {
     throw new LocalFileError(
@@ -260,6 +325,10 @@ function assertStagingOwner(stagingOwner: string): void {
       "INVALID_FILE_OWNER",
     );
   }
+}
+
+function deletionClaimFilename(key: string): string {
+  return `${key}.deletion.json`;
 }
 
 async function writeJson(
@@ -351,7 +420,7 @@ function isLocalFileMetadata(
   namespace: LocalFileNamespace,
   key: string,
 ): value is LocalFileMetadata {
-  if (!value || typeof value !== "object") return false;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const metadata = value as Partial<LocalFileMetadata>;
   return (
     metadata.version === FORMAT_VERSION &&
@@ -373,29 +442,84 @@ function isLocalFileMetadata(
   );
 }
 
+const LOCAL_FILE_METADATA_KEYS = [
+  "version", "key", "namespace", "originalName", "mimeType", "category",
+  "byteSize", "sha256", "createdAt", "updatedAt",
+] as const;
+
+function exactLocalFileMetadata(
+  value: unknown,
+  namespace: LocalFileNamespace,
+  key: string,
+): value is LocalFileMetadata {
+  if (!value || typeof value !== "object" || Array.isArray(value) ||
+    !isLocalFileMetadata(value, namespace, key)) return false;
+  const keys = Object.keys(value);
+  const expected = (value as LocalFileMetadata).stagingOwner === undefined
+    ? [...LOCAL_FILE_METADATA_KEYS]
+    : [...LOCAL_FILE_METADATA_KEYS, "stagingOwner"];
+  return keys.length === expected.length && expected.every((name) => keys.includes(name));
+}
+
+function sameLocalFileMetadata(left: LocalFileMetadata, right: LocalFileMetadata): boolean {
+  const keys = left.stagingOwner === undefined && right.stagingOwner === undefined
+    ? [...LOCAL_FILE_METADATA_KEYS]
+    : [...LOCAL_FILE_METADATA_KEYS, "stagingOwner"] as const;
+  return keys.every((key) => left[key] === right[key]);
+}
+
+function sameExpectedMetadata(
+  left: LocalFileMetadata | null,
+  right: LocalFileMetadata | null,
+): boolean {
+  return left === null || right === null
+    ? left === right
+    : sameLocalFileMetadata(left, right);
+}
+
+function isDeletionClaim(
+  value: unknown,
+  namespace: LocalFileNamespace,
+  key: string,
+): value is LocalFileDeletionClaim {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const claim = value as LocalFileDeletionClaim;
+  const keys = Object.keys(value);
+  return keys.length === 7 && [
+    "version", "kind", "namespace", "key", "deletionOwner", "phase", "expectedMetadata",
+  ].every((name) => keys.includes(name)) && claim.version === FORMAT_VERSION &&
+    claim.kind === "local-file-deletion-claim" && claim.namespace === namespace && claim.key === key &&
+    /^[0-9a-f]{64}$/.test(claim.deletionOwner) &&
+    ["claimed", "object_deleted", "swept"].includes(claim.phase) &&
+    (claim.expectedMetadata === null
+      ? claim.phase === "swept"
+      : exactLocalFileMetadata(claim.expectedMetadata, namespace, key) &&
+        claim.expectedMetadata.stagingOwner === undefined);
+}
+
+function isExactWriteClaim(
+  value: unknown,
+  namespace: LocalFileNamespace,
+  key: string,
+  stagingOwner: string,
+): value is LocalFileWriteClaim {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const claim = value as LocalFileWriteClaim;
+  const keys = Object.keys(value);
+  return keys.length === 4 && ["version", "namespace", "key", "stagingOwner"]
+    .every((name) => keys.includes(name)) && claim.version === FORMAT_VERSION &&
+    claim.namespace === namespace && claim.key === key && claim.stagingOwner === stagingOwner;
+}
+
 function isOwnedMetadataOrClaim(
   value: unknown,
   namespace: LocalFileNamespace,
   key: string,
   stagingOwner: string,
 ): boolean {
-  if (!value || typeof value !== "object") return false;
-  const record = value as Partial<LocalFileMetadata & LocalFileWriteClaim>;
-  if (
-    record.version !== FORMAT_VERSION ||
-    record.namespace !== namespace ||
-    record.key !== key ||
-    record.stagingOwner !== stagingOwner
-  ) {
-    return false;
-  }
-  const keys = Object.keys(record);
-  return (
-    keys.length === 4 &&
-    keys.every((name) =>
-      name === "version" || name === "namespace" || name === "key" ||
-      name === "stagingOwner")
-  ) || isLocalFileMetadata(record, namespace, key);
+  if (isExactWriteClaim(value, namespace, key, stagingOwner)) return true;
+  return exactLocalFileMetadata(value, namespace, key) &&
+    value.stagingOwner === stagingOwner;
 }
 
 async function readRawMetadataIfPresent(
@@ -475,6 +599,367 @@ export async function assertLocalFileKeyAvailable(
 ): Promise<void> {
   assertSafeKey(key);
   await assertKeyAvailableWithoutCreatingDirectories(namespace, key);
+}
+
+export async function inspectOwnedLocalFileFragments(
+  namespace: LocalFileNamespace,
+  key: string,
+  stagingOwner: string,
+): Promise<OwnedLocalFileFragmentInspection> {
+  assertSafeKey(key);
+  assertStagingOwner(stagingOwner);
+  const storageRoot = await requireBrowserStorage().getDirectory();
+  const root = await directoryIfPresent(storageRoot, ROOT_DIRECTORY);
+  const version = root ? await directoryIfPresent(root, `v${FORMAT_VERSION}`) : null;
+  const namespaceDirectory = version
+    ? await directoryIfPresent(version, namespace)
+    : null;
+  const objects = namespaceDirectory
+    ? await directoryIfPresent(namespaceDirectory, "objects")
+    : null;
+  const metadata = namespaceDirectory
+    ? await directoryIfPresent(namespaceDirectory, "metadata")
+    : null;
+  const [objectPresent, rawMetadata] = await Promise.all([
+    objects ? fileEntryExists(objects, objectFilename(key)) : false,
+    metadata ? readRawMetadataIfPresent(metadata, key) : undefined,
+  ]);
+  if (!objectPresent && rawMetadata === undefined) return { state: "missing" };
+  if (rawMetadata !== undefined &&
+    isOwnedMetadataOrClaim(rawMetadata, namespace, key, stagingOwner)) {
+    return {
+      state: "owned",
+      objectPresent,
+      metadataKind: exactLocalFileMetadata(rawMetadata, namespace, key)
+        ? "complete"
+        : "claim",
+    };
+  }
+  return {
+    state: "foreign_or_unverifiable",
+    objectPresent,
+    metadataPresent: rawMetadata !== undefined,
+  };
+}
+
+async function readRawDeletionClaimIfPresent(
+  directory: FileSystemDirectoryHandle,
+  key: string,
+): Promise<unknown | undefined> {
+  try {
+    const handle = await directory.getFileHandle(deletionClaimFilename(key));
+    const file = await handle.getFile();
+    return JSON.parse(await file.text()) as unknown;
+  } catch (error) {
+    if (isNotFoundError(error)) return undefined;
+    throw error;
+  }
+}
+
+function sameDeletionClaim(left: LocalFileDeletionClaim, right: LocalFileDeletionClaim): boolean {
+  return left.version === right.version && left.kind === right.kind &&
+    left.namespace === right.namespace && left.key === right.key &&
+    left.deletionOwner === right.deletionOwner && left.phase === right.phase &&
+    sameExpectedMetadata(left.expectedMetadata, right.expectedMetadata);
+}
+
+async function persistDeletionClaim(
+  metadata: FileSystemDirectoryHandle,
+  claim: LocalFileDeletionClaim,
+  newlyReserved = false,
+): Promise<void> {
+  try {
+    await writeJson(metadata, deletionClaimFilename(claim.key), claim);
+  } catch (error) {
+    let recovered: unknown | undefined;
+    try { recovered = await readRawDeletionClaimIfPresent(metadata, claim.key); }
+    catch (inspectionError) {
+      if (newlyReserved && inspectionError instanceof SyntaxError) {
+        await removeEntryAndConfirm(metadata, deletionClaimFilename(claim.key)).catch(() => undefined);
+      }
+      throw error;
+    }
+    if (isDeletionClaim(recovered, claim.namespace, claim.key) && sameDeletionClaim(recovered, claim)) return;
+    throw error;
+  }
+  const stored = await readRawDeletionClaimIfPresent(metadata, claim.key);
+  if (!isDeletionClaim(stored, claim.namespace, claim.key) || !sameDeletionClaim(stored, claim)) {
+    throw new LocalFileError("The local file deletion claim was not stored exactly.", "FILE_DELETION_CLAIM_UNCERTAIN");
+  }
+}
+
+async function objectFileIfPresent(
+  objects: FileSystemDirectoryHandle,
+  key: string,
+): Promise<File | null> {
+  try {
+    return await (await objects.getFileHandle(objectFilename(key))).getFile();
+  } catch (error) {
+    if (isNotFoundError(error)) return null;
+    throw error;
+  }
+}
+
+async function inspectDeletionCandidateInDirectories(
+  objects: FileSystemDirectoryHandle,
+  metadata: FileSystemDirectoryHandle,
+  namespace: LocalFileNamespace,
+  key: string,
+  expectedMetadata: LocalFileMetadata | null,
+): Promise<LocalFileDeletionCandidateInspection> {
+  const [objectFile, rawMetadata] = await Promise.all([
+    objectFileIfPresent(objects, key),
+    readRawMetadataIfPresent(metadata, key),
+  ]);
+  const objectPresent = objectFile !== null;
+  const metadataPresent = rawMetadata !== undefined;
+  if (!objectPresent && !metadataPresent) return { state: "missing" };
+  if (expectedMetadata === null) {
+    return { state: "foreign_or_unverifiable", objectPresent, metadataPresent };
+  }
+  if (metadataPresent) {
+    if (!exactLocalFileMetadata(rawMetadata, namespace, key) ||
+      rawMetadata.stagingOwner !== undefined) {
+      return { state: "foreign_or_unverifiable", objectPresent, metadataPresent };
+    }
+    if (!sameLocalFileMetadata(rawMetadata, expectedMetadata)) {
+      return { state: "verified_changed", objectPresent, metadataPresent };
+    }
+  }
+  if (objectFile && (objectFile.size !== expectedMetadata.byteSize ||
+    await sha256Blob(objectFile) !== expectedMetadata.sha256.toLowerCase())) {
+    return { state: "verified_changed", objectPresent, metadataPresent };
+  }
+  return { state: "exact", objectPresent, metadataPresent };
+}
+
+export async function inspectLocalFileDeletionCandidate(
+  namespace: LocalFileNamespace,
+  key: string,
+  expectedMetadata: LocalFileMetadata | null,
+): Promise<LocalFileDeletionCandidateInspection> {
+  assertSafeKey(key);
+  if (expectedMetadata !== null &&
+    (!exactLocalFileMetadata(expectedMetadata, namespace, key) ||
+      expectedMetadata.stagingOwner !== undefined)) {
+    throw new LocalFileError(
+      "The expected ordinary local file metadata is invalid.",
+      "INVALID_FILE_METADATA",
+    );
+  }
+  const { objects, metadata } = await getNamespaceDirectories(namespace);
+  return inspectDeletionCandidateInDirectories(
+    objects, metadata, namespace, key, expectedMetadata,
+  );
+}
+
+async function inspectClaimedDeletionInDirectories(
+  objects: FileSystemDirectoryHandle,
+  metadata: FileSystemDirectoryHandle,
+  namespace: LocalFileNamespace,
+  key: string,
+  expectedMetadata: LocalFileMetadata | null,
+  deletionOwner: string,
+): Promise<ClaimedLocalFileDeletionInspection> {
+  const [rawClaim, objectFile, rawMetadata] = await Promise.all([
+    readRawDeletionClaimIfPresent(metadata, key),
+    objectFileIfPresent(objects, key),
+    readRawMetadataIfPresent(metadata, key),
+  ]);
+  if (rawClaim === undefined) return { state: "missing_claim" };
+  const objectPresent = objectFile !== null;
+  const metadataPresent = rawMetadata !== undefined;
+  if (!isDeletionClaim(rawClaim, namespace, key) || rawClaim.deletionOwner !== deletionOwner ||
+    !sameExpectedMetadata(rawClaim.expectedMetadata, expectedMetadata) ||
+    (expectedMetadata === null && (objectPresent || metadataPresent)) ||
+    (expectedMetadata !== null && metadataPresent &&
+      (!exactLocalFileMetadata(rawMetadata, namespace, key) ||
+        !sameLocalFileMetadata(rawMetadata, expectedMetadata))) ||
+    (expectedMetadata !== null && objectPresent &&
+      (objectFile.size !== expectedMetadata.byteSize ||
+        await sha256Blob(objectFile) !== expectedMetadata.sha256.toLowerCase())) ||
+    (rawClaim.phase === "object_deleted" && objectPresent) ||
+    (rawClaim.phase === "swept" && (objectPresent || metadataPresent))) {
+    return { state: "foreign_or_unverifiable", objectPresent, metadataPresent };
+  }
+  return {
+    state: "owned",
+    phase: rawClaim.phase,
+    objectPresent,
+    metadataPresent,
+  };
+}
+
+export async function claimLocalFileDeletion(
+  namespace: LocalFileNamespace,
+  key: string,
+  expectedMetadata: LocalFileMetadata | null,
+  deletionOwner: string,
+): Promise<void> {
+  assertSafeKey(key);
+  assertStagingOwner(deletionOwner);
+  if (expectedMetadata !== null &&
+    (!exactLocalFileMetadata(expectedMetadata, namespace, key) ||
+      expectedMetadata.stagingOwner !== undefined)) {
+    throw new LocalFileError("Only an exact ordinary local file can be claimed for deletion.", "INVALID_FILE_METADATA");
+  }
+  const { objects, metadata } = await getNamespaceDirectories(namespace);
+  const existing = await readRawDeletionClaimIfPresent(metadata, key);
+  if (existing !== undefined) {
+    if (isDeletionClaim(existing, namespace, key) && existing.deletionOwner === deletionOwner &&
+      sameExpectedMetadata(existing.expectedMetadata, expectedMetadata)) return;
+    throw new LocalFileError("The local file has a foreign deletion claim.", "FILE_DELETION_CLAIM_MISMATCH");
+  }
+  const candidate = await inspectDeletionCandidateInDirectories(
+    objects, metadata, namespace, key, expectedMetadata,
+  );
+  if (candidate.state !== "exact" && candidate.state !== "missing") {
+    throw new LocalFileError("The ordinary local file changed before its deletion claim.", "FILE_DELETION_CLAIM_MISMATCH");
+  }
+  await persistDeletionClaim(metadata, {
+    version: FORMAT_VERSION,
+    kind: "local-file-deletion-claim",
+    namespace,
+    key,
+    deletionOwner,
+    phase: candidate.state === "missing" ? "swept" : "claimed",
+    expectedMetadata: expectedMetadata ? { ...expectedMetadata } : null,
+  }, true);
+}
+
+export async function inspectClaimedLocalFileDeletion(
+  namespace: LocalFileNamespace,
+  key: string,
+  expectedMetadata: LocalFileMetadata | null,
+  deletionOwner: string,
+): Promise<ClaimedLocalFileDeletionInspection> {
+  assertSafeKey(key);
+  assertStagingOwner(deletionOwner);
+  if (expectedMetadata !== null &&
+    (!exactLocalFileMetadata(expectedMetadata, namespace, key) ||
+      expectedMetadata.stagingOwner !== undefined)) {
+    throw new LocalFileError("The expected ordinary local file metadata is invalid.", "INVALID_FILE_METADATA");
+  }
+  const { objects, metadata } = await getNamespaceDirectories(namespace);
+  return inspectClaimedDeletionInDirectories(
+    objects, metadata, namespace, key, expectedMetadata, deletionOwner,
+  );
+}
+
+async function removeEntryAndConfirm(
+  directory: FileSystemDirectoryHandle,
+  name: string,
+): Promise<boolean> {
+  try {
+    const removed = await removeEntryIfPresent(directory, name);
+    if (await fileEntryExists(directory, name)) {
+      throw new LocalFileError("The local file deletion could not be confirmed.", "FILE_DELETE_UNCERTAIN");
+    }
+    return removed;
+  } catch (error) {
+    if (!await fileEntryExists(directory, name).catch(() => true)) return true;
+    throw error;
+  }
+}
+
+export async function sweepClaimedLocalFileDeletion(
+  namespace: LocalFileNamespace,
+  key: string,
+  expectedMetadata: LocalFileMetadata | null,
+  deletionOwner: string,
+): Promise<boolean> {
+  assertSafeKey(key);
+  assertStagingOwner(deletionOwner);
+  const { objects, metadata } = await getNamespaceDirectories(namespace);
+  let inspection = await inspectClaimedDeletionInDirectories(
+    objects, metadata, namespace, key, expectedMetadata, deletionOwner,
+  );
+  if (inspection.state !== "owned") {
+    throw new LocalFileError("The local file deletion claim cannot sweep these fragments.", "FILE_DELETION_CLAIM_MISMATCH");
+  }
+  let removed = false;
+  if (inspection.phase === "claimed") {
+    if (inspection.objectPresent) {
+      removed = await removeEntryAndConfirm(objects, objectFilename(key)) || removed;
+    }
+    const current = await readRawDeletionClaimIfPresent(metadata, key);
+    if (!isDeletionClaim(current, namespace, key) || current.deletionOwner !== deletionOwner ||
+      !sameExpectedMetadata(current.expectedMetadata, expectedMetadata)) {
+      throw new LocalFileError("The local file deletion claim changed.", "FILE_DELETION_CLAIM_MISMATCH");
+    }
+    await persistDeletionClaim(metadata, { ...current, phase: "object_deleted" });
+    inspection = await inspectClaimedDeletionInDirectories(
+      objects, metadata, namespace, key, expectedMetadata, deletionOwner,
+    );
+  }
+  if (inspection.state !== "owned") {
+    throw new LocalFileError("A foreign object appeared during local file deletion.", "FILE_DELETION_CLAIM_MISMATCH");
+  }
+  if (inspection.phase === "object_deleted") {
+    if (inspection.metadataPresent) {
+      removed = await removeEntryAndConfirm(metadata, metadataFilename(key)) || removed;
+    }
+    const current = await readRawDeletionClaimIfPresent(metadata, key);
+    if (!isDeletionClaim(current, namespace, key) || current.deletionOwner !== deletionOwner ||
+      !sameExpectedMetadata(current.expectedMetadata, expectedMetadata)) {
+      throw new LocalFileError("The local file deletion claim changed.", "FILE_DELETION_CLAIM_MISMATCH");
+    }
+    await persistDeletionClaim(metadata, { ...current, phase: "swept" });
+    inspection = await inspectClaimedDeletionInDirectories(
+      objects, metadata, namespace, key, expectedMetadata, deletionOwner,
+    );
+  }
+  if (inspection.state !== "owned" || inspection.phase !== "swept") {
+    throw new LocalFileError("The local file deletion did not settle exactly.", "FILE_DELETE_UNCERTAIN");
+  }
+  return removed;
+}
+
+export async function releaseClaimedLocalFileDeletion(
+  namespace: LocalFileNamespace,
+  key: string,
+  expectedMetadata: LocalFileMetadata | null,
+  deletionOwner: string,
+): Promise<boolean> {
+  assertSafeKey(key);
+  assertStagingOwner(deletionOwner);
+  const { objects, metadata } = await getNamespaceDirectories(namespace);
+  const inspection = await inspectClaimedDeletionInDirectories(
+    objects, metadata, namespace, key, expectedMetadata, deletionOwner,
+  );
+  if (inspection.state === "missing_claim") return false;
+  if (inspection.state !== "owned" || inspection.phase !== "swept") {
+    throw new LocalFileError("The local file deletion claim is not ready for release.", "FILE_DELETION_CLAIM_MISMATCH");
+  }
+  return removeEntryAndConfirm(metadata, deletionClaimFilename(key));
+}
+
+export async function abandonClaimedLocalFileDeletion(
+  namespace: LocalFileNamespace,
+  key: string,
+  expectedMetadata: LocalFileMetadata | null,
+  deletionOwner: string,
+): Promise<boolean> {
+  assertSafeKey(key);
+  assertStagingOwner(deletionOwner);
+  const { objects, metadata } = await getNamespaceDirectories(namespace);
+  const inspection = await inspectClaimedDeletionInDirectories(
+    objects,
+    metadata,
+    namespace,
+    key,
+    expectedMetadata,
+    deletionOwner,
+  );
+  if (inspection.state === "missing_claim") return false;
+  if (inspection.state !== "owned" || inspection.phase !== "claimed" ||
+    !inspection.objectPresent || !inspection.metadataPresent) {
+    throw new LocalFileError(
+      "Only an untouched deletion claim can be abandoned.",
+      "FILE_DELETION_CLAIM_MISMATCH",
+    );
+  }
+  return removeEntryAndConfirm(metadata, deletionClaimFilename(key));
 }
 
 /**
@@ -640,10 +1125,11 @@ export async function deleteOwnedLocalFile(
       "FILE_OWNERSHIP_MISMATCH",
     );
   }
-  const [objectDeleted, metadataDeleted] = await Promise.all([
-    removeEntryIfPresent(objects, objectFilename(key)),
-    removeEntryIfPresent(metadata, metadataFilename(key)),
-  ]);
+  // Preserve the ownership proof until the object side is confirmed absent.
+  // A crash can therefore leave metadata-only, but this function never creates
+  // an unverifiable bytes-only fragment.
+  const objectDeleted = await removeEntryAndConfirm(objects, objectFilename(key));
+  const metadataDeleted = await removeEntryAndConfirm(metadata, metadataFilename(key));
   return objectDeleted || metadataDeleted;
 }
 
