@@ -300,6 +300,7 @@ export const CAREER_LEGACY_DEMO_RESOLUTION_STATEMENTS: readonly SqlStatement[] =
         AND (SELECT COUNT(*) FROM career_contact_jobs) = 0
         AND (SELECT COUNT(*) FROM career_contact_interactions) = 0
         AND (SELECT COUNT(*) FROM career_lifecycle_events) = 0
+        AND (SELECT COUNT(*) FROM career_core_write_operations) = 0
         AND (SELECT COUNT(*) FROM career_materials) = 3
         AND (SELECT COUNT(DISTINCT name) FROM career_materials) = 3
         AND NOT EXISTS (
@@ -425,7 +426,7 @@ export async function initializeCareerDb(context?: CareerLockContext) {
       Number(schemaObjectCount[0]?.count ?? 0) === CAREER_V2_SCHEMA_OBJECT_COUNT;
     const isKnownInterruptedV2 = hasExactV2ObjectCount && (
       (currentApplicationId === CAREER_APPLICATION_ID &&
-        (currentUserVersion === 1 || currentUserVersion === CAREER_USER_VERSION)) ||
+        (currentUserVersion === 1 || currentUserVersion === 3)) ||
       (currentApplicationId === 0 && currentUserVersion === 0)
     );
     try {

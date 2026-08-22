@@ -58,7 +58,7 @@ for (const contract of [
     exportName: "zhijiSchema",
     name: "zhiji",
     filename: "zhiji.sqlite3",
-    minimumTables: 12,
+    minimumTables: 13,
     seedTable: "career_stages",
     minimumSeedRows: 9,
     emptyTables: [
@@ -71,6 +71,7 @@ for (const contract of [
       "career_materials",
       "career_activity",
       "career_lifecycle_events",
+      "career_core_write_operations",
     ],
     migrationLedger: {
       table: "career_schema_migrations",
@@ -78,6 +79,7 @@ for (const contract of [
         { version: 1, name: "initial-career-runtime" },
         { version: 2, name: "contact-history" },
         { version: 3, name: "reversible-lifecycle" },
+        { version: 4, name: "career-core-write-recovery" },
       ],
     },
   },

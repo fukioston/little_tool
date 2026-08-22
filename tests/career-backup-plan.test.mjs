@@ -78,6 +78,7 @@ function createVersionDatabase(version, { facts = false, materials = [] } = {}) 
   const statements = [...schema.ZHIJI_V1_SCHEMA_STATEMENTS];
   if (version >= 2) statements.push(...schema.ZHIJI_V2_SCHEMA_MIGRATION_STATEMENTS);
   if (version >= 3) statements.push(...schema.ZHIJI_V3_SCHEMA_MIGRATION_STATEMENTS);
+  if (version >= 4) statements.push(...schema.ZHIJI_V4_SCHEMA_MIGRATION_STATEMENTS);
   statements.push(
     {
       sql: `PRAGMA application_id = ${
@@ -94,7 +95,7 @@ function createVersionDatabase(version, { facts = false, materials = [] } = {}) 
 }
 
 function createDatabase(materials = []) {
-  return createVersionDatabase(3, { materials });
+  return createVersionDatabase(4, { materials });
 }
 
 function createDirectVersionTwoDatabase({
@@ -247,6 +248,11 @@ function assertCanonicalLedger(database) {
     {
       version: 3,
       name: schema.ZHIJI_V3_MIGRATION_NAME,
+      hasAppliedAt: 1,
+    },
+    {
+      version: 4,
+      name: schema.ZHIJI_V4_MIGRATION_NAME,
       hasAppliedAt: 1,
     },
   ]);
@@ -558,18 +564,18 @@ test("legacy restore clears all four attachment columns", () => {
   }
 });
 
-test("restore plan publishes the canonical v3 Career schema identity", () => {
+test("restore plan publishes the canonical v4 Career schema identity", () => {
   assert.equal(CAREER_APPLICATION_ID, 0x5a484a49);
-  assert.equal(CAREER_USER_VERSION, 3);
+  assert.equal(CAREER_USER_VERSION, 4);
   assert.deepEqual(CAREER_SCHEMA_REQUIREMENTS.sourceApplicationIds, [
     0,
     CAREER_APPLICATION_ID,
   ]);
   assert.equal(CAREER_SCHEMA_REQUIREMENTS.applicationId, CAREER_APPLICATION_ID);
-  assert.equal(CAREER_SCHEMA_REQUIREMENTS.minimumUserVersion, 3);
-  assert.equal(CAREER_SCHEMA_REQUIREMENTS.maximumUserVersion, 3);
+  assert.equal(CAREER_SCHEMA_REQUIREMENTS.minimumUserVersion, 4);
+  assert.equal(CAREER_SCHEMA_REQUIREMENTS.maximumUserVersion, 4);
   assert.equal(CAREER_SCHEMA_REQUIREMENTS.sourceMinimumUserVersion, 0);
-  assert.equal(CAREER_SCHEMA_REQUIREMENTS.sourceMaximumUserVersion, 3);
+  assert.equal(CAREER_SCHEMA_REQUIREMENTS.sourceMaximumUserVersion, 4);
 
   const materials = CAREER_SCHEMA_REQUIREMENTS.requiredTables.find(
     ({ name }) => name === "career_materials",
@@ -589,17 +595,36 @@ test("restore plan publishes the canonical v3 Career schema identity", () => {
   const canonicalJobs = CAREER_SCHEMA_REQUIREMENTS.requiredTables.find(
     ({ name }) => name === "career_jobs",
   );
+  const coreWriteOperations = CAREER_SCHEMA_REQUIREMENTS.requiredTables.find(
+    ({ name }) => name === "career_core_write_operations",
+  );
   assert.equal(sourceContacts.columns.includes("updated_at"), false);
   assert.equal(sourceContacts.columns.includes("archived"), false);
   assert.equal(canonicalContacts.columns.includes("updated_at"), true);
   assert.equal(canonicalContacts.columns.includes("archived"), true);
   assert.equal(canonicalJobs.columns.includes("archived_at"), true);
   assert.equal(canonicalJobs.columns.includes("ended_at"), true);
+  assert.deepEqual(coreWriteOperations?.columns, [
+    "operation_id",
+    "purpose",
+    "receipt_version",
+    "kind",
+    "entity_id",
+    "projection_sha256",
+    "operation_at",
+  ]);
+  assert.equal(
+    CAREER_SCHEMA_REQUIREMENTS.sourceRequiredTables.some(
+      ({ name }) => name === "career_core_write_operations",
+    ),
+    false,
+  );
   for (const name of [
     "career_schema_migrations",
     "career_contact_jobs",
     "career_contact_interactions",
     "career_lifecycle_events",
+    "career_core_write_operations",
   ]) {
     assert.ok(
       CAREER_SCHEMA_REQUIREMENTS.requiredTables.some((table) => table.name === name),
@@ -607,8 +632,8 @@ test("restore plan publishes the canonical v3 Career schema identity", () => {
   }
 });
 
-for (const sourceVersion of [0, 1, 2, 3]) {
-  test(`complete restore stages v${sourceVersion} to canonical v3 without losing facts`, () => {
+for (const sourceVersion of [0, 1, 2, 3, 4]) {
+  test(`complete restore stages v${sourceVersion} to canonical v4 without losing facts`, () => {
     const originalKey = `source-v${sourceVersion}`;
     const stagedKey = `staged-v${sourceVersion}`;
     const database = createVersionDatabase(sourceVersion, {
@@ -655,13 +680,17 @@ for (const sourceVersion of [0, 1, 2, 3]) {
         Number(database.selectValue("SELECT COUNT(*) FROM career_lifecycle_events")),
         0,
       );
+      assert.equal(
+        Number(database.selectValue("SELECT COUNT(*) FROM career_core_write_operations")),
+        0,
+      );
       assertNoRestoreGuards(database);
     } finally {
       database.close();
     }
   });
 
-  test(`legacy restore stages v${sourceVersion} to canonical v3 and clears file references`, () => {
+  test(`legacy restore stages v${sourceVersion} to canonical v4 and clears file references`, () => {
     const database = createVersionDatabase(sourceVersion, {
       facts: true,
       materials: [{
@@ -804,7 +833,7 @@ test("strict guard rejects altered DDL with the same object name", () => {
   }
 });
 
-test("strict guard rejects a corrupted v3 migration ledger", () => {
+test("strict guard rejects a corrupted v4 migration ledger", () => {
   const database = createDatabase([{ id: "ledger-material" }]);
   database.exec(`UPDATE career_schema_migrations
     SET name='tampered-contact-history' WHERE version=2`);
@@ -812,7 +841,7 @@ test("strict guard rejects a corrupted v3 migration ledger", () => {
   try {
     assert.throws(() => executeStatementsAtomically(
       database,
-      createLegacyCareerRestoreStatements(3),
+      createLegacyCareerRestoreStatements(4),
     ));
     assert.deepEqual(materialRows(database), before);
     assert.equal(

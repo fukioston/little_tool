@@ -2,10 +2,11 @@ import type { LocalDatabaseSchema } from "./types";
 
 /** SQLite application_id for the ASCII-ish marker "ZHJI". */
 export const ZHIJI_APPLICATION_ID = 0x5a484a49;
-export const ZHIJI_USER_VERSION = 3;
+export const ZHIJI_USER_VERSION = 4;
 export const ZHIJI_V1_MIGRATION_NAME = "initial-career-runtime";
 export const ZHIJI_V2_MIGRATION_NAME = "contact-history";
 export const ZHIJI_V3_MIGRATION_NAME = "reversible-lifecycle";
+export const ZHIJI_V4_MIGRATION_NAME = "career-core-write-recovery";
 
 export const ZHIJI_V1_TABLE_COLUMNS = {
   career_stages: ["id", "name", "color", "position", "is_terminal", "hidden"],
@@ -80,6 +81,10 @@ export const ZHIJI_TABLE_COLUMNS = {
     "id", "job_id", "entity_type", "entity_id", "action",
     "previous_status", "next_status", "previous_due_at", "next_due_at",
     "reason", "created_at",
+  ],
+  career_core_write_operations: [
+    "operation_id", "purpose", "receipt_version", "kind", "entity_id",
+    "projection_sha256", "operation_at",
   ],
 } as const;
 
@@ -382,6 +387,37 @@ export const ZHIJI_V3_SCHEMA_MIGRATION_STATEMENTS: readonly Readonly<{ sql: stri
   },
 ];
 
+/**
+ * Immutable proof that a recoverable core write committed. These rows have no
+ * foreign keys by design: a receipt must remain inspectable after its target
+ * is archived, deleted, or superseded. They are never garbage-collected until
+ * a future protocol can prove that every durable client journal acknowledged
+ * the operation.
+ */
+export const ZHIJI_V4_SCHEMA_MIGRATION_STATEMENTS: readonly Readonly<{ sql: string }>[] = [
+  {
+    sql: `CREATE TABLE career_core_write_operations (
+      operation_id TEXT PRIMARY KEY,
+      purpose TEXT NOT NULL CHECK (purpose = 'career-core-write'),
+      receipt_version INTEGER NOT NULL CHECK (receipt_version = 1),
+      kind TEXT NOT NULL CHECK (kind IN (
+        'stage-rename','job-create','job-update',
+        'interview-create','interview-update'
+      )),
+      entity_id TEXT NOT NULL,
+      projection_sha256 TEXT NOT NULL CHECK (
+        length(projection_sha256) = 64
+        AND projection_sha256 NOT GLOB '*[^0-9a-f]*'
+      ),
+      operation_at TEXT NOT NULL CHECK (length(operation_at) > 0)
+    )`,
+  },
+  {
+    sql: `INSERT INTO career_schema_migrations(version,name,applied_at) VALUES
+      (4,'${ZHIJI_V4_MIGRATION_NAME}',strftime('%Y-%m-%dT%H:%M:%fZ','now'))`,
+  },
+];
+
 function objectSql(
   statements: readonly Readonly<{ sql: string }>[],
 ): Record<string, string> {
@@ -490,6 +526,15 @@ function v3Objects(
 
 const v3MigratedObjects: Record<string, string> = v3Objects(v2MigratedObjects);
 const v3DirectObjects: Record<string, string> = v3Objects(v2DirectObjects);
+const v4MigrationObjects = objectSql(ZHIJI_V4_SCHEMA_MIGRATION_STATEMENTS);
+const v4MigratedObjects: Record<string, string> = {
+  ...v3MigratedObjects,
+  ...v4MigrationObjects,
+};
+const v4DirectObjects: Record<string, string> = {
+  ...v3DirectObjects,
+  ...v4MigrationObjects,
+};
 
 export const ZHIJI_SCHEMA_OBJECT_SQL_VARIANTS = {
   0: Object.fromEntries(
@@ -510,7 +555,13 @@ export const ZHIJI_SCHEMA_OBJECT_SQL_VARIANTS = {
       ? [v3MigratedObjects[name], v3DirectObjects[name]]
       : [v3MigratedObjects[name]],
   ])),
-} as const satisfies Readonly<Record<0 | 1 | 2 | 3, Readonly<Record<string, readonly string[]>>>>;
+  4: Object.fromEntries(Object.keys(v4MigratedObjects).map((name) => [
+    name,
+    name === "career_contacts" || name === "career_tasks"
+      ? [v4MigratedObjects[name], v4DirectObjects[name]]
+      : [v4MigratedObjects[name]],
+  ])),
+} as const satisfies Readonly<Record<0 | 1 | 2 | 3 | 4, Readonly<Record<string, readonly string[]>>>>;
 
 export const ZHIJI_SCHEMA_LINEAGES = {
   2: [
@@ -531,6 +582,16 @@ export const ZHIJI_SCHEMA_LINEAGES = {
     {
       contactsSql: v3DirectObjects.career_contacts,
       tasksSql: v3DirectObjects.career_tasks,
+    },
+  ],
+  4: [
+    {
+      contactsSql: v4MigratedObjects.career_contacts,
+      tasksSql: v4MigratedObjects.career_tasks,
+    },
+    {
+      contactsSql: v4DirectObjects.career_contacts,
+      tasksSql: v4DirectObjects.career_tasks,
     },
   ],
 } as const;
@@ -574,6 +635,11 @@ export const zhijiSchema: LocalDatabaseSchema = {
       version: 3,
       description: ZHIJI_V3_MIGRATION_NAME,
       sql: statementsSql(ZHIJI_V3_SCHEMA_MIGRATION_STATEMENTS),
+    },
+    {
+      version: 4,
+      description: ZHIJI_V4_MIGRATION_NAME,
+      sql: statementsSql(ZHIJI_V4_SCHEMA_MIGRATION_STATEMENTS),
     },
   ],
   seedSql: ZHIJI_STRUCTURAL_SEED_SQL,
