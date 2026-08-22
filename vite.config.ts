@@ -45,7 +45,10 @@ export default defineConfig(async () => {
 
   return {
     server: {
-      host: "localhost",
+      // Bind the IPv4 loopback explicitly. Some browsers resolve `localhost`
+      // to 127.0.0.1 while Node otherwise listens only on ::1, making the
+      // local-only preview appear unavailable even though the process is up.
+      host: "127.0.0.1",
       port: 3000,
       strictPort: true,
       headers: {
